@@ -143,3 +143,9 @@ dmypy.json
 
 # local scratch/analysis work, kept out of the shared repo
 local/
+
+# Claude / code-review-graph local tooling
+.claude/
+.claudeignore
+.mcp.json
+CLAUDE.md
