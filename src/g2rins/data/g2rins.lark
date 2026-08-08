@@ -1,0 +1,285 @@
+g2rins: g2rins_molecule* fragment_definition*
+
+g2rins_molecule.-1: (smiles | smiles? _g2rins_repeat)+ dot_generation?
+
+_g2rins_repeat: stochastic_object+ smiles?
+
+stochastic_object: "{" WS_INLINE* terminal_bond_connector_list WS_INLINE* _repeat_units WS_INLINE* _end_group WS_INLINE* _end_group WS_INLINE* terminal_bond_connector_list "}" stochastic_generation?
+
+_atom_stand_in: atom
+  | stochastic_object
+  | bond_connector
+  | fragment_declaration
+  | bond_connector_list
+
+atom:  bracket_atom
+  | aliphatic_organic
+  | aromatic_organic
+  | "*"
+
+# Ok, this is not every printable_ascii character as described here: https://olsenlabmit.github.io/BigSMILES/docs/line_notation.html#simplifications-and-abbreviations, but it makes parsing so much more easy if we exclude a couple characters here.
+_printable_character: /['?'-Z]/
+  | /['^'-z]/
+  | /[!-']/
+  | /[*-;]/
+  | "~"
+_fragment_name: _printable_character+
+fragment_declaration: "[#" _fragment_name "]"
+
+fragment_definition: dot "{#" _fragment_name "=" g2rins_molecule+ "}"
+
+bracket_atom: "[" isotope? atom_symbol chiral? h_count? atom_charge? atom_class? "]"
+
+atom_symbol: _element_symbols
+  | aromatic_symbol
+  | "*"
+
+bond_symbol: "-"
+  | "="
+  | "#"
+  | "$"
+  | ":"
+  | "/"
+  | "\\"
+
+ring_bond: bond_symbol? DIGIT
+  | bond_symbol? "%" DIGIT? DIGIT
+
+branched_atom: _atom_stand_in ring_bond* branch*
+branch: "(" bond_symbol? (smiles | g2rins_molecule)* ")"
+atom_assembly: bond_symbol? branched_atom
+smiles: branched_atom atom_assembly* molar_amount?
+
+counterion: "." counterion_branched_atom counterion_assembly*
+counterion_assembly: bond_symbol? counterion_branched_atom
+counterion_branched_atom: atom ring_bond* branch*
+
+molar_amount: "|" NUMBER "|"
+
+isotope: INT
+
+bond_connector_symbol: "$"
+  | ">"
+  | "<"
+
+bond_connector_symbol_idx: bond_connector_symbol INT?
+
+bond_connector_generation: "|" WS_INLINE* NUMBER WS_INLINE* "|"
+  | "|" WS_INLINE* NUMBER  _number_list_repeat* WS_INLINE* "|"
+
+ladder_bond_connector: "[" inner_ambi_covalent_connector simple_bond_connector INT? "]"
+  | "[" inner_ambi_covalent_connector non_covalent_bond_connector INT? "]"
+
+inner_bond_connector: bond_connector_symbol_idx (WS_INLINE* "," WS_INLINE* bond_connector_symbol_idx)* bond_connector_generation?
+inner_non_covalent_connector: bond_connector_symbol ":" INT? _non_covalent_context?
+inner_ambi_covalent_connector: inner_bond_connector | inner_non_covalent_connector
+
+simple_bond_connector: "[" inner_bond_connector "]"
+non_covalent_bond_connector: "[" inner_non_covalent_connector "]"
+
+bond_connector: simple_bond_connector | ladder_bond_connector | non_covalent_bond_connector
+bond_connector_list: bond_connector ("|" bond_connector)*
+terminal_bond_connector: "[" inner_bond_connector? "]"
+terminal_bond_connector_list: terminal_bond_connector ("|" terminal_bond_connector)*
+
+stochastic_generation: "|" stochastic_distribution "|"
+flory_schulz: "flory_schulz(" WS_INLINE* NUMBER WS_INLINE* ","? WS_INLINE* ")"
+schulz_zimm: "schulz_zimm(" WS_INLINE* NUMBER WS_INLINE* "," WS_INLINE* NUMBER WS_INLINE* ")"
+gauss: "gauss(" WS_INLINE* NUMBER WS_INLINE* "," WS_INLINE* NUMBER WS_INLINE* ")"
+uniform: "uniform(" WS_INLINE* NUMBER WS_INLINE* "," WS_INLINE* NUMBER WS_INLINE* ")"
+log_normal: "log_normal(" WS_INLINE* NUMBER WS_INLINE* "," WS_INLINE* NUMBER WS_INLINE* ")"
+poisson: "poisson(" WS_INLINE* NUMBER WS_INLINE* ","? WS_INLINE* ")"
+stochastic_distribution: flory_schulz
+  | schulz_zimm
+  | gauss
+  | uniform
+  | log_normal
+  | poisson
+
+_unary_index_operator: "!"
+_binary_index_operator: "~" | "&"
+_index_statement: INT | _branched_index_expression | _unbranched_index_expression
+_branched_index_expression: "(" WS_INLINE* _index_statement WS_INLINE* _binary_index_operator WS_INLINE* _index_statement WS_INLINE* ")"
+_unbranched_index_expression:  _index_statement WS_INLINE* _binary_index_operator WS_INLINE* _index_statement
+_index_expression: _unary_index_operator? WS_INLINE* _index_statement
+_non_covalent_key_value_pair: WS_INLINE* "," WS_INLINE* _printable_character+ "=" _printable_character+ WS_INLINE*
+_non_covalent_context: WS_INLINE* "|" WS_INLINE* _index_expression _non_covalent_key_value_pair*
+
+h_count: "H"
+  | "H" INT
+
+atom_charge: "-" INT?
+  | "+" INT?
+  | "--"
+  | "++"
+
+atom_class: ":" INT
+
+
+dot_system_size: "|" WS_INLINE* NUMBER WS_INLINE* "|"
+dot_generation: dot dot_system_size?
+dot: "."
+
+_number_list_repeat.-1: WS_INLINE+ NUMBER
+
+_repeat_units: _stochastic_unit _monomer_list*
+_monomer_list: WS_INLINE* "," WS_INLINE* _stochastic_unit
+_end_group.-1: ";" WS_INLINE* _stochastic_unit* _monomer_list*
+_stochastic_unit: (smiles | g2rins_molecule) counterion*
+
+
+%import common.DIGIT
+%import common.INT
+%import common.SIGNED_NUMBER
+%import common.NUMBER
+%import common.WS
+%import common.WS_INLINE
+
+aliphatic_organic:  "B"
+  | "C"
+  | "N"
+  | "O"
+  | "S"
+  | "P"
+  | "F"
+  | "Cl"
+  | "Br"
+  | "I"
+
+aromatic_organic: "b"
+  | "c"
+  | "n"
+  | "o"
+  | "s"
+  | "p"
+
+aromatic_symbol: aromatic_organic
+  | "se"
+  | "as"
+
+chiral: "@"
+  | "@@"
+  | "@TH1"
+  | "@TH2"
+  | "@AL1"
+  | "@AL2"
+  | "@SP1"
+  | "@SP2"
+  | "@SP3"
+  | "@TB" INT
+  | "@OH" INT
+
+_element_symbols: "H"
+  | "He"
+  | "Li"
+  | "Be"
+  | "B"
+  | "C"
+  | "N"
+  | "O"
+  | "F"
+  | "Ne"
+  | "Na"
+  | "Mg"
+  | "Al"
+  | "Si"
+  | "P"
+  | "S"
+  | "Cl"
+  | "Ar"
+  | "K"
+  | "Ca"
+  | "Sc"
+  | "Ti"
+  | "V"
+  | "Cr"
+  | "Mn"
+  | "Fe"
+  | "Co"
+  | "Ni"
+  | "Cu"
+  | "Zn"
+  | "Ga"
+  | "Ge"
+  | "As"
+  | "Se"
+  | "Br"
+  | "Kr"
+  | "Rb"
+  | "Sr"
+  | "Y"
+  | "Zr"
+  | "Nb"
+  | "Mo"
+  | "Tc"
+  | "Ru"
+  | "Rh"
+  | "Pd"
+  | "Ag"
+  | "Cd"
+  | "In"
+  | "Sn"
+  | "Sb"
+  | "Te"
+  | "I"
+  | "Xe"
+  | "Cs"
+  | "Ba"
+  | "Hf"
+  | "Ta"
+  | "W"
+  | "Re"
+  | "Os"
+  | "Ir"
+  | "Pt"
+  | "Au"
+  | "Hg"
+  | "Tl"
+  | "Pb"
+  | "Bi"
+  | "Po"
+  | "At"
+  | "Rn"
+  | "Fr"
+  | "Ra"
+  | "Rf"
+  | "Db"
+  | "Sg"
+  | "Bh"
+  | "Hs"
+  | "Mt"
+  | "Ds"
+  | "Rg"
+  | "Cn"
+  | "Fl"
+  | "Lv"
+  | "La"
+  | "Ce"
+  | "Pr"
+  | "Nd"
+  | "Pm"
+  | "Sm"
+  | "Eu"
+  | "Gd"
+  | "Tb"
+  | "Dy"
+  | "Ho"
+  | "Er"
+  | "Tm"
+  | "Yb"
+  | "Lu"
+  | "Ac"
+  | "Th"
+  | "Pa"
+  | "U"
+  | "Np"
+  | "Pu"
+  | "Am"
+  | "Cm"
+  | "Bk"
+  | "Cf"
+  | "Es"
+  | "Fm"
+  | "Md"
+  | "No"
+  | "Lr"

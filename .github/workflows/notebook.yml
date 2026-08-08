@@ -1,0 +1,37 @@
+name: notebooks
+
+# Manual-dispatch only: the guide has no TESTING_ENV fast path, so a full run
+# generates every ensemble in the paper SI across the whole OS/Python matrix.
+on:
+  workflow_dispatch:
+
+env:
+  TESTING_ENV: "True"
+
+jobs:
+  notebook:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: pip install g2rins Python package
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install jupytext ipython jupyter
+          python -m pip install .
+
+      - name: Create test with Jupytext
+        shell: bash -l {0}
+        run: jupytext --to py G2RINS_guide.ipynb
+      - name: Run Notebook test
+        run: python G2RINS_guide.py
