@@ -31,9 +31,6 @@ lint:
     - prettier@3.5.3
     - taplo@0.9.3
   ignore:
-    - linters: [prettier]
-      paths:
-        - SI.md
     - linters: [cspell]
       paths:
         - tests/test_molecule.py

@@ -20,10 +20,10 @@ jobs:
         python-version: ["3.10", "3.13"]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -31,7 +31,7 @@ jobs:
         run: |
           python --version
           which python
-          python -m pip install .
+          python -m pip install ".[test]"
 
       - name: Run pytest on tests/
         run: python -m pytest ./tests/ -vvv
