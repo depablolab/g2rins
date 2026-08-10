@@ -172,6 +172,14 @@
     "arrowstyle",
     "connectionstyle",
     "checkin",
-    "edgelist"
+    "edgelist",
+    "depablolab",
+    "cff",
+    "sdist",
+    "twine",
+    "keepachangelog",
+    "reproducer",
+    "pyproject",
+    "svg"
   ]
 }
