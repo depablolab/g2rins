@@ -18,7 +18,7 @@ python -m pip install -e ".[test]"
 python -m pytest tests/
 ```
 
-CI runs the same suite on Linux, Windows, and macOS with the minimum (3.10) and maximum (3.14) supported Python versions, so passing locally on one platform is usually enough before opening a pull request.
+CI runs the same test suite on Linux, Windows, and macOS using Python 3.10 (the minimum supported version) and Python 3.14 (the highest version currently tested in CI). Pull requests use a faster Linux-only matrix for these two Python versions, while the full cross-platform matrix runs after changes are merged to `main` and on the monthly scheduled CI run. Passing the pull-request checks provides the pre-merge regression gate; the post-merge matrix provides the final cross-platform compatibility check.
 
 ## Contribution workflow
 

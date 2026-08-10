@@ -11,19 +11,19 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Changed
 
-- CI test matrix upper bound raised from Python 3.13 to 3.14 (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
-- All workflows updated to current GitHub Action majors, with least-privilege permissions and full-history checkouts so `setuptools-scm` derives the real tag version.
-- Simplified the `setuptools-scm` configuration in `pyproject.toml` to the documented pattern (no behavioral change to `g2rins.__version__`).
+- Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
+- Updated official GitHub Actions to current stable majors and tightened workflow permissions.
+- Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
+- Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
 
 ### Fixed
 
-- CI installs the `[test]` extra so pytest is available in the test jobs (#1).
-- Distribution builds previously ran on a shallow, tag-less checkout, producing a fallback development version instead of the tag-derived one.
-- Removed a machine-local `.trunk/plugins/trunk` symlink from version control.
+- CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
+- Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 
 ## [1.0.0] - 2026-08-08
 
 Initial public release.
 
 [Unreleased]: https://github.com/depablolab/g2rins/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/depablolab/g2rins/releases/tag/v1.0.0
+[1.0.0]: https://github.com/depablolab/g2rins/tree/v1.0.0
