@@ -180,6 +180,8 @@
     "keepachangelog",
     "reproducer",
     "pyproject",
-    "svg"
+    "svg",
+    "RINS",
+    "docstrings"
   ]
 }

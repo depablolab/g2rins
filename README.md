@@ -56,7 +56,7 @@ Worked examples are in [`G2RINS_guide.ipynb`](G2RINS_guide.ipynb).
 
 G²RINS is the evolution of **G-BigSMILES** ([latest repository](https://github.com/gervasiozaldivar/G-BigSMILES), [original repository](https://github.com/InnocentBug/G-BigSMILES)), which extends the [BigSMILES line notation](https://olsenlabmit.github.io/BigSMILES/docs/line_notation.html):
 
-> Schneider, Walsh, Olsen, de Pablo, *Generative BigSMILES: an extension for polymer informatics, computer simulations & ML/AI*, Digital Discovery **3**, 51–61 (2024). [doi:10.1039/D3DD00147D](https://doi.org/10.1039/D3DD00147D)
+> Schneider, Walsh, Olsen, de Pablo, _Generative BigSMILES: an extension for polymer informatics, computer simulations & ML/AI_, Digital Discovery **3**, 51–61 (2024). [doi:10.1039/D3DD00147D](https://doi.org/10.1039/D3DD00147D)
 
 A publication describing G²RINS is in preparation.
 

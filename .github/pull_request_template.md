@@ -1,3 +1,5 @@
+<!-- markdownlint-disable-file MD041 -->
+
 ## Summary
 
 <!-- What does this PR change? -->

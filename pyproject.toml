@@ -56,6 +56,4 @@ omit = [
 ]
 
 [tool.setuptools.package-data]
-g2rins = [
-  "data/g2rins.lark",
-]
+g2rins = ["data/g2rins.lark"]
