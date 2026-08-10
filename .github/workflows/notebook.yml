@@ -1,12 +1,12 @@
 name: notebooks
 
-# Manual-dispatch only: the guide has no TESTING_ENV fast path, so a full run
-# generates every ensemble in the paper SI across the whole OS/Python matrix.
+# Manual-dispatch only: a full run executes the guide end-to-end and generates
+# every ensemble in the paper SI across the whole OS/Python matrix.
 on:
   workflow_dispatch:
 
-env:
-  TESTING_ENV: "True"
+permissions:
+  contents: read
 
 jobs:
   notebook:
@@ -14,13 +14,16 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.10", "3.13"]
+        python-version: ["3.10", "3.14"]
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v7
+        with:
+          # setuptools-scm needs the full history and tags to derive the version.
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
