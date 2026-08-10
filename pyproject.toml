@@ -5,7 +5,7 @@
 # ]
 
 [build-system]
-requires = ["setuptools>=77", "wheel", "setuptools-scm"]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -36,9 +36,6 @@ test = ["pytest"]
 [project.urls]
 Homepage = "https://github.com/depablolab/g2rins"
 Repository = "https://github.com/depablolab/g2rins"
-
-[tool.setuptools.dynamic]
-version = { attr = "g2rins._version.version" }
 
 [tool.setuptools_scm]
 version_file = "src/g2rins/_version.py"
