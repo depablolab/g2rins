@@ -27,7 +27,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.x"
+          # Pin release builds to the highest CI-tested Python; a floating
+          # "3.x" would silently adopt new releases before CI covers them.
+          python-version: "3.14"
 
       - name: Build sdist and wheel
         run: |
@@ -38,6 +40,8 @@ jobs:
         run: python -m twine check --strict dist/*
 
       - name: Store the distribution packages
+        # Only the tag-triggered github-release job consumes this artifact.
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
         uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
