@@ -1,0 +1,33 @@
+name: Feature request
+description: Suggest an improvement or new capability for G2RINS
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use case
+      description: The scientific or practical problem you are trying to solve.
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired-behavior
+    attributes:
+      label: Desired behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-api
+    attributes:
+      label: Proposed API or representation
+      description: Optional sketch of the interface or G2RINS syntax you have in mind.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
