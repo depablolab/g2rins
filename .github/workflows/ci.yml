@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - trunk-merge/**
   pull_request:
     branches:
       - main
@@ -14,14 +13,26 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs when a PR is updated; push/schedule runs get unique
+# groups and are never cancelled.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  ci-tests:
-    runs-on: ${{ matrix.os }}
+  # Fast pre-merge gate: Linux only, minimum supported Python and the highest
+  # version currently tested. The full OS matrix runs post-merge.
+  pr-tests:
+    name: PR Tests (Python ${{ matrix.python-version }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        # Min/max supported Python; 3.14 is the current ceiling (RDKit ships 3.14 wheels since 2026.3).
-        python-version: ["3.10", "3.14"]
+        python-version:
+          - "3.10"
+          - "3.14"
 
     steps:
       - uses: actions/checkout@v7
@@ -34,11 +45,66 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: pip install g2rins local package
+      - name: Install test environment
         run: |
           python --version
           python -c "import sys; print(sys.executable)"
           python -m pip install ".[test]"
 
-      - name: Run pytest on tests/
-        run: python -m pytest ./tests/ -vvv
+      - name: Run tests
+        run: python -m pytest tests/ -vvv
+
+  # Full compatibility matrix after merges to main and on the monthly schedule.
+  full-tests:
+    name: Full Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    if: github.event_name == 'push' || github.event_name == 'schedule'
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+        python-version:
+          - "3.10"
+          - "3.14"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # setuptools-scm needs the full history and tags to derive the version.
+          fetch-depth: 0
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install test environment
+        run: |
+          python --version
+          python -c "import sys; print(sys.executable)"
+          python -m pip install ".[test]"
+
+      - name: Run tests
+        run: python -m pytest tests/ -vvv
+
+  # Stable check name for branch protection / Rulesets, independent of the
+  # matrix-generated job names.
+  ci-required:
+    name: CI Required
+    if: ${{ always() && github.event_name == 'pull_request' }}
+    needs:
+      - pr-tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Verify PR test matrix passed
+        env:
+          TEST_RESULT: ${{ needs.pr-tests.result }}
+        shell: bash
+        run: |
+          echo "PR test matrix result: ${TEST_RESULT}"
+          test "${TEST_RESULT}" = "success"
