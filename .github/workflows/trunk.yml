@@ -15,6 +15,9 @@ on:
 jobs:
   trunk:
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v5
