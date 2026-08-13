@@ -1,5 +1,8 @@
 # G<sup>2</sup>RINS
 
+[![CI](https://github.com/depablolab/g2rins/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/depablolab/g2rins/actions/workflows/ci.yml)
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+
 Implementation of G2RINS, a line-and-graph representation of polymers. Grammar validation, generative graph construction, and molecular ensemble generation.
 
 ---
@@ -53,9 +56,21 @@ Worked examples are in [`G2RINS_guide.ipynb`](G2RINS_guide.ipynb).
 
 G²RINS is the evolution of **G-BigSMILES** ([latest repository](https://github.com/gervasiozaldivar/G-BigSMILES), [original repository](https://github.com/InnocentBug/G-BigSMILES)), which extends the [BigSMILES line notation](https://olsenlabmit.github.io/BigSMILES/docs/line_notation.html):
 
-> Schneider, Walsh, Olsen, de Pablo, *Generative BigSMILES: an extension for polymer informatics, computer simulations & ML/AI*, Digital Discovery **3**, 51–61 (2024). [doi:10.1039/D3DD00147D](https://doi.org/10.1039/D3DD00147D)
+> Schneider, Walsh, Olsen, de Pablo, _Generative BigSMILES: an extension for polymer informatics, computer simulations & ML/AI_, Digital Discovery **3**, 51–61 (2024). [doi:10.1039/D3DD00147D](https://doi.org/10.1039/D3DD00147D)
 
 A publication describing G²RINS is in preparation.
+
+---
+
+## Contributing
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Bug reports and feature requests go through the [issue tracker](https://github.com/depablolab/g2rins/issues); notable changes are tracked in [CHANGELOG.md](CHANGELOG.md) and on the [releases page](https://github.com/depablolab/g2rins/releases).
+
+---
+
+## Citing
+
+If you use G²RINS in your work, please cite the software using the metadata in [CITATION.cff](CITATION.cff) (GitHub's "Cite this repository" button). The citation for the publication describing G²RINS will be added here once it is available.
 
 ---
 

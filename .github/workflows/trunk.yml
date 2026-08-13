@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - trunk-merge/**
   pull_request:
     branches:
       - main
@@ -18,10 +17,11 @@ permissions:
 
 jobs:
   trunk:
+    name: Trunk Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Trunk Check
         uses: trunk-io/trunk-action@v1

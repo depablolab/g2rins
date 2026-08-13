@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata from this file."
+type: software
+title: "G2RINS"
+abstract: "Implementation of G2RINS, a line-and-graph representation of polymers. Grammar validation, generative graph construction, and molecular ensemble generation."
+authors:
+  - family-names: Zaldivar
+    given-names: Gervasio
+  - family-names: Tian
+    given-names: Yuan
+license: GPL-3.0-only
+repository-code: "https://github.com/depablolab/g2rins"
+version: 1.0.0
+date-released: "2026-08-08"

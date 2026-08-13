@@ -1,13 +1,17 @@
-name: Build Python distribution
-permissions: read-all
+name: release
+
 on:
   push:
     branches:
       - main
-    tags: "*" # Trigger on all tags
+    tags:
+      - "v*"
   pull_request:
     branches:
       - main
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -15,18 +19,55 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
         with:
-          python-version: "3.x"
-      - name: Install pypa/build
+          # setuptools-scm needs the full history and tags to derive the version.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          # Pin release builds to the highest CI-tested Python; a floating
+          # "3.x" would silently adopt new releases before CI covers them.
+          python-version: "3.14"
+
+      - name: Build sdist and wheel
         run: |
-          python3 -m pip install --user --upgrade build
-      - name: Build a binary wheel and a source tarball
-        run: python3 -m build
+          python -m pip install --upgrade build twine
+          python -m build
+
+      - name: Check built distributions
+        run: python -m twine check --strict dist/*
+
       - name: Store the distribution packages
-        uses: actions/upload-artifact@v4
+        # Only the tag-triggered github-release job consumes this artifact.
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        uses: actions/upload-artifact@v7
         with:
           name: python-package-distributions
           path: dist/
+
+  github-release:
+    name: Create GitHub Release
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the distribution packages
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Create GitHub Release for the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          --verify-tag
