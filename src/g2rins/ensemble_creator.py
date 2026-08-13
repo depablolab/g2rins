@@ -1610,7 +1610,27 @@ class _PartialAtomGraph:
 
         new_sto_atom_id, parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
 
-        # Transfer non-used transition bonds to new stochastic bonds
+        # Transfer the source bucket's remaining same-level transition bonds,
+        # converted to propagation, to the instance OF THE FIRED LEVEL. When
+        # the target lies inside a nested stochastic object (own instance, own
+        # MW draw) that owner differs from new_sto_atom_id: filing the bonds
+        # under the landing instance pooled every sibling junction into its
+        # one draw, and the terminate-time wipe then destroyed the unfired
+        # ones (graft architectures could never reach the outer target). For
+        # targets at the fired level itself the two owners coincide (star
+        # initiators, outer-level graft-from), keeping that behavior intact.
+        if sto_gen_id < 0 or selected_target_sto_gen_id == sto_gen_id:
+            owner_sto_atom_id = new_sto_atom_id
+        elif self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id] == sto_gen_id:
+            owner_sto_atom_id = sto_atom_id
+        else:
+            # Nearest ancestor instance at the fired level; fall back to the
+            # landing instance (pre-fix behavior) if none exists.
+            owner_sto_atom_id = new_sto_atom_id
+            for ancestor in reversed(self.stochastic_tracker.parent_map.get(sto_atom_id, [])):
+                if self.stochastic_tracker._stochastic_atom_id_to_gen_id[ancestor] == sto_gen_id:
+                    owner_sto_atom_id = ancestor
+                    break
 
         list_of_new_bonds = []
         list_of_bond_idx_to_delete = []
@@ -1618,12 +1638,16 @@ class _PartialAtomGraph:
         for j, half_bond in enumerate(half_bonds):
             prop_attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
             fired_level_indices = [i for i, attr in enumerate(prop_attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
-            if prop_attr_list and not fired_level_indices:
-                # Transition edges only at OTHER levels (-1 continuations for
-                # trigger_global_transitions, or a level a later call must be
-                # able to fire): leave the bond untouched in this bucket.
-                # Sweeping it into the delete/convert below handed those
-                # continuations a mode-less copy and silently truncated them.
+            if not fired_level_indices:
+                # No transition edge at the fired level: leave the bond
+                # untouched in its bucket. Other levels' continuations (-1
+                # arms for trigger_global_transitions, levels a later call
+                # must fire) would be silently truncated by a mode-less copy,
+                # and termination-only bonds (e.g. outer-declared side-port
+                # caps) must keep their custody for the terminated-descendant
+                # scan — a stripped duplicate of them in an ancestor bucket
+                # masked that bucket's real growth bonds via prefer_parent
+                # and stalled the molecule before its terminators fired.
                 continue
 
             # Shallow copy: all three mode maps are rebound below, the other
@@ -1634,26 +1658,31 @@ class _PartialAtomGraph:
             new_stochastic_bond._mode_target_map = {}
             new_stochastic_bond._mode_target_molar_amounts_map = {}
 
-            if fired_level_indices:
-                list_of_bond_idx_to_delete.append(j)
-                if half_bond.gen_hierarchy == transition_bond.gen_hierarchy and half_bond not in non_used_half_bonds:
-                    bond_attr_list = copy.deepcopy([prop_attr_list[i] for i in fired_level_indices])
-                    for bond_attr in bond_attr_list:
-                        bond_attr[_PROPAGATION_NAME] = bond_attr[_TRANSITION_NAME]
-                        bond_attr[_TRANSITION_NAME] = 0
-                    new_stochastic_bond._mode_attr_map[_PROPAGATION_NAME] = bond_attr_list
-                    new_stochastic_bond._mode_target_map[_PROPAGATION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in fired_level_indices]
-                    new_stochastic_bond._mode_target_molar_amounts_map[_PROPAGATION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in fired_level_indices]
-                    retained_indices = [i for i in range(len(prop_attr_list)) if i not in fired_level_indices]
-                    if retained_indices:
-                        # A mixed bond also carries other-level transition
-                        # edges: keep them as transition modes on the
-                        # transferred copy so their continuations survive for
-                        # their own level's call.
-                        new_stochastic_bond._mode_attr_map[_TRANSITION_NAME] = [prop_attr_list[i] for i in retained_indices]
-                        new_stochastic_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
-                        new_stochastic_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
+            list_of_bond_idx_to_delete.append(j)
+            if half_bond.gen_hierarchy == transition_bond.gen_hierarchy and half_bond not in non_used_half_bonds:
+                bond_attr_list = copy.deepcopy([prop_attr_list[i] for i in fired_level_indices])
+                for bond_attr in bond_attr_list:
+                    bond_attr[_PROPAGATION_NAME] = bond_attr[_TRANSITION_NAME]
+                    bond_attr[_TRANSITION_NAME] = 0
+                new_stochastic_bond._mode_attr_map[_PROPAGATION_NAME] = bond_attr_list
+                new_stochastic_bond._mode_target_map[_PROPAGATION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in fired_level_indices]
+                new_stochastic_bond._mode_target_molar_amounts_map[_PROPAGATION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in fired_level_indices]
+                retained_indices = [i for i in range(len(prop_attr_list)) if i not in fired_level_indices]
+                if retained_indices:
+                    # A mixed bond also carries other-level transition
+                    # edges: keep them as transition modes on the
+                    # transferred copy so their continuations survive for
+                    # their own level's call.
+                    new_stochastic_bond._mode_attr_map[_TRANSITION_NAME] = [prop_attr_list[i] for i in retained_indices]
+                    new_stochastic_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
+                    new_stochastic_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
 
+            if not new_stochastic_bond.has_any_bonds():
+                # Hierarchy-filtered or non-used old-SO bonds: their
+                # fired-level edges are deliberately dropped with the source
+                # entry; a mode-less duplicate serves no consumer and pollutes
+                # the owner bucket.
+                continue
             new_stochastic_bond.parent = parent_list[len(parent_list)-1] if parent_list else -2
             list_of_new_bonds.append(new_stochastic_bond)
 
@@ -1661,9 +1690,9 @@ class _PartialAtomGraph:
 
         for bond in list_of_new_bonds:
             try:
-                self._open_half_bond_map[new_sto_atom_id] += [bond]
+                self._open_half_bond_map[owner_sto_atom_id] += [bond]
             except KeyError:
-                self._open_half_bond_map[new_sto_atom_id] = [bond]
+                self._open_half_bond_map[owner_sto_atom_id] = [bond]
 
         other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, selected_target_idx, self.stochastic_tracker, new_sto_atom_id, rng)
 

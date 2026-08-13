@@ -1751,6 +1751,42 @@ def test_phosphonium_tracked_mw_matches_rdkit():
     assert abs(rdkit_mw - tracked_mw) < 1.0, f"tracked {tracked_mw:.1f} vs RDKit {rdkit_mw:.1f}"
 
 
+def test_nested_side_chain_so_gets_one_instance_per_junction():
+    """A nested stochastic object with its own MW distribution used as a
+    repeat unit (graft side chains entered through backbone ports) grows one
+    instance with one independent draw per junction. The transition sweep
+    used to file the converted sibling ports under the LANDING instance
+    instead of the fired-level instance: every graft pooled into that single
+    poisson(200) draw, side chains never propagated past the junction unit,
+    the unfired ports were destroyed with the instance's terminate-time wipe,
+    and the outer target became unreachable — every chain was discarded as
+    non-representative."""
+    smi = (
+        "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; "
+        "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; "
+        "[<2][H] []}|poisson(2000)|"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        _reset_rngs(seed)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        bad = [w.category.__name__ for w in caught if issubclass(w.category, (PossibleNonRepresentativePolymerChain, DiscardedSamplingPaths))]
+        assert not bad, f"seed {seed}: graft chain flagged non-representative: {bad}"
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        side_id = next(i for i, d in dist.items() if d == "|poisson(200.0)|")
+        side_masses = tracked[side_id]
+        assert len(side_masses) >= 2, f"seed {seed}: grafts pooled into {len(side_masses)} side-chain instance(s): {side_masses}"
+        # The crossing rounding is all-or-nothing: a kept side chain always
+        # carries the junction plus repeat units. A bare ~59 Da junction means
+        # the ports were captured into a nested instance again.
+        assert min(side_masses) > 90.0, f"seed {seed}: bare junction graft survived: {side_masses}"
+
+
 def test_transition_bond_selection_is_level_aware():
     """The dead-end verdict of transition bond selection must be
     deterministic: _pop_random_bond filters candidates by the requested
