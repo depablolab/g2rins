@@ -1557,6 +1557,73 @@ class _PartialAtomGraph:
             return rescued_id, True
         return sto_atom_id, False
 
+    def promote_level_transitions(self, child_sto_atom_id, owner_sto_atom_id, sto_gen_id):
+        """Hand a finished instance's level-``sto_gen_id`` transition sites to
+        that level's live owner as ordinary propagation options, so the
+        owner's next growth step is one weighted draw over ALL its options
+        (chain continuation and unfired entry ports alike) instead of a
+        deterministic continuation fire — the multifunctional initiation
+        principle generalized to every level of the nested tree.
+
+        Promotion is per-edge and lazy: only edges declared at the owner's
+        level convert; transition edges of shallower levels ride along
+        unchanged and are promoted, in turn, at their own level's hand-off.
+        Termination modes ride along too, so a site the owner never draws is
+        capped by the owner's own terminate pass (a parked owner included).
+        The finished level's own propagation modes are dropped: that level is
+        decided. Scans the child's bucket plus its terminated descendants'
+        buckets (a frontier can end inside a deeper instance), the same
+        custody set terminate_graph composes.
+        """
+        tracker = self.stochastic_tracker
+        bucket_ids = [child_sto_atom_id] + [
+            bucket_id
+            for bucket_id in self._open_half_bond_map
+            if bucket_id != child_sto_atom_id and tracker.is_terminated(bucket_id) and child_sto_atom_id in tracker.parent_map.get(bucket_id, [])
+        ]
+        owner_parents = tracker.parent_map.get(owner_sto_atom_id, [])
+        # Pool-native parent tag: a promoted option must rank exactly like
+        # the owner's own bonds under the prefer_parent filter.
+        native_parent = tracker._stochastic_atom_id_to_gen_id[owner_parents[-1]] if owner_parents else -2
+        promoted_bonds = []
+        for bucket_id in bucket_ids:
+            kept_bonds = []
+            for half_bond in self._open_half_bond_map.get(bucket_id, []):
+                attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
+                level_indices = [i for i, attr in enumerate(attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
+                if not level_indices:
+                    kept_bonds.append(half_bond)
+                    continue
+                promoted_bond = copy.copy(half_bond)
+                promoted_bond._mode_attr_map = {}
+                promoted_bond._mode_target_map = {}
+                promoted_bond._mode_target_molar_amounts_map = {}
+                bond_attr_list = copy.deepcopy([attr_list[i] for i in level_indices])
+                for bond_attr in bond_attr_list:
+                    bond_attr[_PROPAGATION_NAME] = bond_attr[_TRANSITION_NAME]
+                    bond_attr[_TRANSITION_NAME] = 0
+                promoted_bond._mode_attr_map[_PROPAGATION_NAME] = bond_attr_list
+                promoted_bond._mode_target_map[_PROPAGATION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in level_indices]
+                promoted_bond._mode_target_molar_amounts_map[_PROPAGATION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in level_indices]
+                retained_indices = [i for i in range(len(attr_list)) if i not in level_indices]
+                if retained_indices:
+                    promoted_bond._mode_attr_map[_TRANSITION_NAME] = [attr_list[i] for i in retained_indices]
+                    promoted_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
+                    promoted_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
+                if half_bond.has_mode_bonds(_TERMINATION_NAME):
+                    promoted_bond._mode_attr_map[_TERMINATION_NAME] = list(half_bond._mode_attr_map[_TERMINATION_NAME])
+                    promoted_bond._mode_target_map[_TERMINATION_NAME] = list(half_bond._mode_target_map[_TERMINATION_NAME])
+                    promoted_bond._mode_target_molar_amounts_map[_TERMINATION_NAME] = list(half_bond._mode_target_molar_amounts_map[_TERMINATION_NAME])
+                promoted_bond.parent = native_parent
+                promoted_bonds.append(promoted_bond)
+            self._open_half_bond_map[bucket_id] = kept_bonds
+        for promoted_bond in promoted_bonds:
+            try:
+                self._open_half_bond_map[owner_sto_atom_id] += [promoted_bond]
+            except KeyError:
+                self._open_half_bond_map[owner_sto_atom_id] = [promoted_bond]
+        return len(promoted_bonds)
+
     def _transition_graph_single_bucket(self, sto_atom_id, sto_gen_id, rng):
         # Early exit if no transition necessary
         if len(self.get_open_half_bonds(sto_atom_id)[0]) < 1:
@@ -1608,7 +1675,7 @@ class _PartialAtomGraph:
 
         selected_target_sto_parent_id = self.generative_graph.nodes[selected_target_idx]["stochastic_id_tree"][1:]
 
-        new_sto_atom_id, parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
+        new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
 
         # Transfer the source bucket's remaining same-level transition bonds,
         # converted to propagation, to the instance OF THE FIRED LEVEL. When
@@ -1631,6 +1698,12 @@ class _PartialAtomGraph:
                 if self.stochastic_tracker._stochastic_atom_id_to_gen_id[ancestor] == sto_gen_id:
                     owner_sto_atom_id = ancestor
                     break
+
+        # Converted bonds become ordinary members of the owner's pool: tag
+        # them with the owner level's native parent value so prefer_parent
+        # ranks them exactly like the owner's own bonds.
+        owner_parents = self.stochastic_tracker.parent_map.get(owner_sto_atom_id, [])
+        owner_native_parent = self.stochastic_tracker._stochastic_atom_id_to_gen_id[owner_parents[-1]] if owner_parents else -2
 
         list_of_new_bonds = []
         list_of_bond_idx_to_delete = []
@@ -1683,7 +1756,7 @@ class _PartialAtomGraph:
                 # entry; a mode-less duplicate serves no consumer and pollutes
                 # the owner bucket.
                 continue
-            new_stochastic_bond.parent = parent_list[len(parent_list)-1] if parent_list else -2
+            new_stochastic_bond.parent = owner_native_parent
             list_of_new_bonds.append(new_stochastic_bond)
 
         self._open_half_bond_map[sto_atom_id] = [bond for j, bond in enumerate(half_bonds) if j not in list_of_bond_idx_to_delete]
@@ -2850,7 +2923,6 @@ class EnsembleCreator:
         checkpoints = {}
         owner_epochs = {}
         forced_overshoot_no_boundary = set()
-        deferred_continuation = None
         mutations = 0
 
         def _commit_mutation():
@@ -2891,19 +2963,13 @@ class EnsembleCreator:
             live_ids,
             live_set,
             sto_atom_id,
-            deferred_junction=None,
         ):
             """Net caps that would replace live descendant continuations if
-            ``sto_atom_id`` parked in this exact topology.
-
-            A finalization-boundary snapshot has already terminated its child
-            but has not yet fired the ancestor-level continuation.  Its
-            deferred owner is therefore also a conditional junction even
-            though it is no longer in ``live_ids``.
-            """
+            ``sto_atom_id`` parked in this exact topology. A finished child's
+            own promoted continuation sites are not conditional junctions:
+            they sit in the owner's pool with their termination modes intact,
+            so the owner's own average-cap estimate already prices them."""
             owners = _live_forest_children(tracker, live_ids, live_set, sto_atom_id)
-            if deferred_junction is not None and deferred_junction[1] == sto_atom_id:
-                owners.append(deferred_junction[0])
             return sum(
                 graph.get_average_junction_termination_mw(
                     owner_sto_atom_id,
@@ -2955,7 +3021,6 @@ class EnsembleCreator:
             tracker,
             live_ids,
             sto_atom_id,
-            deferred_junction=None,
         ):
             live_set = set(live_ids)
             own_mw = graph.get_average_termination_mw(
@@ -2969,11 +3034,10 @@ class EnsembleCreator:
                 live_ids,
                 live_set,
                 sto_atom_id,
-                deferred_junction,
             )
             return own_mw, own_mw + conditional_mw
 
-        def _capture_checkpoint(checkpoint_owner, deferred_junction=None):
+        def _capture_checkpoint(checkpoint_owner):
             """Capture both molecular topology and loop-control state.
 
             Restoring only the graph leaves pending ids and adaptive caches on
@@ -3009,7 +3073,6 @@ class EnsembleCreator:
                 },
                 "owner": checkpoint_owner,
                 "epoch": owner_epochs.get(checkpoint_owner, 0),
-                "deferred_junction": deferred_junction,
             }
 
         def _advance_owner_epoch(sto_atom_id):
@@ -3028,12 +3091,18 @@ class EnsembleCreator:
                 checkpoints.pop(sto_atom_id, None)
 
         def _finalize_pending(sto_atom_id):
-            """Fire the parked instance's declared end groups and continue the
-            chain at the nearest live ancestor's level (e.g. the diblock
-            junction at the parent level). If that ancestor is itself parked,
-            the junction must NOT continue: cap it with the ancestor's end
-            groups instead (graft-through chains otherwise grow a decided
-            level forever, one nested instance per continued unit)."""
+            """Fire the parked instance's declared end groups, then hand its
+            remaining continuation sites to the nearest live ancestor as
+            ordinary growth options (the multifunctional initiation principle
+            generalized to every level of the nested tree): the ancestor's
+            next step is one weighted draw over chain continuation and
+            unfired entry ports alike, instead of a deterministic
+            continuation fire. If that ancestor is itself parked, the
+            junction must NOT continue: cap it with the ancestor's end groups
+            instead (graft-through chains otherwise grow a decided level
+            forever, one nested instance per continued unit). With no live
+            ancestor at all the continuation is inter-object/root and the
+            caller fires it directly."""
             tracker = partial_atom_graph.stochastic_tracker
             partial_atom_graph.terminate_graph(sto_atom_id, rng)
             pending_termination.discard(sto_atom_id)
@@ -3046,12 +3115,13 @@ class EnsembleCreator:
                 partial_atom_graph.cap_junction_bonds(sto_atom_id, nearest_live_ancestor, rng)
                 return None
             if nearest_live_ancestor is None:
-                continuation_gen_id = tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
-            else:
-                continuation_gen_id = tracker._stochastic_atom_id_to_gen_id[nearest_live_ancestor]
-            # The caller owns the continuation so it can preserve the exact
-            # post-child/pre-continuation boundary used for ancestor rounding.
-            return sto_atom_id, nearest_live_ancestor, continuation_gen_id
+                return sto_atom_id, None, tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+            partial_atom_graph.promote_level_transitions(
+                sto_atom_id,
+                nearest_live_ancestor,
+                tracker._stochastic_atom_id_to_gen_id[nearest_live_ancestor],
+            )
+            return None
 
         while True:
             tracker = partial_atom_graph.stochastic_tracker
@@ -3069,12 +3139,11 @@ class EnsembleCreator:
             # Finalize parked instances whose subtree finished, deepest first
             # (a child's caps credit its ancestors before those are decided).
             finalized = None
-            if deferred_continuation is None:
-                for sto_atom_id in sorted(pending_termination, key=lambda i: len(parent_map.get(i, [])), reverse=True):
-                    if any(sto_atom_id in parent_map.get(d, []) for d in unterminated_sto_atom_ids):
-                        continue
-                    finalized = sto_atom_id
-                    break
+            for sto_atom_id in sorted(pending_termination, key=lambda i: len(parent_map.get(i, [])), reverse=True):
+                if any(sto_atom_id in parent_map.get(d, []) for d in unterminated_sto_atom_ids):
+                    continue
+                finalized = sto_atom_id
+                break
             if finalized is not None:
                 if _DECISION_TRACE is not None:
                     _DECISION_TRACE.append({
@@ -3083,28 +3152,24 @@ class EnsembleCreator:
                         "expected": tracker._sto_atom_id_expected_molw[finalized],
                         "actual": tracker._sto_atom_id_actual_molw[finalized],
                     })
-                # Finish the child's own level, then defer its ancestor-level
-                # continuation for one pass.  The nearest live ancestor must be
-                # tested in the post-child/pre-continuation state: finalization
-                # can expose a structural residual that crosses the ancestor,
-                # while its retained owner checkpoint is still the true state
-                # before the unit which spawned this child.
+                # Finish the child's own level. A live-ancestor continuation
+                # is promoted into that ancestor's pool inside
+                # _finalize_pending and fires later as an ordinary owner-level
+                # propagation draw; only the inter-object/root case (no live
+                # ancestor) still fires a transition directly here.
                 continuation = _finalize_pending(finalized)
                 checkpoints.pop(finalized, None)
                 if continuation is not None:
-                    owner_sto_atom_id, continuation_level, continuation_gen_id = continuation
-                    if continuation_level is None:
-                        # No live owner can cross; this is an inter-object/root
-                        # continuation, not an owner-level epoch.
-                        _new_sto_atom_id, transition_success = partial_atom_graph.transition_graph(
-                            owner_sto_atom_id,
-                            continuation_gen_id,
-                            rng,
-                        )
-                        if transition_success:
-                            _commit_mutation()
-                    else:
-                        deferred_continuation = continuation
+                    origin_sto_atom_id, _continuation_level, continuation_gen_id = continuation
+                    # No live owner can cross; this is an inter-object/root
+                    # continuation, not an owner-level epoch.
+                    _new_sto_atom_id, transition_success = partial_atom_graph.transition_graph(
+                        origin_sto_atom_id,
+                        continuation_gen_id,
+                        rng,
+                    )
+                    if transition_success:
+                        _commit_mutation()
                 continue
 
             growable = [i for i in unterminated_sto_atom_ids if i not in pending_termination]
@@ -3113,24 +3178,16 @@ class EnsembleCreator:
                 # descendants, so the next pass finalizes it.
                 continue
 
-            # A deferred child exit belongs to the nearest live ancestor and
-            # must run before any unrelated growth. Otherwise active is the
-            # deepest live non-parked instance (every descendant lists all of
-            # its ancestors, so one pass suffices).
-            if deferred_continuation is not None:
-                active_sto_atom_id = deferred_continuation[1]
-            else:
-                active_sto_atom_id = growable[0]
-                for sto_atom_id in growable:
-                    if sto_atom_id in parent_map:
-                        for ancestor in parent_map[sto_atom_id]:
-                            if active_sto_atom_id == ancestor:
-                                active_sto_atom_id = sto_atom_id
+            # Active is the deepest live non-parked instance (every
+            # descendant lists all of its ancestors, so one pass suffices).
+            active_sto_atom_id = growable[0]
+            for sto_atom_id in growable:
+                if sto_atom_id in parent_map:
+                    for ancestor in parent_map[sto_atom_id]:
+                        if active_sto_atom_id == ancestor:
+                            active_sto_atom_id = sto_atom_id
 
-            if (
-                deferred_continuation is None
-                and len(partial_atom_graph.get_open_half_bonds(active_sto_atom_id)[1]) == 0
-            ):
+            if len(partial_atom_graph.get_open_half_bonds(active_sto_atom_id)[1]) == 0:
                 # A live instance with no open half-bonds can never grow, transition,
                 # or terminate: retire it so the remaining instances and -1 arms
                 # continue instead of truncating the whole molecule. Only a
@@ -3192,15 +3249,10 @@ class EnsembleCreator:
             # keeps the exact per-iteration check).
             crossing_sto_atom_id = None
             crossing_projected = None
-            current_deferred_junction = None
-            crossing_candidates = (
-                [deferred_continuation[1]]
-                if deferred_continuation is not None
-                else sorted(
-                    growable,
-                    key=lambda i: len(parent_map.get(i, [])),
-                    reverse=True,
-                )
+            crossing_candidates = sorted(
+                growable,
+                key=lambda i: len(parent_map.get(i, [])),
+                reverse=True,
             )
             for sto_atom_id in crossing_candidates:
                 expected_i = tracker._sto_atom_id_expected_molw[sto_atom_id]
@@ -3213,21 +3265,11 @@ class EnsembleCreator:
                     and proj_now[sto_atom_id] + cached_margin < expected_i
                 ):
                     continue
-                current_deferred_junction = None
-                if (
-                    deferred_continuation is not None
-                    and deferred_continuation[1] == sto_atom_id
-                ):
-                    current_deferred_junction = (
-                        deferred_continuation[0],
-                        sto_atom_id,
-                    )
                 own_termination_weight, avg_termination_weight = _total_termination_mw(
                     partial_atom_graph,
                     tracker,
                     unterminated_sto_atom_ids,
                     sto_atom_id,
-                    current_deferred_junction,
                 )
                 own_termination_cache[sto_atom_id] = own_termination_weight
                 avg_termination_cache[sto_atom_id] = avg_termination_weight
@@ -3267,7 +3309,6 @@ class EnsembleCreator:
                             snapshot_tracker,
                             snapshot_live_ids,
                             crossing_sto_atom_id,
-                            checkpoint["deferred_junction"],
                         )
                         projected_under = (
                             _projected_molw(
@@ -3320,9 +3361,7 @@ class EnsembleCreator:
                         "snapshot_valid": snapshot_valid, "adopt_overshoot": adopt_overshoot,
                         "flag": termination_flag,
                     })
-                adopted_deferred_junction = None
                 if not adopt_overshoot:
-                    adopted_deferred_junction = checkpoint["deferred_junction"]
                     partial_atom_graph = checkpoint["graph"]
                     # Deepcopy clones the tracker's generator.  Keep consuming
                     # the caller's already-advanced stream; rewinding it would
@@ -3350,74 +3389,15 @@ class EnsembleCreator:
                         )
                     }
                 else:
-                    adopted_deferred_junction = current_deferred_junction
                     checkpoints.pop(crossing_sto_atom_id, None)
-                if (
-                    deferred_continuation is not None
-                    and deferred_continuation[1] == crossing_sto_atom_id
-                ):
-                    # This child exit was either replaced by a cap on the over
-                    # timeline or disappeared when an older under state won.
-                    deferred_continuation = None
-                # Parking changes control state only, not the mass epoch.
+                # Parking changes control state only, not the mass epoch. An
+                # unconsumed promoted continuation site in the parked
+                # instance's pool needs no redirect: it carries its
+                # termination modes and is capped by the instance's own
+                # terminate pass at finalization.
                 pending_termination.add(crossing_sto_atom_id)
-                if (
-                    adopted_deferred_junction is not None
-                    and adopted_deferred_junction[1] == crossing_sto_atom_id
-                ):
-                    # The undershoot timeline ends immediately before the
-                    # ancestor continuation.  Parking redirects that exact
-                    # junction to the ancestor's end group.
-                    partial_atom_graph.cap_junction_bonds(
-                        adopted_deferred_junction[0],
-                        crossing_sto_atom_id,
-                        rng,
-                    )
-                    _commit_mutation()
 
             else:
-                if deferred_continuation is not None:
-                    owner_sto_atom_id, continuation_level, continuation_gen_id = deferred_continuation
-                    deferred_junction = (owner_sto_atom_id, continuation_level)
-                    observed_gain = max_step_gain.get(continuation_level)
-                    lookahead_gain = max(
-                        observed_gain or 0.0,
-                        gain_floor.get(continuation_level, 0.0),
-                    )
-                    expected_i = tracker._sto_atom_id_expected_molw[continuation_level]
-                    need_snapshot = (
-                        termination_flag != 0
-                        and expected_i >= 0
-                        and (
-                            observed_gain is None
-                            or lookahead_gain <= 0.0
-                            or proj_now[continuation_level]
-                            + _LOOKAHEAD_MARGIN * lookahead_gain
-                            >= expected_i - avg_termination_cache.get(continuation_level, 0.0)
-                        )
-                    )
-                    previous_checkpoint = checkpoints.get(continuation_level)
-                    if need_snapshot:
-                        checkpoints[continuation_level] = _capture_checkpoint(
-                            continuation_level,
-                            deferred_junction,
-                        )
-                    _new_sto_atom_id, transition_success = partial_atom_graph.transition_graph(
-                        owner_sto_atom_id,
-                        continuation_gen_id,
-                        rng,
-                    )
-                    deferred_continuation = None
-                    if transition_success:
-                        _advance_owner_epoch(continuation_level)
-                        _commit_mutation()
-                    elif need_snapshot:
-                        if previous_checkpoint is None:
-                            checkpoints.pop(continuation_level, None)
-                        else:
-                            checkpoints[continuation_level] = previous_checkpoint
-                    continue
-
                 # Lazy snapshot: only deepcopy when the NEXT step could cross
                 # the active owner's threshold and an undershoot boundary is
                 # actually needed (never for termination_flag == 0).

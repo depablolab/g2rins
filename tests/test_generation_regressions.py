@@ -1787,6 +1787,41 @@ def test_nested_side_chain_so_gets_one_instance_per_junction():
         assert min(side_masses) > 90.0, f"seed {seed}: bare junction graft survived: {side_masses}"
 
 
+def test_multifunctional_ports_compete_with_chain_continuation():
+    """A multifunctional initiator's [>1] ports enter a nested arm SO while
+    the chain also continues through units embedding another nested SO. Port
+    initiation and chain continuation must COMPETE in the owner's weighted
+    draw (the multifunctional initiation principle generalized to nested
+    levels): every port grows its own arm with its own MW draw. The deferred
+    continuation used to fire directly from the finished child's bucket,
+    bypassing the owner's pool entirely, so exactly one arm ever grew and the
+    remaining ports were silently wiped at the outer termination."""
+    smi = (
+        "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], "
+        "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; "
+        "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        _reset_rngs(seed)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        bad = [w.category.__name__ for w in caught if issubclass(w.category, (PossibleNonRepresentativePolymerChain, DiscardedSamplingPaths))]
+        assert not bad, f"seed {seed}: chain flagged non-representative: {bad}"
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        # Construction order is parse-stable: gen 1 is the SO embedded in the
+        # chain unit, gen 2 the arm SO entered through the [>1] ports.
+        assert dist[2] == "|poisson(100.0)|"
+        arm_masses = tracked[2]
+        assert len(arm_masses) == 3, f"seed {seed}: expected one arm per initiator port, got {arm_masses}"
+        assert min(arm_masses) > 40.0, f"seed {seed}: empty arm: {arm_masses}"
+        assert len(tracked[1]) >= 2, f"seed {seed}: chain continuation lost every draw: {tracked[1]}"
+
+
 def test_transition_bond_selection_is_level_aware():
     """The dead-end verdict of transition bond selection must be
     deterministic: _pop_random_bond filters candidates by the requested
