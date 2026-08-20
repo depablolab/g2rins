@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import pickle
+import warnings
 
 import lark
 import pytest
@@ -162,6 +163,56 @@ def test_warn_no_initiation_for_stochastic_object(smi):
     with pytest.warns(g2rins.exception.NoInitiationForStochasticObject):
         obj = g2rins.G2rins.make(smi)
         obj.get_graph_creator()
+
+
+TERMINATION_DECLARATION_CASES = [
+    pytest.param(
+        # Inner [<]Cl and outer [<]Br both reach the NN exit: the nearer
+        # declaration wins and the outer edge is dropped.
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]Cl [<]|[<1]}|poisson(100)|[>]|[>1]; [>]I; [<]Br, [<1]F []}|poisson(400)|",
+        g2rins.exception.ShadowedTerminationDeclaration,
+        id="shadowed",
+    ),
+    pytest.param(
+        # The NN side port declares no terminator of its own, so the enclosing
+        # object's [<1]F caps it and controls when.
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1]F []}|poisson(400)|",
+        g2rins.exception.InheritedTermination,
+        id="inherited",
+    ),
+    pytest.param(
+        # [<1]Cl is declared beside the unit, but its bond connector belongs to
+        # the enclosing object, which fires the cap and carries its mass.
+        "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br, [<1]Cl [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|gauss(8000.0, 1000.0)|",
+        g2rins.exception.ForeignControlledTermination,
+        id="foreign-controlled",
+    ),
+]
+
+
+@pytest.mark.parametrize(("smi", "category"), TERMINATION_DECLARATION_CASES)
+def test_warn_termination_declaration(smi, category):
+    with pytest.warns(category):
+        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+
+
+@pytest.mark.parametrize(
+    "smi",
+    [
+        "{[] [<]CC[>]; C[>]; [<][H] []}|poisson(50)|",
+        "C{[>][<]CC(C)[>];;[<]}|poisson(900)|[H]",
+        "{[] [<|.8|]CCO[>|.8|], [<|.2|]CC(C)O[>|.2|]; [>][H] ; [<]Br []}|log_normal(1400, 1.15)|",
+    ],
+)
+def test_terminator_declared_beside_its_unit_is_silent(smi):
+    """Capping a site in the step that grows it is the canonical case and must
+    stay quiet; only configurations that hand control to another stochastic
+    object are worth a warning."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    reported = [str(entry.message) for entry in caught if isinstance(entry.message, g2rins.exception.TerminationDeclarationWarning)]
+    assert not reported, reported
 
 
 @pytest.mark.parametrize("smi", ["{[$] [>]CC[<];; [>]}|flory_schulz(0.9)|"])

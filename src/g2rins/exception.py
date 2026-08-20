@@ -228,6 +228,67 @@ class NoTerminationForStochasticObject(ParsingWarning):
 # StochasticMissingPath instead.
 
 
+class TerminationDeclarationWarning(G2RINSWarning):
+    """Family of warnings about which declared terminator caps an open site,
+    and about the stochastic object that decides when it fires."""
+
+    def __init__(self, unit_label, unit_text):
+        super().__init__(unit_text)
+        self.unit_label = unit_label
+        self.unit_text = unit_text
+
+    def _site(self):
+        return f"An open site of unit {self.unit_label} '{self.unit_text}'"
+
+
+class ShadowedTerminationDeclaration(TerminationDeclarationWarning):
+    def __init__(self, unit_label, unit_text, terminators, shadowed):
+        super().__init__(unit_label, unit_text)
+        self.terminators = tuple(terminators)
+        self.shadowed = tuple(shadowed)
+
+    def __str__(self):
+        return (
+            f"{self._site()} is reached by terminators declared at more than one level. The declaration nearest "
+            f"the site wins, so {', '.join(self.terminators)} caps it and {', '.join(self.shadowed)} never will. "
+            "List the alternatives in one terminator list, with weights, if the site should draw among them."
+        )
+
+
+class InheritedTermination(TerminationDeclarationWarning):
+    def __init__(self, unit_label, unit_text, terminators, controlling_level):
+        super().__init__(unit_label, unit_text)
+        self.terminators = tuple(terminators)
+        self.controlling_level = controlling_level
+
+    def __str__(self):
+        return (
+            f"{self._site()} has no terminator declared in its own stochastic object, so it is capped by "
+            f"{', '.join(self.terminators)}, declared in the enclosing stochastic object {self.controlling_level}. "
+            "That object decides when the site is capped and carries the cap's molecular weight, which models a "
+            "later step of the generation. Declare a terminator with a matching bond descriptor in the unit's own "
+            "stochastic object to cap the site in the step that grows it."
+        )
+
+
+class ForeignControlledTermination(TerminationDeclarationWarning):
+    def __init__(self, unit_label, unit_text, terminators, declared_level, firing_level):
+        super().__init__(unit_label, unit_text)
+        self.terminators = tuple(terminators)
+        self.declared_level = declared_level
+        self.firing_level = firing_level
+
+    def __str__(self):
+        return (
+            f"{self._site()} is capped by {', '.join(self.terminators)}, declared in its own stochastic object "
+            f"{self.declared_level}, but the site's bond descriptor belongs to the enclosing stochastic object "
+            f"{self.firing_level}, which can still grow through the site after the declaring object has finished. "
+            f"The declared terminator is the one that caps it, but stochastic object {self.firing_level} decides "
+            "when it fires and its molecular weight counts toward that object's target, not toward the declaring "
+            "object's."
+        )
+
+
 class StochasticMissingPath(ParsingWarning):
     def __init__(self, stochastic_obj, source_bc_pos):
         super().__init__(stochastic_obj)

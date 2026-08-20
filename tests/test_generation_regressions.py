@@ -2043,6 +2043,62 @@ def test_side_port_caps_via_terminal_bond_connector_lists():
         assert counts["Br"] == 1, f"seed {seed}: expected exactly 1 outer Br cap, found {counts['Br']}"
 
 
+def test_same_level_terminator_caps_exiting_site():
+    """A terminator declared beside the unit it caps reaches the site even
+    when the site's bond connector belongs to the enclosing stochastic object.
+    Such a site keeps growing after its own object finished, so the cap is
+    stamped with the object that fires it; stamped with the declaring one it
+    was unreachable and the [<1]Cl never appeared in any chain. Individual
+    chains can still show none, when every exiting site was grown through."""
+    smi = "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br, [<1]Cl [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|gauss(8000.0, 1000.0)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    chlorine_total = 0
+    for seed in range(6):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        chlorine_total += sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
+    assert chlorine_total > 0, "the declared [<1]Cl never reached an exiting site"
+
+
+def test_nearest_terminator_declaration_wins():
+    """When a site is reached by terminators declared at two levels, the
+    nearer declaration is wired and the farther one is removed rather than
+    left to compete: a generative graph carries no edge that can never fire.
+    Here the inner [<]Cl caps the NN exit that the outer [<]Br would otherwise
+    also reach."""
+    smi = "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]Cl [<]|[<1]}|poisson(100)|[>]|[>1]; [>]I; [<]Br, [<1]F []}|poisson(400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make(smi).get_graph_creator()
+        generative_graph = graph_creator.get_generative_graph(include_bond_connectors=False)
+        ensemble_creator = graph_creator.get_ensemble_creator()
+
+    unit_id = g2rins.derive_unit_labels(generative_graph).unit_id
+    unit_text = generative_graph.graph["unit_g2rins"]
+    for node in generative_graph.nodes():
+        terminators = {
+            unit_text.get(unit_id.get(target), "")
+            for _source, target, data in generative_graph.out_edges(node, data=True)
+            if data["termination_weight"] > 0
+        }
+        assert not ("[<]Cl" in terminators and "[<]Br" in terminators), f"shadowed [<]Br survived on {unit_id.get(node)}"
+
+    for seed in SEEDS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        counts = {symbol: sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == symbol) for symbol in ("Cl", "Br", "I")}
+        assert counts["I"] == 1, f"seed {seed}: expected the single declared initiator"
+        assert counts["Cl"] + counts["Br"] == 1, f"seed {seed}: expected exactly one chain-end cap, found {counts}"
+
+
 def test_negative_target_draw_still_terminates():
     """A high-dispersity gauss target can draw negative; storing that draw like
     the negative no-target sentinel disables crossing checks and grows forever.
