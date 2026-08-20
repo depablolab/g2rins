@@ -1749,6 +1749,17 @@ class _PartialAtomGraph:
                     new_stochastic_bond._mode_attr_map[_TRANSITION_NAME] = [prop_attr_list[i] for i in retained_indices]
                     new_stochastic_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
                     new_stochastic_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
+                if half_bond.has_mode_bonds(_TERMINATION_NAME):
+                    # Termination modes ride along with the converted copy, as
+                    # in promote_level_transitions: the copy holds the same
+                    # valence slot under the owner's custody, so a site the
+                    # owner never grows is capped by its declared terminators
+                    # instead of finalizing bare. The owner's own average-cap
+                    # estimate reads the same bucket and level stamp that its
+                    # terminate pass fires, so the moved cap stays priced.
+                    new_stochastic_bond._mode_attr_map[_TERMINATION_NAME] = list(half_bond._mode_attr_map[_TERMINATION_NAME])
+                    new_stochastic_bond._mode_target_map[_TERMINATION_NAME] = list(half_bond._mode_target_map[_TERMINATION_NAME])
+                    new_stochastic_bond._mode_target_molar_amounts_map[_TERMINATION_NAME] = list(half_bond._mode_target_molar_amounts_map[_TERMINATION_NAME])
 
             if not new_stochastic_bond.has_any_bonds():
                 # Hierarchy-filtered or non-used old-SO bonds: their

@@ -1990,10 +1990,12 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     cap, counted as explicit H NODES in the mol graph (SMILES and MolWt are
     blind to a lost cap: it is one implicit hydrogen), even when an arm's
     terminal bond sits parked in a terminated nested instance's bucket at
-    root termination. Chains whose initiator port never grew are skipped —
-    initiator ports carry no termination edges yet — and the seed range stops
-    before 14, whose cap is destroyed earlier by the transition-conversion
-    hand-off; both are known gaps of the follow-up custody change."""
+    root termination, and even when it reaches the root through a
+    transition-conversion hand-off — that path used to rebuild the converted
+    copy without its termination modes, shedding the cap permanently (seed 14
+    was the last such loss). Chains whose initiator port never grew are
+    skipped: initiator ports carry no termination edges, which is the one
+    remaining gap."""
     smi = "{[] [<]PP[>], [<]{[>] [<]{[>] [<]CC[>], [<]{[>] [<]NN[>];; [<]}|poisson(100)|[>];; [<]}|poisson(300)|[>], [<]OO[>]; ;[<]}|poisson(1000)|[>]; O([>])[>]; [<][H] []}|poisson(4000)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -2002,7 +2004,7 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
     assert len(central) == 1, f"expected one difunctional initiator oxygen, found {len(central)}"
     central_origin = str(central[0])
-    for seed in range(14):
+    for seed in range(30):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
