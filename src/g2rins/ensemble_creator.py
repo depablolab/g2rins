@@ -20,7 +20,6 @@ import networkx as nx
 import numpy as np
 from rdkit import Chem, rdBase
 
-from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
 from .chem_resource import (
     atom_color_mapping,
     atom_name_mapping,
@@ -53,6 +52,11 @@ from .generative_graph import (
     _TRANSITION_NAME,
     derive_unit_labels,
     generative_graph_json_data,
+)
+from .nx_rdkit_mol import (
+    mol_graph_to_rdkit_mol,
+    mol_graph_to_smiles,
+    rdkit_mol_to_smiles,
 )
 from .util import _determine_darkness_from_hex, get_global_rng
 
@@ -139,6 +143,7 @@ def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit
     charge = int(charge) if charge is not None and np.isfinite(charge) else 0
     return _rdkit_implicit_hydrogens(int(atomic_num), charge, int(total_bond), bool(aromatic))
 
+
 def _detach_tracebacks(error):
     """Drop traceback frames from ``error`` and its cause/context chain.
 
@@ -199,8 +204,7 @@ class _HalfAtomBond:
                 if d[_TRANSITION_NAME] > 0:
                     target_stochastic_id = graph.nodes[v]["stochastic_id_tree"][0]
                     target_parents_stochastic_id = graph.nodes[v]["stochastic_id_tree"][1:]
-                    if (self.stochastic_id in target_parents_stochastic_id and
-                            d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id and target_stochastic_id !=-1):
+                    if self.stochastic_id in target_parents_stochastic_id and d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id and target_stochastic_id != -1:
                         special_target_list += [(v, d)]
                         special_target_weight += [d[_TRANSITION_NAME]]
                         special_target_molar_amounts += [graph.nodes[v]["unit_molar_amounts"]]
@@ -327,11 +331,7 @@ class _StochasticObjectTracker:
                 raise DeadSamplingPath(context) from error
             raise
 
-        if (
-            record_branch
-            and not self._path_is_conditional
-            and np.count_nonzero(probabilities > 0.0) > 1
-        ):
+        if record_branch and not self._path_is_conditional and np.count_nonzero(probabilities > 0.0) > 1:
             self._path_is_conditional = True
         return probabilities
 
@@ -378,9 +378,7 @@ class _StochasticObjectTracker:
                         # Mirror normalized_probabilities: on a provably
                         # all-dead template the empty support is a model
                         # error, not per-chain budget luck.
-                        raise AllZeroSamplingWeights(
-                            "nested molecular-weight draw (empty truncated support)"
-                        ) from error
+                        raise AllZeroSamplingWeights("nested molecular-weight draw (empty truncated support)") from error
                     raise
             else:
                 new_molw = self._sto_gen_id_distribution[sto_gen_id].draw_mw(self._rng)
@@ -560,10 +558,7 @@ def _bond_records(bond_counts, origin_endpoint):
     for (origin_u, origin_v), count in bond_counts.items():
         pair = tuple(sorted((origin_endpoint[origin_u], origin_endpoint[origin_v]), key=_bond_endpoint_sort_key))
         merged[pair] = merged.get(pair, 0) + count
-    return [
-        {"between": list(pair), "count": count}
-        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(endpoint) for endpoint in item[0]))
-    ]
+    return [{"between": list(pair), "count": count} for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(endpoint) for endpoint in item[0]))]
 
 
 @contextmanager
@@ -1016,11 +1011,7 @@ class _PartialAtomGraph:
         """
         if not half_bonds:
             raise ValueError("Cannot pop from empty list")
-        eligible_half_bonds = [
-            half_bond
-            for half_bond in half_bonds
-            if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
-        ]
+        eligible_half_bonds = [half_bond for half_bond in half_bonds if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
         if not eligible_half_bonds:
             return None, []
         max_hierarchy = max(half_bond.gen_hierarchy for half_bond in eligible_half_bonds)
@@ -1139,9 +1130,7 @@ class _PartialAtomGraph:
                 self.generative_graph,
                 estimator_rng,
                 path_is_conditional=self.stochastic_tracker.path_is_conditional,
-                zero_support_is_unavoidable=(
-                    self.stochastic_tracker.zero_support_is_unavoidable
-                ),
+                zero_support_is_unavoidable=(self.stochastic_tracker.zero_support_is_unavoidable),
             )
             source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
             term_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
@@ -1303,9 +1292,7 @@ class _PartialAtomGraph:
         for _i, half_bond in zip(*terminated_graph.get_open_half_bonds(sto_atom_id), strict=False):
             if half_bond.has_mode_bonds(_TRANSITION_NAME):
                 transition_half_bonds.append(half_bond)
-            elif half_bond.has_mode_bonds(_TERMINATION_NAME) and all(
-                attr.get(_EDGE_STOCHASTIC_ID_NAME) != own_gen_sto_id for attr in half_bond._mode_attr_map[_TERMINATION_NAME]
-            ):
+            elif half_bond.has_mode_bonds(_TERMINATION_NAME) and all(attr.get(_EDGE_STOCHASTIC_ID_NAME) != own_gen_sto_id for attr in half_bond._mode_attr_map[_TERMINATION_NAME]):
                 # An ancestor level's declared cap rides this instance's
                 # frontier without a transition partner (e.g. a side port
                 # whose terminator models a post-polymerization modification,
@@ -1461,9 +1448,7 @@ class _PartialAtomGraph:
         self._open_half_bond_map[bucket_id].remove(half_bond)
 
         all_target_attr, all_target_idx, all_molar_amounts = half_bond.get_mode_bonds(_TRANSITION_NAME)
-        minus_one_indices = [
-            i for i, attr in enumerate(all_target_attr) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == -1
-        ]
+        minus_one_indices = [i for i, attr in enumerate(all_target_attr) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == -1]
 
         target_attr = [all_target_attr[i] for i in minus_one_indices]
         target_idx = [all_target_idx[i] for i in minus_one_indices]
@@ -1494,13 +1479,15 @@ class _PartialAtomGraph:
         selected_target_sto_parent_id = self.generative_graph.nodes[selected_target_idx]["stochastic_id_tree"][1:]
 
         # Each -1 arm is independent: register a fresh instance chain.
-        new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(
-            selected_target_sto_gen_id, -1, selected_target_sto_parent_id, reuse_existing=False
-        )
+        new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, -1, selected_target_sto_parent_id, reuse_existing=False)
 
         other_graph = _PartialAtomGraph(
-            self.generative_graph, self.static_graph, selected_target_idx,
-            self.stochastic_tracker, new_sto_atom_id, rng,
+            self.generative_graph,
+            self.static_graph,
+            selected_target_idx,
+            self.stochastic_tracker,
+            new_sto_atom_id,
+            rng,
         )
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
@@ -2031,35 +2018,19 @@ class EnsembleCreator:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
 
         self._static_graph = self._create_static_graph(self.generative_graph)
-        self._static_proof_supported = all(
-            u == v or self._static_graph.has_edge(v, u)
-            for u, v in self._static_graph.edges()
-        )
+        self._static_proof_supported = all(u == v or self._static_graph.has_edge(v, u) for u, v in self._static_graph.edges())
 
         # The static partition: a unit is one static-connected component.
-        static_components = tuple(
-            frozenset(component)
-            for component in nx.connected_components(
-                self._static_graph.to_undirected(as_view=True)
-            )
-        )
+        static_components = tuple(frozenset(component) for component in nx.connected_components(self._static_graph.to_undirected(as_view=True)))
         self._static_components = static_components
-        self._node_to_static_component = {
-            node: component_id
-            for component_id, component in enumerate(static_components)
-            for node in component
-        }
-        self._statically_empty_nested_mw_sto_gen_ids = (
-            self._find_statically_empty_nested_mw_sto_gen_ids()
-        )
+        self._node_to_static_component = {node: component_id for component_id, component in enumerate(static_components) for node in component}
+        self._statically_empty_nested_mw_sto_gen_ids = self._find_statically_empty_nested_mw_sto_gen_ids()
         if self._static_proof_supported:
             (
                 self._provably_dead_construction_states,
                 self._provably_immediate_zero_components,
             ) = self._find_provably_dead_construction_states()
-            self._provably_zero_termination_states = (
-                self._find_provably_zero_termination_states()
-            )
+            self._provably_zero_termination_states = self._find_provably_zero_termination_states()
         else:
             self._provably_dead_construction_states = frozenset()
             self._provably_immediate_zero_components = frozenset()
@@ -2087,12 +2058,8 @@ class EnsembleCreator:
         # Both weight vectors are immutable after this point, so whether the
         # automatic source draw branches is a per-mode constant.
         self._automatic_source_is_conditional = {
-            False: np.count_nonzero(
-                np.asarray(self._starting_node_weight) > 0.0
-            ) > 1,
-            True: np.count_nonzero(
-                np.asarray(self._repeat_unit_starting_node_weight) > 0.0
-            ) > 1,
+            False: np.count_nonzero(np.asarray(self._starting_node_weight) > 0.0) > 1,
+            True: np.count_nonzero(np.asarray(self._repeat_unit_starting_node_weight) > 0.0) > 1,
         }
 
     def _find_statically_empty_nested_mw_sto_gen_ids(self):
@@ -2108,20 +2075,14 @@ class EnsembleCreator:
         """
         try:
             first_node = next(iter(self._generative_graph.nodes))
-            serial_vectors = tuple(
-                self._generative_graph.nodes[first_node][
-                    "molecular_weight_distribution"
-                ]
-            )
+            serial_vectors = tuple(self._generative_graph.nodes[first_node]["molecular_weight_distribution"])
         except (StopIteration, KeyError, TypeError):
             return frozenset()
 
         bounds = {}
         for sto_gen_id, serial_vector in enumerate(serial_vectors):
             try:
-                distribution = StochasticDistribution.from_serial_vector(
-                    list(serial_vector)
-                )
+                distribution = StochasticDistribution.from_serial_vector(list(serial_vector))
                 frozen = distribution._distribution
                 parameters = getattr(frozen, "kwds", {})
                 scale = parameters.get("scale")
@@ -2171,11 +2132,7 @@ class EnsembleCreator:
                 continue
             child_lower = max(child_bounds[0], 1.0)
             parent_upper = parent_bounds[1]
-            if (
-                np.isfinite(child_lower)
-                and np.isfinite(parent_upper)
-                and child_lower > parent_upper
-            ):
+            if np.isfinite(child_lower) and np.isfinite(parent_upper) and child_lower > parent_upper:
                 empty_ids.add(child)
 
         return frozenset(empty_ids)
@@ -2193,10 +2150,7 @@ class EnsembleCreator:
         Malformed data and unseeded cycles remain unknown (not dead).
         """
         graph = self._generative_graph
-        groups_by_component = {
-            component_id: []
-            for component_id in range(len(self._static_components))
-        }
+        groups_by_component = {component_id: [] for component_id in range(len(self._static_components))}
         immediate_zero_components = set()
         seed_dead_states = set()
 
@@ -2216,12 +2170,7 @@ class EnsembleCreator:
                         target_tree = graph.nodes[target]["stochastic_id_tree"]
                         target_sto_id = target_tree[0]
                         is_special = (
-                            not data["static"]
-                            and transition_weight > 0
-                            and source_sto_id in target_tree[1:]
-                            and data.get(_EDGE_STOCHASTIC_ID_NAME)
-                            == target_sto_id
-                            and target_sto_id != -1
+                            not data["static"] and transition_weight > 0 and source_sto_id in target_tree[1:] and data.get(_EDGE_STOCHASTIC_ID_NAME) == target_sto_id and target_sto_id != -1
                         )
                     except (KeyError, IndexError, TypeError, ValueError):
                         continue
@@ -2230,12 +2179,8 @@ class EnsembleCreator:
                         continue
                     group_found = True
                     try:
-                        molar_amount = graph.nodes[target][
-                            "unit_molar_amounts"
-                        ][target_sto_id]
-                        effective_weight = float(
-                            transition_weight * molar_amount
-                        )
+                        molar_amount = graph.nodes[target]["unit_molar_amounts"][target_sto_id]
+                        effective_weight = float(transition_weight * molar_amount)
                         target_component = self._node_to_static_component[target]
                     except (KeyError, IndexError, TypeError, ValueError):
                         group_unknown = True
@@ -2246,10 +2191,7 @@ class EnsembleCreator:
                     elif effective_weight > 0:
                         target_state = (target_component, target)
                         targets.append(target_state)
-                        if (
-                            target_sto_id
-                            in self._statically_empty_nested_mw_sto_gen_ids
-                        ):
+                        if target_sto_id in self._statically_empty_nested_mw_sto_gen_ids:
                             # Instantiating this nested object dies at its
                             # truncated MW draw before any construction, so
                             # the entered state is dead a priori.
@@ -2263,11 +2205,7 @@ class EnsembleCreator:
                             followable = gen_weight > 0
                     except (KeyError, TypeError, ValueError):
                         pass
-                    group = (
-                        None
-                        if group_unknown
-                        else (node, followable, tuple(targets))
-                    )
+                    group = None if group_unknown else (node, followable, tuple(targets))
                     groups_by_component[component_id].append(group)
                     if group is not None and not targets:
                         immediate_zero_components.add(component_id)
@@ -2290,11 +2228,7 @@ class EnsembleCreator:
                             dead_states.add(state)
                             changed = True
                             break
-                        if (
-                            followable is True
-                            and source_node != consumed_node
-                            and all(target in dead_states for target in targets)
-                        ):
+                        if followable is True and source_node != consumed_node and all(target in dead_states for target in targets):
                             dead_states.add(state)
                             changed = True
                             break
@@ -2340,12 +2274,7 @@ class EnsembleCreator:
                     except (KeyError, TypeError, ValueError):
                         malformed = True
                         break
-                    if (
-                        not np.isfinite(transition_weight)
-                        or transition_weight < 0
-                        or not np.isfinite(termination_weight)
-                        or termination_weight < 0
-                    ):
+                    if not np.isfinite(transition_weight) or transition_weight < 0 or not np.isfinite(termination_weight) or termination_weight < 0:
                         malformed = True
                         break
                     if transition_weight > 0:
@@ -2358,12 +2287,8 @@ class EnsembleCreator:
                         malformed = True
                         break
                     try:
-                        molar_amount = graph.nodes[target][
-                            "unit_molar_amounts"
-                        ][level]
-                        effective_weight = float(
-                            termination_weight * molar_amount
-                        )
+                        molar_amount = graph.nodes[target]["unit_molar_amounts"][level]
+                        effective_weight = float(termination_weight * molar_amount)
                     except (KeyError, IndexError, TypeError, ValueError):
                         unknown_levels.add(level)
                         continue
@@ -2376,18 +2301,11 @@ class EnsembleCreator:
                     continue
 
                 for level, effective_weights in groups.items():
-                    if (
-                        level in unknown_levels
-                        or any(
-                            weight > 0 for weight in effective_weights
-                        )
-                    ):
+                    if level in unknown_levels or any(weight > 0 for weight in effective_weights):
                         continue
                     for consumed_node in (None, *component):
                         if consumed_node != node:
-                            zero_states.add(
-                                (component_id, consumed_node, level)
-                            )
+                            zero_states.add((component_id, consumed_node, level))
 
         return frozenset(zero_states)
 
@@ -2395,25 +2313,19 @@ class EnsembleCreator:
         """Known zero-support failure after attaching ``target``, or None."""
         try:
             component_id = self._node_to_static_component[target]
-            sto_gen_id = self._generative_graph.nodes[target][
-                "stochastic_id_tree"
-            ][0]
+            sto_gen_id = self._generative_graph.nodes[target]["stochastic_id_tree"][0]
         except (KeyError, IndexError, TypeError):
             return None
         if not isinstance(sto_gen_id, (int, np.integer)) or sto_gen_id < 0:
             return None
-        return (
-            (component_id, target)
-            in self._provably_dead_construction_states
-            or (
-                component_id,
-                target,
-                sto_gen_id,
-            ) in getattr(
-                self,
-                "_provably_zero_termination_states",
-                frozenset(),
-            )
+        return (component_id, target) in self._provably_dead_construction_states or (
+            component_id,
+            target,
+            sto_gen_id,
+        ) in getattr(
+            self,
+            "_provably_zero_termination_states",
+            frozenset(),
         )
 
     def _global_source_is_provably_dead(self, component):
@@ -2444,11 +2356,7 @@ class EnsembleCreator:
                     return False
                 if not np.isfinite(transition_weight) or transition_weight < 0:
                     return False
-                if (
-                    not data.get("static", False)
-                    and transition_weight > 0
-                    and data.get(_EDGE_STOCHASTIC_ID_NAME) == -1
-                ):
+                if not data.get("static", False) and transition_weight > 0 and data.get(_EDGE_STOCHASTIC_ID_NAME) == -1:
                     global_edges.append((target, transition_weight))
 
             if not global_edges:
@@ -2458,28 +2366,17 @@ class EnsembleCreator:
             group_has_non_dead_target = False
             for target, transition_weight in global_edges:
                 try:
-                    target_sto_gen_id = graph.nodes[target][
-                        "stochastic_id_tree"
-                    ][0]
-                    if (
-                        not isinstance(target_sto_gen_id, (int, np.integer))
-                        or target_sto_gen_id < 0
-                    ):
+                    target_sto_gen_id = graph.nodes[target]["stochastic_id_tree"][0]
+                    if not isinstance(target_sto_gen_id, (int, np.integer)) or target_sto_gen_id < 0:
                         return False
-                    molar_amount = graph.nodes[target][
-                        "unit_molar_amounts"
-                    ][target_sto_gen_id]
-                    effective_weight = float(
-                        transition_weight * molar_amount
-                    )
+                    molar_amount = graph.nodes[target]["unit_molar_amounts"][target_sto_gen_id]
+                    effective_weight = float(transition_weight * molar_amount)
                 except (KeyError, IndexError, TypeError, ValueError):
                     return False
                 if not np.isfinite(effective_weight) or effective_weight < 0:
                     return False
                 if effective_weight > 0:
-                    target_is_dead = self._attached_target_is_provably_dead(
-                        target
-                    )
+                    target_is_dead = self._attached_target_is_provably_dead(target)
                     if target_is_dead is None:
                         return False
                     if not target_is_dead:
@@ -2548,11 +2445,7 @@ class EnsembleCreator:
                     return False
                 if not np.isfinite(transition_weight) or transition_weight < 0:
                     return False
-                if (
-                    not data.get("static", False)
-                    and transition_weight > 0
-                    and data.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id
-                ):
+                if not data.get("static", False) and transition_weight > 0 and data.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id:
                     level_edges.append((target, data))
             if level_edges:
                 eligible.append((node, level_edges))
@@ -2580,11 +2473,7 @@ class EnsembleCreator:
                 return False
             hierarchy_by_node[node] = hierarchy
         max_hierarchy = max(hierarchy_by_node.values())
-        eligible = [
-            (node, edges)
-            for node, edges in eligible
-            if hierarchy_by_node[node] == max_hierarchy
-        ]
+        eligible = [(node, edges) for node, edges in eligible if hierarchy_by_node[node] == max_hierarchy]
 
         for node, edges in eligible:
             try:
@@ -2606,33 +2495,20 @@ class EnsembleCreator:
             route_has_non_dead_target = False
             for target, data in edges:
                 try:
-                    effective_weight = float(
-                        data[_TRANSITION_NAME]
-                        * graph.nodes[target]["unit_molar_amounts"][sto_gen_id]
-                    )
-                    target_sto_gen_id = graph.nodes[target][
-                        "stochastic_id_tree"
-                    ][0]
+                    effective_weight = float(data[_TRANSITION_NAME] * graph.nodes[target]["unit_molar_amounts"][sto_gen_id])
+                    target_sto_gen_id = graph.nodes[target]["stochastic_id_tree"][0]
                 except (KeyError, IndexError, TypeError, ValueError):
                     return False
                 if not np.isfinite(effective_weight) or effective_weight < 0:
                     return False
                 if effective_weight <= 0:
                     continue
-                if (
-                    target_sto_gen_id == sto_gen_id
-                    and (
-                        source_expansion_is_dead
-                        or source_termination_is_dead
-                    )
-                ):
+                if target_sto_gen_id == sto_gen_id and (source_expansion_is_dead or source_termination_is_dead):
                     continue
                 target_is_dead = self._attached_target_is_provably_dead(target)
                 if target_is_dead is None:
                     return False
-                if (
-                    not target_is_dead
-                ):
+                if not target_is_dead:
                     route_has_non_dead_target = True
 
             if route_has_non_dead_target:
@@ -2656,10 +2532,7 @@ class EnsembleCreator:
             if probability > 0:
                 reachable_sources.append(source)
 
-        return bool(reachable_sources) and all(
-            self._source_is_provably_dead(source)
-            for source in reachable_sources
-        )
+        return bool(reachable_sources) and all(self._source_is_provably_dead(source) for source in reachable_sources)
 
     @staticmethod
     def _create_init_weights(graph):
@@ -2847,14 +2720,8 @@ class EnsembleCreator:
         source_is_conditional = False
         zero_support_is_unavoidable = False
         if automatic_source:
-            zero_support_is_unavoidable = (
-                self._automatic_zero_support_is_unavoidable[
-                    bool(use_repeat_units_as_source)
-                ]
-            )
-            source_is_conditional = self._automatic_source_is_conditional[
-                bool(use_repeat_units_as_source)
-            ]
+            zero_support_is_unavoidable = self._automatic_zero_support_is_unavoidable[bool(use_repeat_units_as_source)]
+            source_is_conditional = self._automatic_source_is_conditional[bool(use_repeat_units_as_source)]
             source = self._get_random_start_node(rng, use_repeat_units_as_source)
 
         # The generative_graph property copies the whole template graph on every access:
@@ -2944,6 +2811,7 @@ class EnsembleCreator:
             nonlocal mutations
             partial_atom_graph.stochastic_tracker.mark_path_conditional()
             mutations += 1
+
         pending_termination = set()
         max_step_gain = {}
         gain_floor = {}
@@ -2963,7 +2831,7 @@ class EnsembleCreator:
                 ancestors = tracker.parent_map.get(candidate, [])
                 if sto_atom_id not in ancestors:
                     continue
-                between = ancestors[ancestors.index(sto_atom_id) + 1:]
+                between = ancestors[ancestors.index(sto_atom_id) + 1 :]
                 if all(ancestor not in live_set for ancestor in between):
                     children.append(candidate)
             return children
@@ -3077,11 +2945,7 @@ class EnsembleCreator:
                 "avg_termination_cache": dict(avg_termination_cache),
                 "owner_epochs": dict(owner_epochs),
                 "forced_overshoot_no_boundary": set(forced_overshoot_no_boundary),
-                "checkpoints": {
-                    owner: checkpoint
-                    for owner, checkpoint in checkpoints.items()
-                    if owner in compatible_ancestors
-                },
+                "checkpoints": {owner: checkpoint for owner, checkpoint in checkpoints.items() if owner in compatible_ancestors},
                 "owner": checkpoint_owner,
                 "epoch": owner_epochs.get(checkpoint_owner, 0),
             }
@@ -3208,18 +3072,22 @@ class EnsembleCreator:
                 # dead-ends below its own drawn target retires silently: the chain
                 # completes on target regardless, and warning here made
                 # create_ensemble discard every chain of such architectures.
-                if (not partial_atom_graph.stochastic_tracker.parent_map.get(active_sto_atom_id)
-                        and partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id] > 0
-                        and partial_atom_graph.stochastic_tracker._sto_atom_id_actual_molw[active_sto_atom_id]
-                        < partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id]):
+                if (
+                    not partial_atom_graph.stochastic_tracker.parent_map.get(active_sto_atom_id)
+                    and partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id] > 0
+                    and partial_atom_graph.stochastic_tracker._sto_atom_id_actual_molw[active_sto_atom_id] < partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id]
+                ):
                     warnings.warn(PossibleNonRepresentativePolymerChain(), stacklevel=1)
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "retire", "id": active_sto_atom_id,
-                        "gen": tracker._stochastic_atom_id_to_gen_id[active_sto_atom_id],
-                        "expected": tracker._sto_atom_id_expected_molw[active_sto_atom_id],
-                        "actual": tracker._sto_atom_id_actual_molw[active_sto_atom_id],
-                    })
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "retire",
+                            "id": active_sto_atom_id,
+                            "gen": tracker._stochastic_atom_id_to_gen_id[active_sto_atom_id],
+                            "expected": tracker._sto_atom_id_expected_molw[active_sto_atom_id],
+                            "actual": tracker._sto_atom_id_actual_molw[active_sto_atom_id],
+                        }
+                    )
                 partial_atom_graph.stochastic_tracker.terminate(active_sto_atom_id)
                 checkpoints.pop(active_sto_atom_id, None)
                 continue
@@ -3270,11 +3138,7 @@ class EnsembleCreator:
                 if expected_i < 0:
                     continue
                 cached_margin = avg_termination_cache.get(sto_atom_id)
-                if (
-                    sto_atom_id != active_sto_atom_id
-                    and cached_margin is not None
-                    and proj_now[sto_atom_id] + cached_margin < expected_i
-                ):
+                if sto_atom_id != active_sto_atom_id and cached_margin is not None and proj_now[sto_atom_id] + cached_margin < expected_i:
                     continue
                 own_termination_weight, avg_termination_weight = _total_termination_mw(
                     partial_atom_graph,
@@ -3303,17 +3167,10 @@ class EnsembleCreator:
                 snapshot_valid = False
                 projected_under = None
                 checkpoint = checkpoints.get(crossing_sto_atom_id)
-                if (
-                    checkpoint is not None
-                    and checkpoint["epoch"] + 1
-                    == owner_epochs.get(crossing_sto_atom_id, 0)
-                ):
+                if checkpoint is not None and checkpoint["epoch"] + 1 == owner_epochs.get(crossing_sto_atom_id, 0):
                     snapshot_graph = checkpoint["graph"]
                     snapshot_tracker = snapshot_graph.stochastic_tracker
-                    if (
-                        crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw
-                        and not snapshot_tracker.is_terminated(crossing_sto_atom_id)
-                    ):
+                    if crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw and not snapshot_tracker.is_terminated(crossing_sto_atom_id):
                         snapshot_live_ids = snapshot_tracker.get_unterminated_sto_atom_ids()
                         _under_own_mw, under_caps_molw = _total_termination_mw(
                             snapshot_graph,
@@ -3334,9 +3191,7 @@ class EnsembleCreator:
                     adopt_overshoot = True
                 elif not snapshot_valid:
                     owner_epoch = owner_epochs.get(crossing_sto_atom_id, 0)
-                    if termination_flag == 1 and (
-                        owner_epoch == 0 or projected_under is not None
-                    ):
+                    if termination_flag == 1 and (owner_epoch == 0 or projected_under is not None):
                         # The first state (or the immediately preceding owner
                         # boundary) is already at/over target: no undershoot
                         # timeline exists for this instance. A nested residual
@@ -3364,14 +3219,20 @@ class EnsembleCreator:
                         p_over = max(0.0, min(1.0, (expected_molw - projected_under) / span))
                         adopt_overshoot = rng.random() < p_over
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "crossing", "id": crossing_sto_atom_id,
-                        "gen": tracker._stochastic_atom_id_to_gen_id[crossing_sto_atom_id],
-                        "expected": expected_molw, "caps": caps_molw,
-                        "proj_over": crossing_projected, "proj_under": projected_under,
-                        "snapshot_valid": snapshot_valid, "adopt_overshoot": adopt_overshoot,
-                        "flag": termination_flag,
-                    })
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "crossing",
+                            "id": crossing_sto_atom_id,
+                            "gen": tracker._stochastic_atom_id_to_gen_id[crossing_sto_atom_id],
+                            "expected": expected_molw,
+                            "caps": caps_molw,
+                            "proj_over": crossing_projected,
+                            "proj_under": projected_under,
+                            "snapshot_valid": snapshot_valid,
+                            "adopt_overshoot": adopt_overshoot,
+                            "flag": termination_flag,
+                        }
+                    )
                 if not adopt_overshoot:
                     partial_atom_graph = checkpoint["graph"]
                     # Deepcopy clones the tracker's generator.  Keep consuming
@@ -3420,19 +3281,21 @@ class EnsembleCreator:
                     need_snapshot = expected_i >= 0 and (
                         observed_gain is None
                         or lookahead_gain <= 0.0
-                        or proj_now[active_sto_atom_id]
-                        + _LOOKAHEAD_MARGIN * lookahead_gain
-                        >= expected_i - avg_termination_cache.get(active_sto_atom_id, 0.0)
+                        or proj_now[active_sto_atom_id] + _LOOKAHEAD_MARGIN * lookahead_gain >= expected_i - avg_termination_cache.get(active_sto_atom_id, 0.0)
                     )
                 if need_snapshot:
                     checkpoints[active_sto_atom_id] = _capture_checkpoint(active_sto_atom_id)
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "grow", "active": active_sto_atom_id,
-                        "mutations": mutations, "need_snapshot": need_snapshot,
-                        "proj": dict(proj_now),
-                        "gains": {k: max_step_gain.get(k) for k in growable},
-                    })
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "grow",
+                            "active": active_sto_atom_id,
+                            "mutations": mutations,
+                            "need_snapshot": need_snapshot,
+                            "proj": dict(proj_now),
+                            "gains": {k: max_step_gain.get(k) for k in growable},
+                        }
+                    )
                 try:
                     partial_atom_graph.propagate_graph(active_sto_atom_id, rng, True)
                     _advance_owner_epoch(active_sto_atom_id)
@@ -3568,8 +3431,7 @@ class EnsembleCreator:
                 if (
                     sto_atom_id in final_tracker._sto_atom_id_actual_molw
                     and not final_tracker.parent_map.get(sto_atom_id)
-                    and final_tracker._sto_atom_id_actual_molw[sto_atom_id]
-                    > final_tracker._sto_atom_id_expected_molw[sto_atom_id] + 1e-9
+                    and final_tracker._sto_atom_id_actual_molw[sto_atom_id] > final_tracker._sto_atom_id_expected_molw[sto_atom_id] + 1e-9
                 ):
                     warnings.warn(ForcedOvershootNoBoundary(), stacklevel=1)
 
@@ -3590,7 +3452,6 @@ class EnsembleCreator:
                 break
         return (partial_atom_graph.atom_graph, partial_atom_graph.units, partial_atom_graph.bonds_idx, partial_atom_graph.sequence, actual_mol_weights, distributions)
 
-
     @staticmethod
     def _unit_graph_with_stars(unit_graph, origin_bond_id):
         """
@@ -3608,7 +3469,19 @@ class EnsembleCreator:
                 star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
         return star_graph
 
-    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None):
+    def create_ensemble(
+        self,
+        n_samples,
+        output_format="mol_graph",
+        ensemble_info=False,
+        max_number_of_discarded_chains: int = 100,
+        termination_flag: Optional[int] = None,
+        json_file: Optional[str] = None,
+        json_max_chains: Optional[int] = None,
+        parallel: bool = False,
+        n_workers: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
         """Sample an ensemble while rejecting explicitly chain-local failures.
 
         ``max_number_of_discarded_chains`` limits consecutive rejected paths
@@ -3682,10 +3555,7 @@ class EnsembleCreator:
             chunk_size = max(1, n_samples // n_workers)
             chunks = [chain_jobs[i : i + chunk_size] for i in range(0, n_samples, chunk_size)]
             with _no_main_reimport(), concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = [
-                    executor.submit(_sample_chain_batch, self, chunk, molecule_format, collect_info, max_number_of_discarded_chains, termination_flag)
-                    for chunk in chunks
-                ]
+                futures = [executor.submit(_sample_chain_batch, self, chunk, molecule_format, collect_info, max_number_of_discarded_chains, termination_flag) for chunk in chunks]
                 # Collected in submission order: records come back sorted by
                 # chain index, and a fatal worker error re-raises here exactly
                 # like on the serial path.
