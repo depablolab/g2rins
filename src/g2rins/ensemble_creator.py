@@ -3095,10 +3095,7 @@ class EnsembleCreator:
             """
             owner_epochs[sto_atom_id] = owner_epochs.get(sto_atom_id, 0) + 1
             checkpoint = checkpoints.get(sto_atom_id)
-            if (
-                checkpoint is not None
-                and checkpoint["epoch"] != owner_epochs[sto_atom_id] - 1
-            ):
+            if checkpoint is not None and checkpoint["epoch"] != owner_epochs[sto_atom_id] - 1:
                 checkpoints.pop(sto_atom_id, None)
 
         def _finalize_pending(sto_atom_id):
@@ -3157,12 +3154,15 @@ class EnsembleCreator:
                 break
             if finalized is not None:
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "finalize", "id": finalized,
-                        "gen": tracker._stochastic_atom_id_to_gen_id[finalized],
-                        "expected": tracker._sto_atom_id_expected_molw[finalized],
-                        "actual": tracker._sto_atom_id_actual_molw[finalized],
-                    })
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "finalize",
+                            "id": finalized,
+                            "gen": tracker._stochastic_atom_id_to_gen_id[finalized],
+                            "expected": tracker._sto_atom_id_expected_molw[finalized],
+                            "actual": tracker._sto_atom_id_actual_molw[finalized],
+                        }
+                    )
                 # Finish the child's own level. A live-ancestor continuation
                 # is promoted into that ancestor's pool inside
                 # _finalize_pending and fires later as an ordinary owner-level
@@ -3386,19 +3386,10 @@ class EnsembleCreator:
                     own_termination_cache = dict(checkpoint["own_termination_cache"])
                     avg_termination_cache = dict(checkpoint["avg_termination_cache"])
                     owner_epochs = dict(checkpoint["owner_epochs"])
-                    forced_overshoot_no_boundary = set(
-                        checkpoint["forced_overshoot_no_boundary"]
-                    )
+                    forced_overshoot_no_boundary = set(checkpoint["forced_overshoot_no_boundary"])
                     restored_tracker = partial_atom_graph.stochastic_tracker
                     restored_live = set(restored_tracker.get_unterminated_sto_atom_ids())
-                    checkpoints = {
-                        owner: prior
-                        for owner, prior in checkpoint["checkpoints"].items()
-                        if (
-                            owner in restored_live
-                            and prior["epoch"] + 1 == owner_epochs.get(owner, 0)
-                        )
-                    }
+                    checkpoints = {owner: prior for owner, prior in checkpoint["checkpoints"].items() if (owner in restored_live and prior["epoch"] + 1 == owner_epochs.get(owner, 0))}
                 else:
                     checkpoints.pop(crossing_sto_atom_id, None)
                 # Parking changes control state only, not the mass epoch. An

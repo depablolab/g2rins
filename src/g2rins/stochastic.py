@@ -418,9 +418,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
             # initiator bond connector stays unwired unless nothing could connect
             # it: its site is the origin of the growth and is consumed by it.
             terminator_wire_bc = [
-                bc_idx
-                for bc_idx in initiator_idx_pos
-                if bc_idx in initiator_non_connected_bc or "{" in self._initiation_residues[bond_idx_to_initiator_idx[bc_idx]].generate_string(True)
+                bc_idx for bc_idx in initiator_idx_pos if bc_idx in initiator_non_connected_bc or "{" in self._initiation_residues[bond_idx_to_initiator_idx[bc_idx]].generate_string(True)
             ]
             if len(terminator_wire_bc) > 0:
                 graph, _non_connected_bc = connect_initiators_to_terminators(graph, terminator_wire_bc, terminator_idx_pos)

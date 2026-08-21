@@ -386,10 +386,7 @@ def _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, resolut
             continue
         stochastic_id_tree = generative_graph.nodes[node]["stochastic_id_tree"]
         if any(
-            data[_TRANSITION_NAME] > 0
-            and data[_EDGE_STOCHASTIC_ID_NAME] >= 0
-            and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree
-            and not unit_id_map.get(target, "").startswith("T")
+            data[_TRANSITION_NAME] > 0 and data[_EDGE_STOCHASTIC_ID_NAME] >= 0 and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree and not unit_id_map.get(target, "").startswith("T")
             for _source, target, data in generative_graph.out_edges(node, data=True)
         ):
             emit(("missing", label), MissingTermination(label, unit_g2rins.get(label, "")))
