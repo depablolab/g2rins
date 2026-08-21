@@ -1761,11 +1761,7 @@ def test_nested_side_chain_so_gets_one_instance_per_junction():
     the unfired ports were destroyed with the instance's terminate-time wipe,
     and the outer target became unreachable — every chain was discarded as
     non-representative."""
-    smi = (
-        "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; "
-        "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; "
-        "[<2][H] []}|poisson(2000)|"
-    )
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; " "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; " "[<2][H] []}|poisson(2000)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -1796,11 +1792,7 @@ def test_multifunctional_ports_compete_with_chain_continuation():
     continuation used to fire directly from the finished child's bucket,
     bypassing the owner's pool entirely, so exactly one arm ever grew and the
     remaining ports were silently wiped at the outer termination."""
-    smi = (
-        "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], "
-        "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; "
-        "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
-    )
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
