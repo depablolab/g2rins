@@ -2099,6 +2099,55 @@ def test_nearest_terminator_declaration_wins():
         assert counts["Cl"] + counts["Br"] == 1, f"seed {seed}: expected exactly one chain-end cap, found {counts}"
 
 
+def test_nested_initiator_block_ends_inherit_outer_terminator():
+    """A nested stochastic object used as the initiator exposes its repeat-unit
+    chain ends through the terminal bond connector path; they inherit the
+    enclosing object's terminator exactly as a nested object in the repeat-unit
+    section does. The initiator wiring used to cap only bond connectors that
+    failed to connect, so these ends could never be capped — visible here as a
+    missing Cl, where an [H] cap would hide behind an inferred hydrogen. Chains
+    whose initiator port never grew are skipped (initiator ports carry no
+    termination edges, the one remaining gap)."""
+    smi = "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make(smi).get_graph_creator()
+        generative_graph = graph_creator.get_generative_graph(include_bond_connectors=False)
+        ensemble_creator = graph_creator.get_ensemble_creator()
+
+    inner_cap_levels = None
+    for node in generative_graph.nodes():
+        growth = set()
+        termination_levels = []
+        for _source, _target, data in generative_graph.out_edges(node, data=True):
+            if data["transition_weight"] > 0:
+                growth.add(("transition", data["stochastic_id"]))
+            elif data["propagation_weight"] > 0:
+                growth.add(("propagation", data["stochastic_id"]))
+            elif data["termination_weight"] > 0:
+                termination_levels.append(data["stochastic_id"])
+        if ("propagation", 1) in growth and ("transition", 0) in growth:
+            inner_cap_levels = termination_levels
+    assert inner_cap_levels == [0], f"inner block end expected the outer terminator stamped 0, found {inner_cap_levels}"
+
+    unit_labels = g2rins.derive_unit_labels(ensemble_creator._generative_graph).unit_id
+    central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
+    assert len(central) == 1
+    central_origin = str(central[0])
+    for seed in range(6):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        central_nodes = [n for n, d in mol_graph.nodes(data=True) if str(d.get("origin_idx")) == central_origin]
+        assert len(central_nodes) == 1
+        if mol_graph.degree(central_nodes[0]) < 2:
+            continue
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        chlorine_count = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
+        assert chlorine_count == 2, f"seed {seed}: both block ends grew but {chlorine_count} Cl cap(s) landed"
+
+
 def test_negative_target_draw_still_terminates():
     """A high-dispersity gauss target can draw negative; storing that draw like
     the negative no-target sentinel disables crossing checks and grows forever.

@@ -187,6 +187,20 @@ TERMINATION_DECLARATION_CASES = [
         g2rins.exception.ForeignControlledTermination,
         id="foreign-controlled",
     ),
+    pytest.param(
+        # A nested object used as the initiator: its block ends inherit the
+        # enclosing object's Cl through the terminal bond connector path.
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|",
+        g2rins.exception.InheritedTermination,
+        id="inherited-initiator-section",
+    ),
+    pytest.param(
+        # Same string with no terminator anywhere: the block ends hand their
+        # growth to the enclosing object and nothing can cap them.
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; []}|poisson(2200)|",
+        g2rins.exception.MissingTermination,
+        id="missing",
+    ),
 ]
 
 
@@ -202,6 +216,11 @@ def test_warn_termination_declaration(smi, category):
         "{[] [<]CC[>]; C[>]; [<][H] []}|poisson(50)|",
         "C{[>][<]CC(C)[>];;[<]}|poisson(900)|[H]",
         "{[] [<|.8|]CCO[>|.8|], [<|.2|]CC(C)O[>|.2|]; [>][H] ; [<]Br []}|log_normal(1400, 1.15)|",
+        # Nested objects whose exits reach a written endcap ([H] in the unit
+        # text) or that are only ENTERED from the site: realized with the
+        # unit, never left open, so no warning.
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|[H])C({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])C[>]; [<][H]; [>][H] []}|poisson(400)|",
+        "{[] [<]CC({[<] [<]NN({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])[>];; [>]}|poisson(200)|[H])CC[>]; [<][H]; []}|poisson(800)|",
     ],
 )
 def test_terminator_declared_beside_its_unit_is_silent(smi):

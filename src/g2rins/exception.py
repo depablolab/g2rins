@@ -289,6 +289,16 @@ class ForeignControlledTermination(TerminationDeclarationWarning):
         )
 
 
+class MissingTermination(TerminationDeclarationWarning):
+    def __str__(self):
+        return (
+            f"{self._site()} can hand its growth to another stochastic object, but no terminator with a matching "
+            "bond descriptor is declared at any level that could cap it. A chain whose growth ends there keeps an "
+            "unsatisfied bond. Declare a matching terminator in the unit's own stochastic object or in the "
+            "enclosing one reached through the terminal bond connector path."
+        )
+
+
 class StochasticMissingPath(ParsingWarning):
     def __init__(self, stochastic_obj, source_bc_pos):
         super().__init__(stochastic_obj)
