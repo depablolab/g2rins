@@ -13,16 +13,17 @@ both runaway/over-counted growth and collapsed/truncated chains.
 
 import warnings
 
-import g2rins
-import g2rins.util
 import numpy as np
 import pytest
+from rdkit import Chem
+from rdkit.Chem import Descriptors
+
+import g2rins
+import g2rins.util
 from g2rins.exception import (
     DiscardedSamplingPaths,
     PossibleNonRepresentativePolymerChain,
 )
-from rdkit import Chem
-from rdkit.Chem import Descriptors
 
 SEEDS = (0, 1, 2)
 
@@ -927,6 +928,7 @@ def test_zero_probability_productive_source_does_not_mask_fatal_routes(monkeypat
 def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
     """Only retained, unconsumed special half-bonds recurse into children."""
     import networkx as nx
+
     from g2rins.ensemble_creator import EnsembleCreator
     from g2rins.generative_graph import (
         _EDGE_STOCHASTIC_ID_NAME,
@@ -1010,6 +1012,7 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
 def test_source_dead_proof_keeps_cross_owner_and_malformed_routes_unknown():
     """Dynamic bucket transfers and malformed hierarchy never prove fatal."""
     import networkx as nx
+
     from g2rins.ensemble_creator import EnsembleCreator
     from g2rins.generative_graph import (
         _EDGE_STOCHASTIC_ID_NAME,
