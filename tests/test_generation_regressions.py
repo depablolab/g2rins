@@ -159,7 +159,7 @@ def test_truncated_chain_contract():
     _reset_rngs(1)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble = ensemble_creator.create_ensemble(n_samples=1, output_format="mol", max_number_of_discarded_chains=3)
+        ensemble = ensemble_creator.create_ensemble(n_samples=1, output_format="mol_graph", max_number_of_discarded_chains=3)
     assert ensemble is None
 
 
@@ -278,9 +278,9 @@ def test_example_ensemble(smi, target_mn, mn_rtol, n_samples, min_dispersity):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-        molecules = ensemble_creator.create_ensemble(n_samples=n_samples, output_format="mol")
+        molecules = ensemble_creator.create_ensemble(n_samples=n_samples, output_format="mol_graph")
     assert molecules is not None and len(molecules) == n_samples
-    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    weights = np.array([Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(m)) for m in molecules])
     mn = weights.mean()
     assert abs(mn - target_mn) / target_mn < mn_rtol, f"Mn {mn:.0f} vs target {target_mn:.0f}"
     if min_dispersity is not None:
@@ -423,7 +423,7 @@ def test_create_ensemble_aromatic_core_unit():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(star).get_graph_creator().get_ensemble_creator()
-        for output_format in ("mol_graph", "mol", "smiles"):
+        for output_format in ("mol_graph", "smiles"):
             for with_info in (False, True):
                 _reset_rngs(0)
                 result = ensemble_creator.create_ensemble(
@@ -435,6 +435,10 @@ def test_create_ensemble_aromatic_core_unit():
                     # units are returned and the aromatic triazole survives the
                     # kekulize-free fragment conversion.
                     assert len(result.units) > 0
+        # The rdkit "mol" output format is gone; convert chains yourself via
+        # g2rins.mol_graph_to_rdkit_mol or Chem.MolFromSmiles.
+        with pytest.raises(ValueError, match="Unsupported format"):
+            ensemble_creator.create_ensemble(n_samples=1, output_format="mol")
 
 
 def test_star_initiator_has_three_arms():
@@ -500,7 +504,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
         warnings.simplefilter("always")
         molecules = ensemble_creator.create_ensemble(
             n_samples=1,
-            output_format="mol",
+            output_format="mol_graph",
             max_number_of_discarded_chains=10,
         )
 
@@ -1877,16 +1881,17 @@ def test_triple_nested_repeat_unit_does_not_starve():
         warnings.simplefilter("always")
         molecules = ensemble_creator.create_ensemble(
             n_samples=n_samples,
-            output_format="mol",
+            output_format="mol_graph",
             max_number_of_discarded_chains=40,
         )
     assert molecules is not None and len(molecules) == n_samples
     discards = [w for w in caught_warnings if issubclass(w.category, DiscardedSamplingPaths)]
     assert not discards, f"starvation discards returned: {[str(w.message) for w in discards]}"
-    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    rdkit_molecules = [g2rins.mol_graph_to_rdkit_mol(graph) for graph in molecules]
+    weights = np.array([Descriptors.MolWt(m) for m in rdkit_molecules])
     mn = weights.mean()
     assert 850 <= mn <= 1150, f"Mn {mn:.0f} off the 1000 outer target"
-    for i, mol in enumerate(molecules):
+    for i, mol in enumerate(rdkit_molecules):
         chlorine_count = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
         assert chlorine_count == 1, f"chain {i}: expected exactly 1 outer Cl cap, found {chlorine_count}"
 
@@ -1987,8 +1992,9 @@ def test_create_ensemble_json_file(tmp_path):
     """The json_file export must be strict JSON (no NaN/numpy leakage) with the
     documented layout: {string, format, graph, ensemble}, derived unit/bond
     labels injected into the graph nodes, canonical unit entries with numbered
-    P-SMILES stars, undirected bond records, chains capped by json_max_chains
-    while statistics keep every sampled chain."""
+    P-SMILES stars and static unit subgraphs, undirected bond records pairing
+    endpoint labels with generative-graph node ids, chains capped by
+    json_max_chains while statistics keep every sampled chain."""
     import json
 
     smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
@@ -2010,8 +2016,9 @@ def test_create_ensemble_json_file(tmp_path):
     assert list(data) == ["string", "format", "graph", "ensemble"]
     # The string is the regenerated canonical text, not the verbatim input.
     assert data["string"].startswith("{[] [<]CC([>])c1ccccc1;")
-    assert data["format"]["version"] == 1
+    assert data["format"]["version"] == 2
     assert data["format"]["derived_node_fields"] == ["unit_id", "bond_id"]
+    assert data["format"]["chain_format"] == "smiles"
 
     labels = g2rins.derive_unit_labels(ensemble_creator._generative_graph)
     for node_dict in data["graph"]["nodes"]:
@@ -2029,18 +2036,56 @@ def test_create_ensemble_json_file(tmp_path):
 
     assert set(ensemble["units"]) == {"I0", "R0", "T0"}
     for unit_id, info in ensemble["units"].items():
-        assert list(info) == ["psmiles", "g2rins", "frequency"]
+        assert list(info) == ["psmiles", "g2rins", "subgraph", "count"]
         assert "[*:1]" in info["psmiles"]
-        assert info["g2rins"] and info["frequency"] > 0
+        assert info["g2rins"] and info["count"] > 0
+        # The subgraph is the unit's static piece of the generative graph:
+        # the same node ids, static edges only, unit_id (only) on its nodes.
+        subgraph_ids = {node_dict["id"] for node_dict in info["subgraph"]["nodes"]}
+        assert subgraph_ids == {node for node, uid in labels.unit_id.items() if uid == unit_id}
+        assert all(node_dict["unit_id"] == unit_id and "bond_id" not in node_dict for node_dict in info["subgraph"]["nodes"])
+        assert all(edge["static"] for edge in info["subgraph"]["edges"])
     assert "[*:2]" in ensemble["units"]["R0"]["psmiles"], "repeat unit carries two numbered stars"
 
     for record in ensemble["bonds"]:
-        assert list(record) == ["between", "count"] and record["count"] > 0
-        for endpoint in record["between"]:
+        assert list(record) == ["labels", "nodes", "count"] and record["count"] > 0
+        for endpoint, node_id in zip(record["labels"], record["nodes"]):
             unit_id, bond_id = endpoint.rsplit(".", 1)
             assert unit_id in ensemble["units"] and int(bond_id) >= 1
-    linkages = {tuple(record["between"]) for record in ensemble["bonds"]}
+            # nodes are aligned with labels: both name the same connection atom.
+            assert labels.unit_id[node_id] == unit_id
+            assert labels.bond_id[node_id] == int(bond_id)
+    linkages = {tuple(record["labels"]) for record in ensemble["bonds"]}
     assert ("I0.1", "R0.1") in linkages and ("R0.2", "T0.1") in linkages
+
+
+def test_create_ensemble_json_file_mol_graph_chains(tmp_path):
+    """With output_format="mol_graph" the file's chains follow the caller's
+    format as node-link graph dicts (picking the format is picking the file
+    size); sequences are written as SMILES regardless."""
+    import json
+
+    import networkx as nx
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    path = tmp_path / "ensemble_graphs.json"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        chains = ensemble_creator.create_ensemble(2, output_format="mol_graph", json_file=str(path))
+
+    data = json.loads(path.read_text())
+    assert data["format"]["chain_format"] == "mol_graph"
+    stored_chains = data["ensemble"]["chains"]
+    assert len(stored_chains) == 2
+    for chain_data, chain_graph in zip(stored_chains, chains):
+        restored = nx.node_link_graph(chain_data, edges="edges")
+        assert restored.number_of_nodes() == chain_graph.number_of_nodes()
+        assert restored.number_of_edges() == chain_graph.number_of_edges()
+    for chain_sequences in data["ensemble"]["sequences"]:
+        for sequence in chain_sequences:
+            assert sequence and all(isinstance(unit, str) for unit in sequence)
 
 
 def test_generative_graph_and_ensemble_share_node_ids():
