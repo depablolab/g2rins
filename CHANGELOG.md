@@ -8,6 +8,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
+- Tagged release builds verify that `CITATION.cff` matches the tag, so a release cannot ship stale citation metadata.
 
 ### Changed
 

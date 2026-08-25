@@ -24,6 +24,18 @@ jobs:
           # setuptools-scm needs the full history and tags to derive the version.
           fetch-depth: 0
 
+      - name: Verify CITATION.cff matches the release tag
+        # The github-release job publishes whatever a v* tag points at;
+        # fail the build first when the citation metadata was not bumped.
+        if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+        run: |
+          citation_version="$(sed -n 's/^version: *//p' CITATION.cff | tr -d '"')"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "${citation_version}" != "${tag_version}" ]; then
+            echo "CITATION.cff says version ${citation_version}, but the tag is ${GITHUB_REF_NAME}. Bump CITATION.cff (version and date-released) and re-tag." >&2
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
