@@ -526,14 +526,20 @@ class EnsembleData:
     """
     Full result of :meth:`EnsembleCreator.create_ensemble` with ``ensemble_info=True``.
 
-    ``chains`` and ``sequences`` follow the requested ``output_format``;
-    the ensemble aggregates are format-independent: ``units`` maps each
-    derived unit_id (see :func:`g2rins.derive_unit_labels`) to
-    ``{"psmiles", "g2rins", "frequency"}`` and ``bonds`` is a list of
-    undirected linkage records ``{"between": ["I0.1", "R0.1"], "count": n}``
-    whose endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
-    ``endpoint.rsplit(".", 1)``), sorted so the same linkage always prints
-    identically.
+    ``chains`` and ``sequences`` follow the requested ``output_format``; the
+    ensemble aggregates are template-level and format-independent. ``units``
+    maps each derived unit_id (see :func:`g2rins.derive_unit_labels`) to
+    ``{"psmiles", "g2rins", "subgraph", "count"}``, where ``subgraph`` is a
+    detached copy of the unit's static subgraph of the generative graph
+    (original node ids, static edges only, ``unit_id`` stamped on the copy's
+    nodes). ``bonds`` is a list of undirected linkage records
+    ``{"labels": ["I0.1", "R0.1"], "nodes": [id, id], "count": n}``:
+    ``labels`` endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
+    ``endpoint.rsplit(".", 1)``) sorted so the same linkage always prints
+    identically, and ``nodes`` holds the generative-graph node ids of the
+    same two connection atoms, aligned with ``labels``. Labels survive a
+    fresh parse of the same string; node ids are only valid for this parsed
+    graph.
     """
 
     chains: list
@@ -553,17 +559,45 @@ def _bond_records(bond_counts, origin_endpoint):
     """
     Undirected linkage records from the growth-direction ``bond_counts``
     (origin_idx pairs): both orientations of a chemical linkage merge into one
-    record with summed counts, endpoints sorted by (unit role, unit number,
-    bond id).
+    record with summed counts. Endpoint labels are sorted by (unit role, unit
+    number, bond id); ``nodes`` carries the generative-graph node id of each
+    endpoint in the same order.
     """
     merged = {}
     for (origin_u, origin_v), count in bond_counts.items():
-        pair = tuple(sorted((origin_endpoint[origin_u], origin_endpoint[origin_v]), key=_bond_endpoint_sort_key))
+        pair = tuple(
+            sorted(
+                ((origin_endpoint[origin_u], origin_u), (origin_endpoint[origin_v], origin_v)),
+                key=lambda endpoint: _bond_endpoint_sort_key(endpoint[0]),
+            )
+        )
         merged[pair] = merged.get(pair, 0) + count
     return [
-        {"between": list(pair), "count": count}
-        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(endpoint) for endpoint in item[0]))
+        {"labels": [label for label, _node in pair], "nodes": [node for _label, node in pair], "count": count}
+        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
     ]
+
+
+def _unit_subgraphs(generative_graph, unit_id_by_node):
+    """
+    Detached static subgraph per unit: the unit's nodes with their static
+    edges only (non-static edges are generative rules, not template
+    structure -- an induced subgraph would drag intra-unit self-transitions
+    along). Node ids are kept; ``unit_id`` is stamped on the copy's nodes,
+    never on the generative graph itself.
+    """
+    unit_nodes = {}
+    for node, unit_id in unit_id_by_node.items():
+        unit_nodes.setdefault(unit_id, []).append(node)
+    subgraphs = {}
+    for unit_id, nodes in unit_nodes.items():
+        subgraph = deepcopy(generative_graph.subgraph(nodes).copy())
+        subgraph.graph.clear()
+        subgraph.remove_edges_from([(u, v, key) for u, v, key, data in subgraph.edges(keys=True, data=True) if not data["static"]])
+        for node in subgraph.nodes:
+            subgraph.nodes[node]["unit_id"] = unit_id
+        subgraphs[unit_id] = subgraph
+    return subgraphs
 
 
 @contextmanager
@@ -634,9 +668,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         mol_graph = sample
         molecule_units = bonds = sequences = mol_weights = distributions = None
 
-    if molecule_format == "mol":
-        molecule = mol_graph_to_rdkit_mol(mol_graph)
-    elif molecule_format == "smiles":
+    if molecule_format == "smiles":
         molecule = mol_graph_to_smiles(mol_graph)
     else:
         molecule = mol_graph
@@ -646,9 +678,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         # Units are static-connected fragments with dangling inter-unit
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
-        if molecule_format == "mol":
-            converted_sequences = [[mol_graph_to_rdkit_mol(unit, kekulize=False) for unit in sequence] for sequence in sequences]
-        elif molecule_format == "smiles":
+        if molecule_format == "smiles":
             converted_sequences = [[mol_graph_to_smiles(unit, kekulize=False) for unit in sequence] for sequence in sequences]
         else:
             converted_sequences = sequences
@@ -3623,10 +3653,13 @@ class EnsembleCreator:
 
         ``json_file`` writes the originating G2RINS string, the generative graph (with
         derived unit/bond annotations) and the ensemble data to that path as
-        JSON; chains and sequences are written as SMILES regardless of
-        ``output_format``. ``json_max_chains``
-        caps only the number of chains stored in the file (default ``None`` =
-        all); statistics always cover every sampled chain.
+        JSON. The file's chains follow ``output_format`` -- SMILES strings, or
+        node-link graph dicts for ``"mol_graph"`` (roughly two orders of
+        magnitude larger; picking the format is picking the file size) -- as
+        recorded in ``format.chain_format``; sequences are written as SMILES
+        regardless. ``json_max_chains`` caps only the number of chains stored
+        in the file (default ``None`` = all); statistics always cover every
+        sampled chain.
 
         ``parallel=False`` (the default) samples everything in this process.
         ``parallel=True`` samples chains in ``n_workers`` subprocesses:
@@ -3653,7 +3686,7 @@ class EnsembleCreator:
         chain), so the cross-mode equality applies to failure-free runs.
         """
 
-        supported_formats = {"mol", "smiles", "mol_graph"}
+        supported_formats = {"smiles", "mol_graph"}
         molecule_format = output_format.lower()
         if molecule_format not in supported_formats:
             raise ValueError(f"Unsupported format: '{output_format}'. " f"Please choose from {list(supported_formats)}.")
@@ -3804,11 +3837,13 @@ class EnsembleCreator:
 
             list_of_sequences.append(record["sequences"])
 
-        # Ensemble aggregates are format-independent: units and bonds are keyed
-        # by the derived labels (which also keeps chemically identical units --
-        # e.g. two Br terminators -- apart), only chains/sequences follow
-        # output_format.
+        # Ensemble aggregates are template-level and format-independent: units
+        # and bonds are keyed by the derived labels (which also keeps
+        # chemically identical units -- e.g. two Br terminators -- apart) and
+        # carry the generative-graph node ids alongside; only chains/sequences
+        # follow output_format.
         labels = derive_unit_labels(self._generative_graph)
+        unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_id)
         origin_unit_id = {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
@@ -3820,52 +3855,52 @@ class EnsembleCreator:
             unit_g2rins = {}
 
         canonical_units = {}
-        for unit_graph, frequency in units.items():
+        for unit_graph, count in units.items():
             # Unit fragments have dangling inter-unit valences: kekulize=False
             # (an aromatic ring at a connection point can't be kekulized in
             # isolation).
             star_mol = mol_graph_to_rdkit_mol(self._unit_graph_with_stars(unit_graph, origin_bond_id), kekulize=False)
             unit_id = origin_unit_id[next(iter(unit_graph.nodes(data=True)))[1]["origin_idx"]]
-            canonical_units[unit_id] = {"psmiles": rdkit_mol_to_smiles(star_mol), "g2rins": unit_g2rins.get(unit_id, ""), "frequency": frequency}
+            canonical_units[unit_id] = {
+                "psmiles": rdkit_mol_to_smiles(star_mol),
+                "g2rins": unit_g2rins.get(unit_id, ""),
+                "subgraph": unit_subgraphs[unit_id],
+                "count": count,
+            }
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))
 
         bond_records = _bond_records(bond_counts, origin_endpoint)
 
         if json_file is not None:
+            # The file's chains follow output_format (the caller's format
+            # choice decides the file size); sequences are always SMILES.
             if molecule_format == "smiles":
 
-                def _chain_smiles(molecule):
+                def _chain_json(molecule):
                     return molecule
 
-                def _unit_smiles(unit):
+                def _sequence_unit_smiles(unit):
                     return unit
-
-            elif molecule_format == "mol":
-
-                def _chain_smiles(molecule):
-                    return rdkit_mol_to_smiles(molecule)
-
-                def _unit_smiles(unit):
-                    return rdkit_mol_to_smiles(unit)
 
             else:
 
-                def _chain_smiles(molecule):
-                    return mol_graph_to_smiles(molecule)
+                def _chain_json(molecule):
+                    return nx.node_link_data(molecule, edges="edges")
 
-                def _unit_smiles(unit):
+                def _sequence_unit_smiles(unit):
                     return mol_graph_to_smiles(unit, kekulize=False)
 
             saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
             json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
             json_data.update(generative_graph_json_data(self._generative_graph))
+            json_data["format"]["chain_format"] = molecule_format
             json_data["ensemble"] = {
-                "units": canonical_units,
-                "chains": [_chain_smiles(molecule) for molecule in saved_chains],
+                "units": {unit_id: {**info, "subgraph": nx.node_link_data(info["subgraph"], edges="edges")} for unit_id, info in canonical_units.items()},
+                "chains": [_chain_json(molecule) for molecule in saved_chains],
                 "bonds": bond_records,
                 "mol_weights": mol_weight_lists,
                 "distributions": ensemble_distributions,
-                "sequences": [[[_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
+                "sequences": [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
             }
             with open(json_file, "w") as file_handle:
                 json.dump(json_data, file_handle, indent=2)

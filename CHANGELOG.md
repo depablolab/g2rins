@@ -9,6 +9,9 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
 - Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, and `MissingTermination`. The canonical configuration — a site capped in the step that grows it — stays silent.
+- Unit records in the ensemble output carry the unit's static subgraph of the generative graph (`subgraph`: original node ids, static edges only, `unit_id` stamped on the copy's nodes; node-link encoded in JSON files).
+- Bond records carry the generative-graph node ids of the two connection atoms (`nodes`, positionally aligned with `labels`; labels survive a fresh parse, node ids are only valid for the graph they came from).
+- Ensemble JSON files follow the requested `output_format` for their stored chains — SMILES strings or node-link graph dicts — and record the choice in `format.chain_format`. Sequences are written as SMILES regardless.
 
 ### Changed
 
@@ -19,6 +22,11 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - When a nested stochastic object finishes, its continuation and the level's remaining entry sites compete in one weighted draw at the owning level, instead of the continuation firing unconditionally.
 - Which terminator caps an open site is resolved at graph construction: the declaration nearest the site wins, and termination edges that can never fire are removed from the generative graph. The stochastic object that owns the site's bond descriptor fires the cap, and the cap's mass counts toward that object's molecular weight target.
 - A nested stochastic object used as an initiator now inherits the enclosing object's terminators for its exposed chain ends, as one used as a repeat unit already did.
+- Exported graph and ensemble JSON is format version 2: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
+
+### Removed
+
+- The `mol` output format of `create_ensemble`. Request `mol_graph` and convert chains with `g2rins.mol_graph_to_rdkit_mol`, or parse the SMILES output.
 
 ### Fixed
 

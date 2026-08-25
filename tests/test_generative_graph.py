@@ -39,7 +39,7 @@ def test_generative_graph_json_data_format_block():
     generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
     data = g2rins.generative_graph_json_data(generative_graph)
 
-    assert data["format"]["version"] == 1
+    assert data["format"]["version"] == 2
     declared = set(data["format"]["derived_node_fields"])
     stored_attrs = {key for _node, attrs in generative_graph.nodes(data=True) for key in attrs}
     injected = {key for node_dict in data["graph"]["nodes"] for key in node_dict} - stored_attrs - {"id"}

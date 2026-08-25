@@ -412,13 +412,13 @@ def generative_graph_json_data(generative_graph):
             node_dict["bond_id"] = labels.bond_id[node]
     return {
         "format": {
-            "version": 1,
+            "version": 2,
             "derived_node_fields": list(_DERIVED_NODE_FIELDS),
             "note": (
                 "unit_id and bond_id are derived annotations injected at export, not stored graph"
                 " attributes; a bond id labels the atom's open-bond position within its unit and"
-                " matches the [*:n] star map of the unit's P-SMILES. Strip derived_node_fields"
-                " before ML training."
+                " matches the [*:n] star map of the unit's P-SMILES. In ensemble files, unit"
+                " subgraph nodes carry unit_id only. Strip derived_node_fields before ML training."
             ),
         },
         "graph": data,
