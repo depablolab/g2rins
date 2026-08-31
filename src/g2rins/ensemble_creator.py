@@ -20,6 +20,7 @@ import networkx as nx
 import numpy as np
 from rdkit import Chem, rdBase
 
+from .convergence import ConvergenceTracker
 from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
 from .chem_resource import (
     atom_color_mapping,
@@ -548,6 +549,20 @@ class EnsembleData:
     sequences: list
     mol_weights: dict
     distributions: dict
+    molecular_weights: list
+
+
+@dataclass
+class ConvergedEnsembleData(EnsembleData):
+    """Result of :meth:`EnsembleCreator.create_ensemble_until_converged`."""
+
+    converged: bool
+    n_batches: int
+    convergence_settings: dict
+    convergence_trace: list
+    number_average_molecular_weight: float
+    weight_average_molecular_weight: float
+    dispersity: float
 
 
 def _bond_endpoint_sort_key(endpoint):
@@ -576,6 +591,42 @@ def _bond_records(bond_counts, origin_endpoint):
         {"labels": [label for label, _node in pair], "nodes": [node for _label, node in pair], "count": count}
         for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
     ]
+
+
+def _merge_ensemble_data(target, batch):
+    """Merge a batch into cumulative :class:`EnsembleData` in place."""
+    target.chains.extend(batch.chains)
+    target.sequences.extend(batch.sequences)
+    target.molecular_weights.extend(batch.molecular_weights)
+
+    for unit_id, unit_data in batch.units.items():
+        if unit_id in target.units:
+            target.units[unit_id]["count"] += unit_data["count"]
+        else:
+            target.units[unit_id] = unit_data
+
+    bonds = {tuple(record["labels"]): record for record in target.bonds}
+    for record in batch.bonds:
+        key = tuple(record["labels"])
+        if key in bonds:
+            bonds[key]["count"] += record["count"]
+        else:
+            copied = dict(record)
+            target.bonds.append(copied)
+            bonds[key] = copied
+    target.bonds.sort(key=lambda record: tuple(_bond_endpoint_sort_key(label) for label in record["labels"]))
+
+    for stochastic_id, weights in batch.mol_weights.items():
+        target.mol_weights.setdefault(stochastic_id, []).extend(weights)
+    for stochastic_id, distribution in batch.distributions.items():
+        target.distributions.setdefault(stochastic_id, distribution)
+
+
+def _contact_frequencies(bonds):
+    total = sum(record["count"] for record in bonds)
+    if not total:
+        return {}
+    return {"|".join(record["labels"]): record["count"] / total for record in bonds}
 
 
 def _unit_subgraphs(generative_graph, unit_id_by_node):
@@ -668,6 +719,14 @@ def _convert_chain(sample, molecule_format, collect_info):
         mol_graph = sample
         molecule_units = bonds = sequences = mol_weights = distributions = None
 
+    molecular_weight = None
+    if collect_info:
+        molecular_weight = sum(
+            atomic_masses[data["atomic_num"]] + data.get("credited_h", 0) * atomic_masses[1]
+            for _node, data in mol_graph.nodes(data=True)
+            if data["atomic_num"] > 0
+        )
+
     if molecule_format == "smiles":
         molecule = mol_graph_to_smiles(mol_graph)
     else:
@@ -690,6 +749,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         "sequences": converted_sequences,
         "mol_weights": mol_weights,
         "distributions": distributions,
+        "molecular_weight": molecular_weight,
     }
 
 
@@ -3800,6 +3860,7 @@ class EnsembleCreator:
             )
 
         list_of_molecules = [record["molecule"] for record in records]
+        molecular_weights = [record["molecular_weight"] for record in records]
 
         if not collect_info:
             return list_of_molecules
@@ -3913,5 +3974,110 @@ class EnsembleCreator:
                 sequences=list_of_sequences,
                 mol_weights=mol_weight_lists,
                 distributions=ensemble_distributions,
+                molecular_weights=molecular_weights,
             )
         return list_of_molecules
+
+    def create_ensemble_until_converged(
+        self,
+        batch_size=25,
+        max_samples=5000,
+        window=4,
+        mass_tolerance=0.002,
+        contact_tolerance=0.01,
+        output_format="mol_graph",
+        max_number_of_discarded_chains=100,
+        termination_flag=None,
+        parallel=False,
+        n_workers=None,
+        seed=None,
+        progress_callback=None,
+    ):
+        """Sample batches until cumulative mass and contact statistics stabilize.
+
+        This is an opt-in alternative to :meth:`create_ensemble`; the existing
+        fixed-size API and its return type remain unchanged. Convergence requires
+        ``window`` consecutive batch-to-batch transitions whose relative Mn/Mw
+        changes and absolute contact-frequency changes satisfy the supplied
+        tolerances. Sampling stops without convergence at ``max_samples``.
+
+        An integer ``seed`` follows the established batch convention: batch
+        ``i`` uses ``seed + i * batch_size``. Results are reproducible for a
+        fixed batch size, execution mode, and worker count.
+        """
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be positive, got {batch_size}.")
+        if max_samples < 1:
+            raise ValueError(f"max_samples must be positive, got {max_samples}.")
+        tracker = ConvergenceTracker(
+            window=window,
+            mass_tolerance=mass_tolerance,
+            contact_tolerance=contact_tolerance,
+        )
+        cumulative = EnsembleData([], {}, [], [], {}, {}, [])
+        converged = False
+        batch_index = 0
+
+        while len(cumulative.chains) < max_samples:
+            current_batch_size = min(batch_size, max_samples - len(cumulative.chains))
+            batch_seed = None if seed is None else seed + batch_index * batch_size
+            batch = self.create_ensemble(
+                current_batch_size,
+                output_format=output_format,
+                ensemble_info=True,
+                max_number_of_discarded_chains=max_number_of_discarded_chains,
+                termination_flag=termination_flag,
+                parallel=parallel,
+                n_workers=n_workers,
+                seed=batch_seed,
+            )
+            if batch is None or not batch.chains:
+                break
+            _merge_ensemble_data(cumulative, batch)
+
+            masses = cumulative.molecular_weights
+            mn = float(np.mean(masses))
+            mw = float(np.dot(masses, masses) / np.sum(masses))
+            contacts = _contact_frequencies(cumulative.bonds)
+            tracker.record(len(cumulative.chains), mn, mw, contacts)
+            batch_index += 1
+
+            if progress_callback is not None:
+                progress_callback(
+                    f"[batch {batch_index}] n_samples={len(cumulative.chains)} "
+                    f"Mn={mn:.2f} Mw={mw:.2f} dispersity={mw / mn:.4f} "
+                    f"convergence: {tracker.progress()}"
+                )
+            if tracker.converged():
+                converged = True
+                break
+            if len(batch.chains) < current_batch_size:
+                break
+
+        if not cumulative.chains:
+            return None
+        masses = cumulative.molecular_weights
+        mn = float(np.mean(masses))
+        mw = float(np.dot(masses, masses) / np.sum(masses))
+        return ConvergedEnsembleData(
+            chains=cumulative.chains,
+            units=cumulative.units,
+            bonds=cumulative.bonds,
+            sequences=cumulative.sequences,
+            mol_weights=cumulative.mol_weights,
+            distributions=cumulative.distributions,
+            molecular_weights=masses,
+            converged=converged,
+            n_batches=batch_index,
+            convergence_settings={
+                "batch_size": batch_size,
+                "max_samples": max_samples,
+                "window": window,
+                "mass_tolerance": mass_tolerance,
+                "contact_tolerance": contact_tolerance,
+            },
+            convergence_trace=tracker.history,
+            number_average_molecular_weight=mn,
+            weight_average_molecular_weight=mw,
+            dispersity=mw / mn,
+        )

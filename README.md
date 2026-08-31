@@ -48,6 +48,27 @@ ensemble_creator = graph_creator.get_ensemble_creator()
 ensemble = ensemble_creator.create_ensemble(100, output_format="smiles", ensemble_info=True)
 ```
 
+Fixed-size sampling remains the default. To sample batches until cumulative
+Mn, Mw, and bond-contact frequencies stabilize, opt in explicitly:
+
+```python
+ensemble = ensemble_creator.create_ensemble_until_converged(
+	batch_size=25,
+	max_samples=5000,
+	window=4,
+	mass_tolerance=0.002,
+	contact_tolerance=0.01,
+	output_format="smiles",
+	seed=7,
+)
+
+print(ensemble.converged, len(ensemble.chains), ensemble.convergence_trace)
+```
+
+Convergence requires every adjacent cumulative snapshot in the trailing
+window to satisfy both tolerances. If the hard sample limit is reached first,
+the result is returned with `converged == False`.
+
 Worked examples are in [`G2RINS_guide.ipynb`](G2RINS_guide.ipynb).
 
 ---
