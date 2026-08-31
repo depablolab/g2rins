@@ -81,6 +81,28 @@ class GenerationError(G2RINSError):
     pass
 
 
+class WorkerProcessFailure(GenerationError):
+    """A process worker repeatedly died before its chain result was returned."""
+
+    def __init__(self, restart_count, native_state=None):
+        self.restart_count = restart_count
+        self.native_state = native_state
+
+    def __str__(self):
+        detail = ""
+        if self.native_state:
+            detail = (
+                f" Last native state: chain={self.native_state.get('chain_index')},"
+                f" stage={self.native_state.get('native_stage')},"
+                f" atoms={self.native_state.get('atom_count')},"
+                f" bonds={self.native_state.get('bond_count')}."
+            )
+        return (
+            f"The sampling process pool failed after {self.restart_count} restart(s)."
+            f"{detail}"
+        )
+
+
 class DoubleBondSymbolDefinition(GenerationError):
     def __init__(self, partial_graph, symbol, bond_attributes):
         self.partial_graph = partial_graph

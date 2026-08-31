@@ -69,6 +69,60 @@ Convergence requires every adjacent cumulative snapshot in the trailing
 window to satisfy both tolerances. If the hard sample limit is reached first,
 the result is returned with `converged == False`.
 
+For long runs, statistics can cover every accepted chain while sample-level
+outputs remain bounded:
+
+```python
+checkpoints = []
+ensemble = ensemble_creator.create_ensemble_until_converged(
+	batch_size=25,
+	max_samples=100_000,
+	output_format="smiles",
+	seed=7,
+	reservoir_size=100,
+	retain_sequences=False,
+	sample_callback=lambda index, record: print(index, record["molecule"]),
+	checkpoint_callback=checkpoints.append,
+)
+
+# Resume from a serialized batch-boundary checkpoint. The sampling and
+# independent reservoir streams continue exactly when an integer seed is used.
+ensemble = ensemble_creator.create_ensemble_until_converged(
+	batch_size=25,
+	max_samples=100_000,
+	output_format="smiles",
+	seed=7,
+	reservoir_size=100,
+	retain_sequences=False,
+	checkpoint=checkpoints[-1],
+)
+```
+
+Set both `retain_chains=False` and `retain_sequences=False` for no retained
+sample records. `metadata=False` omits returned unit/contact metadata without
+changing the statistics used for convergence. `reservoir_size` uses an
+independent random stream, so retention never changes generated chemistry.
+Checkpoints are serializable with `pickle` and require an integer `seed` for
+exact resume.
+
+For diagnosing rare native-library failures, pass
+`native_diagnostics_path="rdkit-state.jsonl"` to either ensemble creation
+method. Immediately before each RDKit build, sanitization, property-cache,
+descriptor, or SMILES operation, G²RINS durably records the chain index and
+seed, atom and bond counts, process ID, operation stage, and library versions.
+The last JSON line for a failed worker identifies its last native stage.
+Python fault handling is enabled automatically, and large-molecule RDKit
+operations run with enlarged-stack protection.
+
+Parallel sampling initializes one reusable `EnsembleCreator` per worker and
+submits only compact chain-index/seed jobs. At most twice the worker count is
+queued at once, numerical libraries are restricted to one native thread per
+process, and workers are periodically recycled where the Python runtime
+supports it. A broken process pool is rebuilt without dropping completed
+ordered results. `max_worker_restarts` controls the restart budget (default
+`2`); exhaustion raises `WorkerProcessFailure`, whose `native_state` contains
+the latest valid record from `native_diagnostics_path` when available.
+
 Worked examples are in [`G2RINS_guide.ipynb`](G2RINS_guide.ipynb).
 
 ---

@@ -14,6 +14,7 @@ from g2rins.nx_rdkit_mol import (
     mol_graph_to_rdkit_mol,
     mol_graph_to_smiles,
     rdkit_mol_to_smiles,
+    rdkit_mol_weight,
 )
 
 
@@ -56,6 +57,22 @@ def test_mol_graph_to_smiles_small():
     graph = _linear_carbon_graph(3)
     assert mol_graph_to_smiles(graph) == "CCC"
     assert mol_graph_to_smiles(graph) == Chem.MolToSmiles(mol_graph_to_rdkit_mol(graph))
+
+
+def test_mol_graph_to_smiles_publishes_every_native_stage():
+    stages = []
+    graph = _linear_carbon_graph(3)
+
+    assert mol_graph_to_smiles(graph, native_stage_callback=stages.append) == "CCC"
+    assert stages == ["build", "sanitize", "property-cache", "smiles"]
+
+
+def test_rdkit_mol_weight_reuses_molecule_and_publishes_stage():
+    stages = []
+    mol = Chem.MolFromSmiles("CCO")
+
+    assert rdkit_mol_weight(mol, stages.append) == pytest.approx(46.069)
+    assert stages == ["descriptor-molwt"]
 
 
 def test_association_edge_renders_as_fragment():

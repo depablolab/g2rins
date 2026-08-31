@@ -6,6 +6,8 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Added
 
+- Sampling benchmarks support concise median-only matrices and sampling-only CPU attribution by implementation category; the post-optimization profile documents why NetworkX remains the internal graph backend for now.
+- Convergence sampling supports bounded chain/sequence reservoirs, per-chain streaming callbacks, optional returned metadata, and serializable seeded checkpoints for exact batch-boundary resume.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
 - Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, and `MissingTermination`. The canonical configuration — a site capped in the step that grows it — stays silent.
@@ -15,6 +17,11 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Changed
 
+- Parallel ensembles now initialize one persistent creator per worker, submit compact chain jobs with at most twice the worker count in flight, cap numerical-library threads, and recycle workers where supported. Broken pools preserve completed ordered results and restart up to `max_worker_restarts`, then raise `WorkerProcessFailure` with the last valid native diagnostic state.
+- Accepted chains now construct and sanitize one RDKit molecule and reuse it for molecular weight and requested canonical SMILES. Optional durable native-stage diagnostics include chain/seed context and library versions, `faulthandler` is enabled automatically, and enlarged-stack protection covers construction, sanitization, descriptors, and SMILES generation for large molecules.
+- Fixed-size and convergence-driven ensemble creation now share one ordered per-chain sampling engine. Convergence updates molecular-weight moments and contact frequencies online instead of rescanning all accumulated samples after every batch.
+- Ensemble sampling now tracks unit counts, contacts, and branching sequences with compact IDs and direct atom indexes, materializing the legacy graph-valued metadata only when returning it. This removes per-unit molecule scans and per-occurrence NetworkX copies without changing the public output.
+- Exact stochastic rounding now restores rejected growth steps through a transaction journal containing an append watermark, frontier/tracker state, compact metadata, and pre-existing atom-attribute values instead of deep-copying the whole partial molecule. The consumed random stream is deliberately not rewound.
 - Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.

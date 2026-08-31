@@ -3,6 +3,7 @@
 
 """Tests for opt-in ensemble sampling until statistical convergence."""
 
+import pickle
 import warnings
 
 import pytest
@@ -63,11 +64,24 @@ def test_create_ensemble_until_converged_stops_after_stable_window(monkeypatch):
     creator = EnsembleCreator.__new__(EnsembleCreator)
     calls = []
 
-    def create_ensemble(n_samples, **kwargs):
-        calls.append((n_samples, kwargs))
-        return _batch(n_samples)
+    def iter_chain_records(**kwargs):
+        calls.append(kwargs)
+        for index in range(kwargs["n_samples"]):
+            yield {
+                "chain_index": kwargs["start_index"] + index,
+                "record": object(),
+                "discards": 0,
+                "reasons": (),
+                "first_cause": None,
+                "warnings": [],
+            }
 
-    monkeypatch.setattr(creator, "create_ensemble", create_ensemble)
+    monkeypatch.setattr(creator, "_iter_chain_records", iter_chain_records)
+    monkeypatch.setattr(
+        creator,
+        "_records_to_ensemble_data",
+        lambda records: _batch(len(records)),
+    )
     progress = []
     result = creator.create_ensemble_until_converged(
         batch_size=2,
@@ -83,7 +97,8 @@ def test_create_ensemble_until_converged_stops_after_stable_window(monkeypatch):
     assert result.molecular_weights == [100.0] * 6
     assert result.units["R0"]["count"] == 6
     assert result.bonds[0]["count"] == 6
-    assert [kwargs["seed"] for _size, kwargs in calls] == [10, 12, 14]
+    assert [kwargs["seed"] for kwargs in calls] == [10, 12, 14]
+    assert [kwargs["start_index"] for kwargs in calls] == [0, 2, 4]
     assert len(progress) == 3
     assert "convergence:" in progress[-1]
 
@@ -92,11 +107,24 @@ def test_create_ensemble_until_converged_honors_max_samples(monkeypatch):
     creator = EnsembleCreator.__new__(EnsembleCreator)
     requested_sizes = []
 
-    def create_ensemble(n_samples, **_kwargs):
-        requested_sizes.append(n_samples)
-        return _batch(n_samples)
+    def iter_chain_records(**kwargs):
+        requested_sizes.append(kwargs["n_samples"])
+        for index in range(kwargs["n_samples"]):
+            yield {
+                "chain_index": kwargs["start_index"] + index,
+                "record": object(),
+                "discards": 0,
+                "reasons": (),
+                "first_cause": None,
+                "warnings": [],
+            }
 
-    monkeypatch.setattr(creator, "create_ensemble", create_ensemble)
+    monkeypatch.setattr(creator, "_iter_chain_records", iter_chain_records)
+    monkeypatch.setattr(
+        creator,
+        "_records_to_ensemble_data",
+        lambda records: _batch(len(records)),
+    )
     result = creator.create_ensemble_until_converged(
         batch_size=2,
         max_samples=5,
@@ -141,3 +169,175 @@ def test_real_ensemble_converges_and_returns_requested_format():
     assert len(result.chains) == 4
     assert all(isinstance(chain, str) for chain in result.chains)
     assert result.convergence_trace[-1]["n_samples"] == 4
+
+
+def test_convergence_can_stream_without_retaining_samples():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        full = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=19,
+        )
+        streamed = []
+        bounded = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=19,
+            retain_chains=False,
+            retain_sequences=False,
+            sample_callback=lambda index, record: streamed.append(
+                (index, record["molecule"], record["sequences"])
+            ),
+        )
+
+    assert [index for index, _chain, _sequences in streamed] == list(range(6))
+    assert [chain for _index, chain, _sequences in streamed] == full.chains
+    assert all(sequences is None for _index, _chain, sequences in streamed)
+    assert bounded.chains == []
+    assert bounded.sequences == []
+    assert bounded.molecular_weights == []
+    assert {
+        unit_id: data["count"] for unit_id, data in bounded.units.items()
+    } == {
+        unit_id: data["count"] for unit_id, data in full.units.items()
+    }
+    assert bounded.bonds == full.bonds
+    assert bounded.convergence_trace == full.convergence_trace
+    assert bounded.number_average_molecular_weight == pytest.approx(
+        full.number_average_molecular_weight
+    )
+    assert bounded.weight_average_molecular_weight == pytest.approx(
+        full.weight_average_molecular_weight
+    )
+
+
+def test_convergence_reservoir_is_bounded_and_generation_independent():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        full = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=23,
+        )
+        reservoir = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=23,
+            reservoir_size=2,
+        )
+        repeated = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=23,
+            reservoir_size=2,
+        )
+
+    assert len(reservoir.chains) == 2
+    assert len(reservoir.sequences) == 2
+    assert len(reservoir.molecular_weights) == 2
+    assert reservoir.chains == repeated.chains
+    assert {
+        unit_id: data["count"] for unit_id, data in reservoir.units.items()
+    } == {
+        unit_id: data["count"] for unit_id, data in full.units.items()
+    }
+    assert reservoir.bonds == full.bonds
+    assert reservoir.convergence_trace == full.convergence_trace
+    assert reservoir.number_average_molecular_weight == pytest.approx(
+        full.number_average_molecular_weight
+    )
+
+
+def test_convergence_can_omit_returned_metadata():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        result = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=4,
+            window=10,
+            output_format="smiles",
+            seed=29,
+            metadata=False,
+            reservoir_size=1,
+        )
+
+    assert len(result.chains) == 1
+    assert result.units == {}
+    assert result.bonds == []
+    assert result.mol_weights == {}
+    assert result.distributions == {}
+    assert result.convergence_trace[-1]["n_samples"] == 4
+
+
+def test_seeded_convergence_checkpoint_resumes_exactly():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        checkpoints = []
+        creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=2,
+            window=10,
+            output_format="smiles",
+            seed=31,
+            reservoir_size=2,
+            checkpoint_callback=checkpoints.append,
+        )
+        checkpoint = pickle.loads(pickle.dumps(checkpoints[-1]))
+        resumed = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=31,
+            reservoir_size=2,
+            checkpoint=checkpoint,
+        )
+        uninterrupted = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=31,
+            reservoir_size=2,
+        )
+
+    assert resumed.chains == uninterrupted.chains
+    assert resumed.sequences == uninterrupted.sequences
+    assert resumed.molecular_weights == uninterrupted.molecular_weights
+    assert resumed.bonds == uninterrupted.bonds
+    assert {
+        unit_id: data["count"] for unit_id, data in resumed.units.items()
+    } == {
+        unit_id: data["count"]
+        for unit_id, data in uninterrupted.units.items()
+    }
+    assert resumed.convergence_trace == uninterrupted.convergence_trace
+    assert resumed.number_average_molecular_weight == pytest.approx(
+        uninterrupted.number_average_molecular_weight
+    )
+    assert resumed.weight_average_molecular_weight == pytest.approx(
+        uninterrupted.weight_average_molecular_weight
+    )
+
+
+def test_convergence_checkpoint_requires_seed():
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    with pytest.raises(ValueError, match="seed"):
+        creator.create_ensemble_until_converged(
+            checkpoint_callback=lambda _checkpoint: None
+        )

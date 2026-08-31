@@ -12,20 +12,27 @@ safety of _no_main_reimport.
 """
 
 import pickle
+import json
+import multiprocessing.spawn
 import subprocess
 import sys
+import threading
 import warnings
+from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
 
 import numpy as np
 import pytest
 
 import g2rins
+import g2rins.ensemble_creator as ensemble_module
 from g2rins.ensemble_creator import EnsembleCreator, _sample_chain_batch
 from g2rins.exception import (
     AllZeroSamplingWeights,
     DiscardedSamplingPaths,
     EmptyTruncatedDistributionSupport,
     TooManyDiscardedChains,
+    WorkerProcessFailure,
 )
 
 FAST_SMI = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
@@ -54,6 +61,17 @@ def test_n_workers_must_be_positive(n_workers):
     ensemble_creator = EnsembleCreator.__new__(EnsembleCreator)
     with pytest.raises(ValueError, match="positive"):
         ensemble_creator.create_ensemble(2, parallel=True, n_workers=n_workers)
+
+
+def test_max_worker_restarts_must_be_non_negative():
+    ensemble_creator = EnsembleCreator.__new__(EnsembleCreator)
+    with pytest.raises(ValueError, match="max_worker_restarts"):
+        ensemble_creator.create_ensemble(
+            2,
+            parallel=True,
+            n_workers=2,
+            max_worker_restarts=-1,
+        )
 
 
 def test_single_worker_hatch_spawns_no_pool(monkeypatch):
@@ -132,6 +150,294 @@ def test_parallel_seed_equivalence():
         serial = ensemble_creator.create_ensemble(6, output_format="smiles", seed=7)
         pooled = ensemble_creator.create_ensemble(6, output_format="smiles", seed=7, parallel=True, n_workers=2)
     assert serial == pooled
+
+
+def test_native_diagnostics_record_chain_seed_versions_and_stages(tmp_path):
+    diagnostics = tmp_path / "native-state.jsonl"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        chains = ensemble_creator.create_ensemble(
+            2,
+            output_format="smiles",
+            ensemble_info=True,
+            seed=7,
+            parallel=True,
+            n_workers=2,
+            native_diagnostics_path=diagnostics,
+        )
+
+    states = [json.loads(line) for line in diagnostics.read_text().splitlines()]
+    assert len(chains.chains) == 2
+    assert {state["chain_index"] for state in states} == {0, 1}
+    assert all(state["atom_count"] > 0 for state in states)
+    assert all(state["bond_count"] > 0 for state in states)
+    assert all(state["g2rins_version"] for state in states)
+    assert all(state["rdkit_version"] for state in states)
+    assert all(state["worker_pid"] > 0 for state in states)
+    for chain_index in (0, 1):
+        chain_states = [
+            state
+            for state in states
+            if state["chain_index"] == chain_index
+            and state["native_stage"].startswith("molecule-")
+        ]
+        assert [state["native_stage"] for state in chain_states] == [
+            "molecule-build",
+            "molecule-sanitize",
+            "molecule-property-cache",
+            "molecule-descriptor-molwt",
+            "molecule-smiles",
+        ]
+        assert chain_states[0]["seed"]["entropy"] == 7
+        assert chain_states[0]["seed"]["spawn_key"] == [chain_index]
+
+
+def test_chain_record_iterator_preserves_global_order_across_modes():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        kwargs = {
+            "n_samples": 4,
+            "molecule_format": "smiles",
+            "collect_info": False,
+            "max_discards": 10,
+            "termination_flag": None,
+            "seed": 7,
+            "start_index": 12,
+        }
+        serial = list(
+            ensemble_creator._iter_chain_records(
+                **kwargs,
+                parallel=False,
+                n_workers=None,
+            )
+        )
+        pooled = list(
+            ensemble_creator._iter_chain_records(
+                **kwargs,
+                parallel=True,
+                n_workers=2,
+            )
+        )
+
+    assert [result["chain_index"] for result in serial] == [12, 13, 14, 15]
+    assert [result["chain_index"] for result in pooled] == [12, 13, 14, 15]
+    assert [result["record"] for result in serial] == [
+        result["record"] for result in pooled
+    ]
+
+
+def test_parallel_scheduler_bounds_compact_inflight_jobs(monkeypatch):
+    submitted_functions = []
+    maximum_inflight = 0
+    current_inflight = 0
+
+    class ImmediateExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            self.outstanding = 0
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            nonlocal current_inflight, maximum_inflight
+            submitted_functions.append((function, args[0]))
+            current_inflight += 1
+            maximum_inflight = max(maximum_inflight, current_inflight)
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            self.outstanding = 0
+
+    real_wait = ensemble_module.concurrent.futures.wait
+
+    def tracking_wait(futures, **kwargs):
+        nonlocal current_inflight
+        done, pending = real_wait(futures, **kwargs)
+        current_inflight -= len(done)
+        return done, pending
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        ImmediateExecutor,
+    )
+    monkeypatch.setattr(ensemble_module.concurrent.futures, "wait", tracking_wait)
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    monkeypatch.setattr(creator, "sample_mol_graph", lambda **_kwargs: "MOL")
+
+    results = list(
+        creator._iter_chain_records(
+            n_samples=9,
+            molecule_format="mol_graph",
+            collect_info=False,
+            max_discards=2,
+            termination_flag=None,
+            parallel=True,
+            n_workers=2,
+            seed=5,
+        )
+    )
+
+    assert maximum_inflight <= 4
+    assert [result["chain_index"] for result in results] == list(range(9))
+    assert all(function is ensemble_module._sample_chain_job for function, _job in submitted_functions)
+    assert all(isinstance(job, tuple) and len(job) == 2 for _function, job in submitted_functions)
+
+
+def test_parallel_scheduler_recovers_broken_pool_in_order(monkeypatch):
+    executor_count = 0
+    first_submission = True
+
+    class RecoveringExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            nonlocal executor_count
+            executor_count += 1
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            nonlocal first_submission
+            if first_submission:
+                first_submission = False
+                raise BrokenProcessPool("simulated worker death during submit")
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        RecoveringExecutor,
+    )
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    monkeypatch.setattr(creator, "sample_mol_graph", lambda **_kwargs: "MOL")
+
+    results = list(
+        creator._iter_chain_records(
+            n_samples=5,
+            molecule_format="mol_graph",
+            collect_info=False,
+            max_discards=2,
+            termination_flag=None,
+            parallel=True,
+            n_workers=2,
+            seed=5,
+            max_worker_restarts=1,
+        )
+    )
+
+    assert executor_count == 2
+    assert [result["chain_index"] for result in results] == list(range(5))
+    assert [result["record"]["molecule"] for result in results] == ["MOL"] * 5
+
+
+def test_parallel_scheduler_reports_last_native_state_after_recovery_exhaustion(
+    monkeypatch, tmp_path
+):
+    diagnostics = tmp_path / "native-state.jsonl"
+    diagnostics.write_text(
+        json.dumps(
+            {
+                "chain_index": 3,
+                "native_stage": "molecule-sanitize",
+                "atom_count": 9000,
+                "bond_count": 8999,
+            }
+        )
+        + "\n"
+    )
+
+    class BrokenExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            initializer(*initargs)
+
+        def submit(self, _function, *_args):
+            future = Future()
+            future.set_exception(BrokenProcessPool("simulated worker death"))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        BrokenExecutor,
+    )
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+
+    with pytest.raises(WorkerProcessFailure) as raised:
+        list(
+            creator._iter_chain_records(
+                n_samples=1,
+                molecule_format="mol_graph",
+                collect_info=False,
+                max_discards=2,
+                termination_flag=None,
+                parallel=True,
+                n_workers=2,
+                seed=5,
+                native_diagnostics_path=diagnostics,
+                max_worker_restarts=0,
+            )
+        )
+
+    assert raised.value.native_state["chain_index"] == 3
+    assert raised.value.native_state["native_stage"] == "molecule-sanitize"
+    assert "atoms=9000" in str(raised.value)
+
+
+def test_spawn_configuration_is_serialized_and_restored(monkeypatch):
+    """Concurrent pool setup must not interleave process-global save/restore."""
+    original_preparation = multiprocessing.spawn.get_preparation_data
+    for name in ensemble_module._NATIVE_THREAD_ENVIRONMENT:
+        monkeypatch.setenv(name, f"original-{name}")
+
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_entered = threading.Event()
+
+    def hold_first_configuration():
+        with ensemble_module._single_native_thread_environment(), ensemble_module._no_main_reimport():
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+
+    def enter_second_configuration():
+        second_started.set()
+        with ensemble_module._single_native_thread_environment(), ensemble_module._no_main_reimport():
+            second_entered.set()
+
+    first = threading.Thread(target=hold_first_configuration)
+    second = threading.Thread(target=enter_second_configuration)
+    first.start()
+    assert first_entered.wait(timeout=5)
+    second.start()
+    assert second_started.wait(timeout=5)
+    assert not second_entered.wait(timeout=0.1)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert second_entered.is_set()
+    assert multiprocessing.spawn.get_preparation_data is original_preparation
+    assert {
+        name: ensemble_module.os.environ[name]
+        for name in ensemble_module._NATIVE_THREAD_ENVIRONMENT
+    } == {
+        name: f"original-{name}"
+        for name in ensemble_module._NATIVE_THREAD_ENVIRONMENT
+    }
 
 
 def test_worker_discards_surface_in_parent():

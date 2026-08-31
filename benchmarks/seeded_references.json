@@ -1,0 +1,747 @@
+{
+  "branched": {
+    "canonical_smiles": "[H]N([H])CCN([H])CCN([H])CCN([H])CCN(CCN([H])CCN([H])[H])CCN([H])CCN(CCN([H])[H])CCN(CCN([H])CCN([H])CCN([H])[H])CCN(CCN(CCN([H])[H])CCN([H])CCN([H])[H])CCN(CCN([H])[H])CCN([H])CCN(CCN([H])CCN([H])[H])CCN(CCO)CCN([H])[H]",
+    "contacts": [
+      {
+        "count": 1,
+        "labels": [
+          "I0.1",
+          "R0.2"
+        ]
+      },
+      {
+        "count": 13,
+        "labels": [
+          "R0.1",
+          "R0.2"
+        ]
+      },
+      {
+        "count": 13,
+        "labels": [
+          "R0.1",
+          "R0.3"
+        ]
+      },
+      {
+        "count": 1,
+        "labels": [
+          "R0.1",
+          "T0.1"
+        ]
+      },
+      {
+        "count": 13,
+        "labels": [
+          "R0.2",
+          "T1.1"
+        ]
+      },
+      {
+        "count": 14,
+        "labels": [
+          "R0.3",
+          "T1.1"
+        ]
+      }
+    ],
+    "graph": {
+      "atoms": 110,
+      "bonds": 109,
+      "elements": {
+        "1": 28,
+        "6": 54,
+        "7": 27,
+        "8": 1
+      },
+      "weisfeiler_lehman": "eab8db70da9f9051c54e53f2b89e4192"
+    },
+    "molecular_weight": 1180.878,
+    "rounding_trace": [
+      {
+        "adopt_overshoot": false,
+        "caps": 15.999,
+        "expected": 1181.0,
+        "flag": null,
+        "gen": 0,
+        "kind": "crossing",
+        "proj_over": 1223.947,
+        "proj_under": 1180.878,
+        "snapshot_valid": true
+      }
+    ],
+    "seed": 0,
+    "sequences": [
+      [
+        "[H][*:1]"
+      ],
+      [
+        "*N(*)CC[*:2]",
+        "*N(*[*:3])CC",
+        "*N(*[*:5])CC",
+        "*N(*[*:4])CC",
+        "*N(*[*:6])CC",
+        "*N(*[*:16])CC",
+        "*N(*[*:7])CC",
+        "*N(*[*:13])CC",
+        "*N(*[*:28])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*)CC[*:8]",
+        "*N(*[*:24])CC",
+        "*N(*[*:19])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*[*:22])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*[*:11])CC",
+        "*N(*[*:25])CC",
+        "*N(*[*:17])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*[*:9])CC",
+        "*N(*[*:20])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*[*:27])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*[*:26])CC",
+        "*N(*[*:23])CC",
+        "*N(*[*:10])CC",
+        "*N(*[*:15])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*)CC[*:12]",
+        "*N(*[*:14])CC",
+        "[HH]"
+      ],
+      [
+        "*N(*[*:21])CC",
+        "*N(*[*:18])CC",
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "O"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ],
+      [
+        "[HH]"
+      ]
+    ],
+    "units": {
+      "I0": {
+        "count": 1,
+        "g2rins": "[<][H]",
+        "psmiles": "[H][*:1]"
+      },
+      "R0": {
+        "count": 27,
+        "g2rins": "[<]CCN([>])[>]",
+        "psmiles": "*(N(*[*:3])CC[*:1])[*:2]"
+      },
+      "T0": {
+        "count": 1,
+        "g2rins": "O[>]",
+        "psmiles": "O[*:1]"
+      },
+      "T1": {
+        "count": 27,
+        "g2rins": "[<][H]",
+        "psmiles": "[H][*:1]"
+      }
+    },
+    "warnings": []
+  },
+  "grafted": {
+    "canonical_smiles": "[H]C(C)(CC(C)(CC(C)(CC(C)(CC(C)(CC(C)(CC(C)(CC(C)(CC(C)(CBr)C(=O)OCCOC(=O)C(C)(C)CC(CC(Br)C(=O)O)C(=O)O)C(=O)OCCOC(=O)C(C)(C)CC(Br)C(=O)O)C(=O)OCCOC(=O)C(C)(C)CC(CC(Br)C(=O)O)C(=O)O)C(=O)OCCOC(=O)C(C)(C)CC(Br)C(=O)O)C(=O)OCCOC(=O)C(C)(C)CC(Br)C(=O)O)C(=O)OCCOC(=O)C(C)(C)CC(Br)C(=O)O)C(=O)OCCOC(=O)C(C)(C)Br)C(=O)OCCOC(=O)C(C)(C)CC(Br)C(=O)O)C(=O)OCCOC(=O)C(C)(C)Br",
+    "contacts": [
+      {
+        "count": 1,
+        "labels": [
+          "I0.1",
+          "R0.1"
+        ]
+      },
+      {
+        "count": 8,
+        "labels": [
+          "R0.1",
+          "R0.3"
+        ]
+      },
+      {
+        "count": 7,
+        "labels": [
+          "R0.2",
+          "R1.1"
+        ]
+      },
+      {
+        "count": 2,
+        "labels": [
+          "R0.2",
+          "T1.1"
+        ]
+      },
+      {
+        "count": 1,
+        "labels": [
+          "R0.3",
+          "T0.1"
+        ]
+      },
+      {
+        "count": 2,
+        "labels": [
+          "R1.1",
+          "R1.2"
+        ]
+      },
+      {
+        "count": 7,
+        "labels": [
+          "R1.2",
+          "T1.1"
+        ]
+      }
+    ],
+    "graph": {
+      "atoms": 182,
+      "bonds": 181,
+      "elements": {
+        "1": 1,
+        "35": 10,
+        "6": 117,
+        "8": 54
+      },
+      "weisfeiler_lehman": "c1e41c0fa9491ddf5e96c479e24c237d"
+    },
+    "molecular_weight": 3241.649,
+    "rounding_trace": [
+      {
+        "adopt_overshoot": false,
+        "caps": 78.896,
+        "expected": 1917.962958973,
+        "flag": null,
+        "gen": 1,
+        "kind": "crossing",
+        "proj_over": 2083.252,
+        "proj_under": 1883.018,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": true,
+        "caps": 710.064,
+        "expected": 3186.418908265,
+        "flag": null,
+        "gen": 0,
+        "kind": "crossing",
+        "proj_over": 3241.649,
+        "proj_under": 3169.586,
+        "snapshot_valid": true
+      }
+    ],
+    "seed": 0,
+    "sequences": [
+      [
+        "[H][*:1]"
+      ],
+      [
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:9]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:8]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:10]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:3]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:5]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:6]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:4]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:2]",
+        "CC(C)C(=O)OCCOC(=O)C(C)(C)[*:7]",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "CCC(=O)O",
+        "Br"
+      ],
+      [
+        "Br"
+      ],
+      [
+        "Br"
+      ]
+    ],
+    "units": {
+      "I0": {
+        "count": 1,
+        "g2rins": "[H][>]",
+        "psmiles": "[H][*:1]"
+      },
+      "R0": {
+        "count": 9,
+        "g2rins": "[<]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>]",
+        "psmiles": "CC(C[*:3])(C(=O)OCCOC(=O)C(C)(C)[*:2])[*:1]"
+      },
+      "R1": {
+        "count": 9,
+        "g2rins": "[<1]CC(C(=O)O)[>1]",
+        "psmiles": "O=C(O)C(C[*:1])[*:2]"
+      },
+      "T0": {
+        "count": 1,
+        "g2rins": "[<]Br",
+        "psmiles": "Br[*:1]"
+      },
+      "T1": {
+        "count": 9,
+        "g2rins": "[<1]Br",
+        "psmiles": "Br[*:1]"
+      }
+    },
+    "warnings": [
+      "InheritedTermination"
+    ]
+  },
+  "heavy-tail": {
+    "canonical_smiles": "[H]NCCCCCCN",
+    "contacts": [
+      {
+        "count": 1,
+        "labels": [
+          "I0.1",
+          "R0.2"
+        ]
+      }
+    ],
+    "graph": {
+      "atoms": 9,
+      "bonds": 8,
+      "elements": {
+        "1": 1,
+        "6": 6,
+        "7": 2
+      },
+      "weisfeiler_lehman": "3ea8af0536f4d22d3251132ed3f8404f"
+    },
+    "molecular_weight": 116.208,
+    "rounding_trace": [
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 30.0,
+        "flag": null,
+        "gen": 0,
+        "kind": "crossing",
+        "proj_over": 116.208,
+        "proj_under": null,
+        "snapshot_valid": false
+      }
+    ],
+    "seed": 0,
+    "sequences": [
+      [
+        "[H][*:1]"
+      ],
+      [
+        "NCCCCCCN"
+      ]
+    ],
+    "units": {
+      "I0": {
+        "count": 1,
+        "g2rins": "[<][H]",
+        "psmiles": "[H][*:1]"
+      },
+      "R0": {
+        "count": 1,
+        "g2rins": "[>]NCCCCCCN[>]",
+        "psmiles": "C(CCCN[*:2])CCN[*:1]"
+      }
+    },
+    "warnings": []
+  },
+  "nested": {
+    "canonical_smiles": "[H]CCC(CCCC(C)N(NN(N)OC(C)OCC)OC(C)OC([H])C)N(NN(N)OC(C)OCC)OC(C)OCC",
+    "contacts": [
+      {
+        "count": 1,
+        "labels": [
+          "I0.1",
+          "R0.3"
+        ]
+      },
+      {
+        "count": 1,
+        "labels": [
+          "R0.1",
+          "R0.3"
+        ]
+      },
+      {
+        "count": 2,
+        "labels": [
+          "R0.2",
+          "R1.3"
+        ]
+      },
+      {
+        "count": 2,
+        "labels": [
+          "R1.1",
+          "R1.3"
+        ]
+      },
+      {
+        "count": 4,
+        "labels": [
+          "R1.2",
+          "R2.2"
+        ]
+      },
+      {
+        "count": 4,
+        "labels": [
+          "R2.1",
+          "R2.2"
+        ]
+      },
+      {
+        "count": 1,
+        "labels": [
+          "R2.1",
+          "T0.1"
+        ]
+      }
+    ],
+    "graph": {
+      "atoms": 42,
+      "bonds": 41,
+      "elements": {
+        "1": 2,
+        "6": 24,
+        "7": 8,
+        "8": 8
+      },
+      "weisfeiler_lehman": "0d6e3aab23bfba6b4bda5b1eaccf2d26"
+    },
+    "molecular_weight": 586.776,
+    "rounding_trace": [
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 88.0,
+        "flag": null,
+        "gen": 2,
+        "kind": "crossing",
+        "proj_over": 89.114,
+        "proj_under": 45.061,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 205.0,
+        "flag": null,
+        "gen": 1,
+        "kind": "crossing",
+        "proj_over": 217.166,
+        "proj_under": 119.144,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 69.0,
+        "flag": null,
+        "gen": 2,
+        "kind": "crossing",
+        "proj_over": 89.114,
+        "proj_under": 45.061,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 73.0,
+        "flag": null,
+        "gen": 2,
+        "kind": "crossing",
+        "proj_over": 89.114,
+        "proj_under": 45.061,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 199.0,
+        "flag": null,
+        "gen": 1,
+        "kind": "crossing",
+        "proj_over": 226.166,
+        "proj_under": 119.144,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 78.0,
+        "flag": null,
+        "gen": 2,
+        "kind": "crossing",
+        "proj_over": 89.114,
+        "proj_under": 45.061,
+        "snapshot_valid": true
+      },
+      {
+        "adopt_overshoot": false,
+        "caps": 0,
+        "expected": 785.0,
+        "flag": null,
+        "gen": 0,
+        "kind": "crossing",
+        "proj_over": 851.876,
+        "proj_under": 586.776,
+        "snapshot_valid": true
+      }
+    ],
+    "seed": 0,
+    "sequences": [
+      [
+        "[H][*:1]"
+      ],
+      [
+        "CCCC[*:3]",
+        "*N(*)N[*:2]",
+        "CCO",
+        "CCO"
+      ],
+      [
+        "*N(*)N",
+        "CCO",
+        "CCO"
+      ],
+      [
+        "CCCC",
+        "*N(*)N[*:4]",
+        "CCO",
+        "CCO",
+        "[HH]"
+      ],
+      [
+        "*N(*)N",
+        "CCO",
+        "CCO"
+      ]
+    ],
+    "units": {
+      "I0": {
+        "count": 1,
+        "g2rins": "[<][H]",
+        "psmiles": "[H][*:1]"
+      },
+      "R0": {
+        "count": 2,
+        "g2rins": "[<]CC({[<] [<]NN({[<] [<]C(C)O[>]; ;  [>]}|poisson(80.0)|[H])[>]; ;  [>]}|poisson(200.0)|[H])CC[>]",
+        "psmiles": "C(C[*:3])C(C[*:1])[*:2]"
+      },
+      "R1": {
+        "count": 4,
+        "g2rins": "[<]NN({[<] [<]C(C)O[>]; ;  [>]}|poisson(80.0)|[H])[>]",
+        "psmiles": "*(N(*[*:3])N[*:1])[*:2]"
+      },
+      "R2": {
+        "count": 8,
+        "g2rins": "[<]C(C)O[>]",
+        "psmiles": "CC(O[*:2])[*:1]"
+      },
+      "T0": {
+        "count": 1,
+        "g2rins": "[<]NN({[<] [<]C(C)O[>]; ;  [>]}|poisson(80.0)|[H])[>]",
+        "psmiles": "[H][*:1]"
+      }
+    },
+    "warnings": [
+      "NoExplicitTermination"
+    ]
+  },
+  "small-linear": {
+    "canonical_smiles": "[H]C(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC(C)CC",
+    "contacts": [
+      {
+        "count": 1,
+        "labels": [
+          "I0.1",
+          "R0.1"
+        ]
+      },
+      {
+        "count": 20,
+        "labels": [
+          "R0.1",
+          "R0.2"
+        ]
+      },
+      {
+        "count": 1,
+        "labels": [
+          "R0.2",
+          "T0.1"
+        ]
+      }
+    ],
+    "graph": {
+      "atoms": 65,
+      "bonds": 64,
+      "elements": {
+        "1": 1,
+        "6": 64
+      },
+      "weisfeiler_lehman": "c14afa8ac8adb4ce797be1b7ed2e22a3"
+    },
+    "molecular_weight": 899.744,
+    "rounding_trace": [
+      {
+        "adopt_overshoot": true,
+        "caps": 0,
+        "expected": 860.0,
+        "flag": null,
+        "gen": 0,
+        "kind": "crossing",
+        "proj_over": 884.709,
+        "proj_under": 842.628,
+        "snapshot_valid": true
+      }
+    ],
+    "seed": 0,
+    "sequences": [
+      [
+        "C[*:1]"
+      ],
+      [
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "CCC",
+        "[HH]"
+      ]
+    ],
+    "units": {
+      "I0": {
+        "count": 1,
+        "g2rins": "C{[>] [<]CC(C)[>]; ;  [<]}|poisson(900.0)|[H]",
+        "psmiles": "C[*:1]"
+      },
+      "R0": {
+        "count": 21,
+        "g2rins": "[<]CC(C)[>]",
+        "psmiles": "CC(C[*:1])[*:2]"
+      },
+      "T0": {
+        "count": 1,
+        "g2rins": "C{[>] [<]CC(C)[>]; ;  [<]}|poisson(900.0)|[H]",
+        "psmiles": "[H][*:1]"
+      }
+    },
+    "warnings": []
+  }
+}

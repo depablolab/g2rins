@@ -55,11 +55,28 @@ def _run_with_big_stack(fn, *args):
     return result[0]
 
 
-def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
+def mol_graph_to_rdkit_mol(
+    mol_graph,
+    kekulize=True,
+    native_stage_callback=None,
+    _on_big_stack=False,
+):
     try:
         from rdkit import Chem
     except ImportError as exc:
         raise RuntimeError("RDKit is  an optional dependency, but to generate RDKit molecules it is required. Please install RDKit for example with `pip install rdkit`.") from exc
+
+    if (
+        not _on_big_stack
+        and mol_graph.number_of_nodes() >= _BIG_STACK_ATOM_THRESHOLD
+    ):
+        return _run_with_big_stack(
+            mol_graph_to_rdkit_mol,
+            mol_graph,
+            kekulize,
+            native_stage_callback,
+            True,
+        )
 
     def convert_bond_type(bond_attr):
         if bond_attr["aromatic"]:
@@ -73,6 +90,8 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         if bond_attr["bond_type"] == 4:
             return Chem.BondType.QUADRUPLE
 
+    if native_stage_callback is not None:
+        native_stage_callback("build")
     mol = Chem.RWMol()
     graph_idx_to_mol_idx = {}
     for graph_idx, data in mol_graph.nodes(data=True):
@@ -102,7 +121,11 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
             continue
         mol.AddBond(graph_idx_to_mol_idx[u], graph_idx_to_mol_idx[v], convert_bond_type(attr))
     if kekulize:
+        if native_stage_callback is not None:
+            native_stage_callback("sanitize")
         Chem.SanitizeMol(mol)
+        if native_stage_callback is not None:
+            native_stage_callback("property-cache")
         mol.UpdatePropertyCache()
     else:
         # Fragment mode (per-unit bookkeeping): a unit is a static-connected piece,
@@ -110,20 +133,44 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         # dangling valence here and cannot be kekulized in isolation, even though
         # the assembled molecule kekulizes fine. Skip only kekulization; the
         # dangling (under-valent) bond does not trip the valence check.
+        if native_stage_callback is not None:
+            native_stage_callback("sanitize-fragment")
         Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
+        if native_stage_callback is not None:
+            native_stage_callback("property-cache-fragment")
         mol.UpdatePropertyCache(strict=False)
     return mol
 
 
-def rdkit_mol_to_smiles(mol):
+def rdkit_mol_to_smiles(mol, native_stage_callback=None):
     """Chem.MolToSmiles guarded against stack overflow on very large molecules."""
     from rdkit import Chem
 
+    if native_stage_callback is not None:
+        native_stage_callback("smiles")
     if mol.GetNumAtoms() < _BIG_STACK_ATOM_THRESHOLD:
         return Chem.MolToSmiles(mol)
     return _run_with_big_stack(Chem.MolToSmiles, mol)
 
 
-def mol_graph_to_smiles(mol_graph, kekulize=True):
+def rdkit_mol_weight(mol, native_stage_callback=None):
+    """Compute molecular weight with large-stack protection and stage reporting."""
+    from rdkit.Chem import Descriptors
+
+    if native_stage_callback is not None:
+        native_stage_callback("descriptor-molwt")
+    if mol.GetNumAtoms() < _BIG_STACK_ATOM_THRESHOLD:
+        return Descriptors.MolWt(mol)
+    return _run_with_big_stack(Descriptors.MolWt, mol)
+
+
+def mol_graph_to_smiles(mol_graph, kekulize=True, native_stage_callback=None):
     """Convert a mol graph to a canonical SMILES string; safe for very large graphs."""
-    return rdkit_mol_to_smiles(mol_graph_to_rdkit_mol(mol_graph, kekulize=kekulize))
+    return rdkit_mol_to_smiles(
+        mol_graph_to_rdkit_mol(
+            mol_graph,
+            kekulize=kekulize,
+            native_stage_callback=native_stage_callback,
+        ),
+        native_stage_callback=native_stage_callback,
+    )
