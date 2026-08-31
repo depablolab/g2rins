@@ -15,9 +15,11 @@ import warnings
 from collections import Counter, OrderedDict, deque
 from collections.abc import Sequence
 from concurrent.futures.process import BrokenProcessPool
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Optional
 
 import networkx as nx
@@ -85,6 +87,9 @@ _DECISION_TRACE = None
 
 # Temporary parity escape hatch while the journal path is validated.
 _USE_LEGACY_CHECKPOINTS = False
+_VERIFY_TERMINATION_MW_CACHE = False
+_USE_STATIC_SOURCE_TEMPLATES = True
+_USE_DIRECT_GRAPH_MERGE = True
 
 # Last state remains available to Python-level diagnostics and tests. Native
 # crashes are covered by the optional durable JSONL sink.
@@ -106,6 +111,10 @@ _SUPPORTS_MAX_TASKS_PER_CHILD = (
 # and leave either multiprocessing's preparation hook or native-thread limits
 # permanently modified.
 _SPAWN_CONFIGURATION_LOCK = threading.RLock()
+_ACTIVE_PARALLEL_SCHEDULER = ContextVar(
+    "g2rins_active_parallel_scheduler",
+    default=None,
+)
 
 
 def _enable_native_faulthandler():
@@ -199,6 +208,8 @@ def _sample_chain_job(
     termination_flag,
     include_sequences=True,
     native_diagnostics_path=None,
+    defer_conversion=False,
+    use_repeat_units_as_source=False,
 ):
     """Execute one compact chain job using the creator initialized in-worker."""
     if _WORKER_ENSEMBLE_CREATOR is None:
@@ -212,6 +223,8 @@ def _sample_chain_job(
         termination_flag,
         include_sequences,
         native_diagnostics_path,
+        defer_conversion,
+        use_repeat_units_as_source,
     )[0]
 
 
@@ -220,60 +233,131 @@ def _last_native_diagnostic(diagnostics_path):
         return None
     try:
         with open(diagnostics_path, "rb") as file_handle:
-            lines = file_handle.readlines()
-        for line in reversed(lines):
-            try:
-                return json.loads(line)
-            except (ValueError, TypeError):
-                continue
+            file_handle.seek(0, os.SEEK_END)
+            position = file_handle.tell()
+            leading_fragment = b""
+            while position:
+                chunk_size = min(8192, position)
+                position -= chunk_size
+                file_handle.seek(position)
+                parts = (file_handle.read(chunk_size) + leading_fragment).split(
+                    b"\n"
+                )
+                leading_fragment = parts[0]
+                for line in reversed(parts[1:]):
+                    if not line.strip():
+                        continue
+                    try:
+                        return json.loads(line)
+                    except (ValueError, TypeError, UnicodeDecodeError):
+                        continue
+            if leading_fragment.strip():
+                try:
+                    return json.loads(leading_fragment)
+                except (ValueError, TypeError, UnicodeDecodeError):
+                    pass
         return None
     except (OSError, ValueError, TypeError):
         return None
 
 
-def _parallel_chain_records(
-    ensemble_creator,
-    chain_jobs,
-    molecule_format,
-    collect_info,
-    max_discards,
-    termination_flag,
-    include_sequences,
-    native_diagnostics_path,
-    n_workers,
-    max_worker_restarts,
-):
-    """Yield ordered records from bounded, restartable compact worker jobs."""
-    ordered_indices = [chain_index for chain_index, _seed in chain_jobs]
-    jobs_by_index = dict(chain_jobs)
-    pending = deque(chain_jobs)
-    completed = {}
-    next_position = 0
-    restart_count = 0
-    max_inflight = max(1, 2 * n_workers)
+class _ParallelChainScheduler:
+    """Own one bounded, restartable worker pool across submission batches."""
 
-    while next_position < len(ordered_indices):
-        executor = None
-        pool_broken = None
+    def __init__(
+        self,
+        ensemble_creator,
+        n_workers,
+        max_worker_restarts,
+        native_diagnostics_path,
+    ):
+        self.ensemble_creator = ensemble_creator
+        self.n_workers = n_workers
+        self.max_worker_restarts = max_worker_restarts
+        self.native_diagnostics_path = native_diagnostics_path
+        self.restart_count = 0
+        self.executor = None
+        self.pool_broken = False
+        self._contexts = None
+
+    def __enter__(self):
+        self._contexts = ExitStack()
         try:
-            with _single_native_thread_environment(), _no_main_reimport():
-                executor_options = {
-                    "max_workers": n_workers,
-                    "initializer": _initialize_sampling_worker,
-                    "initargs": (ensemble_creator,),
-                }
-                if _SUPPORTS_MAX_TASKS_PER_CHILD:
-                    executor_options["max_tasks_per_child"] = (
-                        _MAX_TASKS_PER_CHILD
-                    )
-                executor = concurrent.futures.ProcessPoolExecutor(
-                    **executor_options
-                )
-                inflight = {}
+            self._contexts.enter_context(_single_native_thread_environment())
+            self._contexts.enter_context(_no_main_reimport())
+        except BaseException:
+            self.close(pool_broken=True)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close(pool_broken=isinstance(exc_value, BrokenProcessPool))
+
+    def _create_executor(self):
+        executor_options = {
+            "max_workers": self.n_workers,
+            "initializer": _initialize_sampling_worker,
+            "initargs": (self.ensemble_creator,),
+        }
+        if _SUPPORTS_MAX_TASKS_PER_CHILD:
+            executor_options["max_tasks_per_child"] = _MAX_TASKS_PER_CHILD
+        self.executor = concurrent.futures.ProcessPoolExecutor(**executor_options)
+
+    def close(self, pool_broken=False):
+        if self.executor is not None:
+            self.executor.shutdown(
+                wait=not (pool_broken or self.pool_broken),
+                cancel_futures=pool_broken or self.pool_broken,
+            )
+            self.executor = None
+        self.pool_broken = False
+        if self._contexts is not None:
+            self._contexts.close()
+            self._contexts = None
+
+    def _restart(self, error):
+        self.pool_broken = True
+        if self.executor is not None:
+            self.executor.shutdown(wait=False, cancel_futures=True)
+            self.executor = None
+        self.restart_count += 1
+        if self.restart_count > self.max_worker_restarts:
+            raise WorkerProcessFailure(
+                self.restart_count,
+                _last_native_diagnostic(self.native_diagnostics_path),
+            ) from error
+        self._create_executor()
+        self.pool_broken = False
+
+    def records(
+        self,
+        chain_jobs,
+        molecule_format,
+        collect_info,
+        max_discards,
+        termination_flag,
+        include_sequences,
+        native_diagnostics_path,
+        defer_conversion,
+        use_repeat_units_as_source=False,
+    ):
+        if self.executor is None:
+            self._create_executor()
+        ordered_indices = [chain_index for chain_index, _seed in chain_jobs]
+        jobs_by_index = dict(chain_jobs)
+        pending = deque(chain_jobs)
+        completed = {}
+        next_position = 0
+        max_inflight = max(1, 2 * self.n_workers)
+
+        while next_position < len(ordered_indices):
+            pool_broken = None
+            inflight = {}
+            try:
                 while pending or inflight:
                     while pending and len(inflight) < max_inflight:
                         chain_job = pending.popleft()
-                        future = executor.submit(
+                        future = self.executor.submit(
                             _sample_chain_job,
                             chain_job,
                             molecule_format,
@@ -282,6 +366,8 @@ def _parallel_chain_records(
                             termination_flag,
                             include_sequences,
                             native_diagnostics_path,
+                            defer_conversion,
+                            use_repeat_units_as_source,
                         )
                         inflight[future] = chain_job
 
@@ -296,6 +382,7 @@ def _parallel_chain_records(
                             completed[chain_job[0]] = future.result()
                         except BrokenProcessPool as error:
                             pool_broken = error
+                            self.pool_broken = True
                         except BaseException as error:
                             fatal_error = error
 
@@ -310,29 +397,111 @@ def _parallel_chain_records(
                         raise fatal_error
                     if pool_broken is not None:
                         break
+            except BrokenProcessPool as error:
+                pool_broken = error
+                self.pool_broken = True
 
             if pool_broken is None:
                 return
-        except BrokenProcessPool as error:
-            pool_broken = error
-        finally:
-            if executor is not None:
-                executor.shutdown(
-                    wait=pool_broken is None,
-                    cancel_futures=pool_broken is not None,
-                )
+            self._restart(pool_broken)
+            pending = deque(
+                (chain_index, jobs_by_index[chain_index])
+                for chain_index in ordered_indices[next_position:]
+                if chain_index not in completed
+            )
 
-        restart_count += 1
-        if restart_count > max_worker_restarts:
-            raise WorkerProcessFailure(
-                restart_count,
-                _last_native_diagnostic(native_diagnostics_path),
-            ) from pool_broken
-        pending = deque(
-            (chain_index, jobs_by_index[chain_index])
-            for chain_index in ordered_indices[next_position:]
-            if chain_index not in completed
+
+def _parallel_chain_records(
+    ensemble_creator,
+    chain_jobs,
+    molecule_format,
+    collect_info,
+    max_discards,
+    termination_flag,
+    include_sequences,
+    native_diagnostics_path,
+    n_workers,
+    max_worker_restarts,
+    defer_conversion=False,
+    scheduler=None,
+    use_repeat_units_as_source=False,
+):
+    """Yield ordered records from bounded, restartable compact worker jobs."""
+    if scheduler is not None:
+        yield from scheduler.records(
+            chain_jobs,
+            molecule_format,
+            collect_info,
+            max_discards,
+            termination_flag,
+            include_sequences,
+            native_diagnostics_path,
+            defer_conversion,
+            use_repeat_units_as_source,
         )
+        return
+    with _ParallelChainScheduler(
+        ensemble_creator,
+        n_workers,
+        max_worker_restarts,
+        native_diagnostics_path,
+    ) as local_scheduler:
+        yield from local_scheduler.records(
+            chain_jobs,
+            molecule_format,
+            collect_info,
+            max_discards,
+            termination_flag,
+            include_sequences,
+            native_diagnostics_path,
+            defer_conversion,
+            use_repeat_units_as_source,
+        )
+
+
+def _with_parallel_convergence_scheduler(method):
+    signature = inspect.signature(method)
+
+    @functools.wraps(method)
+    def wrapped(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        values = bound.arguments
+        if (
+            not values["parallel"]
+            or values["batch_size"] < 1
+            or values["max_samples"] < 1
+            or (
+                values["n_workers"] is not None
+                and values["n_workers"] < 2
+            )
+        ):
+            return method(*args, **kwargs)
+        n_workers = values["n_workers"]
+        if n_workers is None:
+            n_workers = max(
+                1,
+                min(
+                    (os.cpu_count() or 1) - 2,
+                    values["batch_size"],
+                    values["max_samples"],
+                ),
+            )
+        if n_workers < 2:
+            return method(*args, **kwargs)
+        with _ParallelChainScheduler(
+            values["self"],
+            n_workers,
+            values["max_worker_restarts"],
+            values["native_diagnostics_path"],
+        ) as scheduler:
+            token = _ACTIVE_PARALLEL_SCHEDULER.set(scheduler)
+            try:
+                return method(*args, **kwargs)
+            finally:
+                _ACTIVE_PARALLEL_SCHEDULER.reset(token)
+
+    return wrapped
 
 
 def _normalized_probabilities(weights, context: str):
@@ -402,6 +571,146 @@ def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit
     charge = int(charge) if charge is not None and np.isfinite(charge) else 0
     return _rdkit_implicit_hydrogens(int(atomic_num), charge, int(total_bond), bool(aromatic))
 
+
+def _static_total_bond(generative_graph, node_idx: int) -> int:
+    """Occupied valence contributed by a template unit's static real bonds."""
+    total_bond = 0
+    has_aromatic = False
+    template_nodes = generative_graph.nodes
+    for _u, v, attr in generative_graph.out_edges(node_idx, data=True):
+        if attr.get("static") and template_nodes[v].get("atomic_num", 0) > 0:
+            total_bond += attr.get(_BOND_TYPE_NAME, 0)
+            if attr.get(_AROMATIC_NAME):
+                has_aromatic = True
+    return total_bond + int(has_aromatic)
+
+
+def _static_fragment_graph(static_graph, source):
+    """Undirected topology instantiated by add_static_sub_graph(source)."""
+    fragment = nx.Graph()
+    fragment.add_node(source)
+    for u, v, _key in nx.edge_dfs(static_graph, source=source):
+        fragment.add_edge(u, v)
+    return fragment
+
+
+def _static_real_anchors(fragment, node_idx):
+    if fragment.nodes[node_idx].get("atomic_num", 0) > 0:
+        return [node_idx]
+    anchors = []
+    seen = {node_idx}
+    queue = [node_idx]
+    while queue:
+        current = queue.pop()
+        for neighbor in fragment.neighbors(current):
+            if neighbor in seen:
+                continue
+            seen.add(neighbor)
+            if fragment.nodes[neighbor].get("atomic_num", 0) > 0:
+                anchors.append(neighbor)
+            else:
+                queue.append(neighbor)
+    return anchors
+
+
+def _collapse_phantom_nodes(graph):
+    """Replace each connected phantom component with its realized bond(s)."""
+    phantom_nodes = {
+        node
+        for node, data in graph.nodes(data=True)
+        if data.get("atomic_num") == 0
+    }
+    processed = set()
+
+    for phantom_node in phantom_nodes:
+        if phantom_node in processed:
+            continue
+
+        component = set()
+        endpoints = []
+        queue = deque([phantom_node])
+        while queue:
+            current = queue.popleft()
+            if current in component:
+                continue
+            component.add(current)
+            processed.add(current)
+            for neighbor in graph.neighbors(current):
+                if neighbor in phantom_nodes:
+                    if neighbor not in component:
+                        queue.append(neighbor)
+                elif neighbor not in endpoints:
+                    endpoints.append(neighbor)
+
+        # A realized junction normally joins two phantom placeholders. Its
+        # edge attributes describe the bond that remains after the placeholders
+        # disappear; static real-to-phantom anchor edges must not override it.
+        candidate_attrs = [
+            dict(attrs)
+            for _u, _v, attrs in graph.subgraph(component).edges(data=True)
+        ]
+        if not candidate_attrs and len(endpoints) >= 2:
+            candidate_attrs = [
+                dict(graph[phantom][endpoint])
+                for phantom in component
+                for endpoint in graph.neighbors(phantom)
+                if endpoint not in phantom_nodes
+            ]
+
+        if len(endpoints) >= 2:
+            bond_attrs = candidate_attrs[0] if candidate_attrs else {}
+            if any(attrs != bond_attrs for attrs in candidate_attrs[1:]):
+                raise RuntimeError(
+                    "Cannot collapse a phantom component with inconsistent bond attributes"
+                )
+            for index, endpoint in enumerate(endpoints):
+                for other_endpoint in endpoints[index + 1 :]:
+                    if endpoint != other_endpoint:
+                        graph.add_edge(endpoint, other_endpoint, **bond_attrs)
+
+    graph.remove_nodes_from(phantom_nodes)
+
+
+def _prepare_termination_fragment_masses(generative_graph, static_graph):
+    """Precompute invariant net cap-fragment masses by target and bond order."""
+    keys = {
+        (target, attr.get(_BOND_TYPE_NAME, 1))
+        for _source, target, attr in generative_graph.edges(data=True)
+        if attr.get(_TERMINATION_NAME, 0) > 0
+    }
+    masses = {}
+    fragment_cache = {}
+    for target, attach_order in keys:
+        if target not in fragment_cache:
+            fragment_cache[target] = _static_fragment_graph(static_graph, target)
+            nx.set_node_attributes(
+                fragment_cache[target],
+                {
+                    node: dict(generative_graph.nodes[node])
+                    for node in fragment_cache[target]
+                },
+            )
+        fragment = fragment_cache[target]
+        anchors = set(_static_real_anchors(fragment, target))
+        mass = 0.0
+        for node, data in fragment.nodes(data=True):
+            atomic_number = data.get("atomic_num", 0)
+            if atomic_number <= 0:
+                continue
+            occupied = _static_total_bond(generative_graph, node)
+            if node in anchors:
+                occupied += attach_order
+            num_h = _infer_hydrogen_count(
+                atomic_number,
+                data.get("charge", 0),
+                occupied,
+                data.get("num_explicit_h", -1),
+                data.get(_AROMATIC_NAME, False),
+            )
+            mass += atomic_masses[atomic_number] + num_h * atomic_masses[1]
+        masses[(target, attach_order)] = mass
+    return masses
+
 def _detach_tracebacks(error):
     """Drop traceback frames from ``error`` and its cause/context chain.
 
@@ -422,71 +731,135 @@ def _detach_tracebacks(error):
     return error
 
 
+@dataclass(frozen=True)
+class _HalfBondTemplate:
+    node_idx: Any
+    weight: float
+    molar_amounts: Any
+    gen_hierarchy: int
+    stochastic_id: int
+    parent: int
+    mode_entries: tuple[tuple[str, tuple, tuple, tuple], ...]
+    special_targets: tuple[tuple[Any, dict], ...]
+    special_weights: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class _StaticNodeTemplate:
+    origin_idx: Any
+    atom_attrs: tuple[tuple[str, Any], ...]
+    static_total_bond: int
+    stochastic_id_tree: tuple[int, ...]
+    half_bond: _HalfBondTemplate
+
+
+@dataclass(frozen=True)
+class _StaticSourceTemplate:
+    nodes: tuple[_StaticNodeTemplate, ...]
+    edges: tuple[tuple[int, int, tuple[tuple[str, Any], ...]], ...]
+
+
 class _HalfAtomBond:
-    def __init__(self, atom_idx: int, node_idx: str, graph, stochastic_tracker, rng):
+    @staticmethod
+    def prepare_template(node_idx, graph):
+        node_data = graph.nodes[node_idx]
+        stochastic_id = node_data["stochastic_id_tree"][0]
+        mode_attrs = {}
+        mode_targets = {}
+        mode_molar_amounts = {}
+        special_targets = []
+        special_weights = []
+
+        for _u, target, edge_data in graph.out_edges(node_idx, data=True):
+            if edge_data["static"]:
+                continue
+            for mode in _NON_STATIC_ATTR:
+                if edge_data[mode] > 0:
+                    mode_attrs.setdefault(mode, []).append(edge_data)
+                    mode_targets.setdefault(mode, []).append(target)
+                    mode_molar_amounts.setdefault(mode, []).append(
+                        graph.nodes[target]["unit_molar_amounts"]
+                    )
+
+            if edge_data[_TRANSITION_NAME] > 0:
+                target_tree = graph.nodes[target]["stochastic_id_tree"]
+                target_stochastic_id = target_tree[0]
+                if (
+                    stochastic_id in target_tree[1:]
+                    and edge_data.get(_EDGE_STOCHASTIC_ID_NAME)
+                    == target_stochastic_id
+                    and target_stochastic_id != -1
+                ):
+                    special_targets.append((target, edge_data))
+                    special_weights.append(
+                        edge_data[_TRANSITION_NAME]
+                        * graph.nodes[target]["unit_molar_amounts"][
+                            target_stochastic_id
+                        ]
+                    )
+
+        mode_entries = tuple(
+            (
+                mode,
+                tuple(mode_attrs[mode]),
+                tuple(mode_targets[mode]),
+                tuple(mode_molar_amounts[mode]),
+            )
+            for mode in mode_attrs
+        )
+        return _HalfBondTemplate(
+            node_idx=node_idx,
+            weight=node_data["gen_weight"],
+            molar_amounts=node_data["unit_molar_amounts"],
+            gen_hierarchy=node_data["gen_hierarchy"],
+            stochastic_id=stochastic_id,
+            parent=node_data["stochastic_id_tree"][1],
+            mode_entries=mode_entries,
+            special_targets=tuple(special_targets),
+            special_weights=tuple(special_weights),
+        )
+
+    def __init__(
+        self,
+        atom_idx: int,
+        node_idx: str,
+        graph,
+        stochastic_tracker,
+        rng,
+        template=None,
+    ):
+        if template is None:
+            template = self.prepare_template(node_idx, graph)
         self.atom_idx: int = atom_idx
-        self.node_idx: str = node_idx
-        self.weight: float = graph.nodes[node_idx]["gen_weight"]
-        self.molar_amounts: float = graph.nodes[node_idx]["unit_molar_amounts"]
-        self.gen_hierarchy: int = graph.nodes[node_idx]["gen_hierarchy"]
-        self.stochastic_id: int = graph.nodes[node_idx]["stochastic_id_tree"][0]
-        self.parent: int = graph.nodes[node_idx]["stochastic_id_tree"][1]
+        self.node_idx: str = template.node_idx
+        self.weight: float = template.weight
+        self.molar_amounts: float = template.molar_amounts
+        self.gen_hierarchy: int = template.gen_hierarchy
+        self.stochastic_id: int = template.stochastic_id
+        self.parent: int = template.parent
         self._graph = graph
 
-        self._mode_attr_map = {}
-        self._mode_target_map = {}
-        self._mode_target_molar_amounts_map = {}
+        # Lists and maps remain instance-owned: transition promotion replaces
+        # and filters them later in the sample lifecycle.
+        self._mode_attr_map = {
+            mode: list(attrs) for mode, attrs, _targets, _molar in template.mode_entries
+        }
+        self._mode_target_map = {
+            mode: list(targets) for mode, _attrs, targets, _molar in template.mode_entries
+        }
+        self._mode_target_molar_amounts_map = {
+            mode: list(molar) for mode, _attrs, _targets, molar in template.mode_entries
+        }
 
         self._special_target = None
-        special_target_list = []
-        special_target_weight = []
-        special_target_molar_amounts = []
-
-        for u, v, d in graph.out_edges(node_idx, data=True):
-            if not d["static"]:
-                for k in _NON_STATIC_ATTR:
-                    if d[k] > 0:
-                        try:
-                            self._mode_attr_map[k] += [d]
-                        except KeyError:
-                            self._mode_attr_map[k] = [d]
-                        try:
-                            self._mode_target_map[k] += [v]
-                        except KeyError:
-                            self._mode_target_map[k] = [v]
-                        try:
-                            self._mode_target_molar_amounts_map[k] += [graph.nodes[v]["unit_molar_amounts"]]
-                        except KeyError:
-                            self._mode_target_molar_amounts_map[k] = [graph.nodes[v]["unit_molar_amounts"]]
-
-                if d[_TRANSITION_NAME] > 0:
-                    target_stochastic_id = graph.nodes[v]["stochastic_id_tree"][0]
-                    target_parents_stochastic_id = graph.nodes[v]["stochastic_id_tree"][1:]
-                    if (self.stochastic_id in target_parents_stochastic_id and
-                            d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id and target_stochastic_id !=-1):
-                        special_target_list += [(v, d)]
-                        special_target_weight += [d[_TRANSITION_NAME]]
-                        special_target_molar_amounts += [graph.nodes[v]["unit_molar_amounts"]]
-
-        if len(special_target_weight) > 0:
-            weights = np.asarray(special_target_weight, dtype=float)
-            # Weight each entry unit by its declared molar amount at its OWN
-            # (managing child-SO) level — the same slot the normal transition
-            # draw uses. The parent-SO slot is shared by every candidate here,
-            # so it would cancel in normalization and silently ignore the
-            # declared entry ratios.
-            molar = np.asarray(
-                [m[graph.nodes[v]["stochastic_id_tree"][0]] for (v, _d), m in zip(special_target_list, special_target_molar_amounts)],
-                dtype=float,
-            )
-            weights *= molar
+        if template.special_targets:
             chosen = stochastic_tracker.choose(
                 rng,
-                len(special_target_list),
-                weights,
+                len(template.special_targets),
+                np.asarray(template.special_weights, dtype=float),
                 "nested special-target selection",
             )
-            self._special_target = special_target_list[chosen]
+            self._special_target = template.special_targets[chosen]
 
     def has_any_bonds(self):
         has_bonds = False
@@ -521,6 +894,7 @@ class _StochasticObjectTracker:
         rng=None,
         path_is_conditional=False,
         zero_support_is_unavoidable=False,
+        prepared_distributions=None,
     ):
         self._rng = rng
         self._path_is_conditional = bool(path_is_conditional)
@@ -544,13 +918,22 @@ class _StochasticObjectTracker:
         self._terminated_sto_atom_ids = set()
         self.parent_map = {}
         self._parent_molw = {}
+        self._active_transactions = []
 
-        for _node_idx, data in generative_graph.nodes(data=True):
-            for index, _stochastic_vector in enumerate(data["molecular_weight_distribution"]):
-                stochastic_vector = _stochastic_vector.copy()
-                distribution = StochasticDistribution.from_serial_vector(stochastic_vector)
-                self._register_sto_gen_id(index, distribution)
-            break
+        if prepared_distributions is None:
+            for _node_idx, data in generative_graph.nodes(data=True):
+                for index, stochastic_vector in enumerate(
+                    data["molecular_weight_distribution"]
+                ):
+                    distribution = StochasticDistribution.from_serial_vector(
+                        list(stochastic_vector)
+                    )
+                    if distribution is not None:
+                        self._register_sto_gen_id(index, distribution)
+                break
+        else:
+            for sto_gen_id, distribution in prepared_distributions.items():
+                self._register_sto_gen_id(sto_gen_id, distribution)
 
     @property
     def sto_atom_id_expected_molw(self):
@@ -570,7 +953,22 @@ class _StochasticObjectTracker:
 
     def mark_path_conditional(self):
         """Make later sampling dead ends eligible for chain-local rejection."""
+        self._journal_scalar("_path_is_conditional")
         self._path_is_conditional = True
+
+    def _journal_scalar(self, name):
+        for transaction in self._active_transactions:
+            transaction.record_tracker_scalar(name, getattr(self, name))
+
+    def _journal_mapping_key(self, name, key):
+        mapping = getattr(self, name)
+        for transaction in self._active_transactions:
+            transaction.record_tracker_mapping_key(name, key, mapping)
+
+    def _journal_set_member(self, name, value):
+        values = getattr(self, name)
+        for transaction in self._active_transactions:
+            transaction.record_tracker_set_member(name, value, value in values)
 
     def normalized_probabilities(self, weights, context, *, record_branch=True):
         """Normalize one draw and retain whether this attempt branched.
@@ -595,6 +993,7 @@ class _StochasticObjectTracker:
             and not self._path_is_conditional
             and np.count_nonzero(probabilities > 0.0) > 1
         ):
+            self._journal_scalar("_path_is_conditional")
             self._path_is_conditional = True
         return probabilities
 
@@ -626,6 +1025,8 @@ class _StochasticObjectTracker:
         except ValueError:
             new_sto_atom_id = 0
 
+        self._journal_mapping_key("_stochastic_atom_id_to_gen_id", new_sto_atom_id)
+        self._journal_mapping_key("_stochastic_gen_id_to_atom_id", sto_gen_id)
         self._stochastic_atom_id_to_gen_id[new_sto_atom_id] = sto_gen_id
         try:
             self._stochastic_gen_id_to_atom_id[sto_gen_id].add(new_sto_atom_id)
@@ -656,15 +1057,19 @@ class _StochasticObjectTracker:
                     # target (e.g. uniform(0,0), poisson) and terminates at the
                     # earliest molecular boundary the architecture can form.
                     new_molw = self._sto_gen_id_distribution[sto_gen_id].draw_mw(self._rng, lower=1.0)
+            self._journal_mapping_key("_sto_atom_id_expected_molw", new_sto_atom_id)
             self._sto_atom_id_expected_molw[new_sto_atom_id] = new_molw
         else:
+            self._journal_mapping_key("_sto_atom_id_expected_molw", new_sto_atom_id)
             self._sto_atom_id_expected_molw[new_sto_atom_id] = -1
+        self._journal_mapping_key("_sto_atom_id_actual_molw", new_sto_atom_id)
         try:
             self._sto_atom_id_actual_molw[new_sto_atom_id] = self._parent_molw[sto_gen_id]
         except KeyError:
             self._sto_atom_id_actual_molw[new_sto_atom_id] = 0
 
         if is_nested_parent:
+            self._journal_mapping_key("parent_map", new_sto_atom_id)
             self.parent_map[new_sto_atom_id] = [old_atom_id]
 
         return new_sto_atom_id
@@ -705,6 +1110,7 @@ class _StochasticObjectTracker:
             else:
                 new_sto_atom_id = self.register_new_atom_instance(sto_gen_id, old_atom_id, None, False)
         if len(parent_list) > 0:
+            self._journal_mapping_key("parent_map", new_sto_atom_id)
             self.parent_map[new_sto_atom_id] = parent_list
             # Ancestors materialized implicitly above (growth entering a deeply
             # nested unit directly) need their own chains recorded: without
@@ -713,6 +1119,7 @@ class _StochasticObjectTracker:
             # parentless, firing its continuation at the wrong level.
             for k, ancestor_id in enumerate(parent_list):
                 if k > 0 and ancestor_id not in self.parent_map:
+                    self._journal_mapping_key("parent_map", ancestor_id)
                     self.parent_map[ancestor_id] = parent_list[:k]
 
         return new_sto_atom_id, parent_list
@@ -724,6 +1131,7 @@ class _StochasticObjectTracker:
         # than the neutral valence implies, thiophene sulfur binds none).
         num_H = _infer_hydrogen_count(atomic_num, charge, total_atom_bonds, num_explicit_h, aromatic)
         added_mass = atomic_masses[atomic_num] + num_H * atomic_masses.get(1)
+        self._journal_mapping_key("_sto_atom_id_actual_molw", sto_atom_id)
         self._sto_atom_id_actual_molw[sto_atom_id] += added_mass
 
         # Ancestors are credited the exact same mass as the instance itself: an
@@ -732,6 +1140,7 @@ class _StochasticObjectTracker:
         # target before should_terminate fired.
         if self.parent_map.get(sto_atom_id):
             for parent_sto_atom_id in self.parent_map.get(sto_atom_id):
+                self._journal_mapping_key("_sto_atom_id_actual_molw", parent_sto_atom_id)
                 self._sto_atom_id_actual_molw[parent_sto_atom_id] += added_mass
         return num_H
 
@@ -742,8 +1151,10 @@ class _StochasticObjectTracker:
         if not delta_h:
             return
         mass = delta_h * atomic_masses.get(1)
+        self._journal_mapping_key("_sto_atom_id_actual_molw", sto_atom_id)
         self._sto_atom_id_actual_molw[sto_atom_id] += mass
         for parent_sto_atom_id in self.parent_map.get(sto_atom_id, []):
+            self._journal_mapping_key("_sto_atom_id_actual_molw", parent_sto_atom_id)
             self._sto_atom_id_actual_molw[parent_sto_atom_id] += mass
 
     def should_terminate(self, sto_atom_id, avg_termination_weight=0.0):
@@ -763,14 +1174,19 @@ class _StochasticObjectTracker:
         if self.is_terminated(sto_atom_id):
             raise RuntimeError("You cannot terminate an already terminated stochastic ID. This is a bug, please report on github.")
         try:
-            self._parent_molw[self._stochastic_atom_id_to_gen_id[sto_atom_id]] = 0
+            sto_gen_id = self._stochastic_atom_id_to_gen_id[sto_atom_id]
+            self._journal_mapping_key("_parent_molw", sto_gen_id)
+            self._parent_molw[sto_gen_id] = 0
         except KeyError:
             pass
+        self._journal_set_member("_terminated_sto_atom_ids", sto_atom_id)
         self._terminated_sto_atom_ids.add(sto_atom_id)
 
     def draw_mw(self, sto_gen_id, sto_atom_id=None, rng=None) -> None | float:
         if sto_gen_id is None:
-            sto_gen_id = self._stochastic_atom_id_to_sto_gen_id[sto_atom_id]
+            sto_gen_id = self._stochastic_atom_id_to_gen_id[sto_atom_id]
+        if rng is None:
+            rng = self._rng
 
         return self._sto_gen_id_distribution[sto_gen_id].draw_mw(rng)
 
@@ -841,10 +1257,126 @@ class ConvergenceCheckpoint:
     contact_total: int
     aggregate: EnsembleData
     convergence_history: list
-    retained_records: list
+    retained_records: tuple
     retained_seen: int
     reservoir_rng_state: dict | None
     settings: dict
+    policy: str = "full"
+
+
+class _MetadataLevel(IntEnum):
+    """Amount of metadata carried between private sampling stages."""
+
+    NONE = 0
+    COUNTS = 1
+    COMPACT_SEQUENCES = 2
+    FULL_LEGACY = 3
+
+
+def _metadata_level(value):
+    """Accept historical private booleans while using explicit levels internally."""
+    if isinstance(value, _MetadataLevel):
+        return value
+    if value is None or isinstance(value, bool):
+        return _MetadataLevel.FULL_LEGACY if value else _MetadataLevel.NONE
+    return _MetadataLevel(value)
+
+
+@dataclass
+class _CompactMetadata:
+    unit_counts: dict
+    bond_counts: dict
+    labeled_bond_counts: dict
+    occurrences: tuple
+    sequences: tuple
+    unit_prototypes: dict
+
+    def materialize_sequences(self):
+        def materialize_unit(occurrence_id):
+            occurrence = self.occurrences[occurrence_id]
+            unit = deepcopy(self.unit_prototypes[occurrence.prototype_key])
+            for (
+                parent_origin,
+                connection_id,
+                node_attributes,
+                edge_attributes,
+            ) in occurrence.connections:
+                parent_node = next(
+                    node
+                    for node, data in unit.nodes(data=True)
+                    if str(data["origin_idx"]) == parent_origin
+                )
+                placeholder = "C" + str(connection_id)
+                unit.add_node(placeholder, **node_attributes)
+                unit.nodes[placeholder]["atomic_num"] = 0
+                unit.nodes[placeholder]["connection"] = connection_id
+                unit.add_edge(parent_node, placeholder, **edge_attributes)
+            return unit
+
+        return [
+            [materialize_unit(occurrence_id) for occurrence_id in sequence]
+            for sequence in self.sequences
+        ]
+
+
+@dataclass
+class _SampledMolecule:
+    graph: nx.Graph
+    metadata: _CompactMetadata
+    mol_weights: dict
+    distributions: dict
+    legacy_units: dict | None = None
+    legacy_sequences: list | None = None
+
+    def __getitem__(self, index):
+        legacy = (
+            self.graph,
+            self.legacy_units,
+            self.metadata.bond_counts,
+            self.legacy_sequences,
+            self.mol_weights,
+            self.distributions,
+        )
+        return legacy[index]
+
+
+@dataclass(frozen=True)
+class _ChainRecord:
+    molecule: Any
+    unit_counts: dict | None
+    bonds: dict | None
+    contact_counts: dict | None
+    sequences: list | None
+    mol_weights: dict | None
+    distributions: dict | None
+    molecular_weight: float | None
+    legacy_units: dict | None = None
+
+    def __getitem__(self, name):
+        """Preserve the historical callback/test mapping interface."""
+        if name == "molecule_units":
+            return self.legacy_units
+        return getattr(self, name)
+
+    def callback_record(self):
+        return {
+            "molecule": self.molecule,
+            "molecule_units": self.legacy_units,
+            "bonds": self.bonds,
+            "sequences": self.sequences,
+            "mol_weights": self.mol_weights,
+            "distributions": self.distributions,
+            "molecular_weight": self.molecular_weight,
+        }
+
+
+@dataclass(frozen=True)
+class _DeferredChainRecord:
+    sample: _SampledMolecule
+    molecular_weight: float
+    chain_index: int | None
+    seed_sequence: Any
+    native_diagnostics_path: Any
 
 
 def _bond_endpoint_sort_key(endpoint):
@@ -852,14 +1384,8 @@ def _bond_endpoint_sort_key(endpoint):
     return unit_id[0], int(unit_id[1:]), int(bond_id)
 
 
-def _bond_records(bond_counts, origin_endpoint):
-    """
-    Undirected linkage records from the growth-direction ``bond_counts``
-    (origin_idx pairs): both orientations of a chemical linkage merge into one
-    record with summed counts. Endpoint labels are sorted by (unit role, unit
-    number, bond id); ``nodes`` carries the generative-graph node id of each
-    endpoint in the same order.
-    """
+def _labeled_bond_counts(bond_counts, origin_endpoint):
+    """Canonical endpoint-label/node pairs with both directions merged."""
     merged = {}
     for (origin_u, origin_v), count in bond_counts.items():
         pair = tuple(
@@ -869,10 +1395,23 @@ def _bond_records(bond_counts, origin_endpoint):
             )
         )
         merged[pair] = merged.get(pair, 0) + count
+    return merged
+
+
+def _bond_records_from_labeled(labeled_bond_counts):
     return [
         {"labels": [label for label, _node in pair], "nodes": [node for _label, node in pair], "count": count}
-        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
+        for pair, count in sorted(labeled_bond_counts.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
     ]
+
+
+def _bond_records(bond_counts, origin_endpoint):
+    """
+    Undirected linkage records from growth-direction origin-index pairs.
+    """
+    return _bond_records_from_labeled(
+        _labeled_bond_counts(bond_counts, origin_endpoint)
+    )
 
 
 def _merge_ensemble_data(target, batch):
@@ -956,7 +1495,13 @@ def _no_main_reimport():
             multiprocessing.spawn.get_preparation_data = orig
 
 
-def _attempt_chain(atom_graph, collect_info, termination_flag, rng):
+def _attempt_chain(
+    atom_graph,
+    collect_info,
+    termination_flag,
+    rng,
+    use_repeat_units_as_source=False,
+):
     """One sampling attempt, classified for the discard/retry contract shared
     by the serial loop and the parallel workers.
 
@@ -973,10 +1518,20 @@ def _attempt_chain(atom_graph, collect_info, termination_flag, rng):
     try:
         with warnings.catch_warnings(record=True) as caught_warnings:
             warnings.simplefilter("always")
-            if collect_info:
-                sample = atom_graph.sample_mol_graph(termination_flag=termination_flag, molecule_info=True, rng=rng)
+            metadata_mode = _metadata_level(collect_info)
+            if metadata_mode is not _MetadataLevel.NONE:
+                sample = atom_graph.sample_mol_graph(
+                    termination_flag=termination_flag,
+                    use_repeat_units_as_source=use_repeat_units_as_source,
+                    rng=rng,
+                    _metadata_mode=metadata_mode,
+                )
             else:
-                sample = atom_graph.sample_mol_graph(termination_flag=termination_flag, rng=rng)
+                sample = atom_graph.sample_mol_graph(
+                    termination_flag=termination_flag,
+                    use_repeat_units_as_source=use_repeat_units_as_source,
+                    rng=rng,
+                )
         for caught in caught_warnings:
             if issubclass(caught.category, PossibleNonRepresentativePolymerChain):
                 # Truncated chain (sampler ran out of growth/transition moves
@@ -1001,19 +1556,30 @@ def _convert_chain(
     chain_index=None,
     seed_sequence=None,
     native_diagnostics_path=None,
+    molecular_weight=None,
 ):
     """Convert one accepted sample_mol_graph result into a chain record in the
     requested output format."""
-    if collect_info:
-        mol_graph, molecule_units, bonds, sequences, mol_weights, distributions = sample
+    metadata_mode = _metadata_level(collect_info)
+    if metadata_mode is not _MetadataLevel.NONE:
+        mol_graph = sample.graph
+        unit_counts = sample.metadata.unit_counts
+        bonds = sample.metadata.bond_counts
+        contact_counts = sample.metadata.labeled_bond_counts
+        mol_weights = sample.mol_weights
+        distributions = sample.distributions
+        legacy_units = sample.legacy_units
     else:
         mol_graph = sample
-        molecule_units = bonds = sequences = mol_weights = distributions = None
+        unit_counts = bonds = contact_counts = mol_weights = distributions = legacy_units = None
 
     rdkit_mol = None
-    molecular_weight = None
     publish_native_stage = None
-    if collect_info or molecule_format == "smiles":
+    needs_weight = (
+        metadata_mode is not _MetadataLevel.NONE
+        and molecular_weight is None
+    )
+    if needs_weight or molecule_format == "smiles":
         _enable_native_faulthandler()
         publish_native_stage = _native_state_publisher(
             chain_index,
@@ -1027,7 +1593,7 @@ def _convert_chain(
                 f"molecule-{stage}"
             ),
         )
-    if collect_info:
+    if needs_weight:
         molecular_weight = rdkit_mol_weight(
             rdkit_mol,
             native_stage_callback=lambda stage: publish_native_stage(
@@ -1046,7 +1612,12 @@ def _convert_chain(
         molecule = mol_graph
 
     converted_sequences = None
-    if collect_info and include_sequences:
+    if metadata_mode >= _MetadataLevel.COMPACT_SEQUENCES and include_sequences:
+        sequences = (
+            sample.legacy_sequences
+            if sample.legacy_sequences is not None
+            else sample.metadata.materialize_sequences()
+        )
         # Units are static-connected fragments with dangling inter-unit
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
@@ -1067,15 +1638,74 @@ def _convert_chain(
         else:
             converted_sequences = sequences
 
-    return {
-        "molecule": molecule,
-        "molecule_units": molecule_units,
-        "bonds": bonds,
-        "sequences": converted_sequences,
-        "mol_weights": mol_weights,
-        "distributions": distributions,
-        "molecular_weight": molecular_weight,
-    }
+    return _ChainRecord(
+        molecule=molecule,
+        unit_counts=unit_counts,
+        bonds=bonds,
+        contact_counts=contact_counts,
+        sequences=converted_sequences,
+        mol_weights=mol_weights,
+        distributions=distributions,
+        molecular_weight=molecular_weight,
+        legacy_units=legacy_units,
+    )
+
+
+def _defer_chain_conversion(
+    sample,
+    collect_info,
+    chain_index=None,
+    seed_sequence=None,
+    native_diagnostics_path=None,
+):
+    """Compute mandatory convergence statistics but defer output conversion."""
+    metadata_mode = _metadata_level(collect_info)
+    if metadata_mode is _MetadataLevel.NONE:
+        raise ValueError("deferred conversion requires chain metadata")
+    publish_native_stage = _native_state_publisher(
+        chain_index,
+        seed_sequence,
+        sample.graph,
+        native_diagnostics_path,
+    )
+    _enable_native_faulthandler()
+    rdkit_mol = mol_graph_to_rdkit_mol(
+        sample.graph,
+        native_stage_callback=lambda stage: publish_native_stage(
+            f"molecule-{stage}"
+        ),
+    )
+    molecular_weight = rdkit_mol_weight(
+        rdkit_mol,
+        native_stage_callback=lambda stage: publish_native_stage(
+            f"molecule-{stage}"
+        ),
+    )
+    return _DeferredChainRecord(
+        sample,
+        molecular_weight,
+        chain_index,
+        seed_sequence,
+        native_diagnostics_path,
+    )
+
+
+def _materialize_deferred_chain(
+    deferred,
+    molecule_format,
+    collect_info,
+    include_sequences,
+):
+    return _convert_chain(
+        deferred.sample,
+        molecule_format,
+        collect_info,
+        include_sequences,
+        deferred.chain_index,
+        deferred.seed_sequence,
+        deferred.native_diagnostics_path,
+        molecular_weight=deferred.molecular_weight,
+    )
 
 
 def _portable_warning(caught):
@@ -1097,6 +1727,8 @@ def _sample_chain_batch(
     termination_flag,
     include_sequences=True,
     native_diagnostics_path=None,
+    defer_conversion=False,
+    use_repeat_units_as_source=False,
 ):
     """Sample a batch of chains in one worker process (module level so
     ProcessPoolExecutor can pickle it).
@@ -1120,18 +1752,33 @@ def _sample_chain_batch(
         deferred_warnings = []
         record = None
         while True:
-            sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(atom_graph, collect_info, termination_flag, rng)
+            sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(
+                atom_graph,
+                collect_info,
+                termination_flag,
+                rng,
+                use_repeat_units_as_source,
+            )
             deferred_warnings.extend(attempt_warnings)
             if sample is not None:
-                record = _convert_chain(
-                    sample,
-                    molecule_format,
-                    collect_info,
-                    include_sequences,
-                    chain_index,
-                    seed_sequence,
-                    native_diagnostics_path,
-                )
+                if defer_conversion:
+                    record = _defer_chain_conversion(
+                        sample,
+                        collect_info,
+                        chain_index,
+                        seed_sequence,
+                        native_diagnostics_path,
+                    )
+                else:
+                    record = _convert_chain(
+                        sample,
+                        molecule_format,
+                        collect_info,
+                        include_sequences,
+                        chain_index,
+                        seed_sequence,
+                        native_diagnostics_path,
+                    )
                 break
             discards += 1
             reasons.update(attempt_reasons)
@@ -1180,6 +1827,8 @@ class _PartialAtomGraph:
         rng,
         collect_info=True,
         unit_id_by_origin=None,
+        termination_fragment_masses=None,
+        static_source_templates=None,
     ):
         self._atom_id = 0
         self.generative_graph = generative_graph
@@ -1189,9 +1838,16 @@ class _PartialAtomGraph:
         # recursively copy graph-valued unit keys and sequence fragments.
         self.collect_info = collect_info
         self._unit_id_by_origin = unit_id_by_origin or {}
+        self._termination_fragment_masses = (
+            termination_fragment_masses
+            if termination_fragment_masses is not None
+            else _prepare_termination_fragment_masses(generative_graph, static_graph)
+        )
+        self._static_source_templates = static_source_templates or {}
 
         self.atom_graph = nx.Graph()
         self._open_half_bond_map: dict[int, list[_HalfAtomBond]] = {}
+        self._active_transactions = []
         self._last_merge_connection = None
         self.add_static_sub_graph(source_node, sto_atom_id, rng)
 
@@ -1213,6 +1869,8 @@ class _PartialAtomGraph:
         memo[id(self.generative_graph)] = self.generative_graph
         memo[id(self.static_graph)] = self.static_graph
         memo[id(self._unit_id_by_origin)] = self._unit_id_by_origin
+        memo[id(self._termination_fragment_masses)] = self._termination_fragment_masses
+        memo[id(self._static_source_templates)] = self._static_source_templates
         # Prototypes are an append-only derived cache keyed entirely by unit
         # identity and remaining connector origins. Occurrences, counts, and
         # sequences are still copied per timeline; sharing this bounded cache
@@ -1225,32 +1883,43 @@ class _PartialAtomGraph:
         return new_graph
 
     def merge(self, other, self_idx, other_idx, bond_attr):
-        # relabel other idx
-        remapping_dict = {idx: idx + self._atom_id for idx in other.atom_graph.nodes}
-        other_graph = nx.relabel_nodes(other.atom_graph, remapping_dict, copy=True)
+        offset = self._atom_id
         other_open_half_bond_map = {}
         for stochastic_id in other._open_half_bond_map:
             for half_bond in other._open_half_bond_map[stochastic_id]:
                 new_half_bond = copy.copy(half_bond)
-                new_half_bond.atom_idx += self._atom_id
+                new_half_bond.atom_idx += offset
                 try:
                     other_open_half_bond_map[stochastic_id] += [new_half_bond]
                 except KeyError:
                     other_open_half_bond_map[stochastic_id] = [new_half_bond]
 
-        other_idx += self._atom_id
+        other_idx += offset
 
         # Now we can do the actual merging
         self._atom_id += other._atom_id
 
-        # In-place merge: relabel above guarantees disjoint node ids, so we can skip
-        # nx.union (which allocates a fresh graph and re-validates non-overlap).
-        self.atom_graph.add_nodes_from(other_graph.nodes(data=True))
-        self.atom_graph.add_edges_from(other_graph.edges(data=True))
+        if _USE_DIRECT_GRAPH_MERGE:
+            self.atom_graph.add_nodes_from(
+                (node_idx + offset, data)
+                for node_idx, data in other.atom_graph.nodes(data=True)
+            )
+            self.atom_graph.add_edges_from(
+                (u_idx + offset, v_idx + offset, data)
+                for u_idx, v_idx, data in other.atom_graph.edges(data=True)
+            )
+        else:
+            remapping = {
+                node_idx: node_idx + offset for node_idx in other.atom_graph.nodes
+            }
+            other_graph = nx.relabel_nodes(other.atom_graph, remapping, copy=True)
+            self.atom_graph.add_nodes_from(other_graph.nodes(data=True))
+            self.atom_graph.add_edges_from(other_graph.edges(data=True))
         self.atom_graph.add_edge(self_idx, other_idx, **bond_attr)
         self._last_merge_connection = (self_idx, other_idx)
         self._apply_realized_bond(self_idx, other_idx, bond_attr)
         for stochastic_id in other_open_half_bond_map:
+            self._journal_frontier_bucket(stochastic_id)
             try:
                 self._open_half_bond_map[stochastic_id] += other_open_half_bond_map[stochastic_id]
             except KeyError:
@@ -1296,6 +1965,7 @@ class _PartialAtomGraph:
         graph_nodes = self.atom_graph.nodes
         for endpoint, opposite in ((u_idx, v_idx), (v_idx, u_idx)):
             for real_idx in self._real_anchors(endpoint, exclude=opposite):
+                self._journal_runtime_node(real_idx)
                 data = graph_nodes[real_idx]
                 data["occupied_valence"] += order
                 new_h = _infer_hydrogen_count(
@@ -1309,6 +1979,30 @@ class _PartialAtomGraph:
                 if delta:
                     data["credited_h"] = new_h
                     self.stochastic_tracker.credit_hydrogen_delta(data["owner_sto_atom_id"], delta)
+
+    def _journal_runtime_node(self, node_idx):
+        for transaction in self._active_transactions:
+            transaction.record_runtime_node(node_idx)
+
+    def _journal_frontier_bucket(self, bucket_id):
+        for transaction in self._active_transactions:
+            transaction.record_frontier_bucket(bucket_id)
+
+    def _journal_metadata_counter(self, name, key):
+        for transaction in self._active_transactions:
+            transaction.record_metadata_counter(name, key)
+
+    def _journal_occurrence_connections(self, occurrence_id):
+        for transaction in self._active_transactions:
+            transaction.record_occurrence_connections(occurrence_id)
+
+    def _journal_sequence(self, sequence_index):
+        for transaction in self._active_transactions:
+            transaction.record_sequence(sequence_index)
+
+    def _journal_terminal_occurrences(self):
+        for transaction in self._active_transactions:
+            transaction.record_terminal_occurrences()
 
     def _real_anchors(self, atom_idx, exclude):
         """Real atom(s) a junction at atom_idx ultimately binds: the atom
@@ -1344,22 +2038,17 @@ class _PartialAtomGraph:
         per unfired site, so the tracker ran light and should_terminate let
         chains grow past their target (P1-01).
         """
-        total_bond = 0
-        has_aromatic = False
-        template_nodes = self.generative_graph.nodes
-
-        for _u, v, attr in self.generative_graph.out_edges(node_idx, data=True):
-            if attr.get("static") and template_nodes[v].get("atomic_num", 0) > 0:
-                total_bond += attr.get("bond_type", 0)
-                if attr.get("aromatic"):
-                    has_aromatic = True
-
-        if has_aromatic:
-            total_bond += 1
-
-        return total_bond
+        return _static_total_bond(self.generative_graph, node_idx)
 
     def add_static_sub_graph(self, source, sto_atom_id, rng):
+        if _USE_STATIC_SOURCE_TEMPLATES and source in self._static_source_templates:
+            self._add_static_source_template(
+                self._static_source_templates[source],
+                sto_atom_id,
+                rng,
+            )
+            return
+
         atom_key_to_gen_key = {}
         gen_key_to_atom_key = {}
 
@@ -1426,6 +2115,43 @@ class _PartialAtomGraph:
         for u_atom_idx, v_atom_idx in edges_data_map:
             self.atom_graph.add_edge(u_atom_idx, v_atom_idx, **edges_data_map[(u_atom_idx, v_atom_idx)])
 
+    def _add_static_source_template(self, template, sto_atom_id, rng):
+        for node in template.nodes:
+            atom_idx = self._atom_id
+            data = dict(node.atom_attrs)
+            self.atom_graph.add_node(
+                atom_idx,
+                **(data | {"origin_idx": str(node.origin_idx)}),
+            )
+            half_bond = _HalfAtomBond(
+                atom_idx,
+                node.origin_idx,
+                self.generative_graph,
+                self.stochastic_tracker,
+                rng,
+                template=node.half_bond,
+            )
+            credited_h = self.stochastic_tracker.add_molw(
+                sto_atom_id,
+                data["atomic_num"],
+                node.static_total_bond,
+                node.stochastic_id_tree,
+                num_explicit_h=data.get("num_explicit_h", -1),
+                charge=data["charge"],
+                aromatic=data.get(_AROMATIC_NAME, False),
+            )
+            runtime_attrs = self.atom_graph.nodes[atom_idx]
+            runtime_attrs["owner_sto_atom_id"] = sto_atom_id
+            runtime_attrs["occupied_valence"] = node.static_total_bond
+            runtime_attrs["credited_h"] = credited_h
+            self._atom_id += 1
+
+            if half_bond.weight > 0 and half_bond.has_any_bonds():
+                self._open_half_bond_map.setdefault(sto_atom_id, []).append(half_bond)
+
+        for u_idx, v_idx, edge_attrs in template.edges:
+            self.atom_graph.add_edge(u_idx, v_idx, **dict(edge_attrs))
+
     def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | set[str] = None) -> dict[str, bool | float | int]:
         if keys_to_copy is None:
             keys_to_copy = self._ATOM_ATTRS
@@ -1465,6 +2191,7 @@ class _PartialAtomGraph:
                 raise RuntimeError("There should only be one possible connection left. Please report this bug on github.")
             return possible_connections[0]
 
+        self._journal_frontier_bucket(sto_atom_idx)
         target_half_bond = self._open_half_bond_map[sto_atom_idx].pop(found_target_index)
         return target_half_bond.atom_idx
 
@@ -1594,34 +2321,6 @@ class _PartialAtomGraph:
         include_transition_bonds=False,
         require_transition_bonds=False,
     ):
-        # Estimation is observational: constructing candidate cap fragments can
-        # initialize half-bonds with stochastic special targets, but merely
-        # checking a boundary must not advance the sample's RNG stream.
-        estimator_rng = copy.deepcopy(rng)
-
-        def _get_terminator_atom_graph(source):
-            stochastic_object_tracker = _StochasticObjectTracker(
-                self.generative_graph,
-                estimator_rng,
-                path_is_conditional=self.stochastic_tracker.path_is_conditional,
-                zero_support_is_unavoidable=(
-                    self.stochastic_tracker.zero_support_is_unavoidable
-                ),
-            )
-            source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
-            term_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
-            terminator_atom_graph = _PartialAtomGraph(
-                self.generative_graph,
-                static_graph,
-                source,
-                stochastic_object_tracker,
-                term_sto_atom_id,
-                estimator_rng,
-                collect_info=False,
-            )
-            del stochastic_object_tracker
-            return terminator_atom_graph
-
         termination_bonds = self._get_level_termination_bonds(
             owner_sto_atom_id,
             level_sto_atom_id,
@@ -1653,7 +2352,6 @@ class _PartialAtomGraph:
             )
             source_delta_by_order.clear()
             for i, node_id in enumerate(target_ids):
-                terminator_atom_graph = _get_terminator_atom_graph(node_id)
                 attach_order = target_attributes[i].get(_BOND_TYPE_NAME, 1)
                 # The estimate must be the NET tracker delta the attach would
                 # realize, mirroring merge/_apply_realized_bond without mutating:
@@ -1661,27 +2359,19 @@ class _PartialAtomGraph:
                 # existing endpoint sheds and, for split-dummy connectors, by
                 # charging the attach order to the massless dummy instead of
                 # its real anchors (so their hydrogens stayed uncounted).
-                extra_occupied = {}
-                for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    if data["origin_idx"] == str(node_id):
-                        for anchor in terminator_atom_graph._real_anchors(frag_node, exclude=None):
-                            extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
-                        break
-                terminator_weight = 0
-                for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    atomic_number = data["atomic_num"]
-                    if atomic_number <= 0:
-                        # Phantom placeholders carry no mass and no hydrogens.
-                        continue
-                    occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
-                    num_H = _infer_hydrogen_count(
-                        atomic_number,
-                        data.get("charge", 0),
-                        occupied,
-                        data.get("num_explicit_h", -1),
-                        data.get(_AROMATIC_NAME, False),
+                terminator_weight = self._termination_fragment_masses[(node_id, attach_order)]
+                if _VERIFY_TERMINATION_MW_CACHE:
+                    legacy_weight = self._legacy_termination_fragment_mass(
+                        node_id,
+                        attach_order,
+                        static_graph,
+                        rng,
                     )
-                    terminator_weight += atomic_masses[atomic_number] + num_H * atomic_masses.get(1)
+                    if not np.isclose(terminator_weight, legacy_weight, rtol=0, atol=1e-12):
+                        raise AssertionError(
+                            f"termination fragment cache mismatch for {(node_id, attach_order)}: "
+                            f"{terminator_weight} != {legacy_weight}"
+                        )
                 if attach_order not in source_delta_by_order:
                     delta = 0.0
                     for anchor in self._real_anchors(termination_bond.atom_idx, exclude=None):
@@ -1697,6 +2387,53 @@ class _PartialAtomGraph:
                     source_delta_by_order[attach_order] = delta
                 avg_termination_mw += target_prob[i] * (terminator_weight + source_delta_by_order[attach_order])
         return avg_termination_mw
+
+    def _legacy_termination_fragment_mass(self, source, attach_order, static_graph, rng):
+        """Slow construction oracle used only when cache parity is requested."""
+        estimator_rng = copy.deepcopy(rng)
+        tracker = _StochasticObjectTracker(
+            self.generative_graph,
+            estimator_rng,
+            path_is_conditional=self.stochastic_tracker.path_is_conditional,
+            zero_support_is_unavoidable=self.stochastic_tracker.zero_support_is_unavoidable,
+            prepared_distributions=self.stochastic_tracker._sto_gen_id_distribution,
+        )
+        source_tree = self.generative_graph.nodes[source]["stochastic_id_tree"]
+        sto_atom_id = tracker.register_new_atom_instance(
+            source_tree[0], source_tree[1], None, False
+        )
+        fragment = _PartialAtomGraph(
+            self.generative_graph,
+            static_graph,
+            source,
+            tracker,
+            sto_atom_id,
+            estimator_rng,
+            collect_info=False,
+            termination_fragment_masses=self._termination_fragment_masses,
+            static_source_templates=self._static_source_templates,
+        )
+        extra_occupied = {}
+        for frag_node, data in fragment.atom_graph.nodes(data=True):
+            if data["origin_idx"] == str(source):
+                for anchor in fragment._real_anchors(frag_node, exclude=None):
+                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
+                break
+        weight = 0.0
+        for frag_node, data in fragment.atom_graph.nodes(data=True):
+            atomic_number = data["atomic_num"]
+            if atomic_number <= 0:
+                continue
+            occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
+            num_h = _infer_hydrogen_count(
+                atomic_number,
+                data.get("charge", 0),
+                occupied,
+                data.get("num_explicit_h", -1),
+                data.get(_AROMATIC_NAME, False),
+            )
+            weight += atomic_masses[atomic_number] + num_h * atomic_masses[1]
+        return weight
 
     def get_average_termination_mw(self, sto_atom_id, static_graph, rng):
         return self._get_average_level_termination_mw(
@@ -1755,6 +2492,7 @@ class _PartialAtomGraph:
                 "termination bond draw",
             )
             selected_bucket_id, selected_bond = pairs[selected_idx]
+            terminated_graph._journal_frontier_bucket(selected_bucket_id)
             bond_list = terminated_graph._open_half_bond_map[selected_bucket_id]
             for k, bond in enumerate(bond_list):
                 if bond is selected_bond:
@@ -1817,6 +2555,8 @@ class _PartialAtomGraph:
                 sto_atom_id,
                 rng,
                 collect_info=False,
+                termination_fragment_masses=self._termination_fragment_masses,
+                static_source_templates=self._static_source_templates,
             )
             other_half_bond_atom_idx = other_partial_graph.pop_target_open_half_bond(sto_atom_id, selected_target)
             pre_merge_watermark = terminated_graph._atom_id
@@ -1829,6 +2569,7 @@ class _PartialAtomGraph:
             last_unit = terminated_graph.add_new_unit_and_bond(pre_merge_watermark)
             terminated_graph.add_unit_to_sequence(last_unit)
 
+        terminated_graph._journal_frontier_bucket(sto_atom_id)
         terminated_graph._open_half_bond_map[sto_atom_id] = []
         for bond in transition_half_bonds + foreign_termination_half_bonds:
             # A half-bond is one valence slot: once consumed by termination it
@@ -1898,6 +2639,8 @@ class _PartialAtomGraph:
                     level_sto_atom_id,
                     rng,
                     collect_info=False,
+                    termination_fragment_masses=self._termination_fragment_masses,
+                    static_source_templates=self._static_source_templates,
                 )
                 other_half_bond_atom_idx = other_partial_graph.pop_target_open_half_bond(level_sto_atom_id, selected_target)
                 pre_merge_watermark = self._atom_id
@@ -1909,6 +2652,7 @@ class _PartialAtomGraph:
                 )
                 last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
                 self.add_unit_to_sequence(last_unit)
+                self._journal_frontier_bucket(bucket_id)
                 bucket.remove(half_bond)
 
     def trigger_global_transitions(self, rng):
@@ -1940,6 +2684,7 @@ class _PartialAtomGraph:
         )
         bucket_id, half_bond = candidates[chosen_idx]
 
+        self._journal_frontier_bucket(bucket_id)
         self._open_half_bond_map[bucket_id].remove(half_bond)
 
         all_target_attr, all_target_idx, all_molar_amounts = half_bond.get_mode_bonds(_TRANSITION_NAME)
@@ -1984,6 +2729,8 @@ class _PartialAtomGraph:
             self.generative_graph, self.static_graph, selected_target_idx,
             self.stochastic_tracker, new_sto_atom_id, rng,
             collect_info=False,
+            termination_fragment_masses=self._termination_fragment_masses,
+            static_source_templates=self._static_source_templates,
         )
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
@@ -2070,6 +2817,7 @@ class _PartialAtomGraph:
         native_parent = tracker._stochastic_atom_id_to_gen_id[owner_parents[-1]] if owner_parents else -2
         promoted_bonds = []
         for bucket_id in bucket_ids:
+            self._journal_frontier_bucket(bucket_id)
             kept_bonds = []
             for half_bond in self._open_half_bond_map.get(bucket_id, []):
                 attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
@@ -2101,6 +2849,7 @@ class _PartialAtomGraph:
                 promoted_bonds.append(promoted_bond)
             self._open_half_bond_map[bucket_id] = kept_bonds
         for promoted_bond in promoted_bonds:
+            self._journal_frontier_bucket(owner_sto_atom_id)
             try:
                 self._open_half_bond_map[owner_sto_atom_id] += [promoted_bond]
             except KeyError:
@@ -2112,6 +2861,7 @@ class _PartialAtomGraph:
         if len(self.get_open_half_bonds(sto_atom_id)[0]) < 1:
             return sto_atom_id, False
 
+        self._journal_frontier_bucket(sto_atom_id)
         half_bonds = self._open_half_bond_map[sto_atom_id]
 
         transition_bond, non_used_half_bonds = self._pop_random_bond(half_bonds, sto_atom_id, sto_gen_id, rng)
@@ -2256,6 +3006,7 @@ class _PartialAtomGraph:
         self._open_half_bond_map[sto_atom_id] = [bond for j, bond in enumerate(half_bonds) if j not in list_of_bond_idx_to_delete]
 
         for bond in list_of_new_bonds:
+            self._journal_frontier_bucket(owner_sto_atom_id)
             try:
                 self._open_half_bond_map[owner_sto_atom_id] += [bond]
             except KeyError:
@@ -2269,6 +3020,8 @@ class _PartialAtomGraph:
             new_sto_atom_id,
             rng,
             collect_info=False,
+            termination_fragment_masses=self._termination_fragment_masses,
+            static_source_templates=self._static_source_templates,
         )
 
         other_target_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
@@ -2303,6 +3056,7 @@ class _PartialAtomGraph:
             # Select one of them
             if len(stochastic_idx) > 0:
                 selected_stochastic_idx = rng.choice(stochastic_idx, p=stochastic_prob)
+                self._journal_frontier_bucket(sto_atom_id)
                 stochastic_half_bond = self._open_half_bond_map[sto_atom_id].pop(selected_stochastic_idx)
 
             return stochastic_half_bond
@@ -2348,6 +3102,8 @@ class _PartialAtomGraph:
             new_sto_atom_id,
             rng,
             collect_info=False,
+            termination_fragment_masses=self._termination_fragment_masses,
+            static_source_templates=self._static_source_templates,
         )
 
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
@@ -2376,6 +3132,7 @@ class _PartialAtomGraph:
                     special_bonds += [half_bond]
                 else:
                     normal_bonds += [half_bond]
+            self._journal_frontier_bucket(sto_atom_id)
             self._open_half_bond_map[sto_atom_id] = normal_bonds
 
             return special_bonds
@@ -2407,6 +3164,8 @@ class _PartialAtomGraph:
                 new_sto_atom_id,
                 rng,
                 collect_info=False,
+                termination_fragment_masses=self._termination_fragment_masses,
+                static_source_templates=self._static_source_templates,
             )
 
             other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
@@ -2420,18 +3179,21 @@ class _PartialAtomGraph:
     def add_new_unit_and_bond(self, pre_merge_watermark):
         # `pre_merge_watermark` is self._atom_id captured BEFORE the most recent
         # merge: merge() relabels incoming nodes to ids >= that watermark, so the
-        # newly added unit is exactly the nodes at or above it.
+        # newly added unit is exactly the contiguous suffix ending at _atom_id.
         connection = self._last_merge_connection
         self._last_merge_connection = None
         if not self.collect_info:
             return None
         current_atom_graph = self.atom_graph
-        new_nodes = tuple(node for node in current_atom_graph.nodes() if node >= pre_merge_watermark)
+        new_nodes = tuple(range(pre_merge_watermark, self._atom_id))
         if connection is not None:
             u, v = connection
-            self._bond_counts[
-                (current_atom_graph.nodes[u]["origin_idx"], current_atom_graph.nodes[v]["origin_idx"])
-            ] += 1
+            bond_key = (
+                current_atom_graph.nodes[u]["origin_idx"],
+                current_atom_graph.nodes[v]["origin_idx"],
+            )
+            self._journal_metadata_counter("_bond_counts", bond_key)
+            self._bond_counts[bond_key] += 1
 
         return self._record_unit_occurrence(new_nodes, connection)
 
@@ -2458,6 +3220,7 @@ class _PartialAtomGraph:
                 [],
             )
         )
+        self._journal_metadata_counter("_unit_counts", unit_id)
         self._unit_counts[unit_id] += 1
         for node in nodes:
             self._atom_to_unit_occurrence[node] = occurrence_id
@@ -2468,6 +3231,7 @@ class _PartialAtomGraph:
 
     def _add_sequence_connection(self, occurrence_id, parent_node, child_node):
         parent_origin = str(self.atom_graph.nodes[parent_node]["origin_idx"])
+        self._journal_occurrence_connections(occurrence_id)
         self._unit_occurrences[occurrence_id].connections.append(
             (
                 parent_origin,
@@ -2487,6 +3251,7 @@ class _PartialAtomGraph:
         connection = self._connection_to_occurrence(last_unit)
         if len(self._sequences) == 1:
             self._sequences.append([last_unit])
+            self._journal_terminal_occurrences()
             self._terminal_unit_occurrences.append(last_unit)
             if connection is not None:
                 u, v = connection
@@ -2500,14 +3265,17 @@ class _PartialAtomGraph:
         if parent_occurrence is None:
             return
         if parent_occurrence in self._terminal_unit_occurrences:
+            self._journal_terminal_occurrences()
             self._terminal_unit_occurrences.remove(parent_occurrence)
             self._terminal_unit_occurrences.append(last_unit)
-            for sequence in self._sequences:
+            for sequence_index, sequence in enumerate(self._sequences):
                 if parent_occurrence in sequence:
+                    self._journal_sequence(sequence_index)
                     sequence.append(last_unit)
                     break
         else:
             self._add_sequence_connection(parent_occurrence, u, v)
+            self._journal_terminal_occurrences()
             self._terminal_unit_occurrences.append(last_unit)
             self._sequences.append([last_unit])
 
@@ -2543,55 +3311,156 @@ class _PartialAtomGraph:
         ]
         return units, dict(self._bond_counts), sequences
 
+    def compact_metadata(self, include_sequences=False):
+        """Return stable IDs and optionally the compact sequence recipe."""
+        return _CompactMetadata(
+            unit_counts=dict(self._unit_counts),
+            bond_counts=dict(self._bond_counts),
+                labeled_bond_counts={},
+            occurrences=(tuple(self._unit_occurrences) if include_sequences else ()),
+            sequences=(
+                tuple(tuple(sequence) for sequence in self._sequences)
+                if include_sequences
+                else ()
+            ),
+            unit_prototypes=(dict(self._unit_prototypes) if include_sequences else {}),
+        )
+
 
 class _GrowthTransaction:
     """Rollback state for one owner-level stochastic growth step.
 
-    Molecular topology is append-oriented, so a node-ID watermark removes the
-    discarded suffix. Only the two runtime atom attributes that realized bonds
-    can change on pre-existing nodes are retained. The frontier, stochastic
-    tracker, and compact metadata are much smaller than the molecular graph and
-    are copied exactly to preserve list ordering and nested-owner semantics.
+    Capture itself is constant-size. Mutators record the first old value for
+    every touched tracker key, frontier bucket, runtime atom, and compact
+    metadata entry in every live compatible transaction. This is necessary
+    because descendant work can continue while an ancestor boundary remains
+    eligible for rollback.
     """
 
-    _TRACKER_STATE = (
-        "_path_is_conditional",
-        "_stochastic_gen_id_to_atom_id",
-        "_stochastic_atom_id_to_gen_id",
-        "_sto_atom_id_actual_molw",
-        "_sto_atom_id_expected_molw",
-        "_terminated_sto_atom_ids",
-        "parent_map",
-        "_parent_molw",
-    )
+    _MISSING = object()
 
     def __init__(self, graph, owner, epoch):
         self.graph = graph
         self.owner = owner
         self.epoch = epoch
         self.atom_watermark = graph._atom_id
-        self.node_runtime = {
-            node: (data.get("occupied_valence"), data.get("credited_h"))
-            for node, data in graph.atom_graph.nodes(data=True)
-        }
-        memo = {id(graph.generative_graph): graph.generative_graph}
-        self.open_half_bond_map = copy.deepcopy(graph._open_half_bond_map, memo)
-
-        tracker = graph.stochastic_tracker
-        self.tracker = copy.copy(tracker)
-        for name in self._TRACKER_STATE:
-            setattr(self.tracker, name, copy.deepcopy(getattr(tracker, name)))
-        self.tracker._rng = tracker._rng
-
         self.atom_id = graph._atom_id
+        self.node_runtime = {}
+        self.frontier_buckets = {}
+        self.tracker_scalars = {}
+        self.tracker_mapping_keys = {}
+        self.tracker_set_members = {}
+        self.metadata_counters = {}
+        self.occurrence_connections = {}
+        self.sequence_lengths = {}
+        self.terminal_unit_occurrences = None
+        self.unit_occurrence_watermark = len(graph._unit_occurrences)
+        self.sequence_watermark = len(graph._sequences)
         self.last_merge_connection = graph._last_merge_connection
-        self.bond_counts = graph._bond_counts.copy()
-        self.unit_counts = graph._unit_counts.copy()
-        self.unit_occurrences = copy.deepcopy(graph._unit_occurrences)
-        self.atom_to_unit_occurrence = dict(graph._atom_to_unit_occurrence)
-        self.sequences = [list(sequence) for sequence in graph._sequences]
-        self.terminal_unit_occurrences = list(graph._terminal_unit_occurrences)
         self.current_connection = graph.current_connection
+        graph._active_transactions.append(self)
+        graph.stochastic_tracker._active_transactions.append(self)
+
+    def record_runtime_node(self, node):
+        if node not in self.node_runtime:
+            data = self.graph.atom_graph.nodes[node]
+            self.node_runtime[node] = (
+                data.get("occupied_valence"),
+                data.get("credited_h"),
+            )
+
+    def record_frontier_bucket(self, bucket_id):
+        if bucket_id in self.frontier_buckets:
+            return
+        if bucket_id not in self.graph._open_half_bond_map:
+            self.frontier_buckets[bucket_id] = self._MISSING
+            return
+        memo = {id(self.graph.generative_graph): self.graph.generative_graph}
+        self.frontier_buckets[bucket_id] = copy.deepcopy(
+            self.graph._open_half_bond_map[bucket_id], memo
+        )
+
+    def record_tracker_scalar(self, name, value):
+        self.tracker_scalars.setdefault(name, value)
+
+    def record_tracker_mapping_key(self, name, key, mapping):
+        journal_key = (name, key)
+        if journal_key in self.tracker_mapping_keys:
+            return
+        self.tracker_mapping_keys[journal_key] = (
+            copy.deepcopy(mapping[key]) if key in mapping else self._MISSING
+        )
+
+    def record_tracker_set_member(self, name, value, was_present):
+        self.tracker_set_members.setdefault((name, value), was_present)
+
+    def record_metadata_counter(self, name, key):
+        journal_key = (name, key)
+        if journal_key not in self.metadata_counters:
+            self.metadata_counters[journal_key] = getattr(self.graph, name)[key]
+
+    def record_occurrence_connections(self, occurrence_id):
+        if (
+            occurrence_id < self.unit_occurrence_watermark
+            and occurrence_id not in self.occurrence_connections
+        ):
+            self.occurrence_connections[occurrence_id] = list(
+                self.graph._unit_occurrences[occurrence_id].connections
+            )
+
+    def record_sequence(self, sequence_index):
+        if sequence_index < self.sequence_watermark:
+            self.sequence_lengths.setdefault(
+                sequence_index, len(self.graph._sequences[sequence_index])
+            )
+
+    def record_terminal_occurrences(self):
+        if self.terminal_unit_occurrences is None:
+            self.terminal_unit_occurrences = list(
+                self.graph._terminal_unit_occurrences
+            )
+
+    def _restore_tracker(self, tracker):
+        for name, value in self.tracker_scalars.items():
+            setattr(tracker, name, value)
+        for (name, key), value in self.tracker_mapping_keys.items():
+            mapping = getattr(tracker, name)
+            if value is self._MISSING:
+                mapping.pop(key, None)
+            else:
+                mapping[key] = copy.deepcopy(value)
+        for (name, value), was_present in self.tracker_set_members.items():
+            values = getattr(tracker, name)
+            if was_present:
+                values.add(value)
+            else:
+                values.discard(value)
+
+    def _snapshot_tracker(self):
+        tracker = self.graph.stochastic_tracker
+        snapshot = copy.copy(tracker)
+        snapshot._active_transactions = []
+        for name in (
+            "_stochastic_gen_id_to_atom_id",
+            "_stochastic_atom_id_to_gen_id",
+            "_sto_atom_id_actual_molw",
+            "_sto_atom_id_expected_molw",
+            "parent_map",
+            "_parent_molw",
+        ):
+            setattr(snapshot, name, copy.deepcopy(getattr(tracker, name)))
+        snapshot._terminated_sto_atom_ids = set(tracker._terminated_sto_atom_ids)
+        self._restore_tracker(snapshot)
+        return snapshot
+
+    def _snapshot_frontier(self):
+        frontier = dict(self.graph._open_half_bond_map)
+        for bucket_id, value in self.frontier_buckets.items():
+            if value is self._MISSING:
+                frontier.pop(bucket_id, None)
+            else:
+                frontier[bucket_id] = value
+        return frontier
 
     def _restore_runtime_attributes(self):
         for node, (occupied_valence, credited_h) in self.node_runtime.items():
@@ -2619,8 +3488,8 @@ class _GrowthTransaction:
             self.graph.atom_graph,
             filter_node=lambda node: node < self.atom_watermark,
         )
-        snapshot._open_half_bond_map = self.open_half_bond_map
-        snapshot.stochastic_tracker = self.tracker
+        snapshot._open_half_bond_map = self._snapshot_frontier()
+        snapshot.stochastic_tracker = self._snapshot_tracker()
         try:
             yield snapshot
         finally:
@@ -2637,15 +3506,31 @@ class _GrowthTransaction:
         self._restore_runtime_attributes()
         self.graph._atom_id = self.atom_id
         self.graph._last_merge_connection = self.last_merge_connection
-        self.graph._open_half_bond_map = self.open_half_bond_map
-        self.tracker._rng = rng
-        self.graph.stochastic_tracker = self.tracker
-        self.graph._bond_counts = self.bond_counts
-        self.graph._unit_counts = self.unit_counts
-        self.graph._unit_occurrences = self.unit_occurrences
-        self.graph._atom_to_unit_occurrence = self.atom_to_unit_occurrence
-        self.graph._sequences = self.sequences
-        self.graph._terminal_unit_occurrences = self.terminal_unit_occurrences
+        for bucket_id, value in self.frontier_buckets.items():
+            if value is self._MISSING:
+                self.graph._open_half_bond_map.pop(bucket_id, None)
+            else:
+                self.graph._open_half_bond_map[bucket_id] = value
+        tracker = self.graph.stochastic_tracker
+        self._restore_tracker(tracker)
+        tracker._rng = rng
+        for (name, key), value in self.metadata_counters.items():
+            counter = getattr(self.graph, name)
+            if value:
+                counter[key] = value
+            else:
+                counter.pop(key, None)
+        for occurrence_id, connections in self.occurrence_connections.items():
+            self.graph._unit_occurrences[occurrence_id].connections = connections
+        del self.graph._unit_occurrences[self.unit_occurrence_watermark:]
+        for node in tuple(self.graph._atom_to_unit_occurrence):
+            if node >= self.atom_watermark:
+                self.graph._atom_to_unit_occurrence.pop(node, None)
+        for sequence_index, length in self.sequence_lengths.items():
+            del self.graph._sequences[sequence_index][length:]
+        del self.graph._sequences[self.sequence_watermark:]
+        if self.terminal_unit_occurrences is not None:
+            self.graph._terminal_unit_occurrences = self.terminal_unit_occurrences
         self.graph.current_connection = self.current_connection
         return self.graph
 
@@ -2655,6 +3540,7 @@ class EnsembleCreator:
     def __init__(self, generative_graph):
 
         self._generative_graph = generative_graph.copy()
+        self._prepared_distributions = self._prepare_distributions()
         labels = derive_unit_labels(self._generative_graph)
         self._unit_id_by_origin = {
             node: unit_id for node, unit_id in labels.unit_id.items()
@@ -2662,6 +3548,16 @@ class EnsembleCreator:
         self._unit_id_by_origin.update(
             {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         )
+        self._origin_unit_id = {
+            str(node): unit_id for node, unit_id in labels.unit_id.items()
+        }
+        self._origin_bond_id = {
+            str(node): bond_id for node, bond_id in labels.bond_id.items()
+        }
+        self._origin_endpoint = {
+            origin: f"{self._origin_unit_id[origin]}.{bond_id}"
+            for origin, bond_id in self._origin_bond_id.items()
+        }
 
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
@@ -2671,6 +3567,12 @@ class EnsembleCreator:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
 
         self._static_graph = self._create_static_graph(self.generative_graph)
+        self._static_source_templates = self._prepare_static_source_templates()
+        self._canonical_unit_info = self._prepare_canonical_unit_info(labels)
+        self._termination_fragment_masses = _prepare_termination_fragment_masses(
+            self._generative_graph,
+            self._static_graph,
+        )
         self._static_proof_supported = all(
             u == v or self._static_graph.has_edge(v, u)
             for u, v in self._static_graph.edges()
@@ -2735,6 +3637,132 @@ class EnsembleCreator:
             ) > 1,
         }
 
+    def _prepare_distributions(self):
+        """Deserialize immutable distribution templates once per creator."""
+        try:
+            first_node = next(iter(self._generative_graph.nodes))
+            serial_vectors = self._generative_graph.nodes[first_node][
+                "molecular_weight_distribution"
+            ]
+        except (StopIteration, KeyError, TypeError):
+            return {}
+
+        prepared = {}
+        for sto_gen_id, serial_vector in enumerate(serial_vectors):
+            distribution = StochasticDistribution.from_serial_vector(
+                list(tuple(serial_vector))
+            )
+            if distribution is not None:
+                prepared[sto_gen_id] = distribution
+        return prepared
+
+    def _prepare_static_source_templates(self):
+        """Capture exact per-source static traversal and half-bond descriptors."""
+        templates = {}
+        for source in self._generative_graph.nodes:
+            ordered_origins = [source]
+            origin_to_local = {source: 0}
+            edges = {}
+
+            for u_idx, v_idx, key in nx.edge_dfs(
+                self._static_graph,
+                source=source,
+            ):
+                for origin_idx in (u_idx, v_idx):
+                    if origin_idx not in origin_to_local:
+                        origin_to_local[origin_idx] = len(ordered_origins)
+                        ordered_origins.append(origin_idx)
+
+                u_local = origin_to_local[u_idx]
+                v_local = origin_to_local[v_idx]
+                if (u_local, v_local) not in edges and (v_local, u_local) not in edges:
+                    edge_data = self._static_graph.get_edge_data(u_idx, v_idx, key)
+                    edge_attrs = _PartialAtomGraph._copy_some_dict_attr(
+                        edge_data,
+                        _PartialAtomGraph._BOND_ATTRS,
+                    )
+                    edges[(u_local, v_local)] = tuple(edge_attrs.items())
+
+            nodes = []
+            for origin_idx in ordered_origins:
+                node_data = self._generative_graph.nodes[origin_idx]
+                atom_attrs = _PartialAtomGraph._copy_some_dict_attr(
+                    node_data,
+                    _PartialAtomGraph._ATOM_ATTRS,
+                )
+                nodes.append(
+                    _StaticNodeTemplate(
+                        origin_idx=origin_idx,
+                        atom_attrs=tuple(atom_attrs.items()),
+                        static_total_bond=_static_total_bond(
+                            self._generative_graph,
+                            origin_idx,
+                        ),
+                        stochastic_id_tree=tuple(node_data["stochastic_id_tree"]),
+                        half_bond=_HalfAtomBond.prepare_template(
+                            origin_idx,
+                            self._generative_graph,
+                        ),
+                    )
+                )
+
+            templates[source] = _StaticSourceTemplate(
+                nodes=tuple(nodes),
+                edges=tuple(
+                    (u_idx, v_idx, attrs)
+                    for (u_idx, v_idx), attrs in edges.items()
+                ),
+            )
+        return templates
+
+    def _prepare_canonical_unit_info(self, labels):
+        """Prepare format-independent public unit metadata once per creator."""
+        unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_id)
+        unit_g2rins = self._generative_graph.graph.get("unit_g2rins", {})
+        if not set(unit_g2rins).issubset(unit_subgraphs):
+            unit_g2rins = {}
+
+        representative_sources = {}
+        for source in self._generative_graph.nodes:
+            unit_id = self._unit_id_by_origin[source]
+            representative_sources.setdefault(unit_id, source)
+
+        canonical = {}
+        self._canonical_unit_prototypes = {}
+        for unit_id, source in representative_sources.items():
+            template = self._static_source_templates[source]
+            unit_graph = nx.Graph()
+            for local_id, node in enumerate(template.nodes):
+                unit_graph.add_node(
+                    local_id,
+                    **dict(node.atom_attrs),
+                    origin_idx=node.origin_idx,
+                )
+            for left, right, attributes in template.edges:
+                unit_graph.add_edge(left, right, **dict(attributes))
+            self._canonical_unit_prototypes[unit_id] = unit_graph
+            try:
+                with rdBase.BlockLogs():
+                    star_mol = mol_graph_to_rdkit_mol(
+                        self._unit_graph_with_stars(
+                            unit_graph,
+                            self._origin_bond_id,
+                        ),
+                        kekulize=False,
+                    )
+                    psmiles = rdkit_mol_to_smiles(star_mol)
+            except Exception:
+                # Historically unit conversion happened only after a chain was
+                # accepted. Do not reject a model at creator construction for
+                # an unreachable/dead template; retry if it reaches output.
+                psmiles = None
+            canonical[unit_id] = {
+                "psmiles": psmiles,
+                "g2rins": unit_g2rins.get(unit_id, ""),
+                "subgraph": unit_subgraphs[unit_id],
+            }
+        return canonical
+
     def _find_statically_empty_nested_mw_sto_gen_ids(self):
         """Find nested MW draws whose truncated support is empty on every chain.
 
@@ -2746,22 +3774,9 @@ class EnsembleCreator:
         bounds, infinite parent support, malformed trees) stays out of the
         set, keeping the failure chain-local.
         """
-        try:
-            first_node = next(iter(self._generative_graph.nodes))
-            serial_vectors = tuple(
-                self._generative_graph.nodes[first_node][
-                    "molecular_weight_distribution"
-                ]
-            )
-        except (StopIteration, KeyError, TypeError):
-            return frozenset()
-
         bounds = {}
-        for sto_gen_id, serial_vector in enumerate(serial_vectors):
+        for sto_gen_id, distribution in self._prepared_distributions.items():
             try:
-                distribution = StochasticDistribution.from_serial_vector(
-                    list(serial_vector)
-                )
                 frozen = distribution._distribution
                 parameters = getattr(frozen, "kwds", {})
                 scale = parameters.get("scale")
@@ -3478,8 +4493,14 @@ class EnsembleCreator:
         termination_flag: Optional[int] = None,
         tolerate_incomplete_stochastic_generation_with_no_more_than_X_open_bonds=0,
         molecule_info=False,
+        _metadata_mode=None,
     ):
         # TODO: consider using repeat units as source not an option.
+        internal_request = _metadata_mode is not None
+        metadata_mode = _metadata_level(
+            _metadata_mode if internal_request else molecule_info
+        )
+        collect_info = metadata_mode is not _MetadataLevel.NONE
         if rng is None:
             rng = get_global_rng()
 
@@ -3518,6 +4539,7 @@ class EnsembleCreator:
             rng,
             path_is_conditional=source_is_conditional,
             zero_support_is_unavoidable=zero_support_is_unavoidable,
+            prepared_distributions=self._prepared_distributions,
         )
 
         source_stochastic_id_tree = generative_graph.nodes[source]["stochastic_id_tree"]
@@ -3532,12 +4554,14 @@ class EnsembleCreator:
             stochastic_object_tracker,
             sto_atom_id,
             rng,
-            collect_info=molecule_info,
+            collect_info=collect_info,
             unit_id_by_origin=self._unit_id_by_origin,
+            termination_fragment_masses=self._termination_fragment_masses,
+            static_source_templates=self._static_source_templates,
         )
         del stochastic_object_tracker
 
-        if molecule_info:
+        if collect_info:
             source_occurrence = partial_atom_graph._record_unit_occurrence(
                 tuple(partial_atom_graph.atom_graph.nodes)
             )
@@ -3750,6 +4774,35 @@ class EnsembleCreator:
                 with checkpoint["transaction"].snapshot_view() as snapshot:
                     yield snapshot
 
+        def _sync_transactions():
+            """Retain journals reachable from the current checkpoint forest."""
+            live_transactions = set()
+            visited = set()
+
+            def visit(checkpoint):
+                checkpoint_id = id(checkpoint)
+                if checkpoint_id in visited:
+                    return
+                visited.add(checkpoint_id)
+                transaction = checkpoint.get("transaction")
+                if transaction is not None:
+                    live_transactions.add(transaction)
+                for ancestor in checkpoint.get("checkpoints", {}).values():
+                    visit(ancestor)
+
+            for checkpoint in checkpoints.values():
+                visit(checkpoint)
+            partial_atom_graph._active_transactions[:] = [
+                transaction
+                for transaction in partial_atom_graph._active_transactions
+                if transaction in live_transactions
+            ]
+            partial_atom_graph.stochastic_tracker._active_transactions[:] = [
+                transaction
+                for transaction in partial_atom_graph.stochastic_tracker._active_transactions
+                if transaction in live_transactions
+            ]
+
         def _advance_owner_epoch(sto_atom_id):
             """Record one successful composition step at exactly this level.
 
@@ -3761,6 +4814,7 @@ class EnsembleCreator:
             checkpoint = checkpoints.get(sto_atom_id)
             if checkpoint is not None and checkpoint["epoch"] != owner_epochs[sto_atom_id] - 1:
                 checkpoints.pop(sto_atom_id, None)
+                _sync_transactions()
 
         def _finalize_pending(sto_atom_id):
             """Fire the parked instance's declared end groups, then hand its
@@ -3803,6 +4857,7 @@ class EnsembleCreator:
                     break
                 # A -1 arm starts a fresh, independent owner timeline.
                 checkpoints.clear()
+                _sync_transactions()
                 _commit_mutation()
                 continue
 
@@ -3834,6 +4889,7 @@ class EnsembleCreator:
                 # ancestor) still fires a transition directly here.
                 continuation = _finalize_pending(finalized)
                 checkpoints.pop(finalized, None)
+                _sync_transactions()
                 if continuation is not None:
                     origin_sto_atom_id, _continuation_level, continuation_gen_id = continuation
                     # No live owner can cross; this is an inter-object/root
@@ -3886,6 +4942,7 @@ class EnsembleCreator:
                     })
                 partial_atom_graph.stochastic_tracker.terminate(active_sto_atom_id)
                 checkpoints.pop(active_sto_atom_id, None)
+                _sync_transactions()
                 continue
 
             # Track per-instance PROJECTED mass gains for every growable
@@ -4057,8 +5114,10 @@ class EnsembleCreator:
                     restored_tracker = partial_atom_graph.stochastic_tracker
                     restored_live = set(restored_tracker.get_unterminated_sto_atom_ids())
                     checkpoints = {owner: prior for owner, prior in checkpoint["checkpoints"].items() if (owner in restored_live and prior["epoch"] + 1 == owner_epochs.get(owner, 0))}
+                    _sync_transactions()
                 else:
                     checkpoints.pop(crossing_sto_atom_id, None)
+                    _sync_transactions()
                 # Parking changes control state only, not the mass epoch. An
                 # unconsumed promoted continuation site in the parked
                 # instance's pool needs no redirect: it carries its
@@ -4093,6 +5152,7 @@ class EnsembleCreator:
                     )
                 if need_snapshot:
                     checkpoints[active_sto_atom_id] = _capture_checkpoint(active_sto_atom_id)
+                    _sync_transactions()
                 if _DECISION_TRACE is not None:
                     _DECISION_TRACE.append({
                         "kind": "grow", "active": active_sto_atom_id,
@@ -4139,62 +5199,10 @@ class EnsembleCreator:
                         pending_termination.clear()
                         break
 
-        def find_non_phantom_endpoints(G, phantom_node):
+        checkpoints.clear()
+        _sync_transactions()
 
-            visited = set()
-            non_phantom_endpoints = []
-            queue = [phantom_node]
-
-            while queue:
-                current = queue.pop(0)
-                if current in visited:
-                    continue
-                visited.add(current)
-
-                for neighbor in G.neighbors(current):
-                    if neighbor in visited:
-                        continue
-                    attr = G[phantom_node][neighbor]
-                    if G.nodes[neighbor].get("num") == 0:
-                        # Continue traversing through zero nodes
-                        queue.append(neighbor)
-                    else:
-                        # Found a non-zero endpoint
-                        non_phantom_endpoints.append(neighbor)
-
-            return non_phantom_endpoints, attr
-
-        phantom_nodes = [node for node, data in partial_atom_graph.atom_graph.nodes(data=True) if data.get("atomic_num") == 0]
-        processed = set()
-
-        for phantom_node in phantom_nodes:
-            if phantom_node in processed:
-                continue
-
-            # Find all non-zero endpoints from this zero node
-            endpoints, attr = find_non_phantom_endpoints(partial_atom_graph.atom_graph, phantom_node)
-
-            # Mark all zero nodes in this chain as processed
-            visited = set()
-            queue = [phantom_node]
-            while queue:
-                current = queue.pop(0)
-                if current in visited:
-                    continue
-                visited.add(current)
-                processed.add(current)
-
-                for neighbor in partial_atom_graph.atom_graph.neighbors(current):
-                    if neighbor not in visited and partial_atom_graph.atom_graph.nodes[neighbor].get("num") == 0:
-                        queue.append(neighbor)
-
-            # Connect all non-zero endpoints to each other
-            for i, ep1 in enumerate(endpoints):
-                for ep2 in endpoints[i + 1 :]:
-                    partial_atom_graph.atom_graph.add_edge(ep1, ep2, **attr)
-
-        # Remove all zero nodes
-        partial_atom_graph.atom_graph.remove_nodes_from(phantom_nodes)
+        _collapse_phantom_nodes(partial_atom_graph.atom_graph)
 
         # Reconcile hydrogen credits with the FINAL realized connectivity:
         # phantom collapse can close cliques with extra bonds, and any bond
@@ -4240,7 +5248,7 @@ class EnsembleCreator:
                 ):
                     warnings.warn(ForcedOvershootNoBoundary(), stacklevel=1)
 
-        if not molecule_info:
+        if not collect_info:
             return partial_atom_graph.atom_graph
         actual_mol_weights = {}
         for instance_id in partial_atom_graph.stochastic_tracker.sto_atom_id_actual_molw:
@@ -4255,8 +5263,37 @@ class EnsembleCreator:
                 distributions[stochastic_id] = distribution.generate_string(True)
             except AttributeError:
                 break
+        include_sequences = metadata_mode >= _MetadataLevel.COMPACT_SEQUENCES
+        compact = partial_atom_graph.compact_metadata(include_sequences)
+        compact.labeled_bond_counts = _labeled_bond_counts(
+            compact.bond_counts,
+            self._origin_endpoint,
+        )
+        if internal_request:
+            legacy_units = None
+            legacy_sequences = None
+            if metadata_mode is _MetadataLevel.FULL_LEGACY:
+                legacy_units, _legacy_bonds, legacy_sequences = (
+                    partial_atom_graph.materialize_legacy_metadata()
+                )
+            return _SampledMolecule(
+                partial_atom_graph.atom_graph,
+                compact,
+                actual_mol_weights,
+                distributions,
+                legacy_units,
+                legacy_sequences,
+            )
+
         units, bonds, sequences = partial_atom_graph.materialize_legacy_metadata()
-        return (partial_atom_graph.atom_graph, units, bonds, sequences, actual_mol_weights, distributions)
+        return (
+            partial_atom_graph.atom_graph,
+            units,
+            bonds,
+            sequences,
+            actual_mol_weights,
+            distributions,
+        )
 
 
     @staticmethod
@@ -4290,6 +5327,9 @@ class EnsembleCreator:
         include_sequences=True,
         native_diagnostics_path=None,
         max_worker_restarts=2,
+        defer_conversion=False,
+        parallel_scheduler=None,
+        use_repeat_units_as_source=False,
     ):
         """Yield ordered per-chain success/failure records.
 
@@ -4316,6 +5356,9 @@ class EnsembleCreator:
                 native_diagnostics_path,
                 n_workers,
                 max_worker_restarts,
+                defer_conversion,
+                parallel_scheduler,
+                use_repeat_units_as_source,
             )
             return
 
@@ -4337,22 +5380,33 @@ class EnsembleCreator:
                     collect_info,
                     termination_flag,
                     rng,
+                    use_repeat_units_as_source,
                 )
                 deferred_warnings.extend(attempt_warnings)
                 if sample is not None:
-                    record = _convert_chain(
-                        sample,
-                        molecule_format,
-                        collect_info,
-                        include_sequences,
-                        chain_index,
-                        (
-                            seed_sequences[local_index]
-                            if seed_sequences is not None
-                            else None
-                        ),
-                        native_diagnostics_path,
+                    seed_sequence = (
+                        seed_sequences[local_index]
+                        if seed_sequences is not None
+                        else None
                     )
+                    if defer_conversion:
+                        record = _defer_chain_conversion(
+                            sample,
+                            collect_info,
+                            chain_index,
+                            seed_sequence,
+                            native_diagnostics_path,
+                        )
+                    else:
+                        record = _convert_chain(
+                            sample,
+                            molecule_format,
+                            collect_info,
+                            include_sequences,
+                            chain_index,
+                            seed_sequence,
+                            native_diagnostics_path,
+                        )
                     break
                 discards += 1
                 reasons.update(attempt_reasons)
@@ -4375,75 +5429,83 @@ class EnsembleCreator:
                 # the first chain whose consecutive-discard budget expires.
                 return
 
-    def _records_to_ensemble_data(self, records):
+    def _materialize_unit_counts(self, unit_counts):
+        if not hasattr(self, "_canonical_unit_info"):
+            return {
+                unit_id: {"count": count}
+                for unit_id, count in unit_counts.items()
+            }
+        canonical_units = {}
+        for unit_id, count in unit_counts.items():
+            info = self._canonical_unit_info[unit_id]
+            psmiles = info["psmiles"]
+            if psmiles is None:
+                star_mol = mol_graph_to_rdkit_mol(
+                    self._unit_graph_with_stars(
+                        self._canonical_unit_prototypes[unit_id],
+                        self._origin_bond_id,
+                    ),
+                    kekulize=False,
+                )
+                psmiles = rdkit_mol_to_smiles(star_mol)
+                info["psmiles"] = psmiles
+            canonical_units[unit_id] = {
+                **info,
+                "psmiles": psmiles,
+                "subgraph": deepcopy(info["subgraph"]),
+                "count": count,
+            }
+        return dict(
+            sorted(
+                canonical_units.items(),
+                key=lambda item: (item[0][0], int(item[0][1:])),
+            )
+        )
+
+    def _records_to_ensemble_data(self, records, materialize_units=True):
         """Materialize public aggregate metadata from accepted chain records."""
         molecules = [record["molecule"] for record in records]
         molecular_weights = [record["molecular_weight"] for record in records]
         bond_counts = Counter()
-        units = {}
-        origin_idx_to_unit = {}
+        labeled_bond_counts = Counter()
+        unit_counts = Counter()
         mol_weight_lists = {}
         ensemble_distributions = {}
         sequences = []
 
         for record in records:
-            for unit, count in record["molecule_units"].items():
-                origin_key = frozenset(
-                    data["origin_idx"] for _node, data in unit.nodes(data=True)
-                )
-                if origin_key in origin_idx_to_unit:
-                    units[origin_idx_to_unit[origin_key]] += count
-                else:
-                    origin_idx_to_unit[origin_key] = unit
-                    units[unit] = count
-            bond_counts.update(record["bonds"])
+            if isinstance(record, _ChainRecord):
+                unit_counts.update(record.unit_counts or {})
+                labeled_bond_counts.update(record.contact_counts or {})
+            else:
+                for unit, count in (record["molecule_units"] or {}).items():
+                    unit_id = self._unit_id_by_origin[
+                        next(iter(unit.nodes(data=True)))[1]["origin_idx"]
+                    ]
+                    unit_counts[unit_id] += count
+                bond_counts.update(record["bonds"])
             for stochastic_id, weights in record["mol_weights"].items():
                 mol_weight_lists.setdefault(stochastic_id, []).extend(weights)
             for stochastic_id, distribution in record["distributions"].items():
                 ensemble_distributions.setdefault(stochastic_id, distribution)
             sequences.append(record["sequences"])
 
-        labels = derive_unit_labels(self._generative_graph)
-        unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_id)
-        origin_unit_id = {
-            str(node): unit_id for node, unit_id in labels.unit_id.items()
-        }
-        origin_bond_id = {
-            str(node): bond_id for node, bond_id in labels.bond_id.items()
-        }
-        origin_endpoint = {
-            origin: f"{origin_unit_id[origin]}.{bond_id}"
-            for origin, bond_id in origin_bond_id.items()
-        }
-        unit_g2rins = self._generative_graph.graph.get("unit_g2rins", {})
-        if not set(unit_g2rins).issubset(origin_unit_id.values()):
-            unit_g2rins = {}
-
-        canonical_units = {}
-        for unit_graph, count in units.items():
-            star_mol = mol_graph_to_rdkit_mol(
-                self._unit_graph_with_stars(unit_graph, origin_bond_id),
-                kekulize=False,
-            )
-            unit_id = origin_unit_id[
-                next(iter(unit_graph.nodes(data=True)))[1]["origin_idx"]
-            ]
-            canonical_units[unit_id] = {
-                "psmiles": rdkit_mol_to_smiles(star_mol),
-                "g2rins": unit_g2rins.get(unit_id, ""),
-                "subgraph": unit_subgraphs[unit_id],
-                "count": count,
+        canonical_units = (
+            self._materialize_unit_counts(unit_counts)
+            if materialize_units
+            else {
+                unit_id: {"count": count}
+                for unit_id, count in unit_counts.items()
             }
-        canonical_units = dict(
-            sorted(
-                canonical_units.items(),
-                key=lambda item: (item[0][0], int(item[0][1:])),
-            )
         )
         return EnsembleData(
             chains=molecules,
             units=canonical_units,
-            bonds=_bond_records(bond_counts, origin_endpoint),
+            bonds=(
+                _bond_records_from_labeled(labeled_bond_counts)
+                if labeled_bond_counts
+                else _bond_records(bond_counts, self._origin_endpoint)
+            ),
             sequences=sequences,
             mol_weights=mol_weight_lists,
             distributions=ensemble_distributions,
@@ -4521,7 +5583,11 @@ class EnsembleCreator:
 
         # The JSON dump needs unit/sequence info even when the caller did not
         # ask for the returned ensemble information.
-        collect_info = ensemble_info or json_file is not None
+        collect_info = (
+            _MetadataLevel.COMPACT_SEQUENCES
+            if ensemble_info or json_file is not None
+            else _MetadataLevel.NONE
+        )
 
         total_discards = 0
         discard_reasons = Counter()
@@ -4617,6 +5683,7 @@ class EnsembleCreator:
             return ensemble_data
         return list_of_molecules
 
+    @_with_parallel_convergence_scheduler
     def create_ensemble_until_converged(
         self,
         batch_size=25,
@@ -4640,6 +5707,8 @@ class EnsembleCreator:
         checkpoint_callback=None,
         native_diagnostics_path=None,
         max_worker_restarts=2,
+        checkpoint_policy="full",
+        use_repeat_units_as_source=False,
     ):
         """Sample batches until cumulative mass and contact statistics stabilize.
 
@@ -4661,9 +5730,13 @@ class EnsembleCreator:
         receives ``(global_chain_index, record)`` for every accepted chain.
         To resume at a batch boundary, pass a :class:`ConvergenceCheckpoint`
         previously received by ``checkpoint_callback``. Exact resume requires
-        an integer seed. ``native_diagnostics_path`` has the same durable
+        an integer seed. ``checkpoint_policy='full'`` preserves retained
+        payloads; ``'statistics'`` omits them from checkpoints and therefore
+        returns no retained sample payload after resume. ``native_diagnostics_path`` has the same durable
         native-stage logging semantics as :meth:`create_ensemble`, as does the
         ``max_worker_restarts`` recovery policy.
+        Set ``use_repeat_units_as_source=True`` to seed each chain from a
+        repeat unit when the polymer has no initiator.
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
@@ -4677,6 +5750,10 @@ class EnsembleCreator:
             raise TypeError("sample_callback must be callable or None.")
         if checkpoint_callback is not None and not callable(checkpoint_callback):
             raise TypeError("checkpoint_callback must be callable or None.")
+        if checkpoint_policy not in {"full", "statistics"}:
+            raise ValueError(
+                "checkpoint_policy must be 'full' or 'statistics'."
+            )
         if (checkpoint is not None or checkpoint_callback is not None) and seed is None:
             raise ValueError("seed is required for resumable convergence checkpoints.")
         if checkpoint is not None and not isinstance(
@@ -4708,6 +5785,12 @@ class EnsembleCreator:
             contact_tolerance=contact_tolerance,
         )
         retain_samples = retain_chains or retain_sequences
+        if sample_callback is not None:
+            metadata_mode = _MetadataLevel.FULL_LEGACY
+        elif retain_sequences:
+            metadata_mode = _MetadataLevel.COMPACT_SEQUENCES
+        else:
+            metadata_mode = _MetadataLevel.COUNTS
         checkpoint_settings = {
             "batch_size": batch_size,
             "output_format": molecule_format,
@@ -4723,6 +5806,8 @@ class EnsembleCreator:
             "retain_sequences": retain_sequences,
             "metadata": metadata,
             "reservoir_size": reservoir_size,
+            "checkpoint_policy": checkpoint_policy,
+            "use_repeat_units_as_source": bool(use_repeat_units_as_source),
         }
         reservoir_rng = None
         if retain_samples and reservoir_size is not None:
@@ -4730,7 +5815,9 @@ class EnsembleCreator:
             reservoir_rng = np.random.default_rng(retention_seed)
 
         if checkpoint is None:
-            aggregate = EnsembleData([], {}, [], [], {}, {}, [])
+            aggregate_unit_counts = Counter()
+            aggregate_bond_counts = Counter()
+            aggregate_distributions = {}
             batch_index = 0
             accepted_count = 0
             next_chain_index = 0
@@ -4743,9 +5830,27 @@ class EnsembleCreator:
         else:
             if checkpoint.seed != seed:
                 raise ValueError("checkpoint seed does not match seed.")
-            if checkpoint.settings != checkpoint_settings:
+            saved_settings = dict(checkpoint.settings)
+            saved_settings.setdefault(
+                "checkpoint_policy",
+                getattr(checkpoint, "policy", "full"),
+            )
+            saved_settings.setdefault("use_repeat_units_as_source", False)
+            if saved_settings != checkpoint_settings:
                 raise ValueError("checkpoint settings do not match this convergence run.")
-            aggregate = deepcopy(checkpoint.aggregate)
+            aggregate_unit_counts = Counter(
+                {
+                    unit_id: unit_data["count"]
+                    for unit_id, unit_data in checkpoint.aggregate.units.items()
+                }
+            )
+            aggregate_bond_counts = Counter(
+                {
+                    tuple(zip(record["labels"], record["nodes"])): record["count"]
+                    for record in checkpoint.aggregate.bonds
+                }
+            )
+            aggregate_distributions = dict(checkpoint.aggregate.distributions)
             batch_index = checkpoint.batch_index
             accepted_count = checkpoint.accepted_count
             next_chain_index = checkpoint.next_chain_index
@@ -4754,14 +5859,19 @@ class EnsembleCreator:
             contact_counts = Counter(checkpoint.contact_counts)
             contact_total = checkpoint.contact_total
             tracker.history = deepcopy(checkpoint.convergence_history)
-            retained_records = deepcopy(checkpoint.retained_records)
+            retained_records = list(deepcopy(checkpoint.retained_records))
             retained_seen = checkpoint.retained_seen
             if reservoir_rng is not None and checkpoint.reservoir_rng_state is not None:
                 reservoir_rng.bit_generator.state = deepcopy(
                     checkpoint.reservoir_rng_state
                 )
 
+        retain_checkpoint_payloads = not (
+            checkpoint is not None and checkpoint_policy == "statistics"
+        )
+
         converged = tracker.converged()
+        progress_header_pending = True
 
         while accepted_count < max_samples and not converged:
             current_batch_size = min(batch_size, max_samples - accepted_count)
@@ -4772,7 +5882,7 @@ class EnsembleCreator:
                     1,
                     min((os.cpu_count() or 1) - 2, current_batch_size),
                 )
-            records = []
+            batch_accepted = 0
             total_discards = 0
             discard_reasons = Counter()
             first_discard_cause = None
@@ -4780,16 +5890,19 @@ class EnsembleCreator:
             for chain_result in self._iter_chain_records(
                 n_samples=current_batch_size,
                 molecule_format=molecule_format,
-                collect_info=True,
+                collect_info=metadata_mode,
                 max_discards=max_number_of_discarded_chains,
                 termination_flag=termination_flag,
                 parallel=parallel,
                 n_workers=batch_workers,
                 seed=batch_seed,
                 start_index=next_chain_index,
-                include_sequences=retain_sequences,
+                include_sequences=retain_sequences or sample_callback is not None,
                 native_diagnostics_path=native_diagnostics_path,
                 max_worker_restarts=max_worker_restarts,
+                defer_conversion=True,
+                parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
+                use_repeat_units_as_source=use_repeat_units_as_source,
             ):
                 next_chain_index = max(
                     next_chain_index,
@@ -4800,29 +5913,75 @@ class EnsembleCreator:
                 total_discards += chain_result["discards"]
                 discard_reasons.update(dict(chain_result["reasons"]))
                 if chain_result["record"] is not None:
-                    records.append(chain_result["record"])
+                    deferred = chain_result["record"]
+                    if not isinstance(deferred, _DeferredChainRecord):
+                        raise TypeError(
+                            "convergence sampling requires a deferred chain record"
+                        )
                     chain_index = chain_result["chain_index"]
+                    sample = deferred.sample
+                    metadata_record = sample.metadata
+                    molecular_weight = deferred.molecular_weight
+                    accepted_count += 1
+                    batch_accepted += 1
+                    mass_sum += molecular_weight
+                    mass_square_sum += molecular_weight * molecular_weight
+                    for pair, count in metadata_record.labeled_bond_counts.items():
+                        contact_key = "|".join(label for label, _node in pair)
+                        contact_counts[contact_key] += count
+                        contact_total += count
+                    if metadata:
+                        aggregate_unit_counts.update(metadata_record.unit_counts)
+                        aggregate_bond_counts.update(
+                            metadata_record.labeled_bond_counts
+                        )
+                        for stochastic_id, distribution in sample.distributions.items():
+                            aggregate_distributions.setdefault(
+                                stochastic_id,
+                                distribution,
+                            )
+
+                    materialized = None
                     if sample_callback is not None:
-                        sample_callback(chain_index, chain_result["record"])
+                        materialized = _materialize_deferred_chain(
+                            deferred,
+                            molecule_format,
+                            metadata_mode,
+                            True,
+                        )
+                        sample_callback(
+                            chain_index,
+                            materialized.callback_record(),
+                        )
                     if retain_samples:
                         retained_seen += 1
+                        retained_position = None
                         if reservoir_size is None:
-                            retained_records.append(
-                                (chain_index, chain_result["record"])
-                            )
-                        elif len(retained_records) < reservoir_size:
-                            retained_records.append(
-                                (chain_index, chain_result["record"])
-                            )
+                            retained_position = len(retained_records)
+                        elif retained_seen <= reservoir_size:
+                            retained_position = retained_seen - 1
                         elif reservoir_size:
                             replacement = int(
                                 reservoir_rng.integers(retained_seen)
                             )
                             if replacement < reservoir_size:
-                                retained_records[replacement] = (
-                                    chain_index,
-                                    chain_result["record"],
+                                retained_position = replacement
+                        if (
+                            retained_position is not None
+                            and retain_checkpoint_payloads
+                        ):
+                            if materialized is None:
+                                materialized = _materialize_deferred_chain(
+                                    deferred,
+                                    molecule_format,
+                                    metadata_mode,
+                                    retain_sequences,
                                 )
+                            retained_entry = (chain_index, materialized)
+                            if retained_position == len(retained_records):
+                                retained_records.append(retained_entry)
+                            else:
+                                retained_records[retained_position] = retained_entry
                 else:
                     failed = True
                     if first_discard_cause is None:
@@ -4841,31 +6000,13 @@ class EnsembleCreator:
                     ),
                     stacklevel=2,
                 )
-            if not records:
+            if not batch_accepted:
                 if first_discard_cause is not None:
                     raise first_discard_cause
                 break
 
-            batch = self._records_to_ensemble_data(records)
-            accepted_count += len(records)
-            # Aggregate metadata is independent of retained sample records.
-            # Avoid extending sample-level lists, which would defeat bounded
-            # retention, while preserving exact unit and contact totals.
-            if metadata:
-                batch_aggregate = EnsembleData(
-                    [], batch.units, batch.bonds, [], {}, batch.distributions, []
-                )
-                _merge_ensemble_data(aggregate, batch_aggregate)
-
-            mass_sum += sum(batch.molecular_weights)
-            mass_square_sum += sum(
-                mass * mass for mass in batch.molecular_weights
-            )
             mn = mass_sum / accepted_count
             mw = mass_square_sum / mass_sum
-            for contact in batch.bonds:
-                contact_counts["|".join(contact["labels"])] += contact["count"]
-                contact_total += contact["count"]
             contacts = {
                 key: count / contact_total
                 for key, count in contact_counts.items()
@@ -4884,9 +6025,24 @@ class EnsembleCreator:
                         mass_square_sum=mass_square_sum,
                         contact_counts=dict(contact_counts),
                         contact_total=contact_total,
-                        aggregate=deepcopy(aggregate),
+                        aggregate=EnsembleData(
+                            [],
+                            {
+                                unit_id: {"count": count}
+                                for unit_id, count in aggregate_unit_counts.items()
+                            },
+                            _bond_records_from_labeled(aggregate_bond_counts),
+                            [],
+                            {},
+                            dict(aggregate_distributions),
+                            [],
+                        ),
                         convergence_history=deepcopy(tracker.history),
-                        retained_records=deepcopy(retained_records),
+                        retained_records=(
+                            tuple(deepcopy(retained_records))
+                            if checkpoint_policy == "full"
+                            else ()
+                        ),
                         retained_seen=retained_seen,
                         reservoir_rng_state=(
                             deepcopy(reservoir_rng.bit_generator.state)
@@ -4894,39 +6050,68 @@ class EnsembleCreator:
                             else None
                         ),
                         settings=dict(checkpoint_settings),
+                        policy=checkpoint_policy,
                     )
                 )
 
             if progress_callback is not None:
-                progress_callback(
-                    f"[batch {batch_index}] n_samples={accepted_count} "
-                    f"Mn={mn:.2f} Mw={mw:.2f} dispersity={mw / mn:.4f} "
-                    f"convergence: {tracker.progress()}"
+                progress_row = (
+                    f"{batch_index:5d} | {accepted_count:7d} | "
+                    f"{mn:14.1f} | {mw:14.1f} | {tracker.progress()}"
                 )
+                if progress_header_pending:
+                    progress_row = (
+                        "Batch | Samples |             Mn |             Mw | Status\n"
+                        "------|---------|----------------|----------------|-------\n"
+                        f"{progress_row}"
+                    )
+                    progress_header_pending = False
+                progress_callback(progress_row)
             if tracker.converged():
                 converged = True
                 break
-            if len(batch.chains) < current_batch_size:
+            if batch_accepted < current_batch_size:
                 break
 
         if not accepted_count:
             return None
         retained_records.sort(key=lambda item: item[0])
-        retained_data = self._records_to_ensemble_data(
-            [record for _index, record in retained_records]
+        retained = [record for _index, record in retained_records]
+        chains = [record.molecule for record in retained] if retain_chains else []
+        sequences = (
+            [record.sequences for record in retained]
+            if retain_sequences
+            else []
         )
-        chains = retained_data.chains if retain_chains else []
-        sequences = retained_data.sequences if retain_sequences else []
-        masses = retained_data.molecular_weights if retain_samples else []
+        masses = (
+            [record.molecular_weight for record in retained]
+            if retain_samples
+            else []
+        )
+        retained_mol_weights = {}
+        if metadata:
+            for record in retained:
+                for stochastic_id, weights in record.mol_weights.items():
+                    retained_mol_weights.setdefault(stochastic_id, []).extend(weights)
         mn = mass_sum / accepted_count
         mw = mass_square_sum / mass_sum
         return ConvergedEnsembleData(
             chains=chains,
-            units=aggregate.units if metadata else {},
-            bonds=aggregate.bonds if metadata else [],
+            units=(
+                self._materialize_unit_counts(
+                    aggregate_unit_counts
+                )
+                if metadata
+                else {}
+            ),
+            bonds=(
+                _bond_records_from_labeled(aggregate_bond_counts)
+                if metadata
+                else []
+            ),
             sequences=sequences,
-            mol_weights=retained_data.mol_weights if metadata else {},
-            distributions=aggregate.distributions if metadata else {},
+            mol_weights=retained_mol_weights if metadata else {},
+            distributions=aggregate_distributions if metadata else {},
             molecular_weights=masses,
             converged=converged,
             n_batches=batch_index,
@@ -4940,6 +6125,10 @@ class EnsembleCreator:
                 "retain_sequences": retain_sequences,
                 "metadata": metadata,
                 "reservoir_size": reservoir_size,
+                "checkpoint_policy": checkpoint_policy,
+                "use_repeat_units_as_source": bool(
+                    use_repeat_units_as_source
+                ),
             },
             convergence_trace=tracker.history,
             number_average_molecular_weight=mn,

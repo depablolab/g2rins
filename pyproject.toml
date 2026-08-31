@@ -22,7 +22,6 @@ dependencies = [
   "scipy",
   "numpy",
   "networkx",
-  "matplotlib",
   "rdkit",
   "lark",
   "typing_extensions",

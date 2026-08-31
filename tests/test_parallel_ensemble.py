@@ -152,6 +152,288 @@ def test_parallel_seed_equivalence():
     assert serial == pooled
 
 
+def test_parallel_compact_metadata_record_equivalence():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        serial = creator.create_ensemble(
+            3,
+            output_format="smiles",
+            ensemble_info=True,
+            seed=31,
+        )
+        pooled = creator.create_ensemble(
+            3,
+            output_format="smiles",
+            ensemble_info=True,
+            seed=31,
+            parallel=True,
+            n_workers=2,
+        )
+
+    assert serial.chains == pooled.chains
+    assert serial.sequences == pooled.sequences
+    assert serial.bonds == pooled.bonds
+    assert serial.mol_weights == pooled.mol_weights
+    assert serial.distributions == pooled.distributions
+    assert serial.molecular_weights == pooled.molecular_weights
+    assert {
+        unit_id: {
+            "psmiles": info["psmiles"],
+            "g2rins": info["g2rins"],
+            "count": info["count"],
+        }
+        for unit_id, info in serial.units.items()
+    } == {
+        unit_id: {
+            "psmiles": info["psmiles"],
+            "g2rins": info["g2rins"],
+            "count": info["count"],
+        }
+        for unit_id, info in pooled.units.items()
+    }
+
+
+def test_parallel_deferred_convergence_record_equivalence():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        settings = {
+            "batch_size": 2,
+            "max_samples": 4,
+            "window": 10,
+            "output_format": "smiles",
+            "seed": 37,
+            "reservoir_size": 2,
+        }
+        serial = creator.create_ensemble_until_converged(**settings)
+        pooled = creator.create_ensemble_until_converged(
+            **settings,
+            parallel=True,
+            n_workers=2,
+        )
+
+    assert serial.chains == pooled.chains
+    assert serial.sequences == pooled.sequences
+    assert serial.bonds == pooled.bonds
+    assert serial.mol_weights == pooled.mol_weights
+    assert serial.distributions == pooled.distributions
+    assert serial.molecular_weights == pooled.molecular_weights
+    assert serial.convergence_trace == pooled.convergence_trace
+    assert serial.number_average_molecular_weight == pytest.approx(
+        pooled.number_average_molecular_weight
+    )
+    assert serial.weight_average_molecular_weight == pytest.approx(
+        pooled.weight_average_molecular_weight
+    )
+
+
+def test_parallel_convergence_reuses_one_executor_across_batches(monkeypatch):
+    executor_count = 0
+
+    class ImmediateExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            nonlocal executor_count
+            executor_count += 1
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        ImmediateExecutor,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        result = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=4,
+            window=10,
+            seed=41,
+            parallel=True,
+            n_workers=2,
+        )
+
+    assert executor_count == 1
+    assert result.n_batches == 2
+    assert len(result.chains) == 4
+
+
+def test_parallel_convergence_restarts_broken_pool_between_batches(monkeypatch):
+    executor_count = 0
+    submitted_indices = []
+
+    class BetweenBatchFailureExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            nonlocal executor_count
+            executor_count += 1
+            self.generation = executor_count
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            chain_index = args[0][0]
+            submitted_indices.append((self.generation, chain_index))
+            if self.generation == 1 and chain_index >= 2:
+                raise BrokenProcessPool("simulated death between batches")
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        BetweenBatchFailureExecutor,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        result = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=4,
+            window=10,
+            seed=43,
+            parallel=True,
+            n_workers=2,
+            max_worker_restarts=1,
+        )
+
+    assert executor_count == 2
+    assert submitted_indices.count((1, 0)) == 1
+    assert submitted_indices.count((1, 1)) == 1
+    assert [index for generation, index in submitted_indices if generation == 2] == [
+        2,
+        3,
+    ]
+    assert len(result.chains) == 4
+
+
+def test_persistent_scheduler_restores_spawn_configuration_after_error(monkeypatch):
+    original_preparation = multiprocessing.spawn.get_preparation_data
+    for name in ensemble_module._NATIVE_THREAD_ENVIRONMENT:
+        monkeypatch.setenv(name, f"original-{name}")
+
+    class FatalExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            initializer(*initargs)
+
+        def submit(self, _function, *_args):
+            future = Future()
+            future.set_exception(RuntimeError("simulated fatal worker error"))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        FatalExecutor,
+    )
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+
+    with pytest.raises(RuntimeError, match="simulated fatal worker error"):
+        creator.create_ensemble_until_converged(
+            batch_size=1,
+            max_samples=1,
+            window=2,
+            seed=47,
+            parallel=True,
+            n_workers=2,
+        )
+
+    assert multiprocessing.spawn.get_preparation_data is original_preparation
+    assert {
+        name: ensemble_module.os.environ[name]
+        for name in ensemble_module._NATIVE_THREAD_ENVIRONMENT
+    } == {
+        name: f"original-{name}"
+        for name in ensemble_module._NATIVE_THREAD_ENVIRONMENT
+    }
+
+
+def test_parallel_callback_does_not_reenter_convergence_scheduler(monkeypatch):
+    executor_count = 0
+
+    class ImmediateExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            nonlocal executor_count
+            executor_count += 1
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            future = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        ImmediateExecutor,
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        nested = []
+
+        def sample_callback(_index, _record):
+            nested.extend(
+                creator.create_ensemble(
+                    1,
+                    parallel=True,
+                    n_workers=2,
+                    seed=53,
+                )
+            )
+
+        result = creator.create_ensemble_until_converged(
+            batch_size=1,
+            max_samples=1,
+            window=2,
+            seed=53,
+            parallel=True,
+            n_workers=2,
+            sample_callback=sample_callback,
+        )
+
+    assert executor_count == 2
+    assert len(result.chains) == 1
+    assert len(nested) == 1
+
+
 def test_native_diagnostics_record_chain_seed_versions_and_stages(tmp_path):
     diagnostics = tmp_path / "native-state.jsonl"
     with warnings.catch_warnings():
@@ -353,6 +635,7 @@ def test_parallel_scheduler_reports_last_native_state_after_recovery_exhaustion(
             }
         )
         + "\n"
+        + ("incomplete-native-record" * 600)
     )
 
     class BrokenExecutor:

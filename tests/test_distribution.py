@@ -12,8 +12,10 @@ NSTAT = 2000
 
 def test_empty_serialize():
     vector = g2rins.StochasticDistribution.get_empty_serial_vector()
+    original = vector.copy()
     instance = g2rins.StochasticDistribution.from_serial_vector(vector)
     assert instance is None
+    assert vector == original
 
 
 @pytest.mark.parametrize("a", [0.01, 0.05, 0.1, 0.3, 0.5])

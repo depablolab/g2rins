@@ -522,9 +522,10 @@ class StochasticDistribution(StochasticGeneration):
         """
         candidates: List[Tuple[float, ...]] = []
         type_candidates: List[Type[_T]] = []
+        serial_values = iter(vector)
         for distr_type in cls._known_distributions:
             default_serial = distr_type.default_serialize()
-            given_serial = tuple((vector.pop(0) for _ in default_serial))
+            given_serial = tuple(next(serial_values) for _ in default_serial)
             if default_serial != given_serial:
                 candidates.append(given_serial)
                 type_candidates.append(distr_type)

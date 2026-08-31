@@ -950,6 +950,35 @@ class GraphCreator:
 
         edges_to_add = []
 
+        def connector_paths(source, target):
+            """Yield simple connector-only paths that can still be valid."""
+            allowed_nodes = bc_idx_set | {source, target}
+
+            def visit(node, path, visited, previous_was_non_static):
+                if node == target:
+                    yield tuple(path)
+                    return
+                for u, v, key, data in graph.out_edges(
+                    node,
+                    keys=True,
+                    data=True,
+                ):
+                    if v not in allowed_nodes or v in visited:
+                        continue
+                    is_non_static = any(
+                        data.get(attribute, 0) > 0
+                        for attribute in _NON_STATIC_ATTR
+                    )
+                    if previous_was_non_static and is_non_static:
+                        continue
+                    visited.add(v)
+                    path.append((u, v, key))
+                    yield from visit(v, path, visited, is_non_static)
+                    path.pop()
+                    visited.remove(v)
+
+            yield from visit(source, [], {source}, False)
+
         # Iterating SETS of (uuid string) node ids is PYTHONHASHSEED-dependent;
         # the loops below build weighted edges in iteration order, which must be
         # parse-stable so the generated graph is reproducible across processes.
@@ -967,8 +996,13 @@ class GraphCreator:
                     traversal_condition = GraphDecider(bc_idx_set, in_idx)
                     non_bond_connector_successor = conditional_traversal(graph, in_idx, traversal_condition)
                     for target in sorted(non_bond_connector_successor, key=_graph_node_order.__getitem__):
-                        all_paths = list(nx.all_simple_edge_paths(graph, in_idx, target))
-                        for path in all_paths:
+                        # BondConnectorPath.valid rejects every path containing
+                        # an internal atom. Enumerating those paths in the full
+                        # molecular graph is therefore wasted work and can be
+                        # exponential for branched, ring-containing repeat
+                        # units. The bounded traversal also stops as soon as
+                        # consecutive stochastic edges make a route invalid.
+                        for path in connector_paths(in_idx, target):
                             bond_connector_path = BondConnectorPath(path, graph)
                             if bond_connector_path.valid(bc_idx):
                                 data = bond_connector_path.combined_attr

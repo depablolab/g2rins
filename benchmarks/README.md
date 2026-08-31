@@ -41,6 +41,35 @@ Available cases cover small and large linear chains, branching, nested stochasti
 
 Exact stochastic rounding is the default. Compare forced boundaries explicitly with `--termination overshoot` or `--termination undershoot`. Wall-clock results are descriptive, not absolute CI limits; automated performance gates should compare relative medians on the same machine.
 
+## Compare a source tree with the original checkout
+
+`compare_versions` runs the common public `create_ensemble()` API against two
+source trees using the same interpreter, inputs, seeds, and one thread per
+numeric runtime. Every repetition runs in a fresh subprocess. It reports
+sampling and end-to-end wall time, peak RSS immediately after sampling, and
+node-ID-independent output parity:
+
+```bash
+conda run -n poly_catalog_env python -m benchmarks.compare_versions \
+  --case small-linear --case large-linear --metadata both --runs 3 \
+  --source original=/path/to/original/g2rins \
+  --source optimized=/path/to/optimized/g2rins \
+  --include-runs --output comparison.json
+```
+
+Parity covers canonical SMILES, molecular weight, attributed topology,
+provenance grouping, warnings, and—when requested—unit counts and labels,
+contact counts, sequence contents, stochastic masses, and distributions. Raw
+parser UUIDs and internal stochastic-instance IDs are normalized while their
+grouping relationships are retained. The command exits nonzero if either
+version is not repeatable or any cross-version output differs.
+
+The August 31 original-versus-optimized measurements are summarized in
+[COMPARISON_ORIGINAL_2026-08-31.md](COMPARISON_ORIGINAL_2026-08-31.md); the
+machine-readable medians, all raw repetitions, and normalized output evidence
+are retained in
+[COMPARISON_ORIGINAL_2026-08-31.json](COMPARISON_ORIGINAL_2026-08-31.json).
+
 For the seeded 8,525-atom `large-linear` case on the reference development machine, three exact-rounding runs after all planned optimization phases produced these medians:
 
 | Metadata | Sampling | Peak RSS | Transactions | Whole-molecule copies |

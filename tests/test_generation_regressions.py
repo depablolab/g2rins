@@ -13,6 +13,7 @@ both runaway/over-counted growth and collapsed/truncated chains.
 
 import warnings
 
+import networkx as nx
 import numpy as np
 import pytest
 from rdkit import Chem
@@ -26,6 +27,51 @@ from g2rins.exception import (
 )
 
 SEEDS = (0, 1, 2)
+
+
+def test_adjacent_phantom_nodes_collapse_to_realized_junction_bond():
+    """A phantom pair must become one real bond with the junction attributes."""
+    from g2rins.ensemble_creator import _collapse_phantom_nodes
+
+    graph = nx.Graph()
+    graph.add_nodes_from(
+        (
+            (0, {"atomic_num": 6}),
+            (1, {"atomic_num": 0}),
+            (2, {"atomic_num": 0}),
+            (3, {"atomic_num": 8}),
+        )
+    )
+    graph.add_edge(0, 1, bond_type=1, aromatic=False)
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False)
+
+    _collapse_phantom_nodes(graph)
+
+    assert set(graph) == {0, 3}
+    assert graph.get_edge_data(0, 3) == {"bond_type": 2, "aromatic": False}
+
+
+def test_single_phantom_bridge_collapses_without_a_self_loop():
+    from g2rins.ensemble_creator import _collapse_phantom_nodes
+
+    graph = nx.Graph()
+    graph.add_nodes_from(
+        (
+            (0, {"atomic_num": 6}),
+            (1, {"atomic_num": 0}),
+            (2, {"atomic_num": 7}),
+        )
+    )
+    graph.add_edge(0, 1, bond_type=1, aromatic=False)
+    graph.add_edge(1, 2, bond_type=1, aromatic=False)
+
+    _collapse_phantom_nodes(graph)
+
+    assert set(graph) == {0, 2}
+    assert list(graph.edges(data=True)) == [
+        (0, 2, {"bond_type": 1, "aromatic": False})
+    ]
 
 
 def _reset_rngs(seed):

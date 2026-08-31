@@ -143,14 +143,29 @@ def mol_graph_to_rdkit_mol(
 
 
 def rdkit_mol_to_smiles(mol, native_stage_callback=None):
-    """Chem.MolToSmiles guarded against stack overflow on very large molecules."""
+    """Serialize ``mol`` to SMILES, with large-molecule RDKit safeguards.
+
+    Canonical traversal can exhaust RDKit's finite set of simultaneously open
+    ring labels for large, ring-rich polymers even though the molecule is
+    valid. In that specific case, retry in atom order; the resulting SMILES is
+    non-canonical but represents the same molecule.
+    """
     from rdkit import Chem
 
     if native_stage_callback is not None:
         native_stage_callback("smiles")
+
+    def serialize():
+        try:
+            return Chem.MolToSmiles(mol)
+        except ValueError as exc:
+            if "Too many rings open at once" not in str(exc):
+                raise
+            return Chem.MolToSmiles(mol, canonical=False)
+
     if mol.GetNumAtoms() < _BIG_STACK_ATOM_THRESHOLD:
-        return Chem.MolToSmiles(mol)
-    return _run_with_big_stack(Chem.MolToSmiles, mol)
+        return serialize()
+    return _run_with_big_stack(serialize)
 
 
 def rdkit_mol_weight(mol, native_stage_callback=None):

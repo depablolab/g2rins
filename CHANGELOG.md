@@ -6,6 +6,13 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Added
 
+- Convergence-driven ensemble generation accepts
+  `use_repeat_units_as_source=True`, enabling iterative sampling of polymers
+  without an initiator.
+- Convergence checkpoints support an opt-in `statistics` policy that stores
+  resumable convergence counters, history, aggregate metadata, and reservoir
+  RNG state without embedding retained chain graphs. The compatible default
+  remains `full`.
 - Sampling benchmarks support concise median-only matrices and sampling-only CPU attribution by implementation category; the post-optimization profile documents why NetworkX remains the internal graph backend for now.
 - Convergence sampling supports bounded chain/sequence reservoirs, per-chain streaming callbacks, optional returned metadata, and serializable seeded checkpoints for exact batch-boundary resume.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
@@ -17,11 +24,36 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Changed
 
+- Native crash-diagnostic recovery scans JSONL logs backward in bounded chunks
+  instead of loading the complete file, and accepted private chain records are
+  frozen before checkpoint retention.
+- Parallel convergence now keeps one bounded, restartable worker pool across
+  successful batches instead of paying process startup per batch. Broken pools
+  are replaced without losing completed ordered chains, and nested callback
+  sampling uses an independent scheduler.
+- Convergence now aggregates each accepted chain immediately and defers
+  sequence/requested-format conversion until after callback or reservoir
+  selection. Unretained chains are discarded without batch/final compatibility
+  conversion, while molecular-weight moments, contacts, units, checkpoints,
+  callbacks, and seeded reservoir behavior remain unchanged.
+- Sampling now uses explicit private metadata levels for graph-only, counts,
+  compact-sequence, and full legacy records. Convergence without retained
+  sequences uses stable unit IDs and endpoint counts without materializing
+  graph-valued units, while callbacks and public outputs retain their full
+  compatibility payloads.
+- Sampling prepares source-specific static-unit and half-bond templates once
+  per ensemble creator, and merges incoming graph data directly by atom-ID
+  offset instead of repeatedly traversing and relabeling static graphs.
+- Sampling prepares stochastic distributions once per ensemble creator and
+  reuses those immutable templates across attempts and termination estimates.
+- Sampling precomputes invariant termination-fragment masses per ensemble
+  creator; boundary lookahead now evaluates only live endpoint hydrogen loss
+  and dynamic target probabilities instead of constructing temporary graphs.
 - Parallel ensembles now initialize one persistent creator per worker, submit compact chain jobs with at most twice the worker count in flight, cap numerical-library threads, and recycle workers where supported. Broken pools preserve completed ordered results and restart up to `max_worker_restarts`, then raise `WorkerProcessFailure` with the last valid native diagnostic state.
 - Accepted chains now construct and sanitize one RDKit molecule and reuse it for molecular weight and requested canonical SMILES. Optional durable native-stage diagnostics include chain/seed context and library versions, `faulthandler` is enabled automatically, and enlarged-stack protection covers construction, sanitization, descriptors, and SMILES generation for large molecules.
 - Fixed-size and convergence-driven ensemble creation now share one ordered per-chain sampling engine. Convergence updates molecular-weight moments and contact frequencies online instead of rescanning all accumulated samples after every batch.
 - Ensemble sampling now tracks unit counts, contacts, and branching sequences with compact IDs and direct atom indexes, materializing the legacy graph-valued metadata only when returning it. This removes per-unit molecule scans and per-occurrence NetworkX copies without changing the public output.
-- Exact stochastic rounding now restores rejected growth steps through a transaction journal containing an append watermark, frontier/tracker state, compact metadata, and pre-existing atom-attribute values instead of deep-copying the whole partial molecule. The consumed random stream is deliberately not rewound.
+- Exact stochastic rounding now restores rejected growth steps through sparse first-write mutation journals and append watermarks instead of copying the partial molecule, frontier, stochastic tracker, and compact metadata at checkpoint capture. The consumed random stream is deliberately not rewound.
 - Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
@@ -33,10 +65,18 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Removed
 
+- Matplotlib is no longer a runtime dependency; an unused internal plotting
+  helper had loaded it during ordinary parsing.
 - The `mol` output format of `create_ensemble`. Request `mol_graph` and convert chains with `g2rins.mol_graph_to_rdkit_mol`, or parse the SMILES output.
 
 ### Fixed
 
+- Bond-connector removal no longer enumerates exponentially many impossible
+  atom paths and invalid consecutive-transition routes when constructing
+  branched, ring-containing initiator-free polymer graphs.
+- Adjacent phantom connector nodes are now traversed as one component and
+  collapsed using the realized junction's bond attributes, preserving the
+  intended bond between their real-atom endpoints.
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 - Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.

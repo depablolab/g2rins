@@ -69,6 +69,10 @@ Convergence requires every adjacent cumulative snapshot in the trailing
 window to satisfy both tolerances. If the hard sample limit is reached first,
 the result is returned with `converged == False`.
 
+For polymers without an initiator, pass
+`use_repeat_units_as_source=True` to seed each iteratively generated chain
+from a repeat unit.
+
 For long runs, statistics can cover every accepted chain while sample-level
 outputs remain bounded:
 
@@ -103,7 +107,12 @@ sample records. `metadata=False` omits returned unit/contact metadata without
 changing the statistics used for convergence. `reservoir_size` uses an
 independent random stream, so retention never changes generated chemistry.
 Checkpoints are serializable with `pickle` and require an integer `seed` for
-exact resume.
+exact resume. The default `checkpoint_policy="full"` embeds retained chains
+and sequences for exact output reconstruction. For much smaller checkpoints,
+pass `checkpoint_policy="statistics"` to both the original and resumed calls.
+This preserves convergence counters, aggregate metadata, history, and
+reservoir RNG state, but a resumed result deliberately contains no retained
+chains, sequences, or per-chain molecular weights from that run.
 
 For diagnosing rare native-library failures, pass
 `native_diagnostics_path="rdkit-state.jsonl"` to either ensemble creation

@@ -205,29 +205,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
         if self.stochastic_generation is None:
             raise UndefinedDistribution(self)
 
-        import matplotlib.pyplot as plt
-
-        def quick_viz(G, title="Graph"):
-            plt.figure(figsize=(12, 8))
-
-            # Get layout
-            pos = nx.spring_layout(G, k=1, iterations=50)
-
-            # Draw nodes
-            nx.draw_networkx_nodes(G, pos, node_size=500, node_color="lightblue")
-
-            # Draw edges (for MultiDiGraph, this handles multiple edges automatically)
-            nx.draw_networkx_edges(G, pos, edge_color="gray", arrows=True, arrowsize=20, arrowstyle="->", connectionstyle="arc3,rad=0.1")  # Curves edges to show multiple
-
-            # Draw labels using smi_text attribute
-            labels = nx.get_node_attributes(G, "smi_text")
-            nx.draw_networkx_labels(G, pos, labels, font_size=8)
-
-            plt.axis("off")
-            plt.tight_layout()
-            plt.title(title)
-            plt.show()
-
         def build_idx(residues, graph):
             """
             Build a list that maps uuid of all bond_connectors to their position in the string.
