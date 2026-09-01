@@ -209,6 +209,28 @@ def test_truncated_chain_contract():
     assert ensemble is None
 
 
+def test_cyclic_monomer_generation_serializes_to_smiles():
+    """Long ring-rich cyclic polymers should still serialize to SMILES even
+    when RDKit hits its open-ring label limit."""
+    g2rins_string = "{[] [>]c1nc2ccc([<])cc2[nH]1; [H][>]; [<][H] []}|poisson(100000)|"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(g2rins_string).get_graph_creator().get_ensemble_creator()
+
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mol_graph = ensemble_creator.sample_mol_graph()
+
+    assert all(data.get("atomic_num") != 0 for _, data in mol_graph.nodes(data=True))
+    smiles = g2rins.mol_graph_to_smiles(mol_graph)
+    assert isinstance(smiles, str) and smiles
+    mol = Chem.MolFromSmiles(smiles)
+    assert mol is not None
+    Chem.SanitizeMol(mol)
+
+
 def test_unit_id_deterministic():
     """unit_id numbering must not depend on the (random UUID) node ids: parsing
     the same string repeatedly must label the same atoms with the same units

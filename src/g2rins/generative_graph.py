@@ -39,6 +39,8 @@ _STATIC_NAME = "static"
 _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
+_ATOM_CHIRAL_TOKEN_NAME = "atom_chiral_token"
+_BOND_SYMBOL_RAW_NAME = "bond_symbol_raw"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 10
 
@@ -1058,6 +1060,8 @@ class GraphCreator:
         stochastic_id_name=_EDGE_STOCHASTIC_ID_NAME,
         aromatic_name=_AROMATIC_NAME,
         bond_type_name=_BOND_TYPE_NAME,
+        atom_chiral_name=_ATOM_CHIRAL_TOKEN_NAME,
+        bond_symbol_raw_name=_BOND_SYMBOL_RAW_NAME,
         smi_bond_mapping=smi_bond_mapping,
     )
     def get_generative_graph(self, include_bond_connectors=False, return_extra_graph_info=False):
@@ -1077,6 +1081,7 @@ class GraphCreator:
         - **gen_weight** float Weight to select this atom for the next generation step.
         - **gen_hierarchy**: int Hierarchy for the selection of the atom for the next generation step. Default is 0. Atoms with a higher hierarchy number will be chosen first.
         - **stochastic_id_tree**: vector[int] Identification of the stochastic objects to which the node belongs. The vector is ordered from nearest to farthest ancestor (e.g., first element is node stochastic id, second element is parent, third is grandparent, etc.).  All elements are -1 if not a stochastic object, element is -2 if ancestor is absent.
+        - **{atom_chiral_name}**: string Optional chirality token written on a bracket atom (for example ``@`` or ``@@``).
 
         Edges (Bonds) have the following properties:
 
@@ -1087,6 +1092,7 @@ class GraphCreator:
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
+        - **{bond_symbol_raw_name}**: string Optional original written bond token (for example ``/`` or ``\\``).
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
@@ -1176,6 +1182,7 @@ class GraphCreator:
             # written count on non-aromatic atoms produced radicals when
             # under-coordinated and over-valence crashes when over-coordinated.
             num_explicit_h = -1
+            atom_chiral_token = None
             if aromatic:
                 try:
                     h_count = obj.h_count
@@ -1183,6 +1190,12 @@ class GraphCreator:
                         num_explicit_h = h_count.num
                 except AttributeError:
                     num_explicit_h = -1
+            try:
+                chiral = obj.chiral
+                if chiral is not None:
+                    atom_chiral_token = str(chiral)
+            except AttributeError:
+                atom_chiral_token = None
 
             if "stochastic_obj" not in data or data["stochastic_obj"].stochastic_generation is None:
                 stochastic_id = -1
@@ -1219,23 +1232,24 @@ class GraphCreator:
                         current_stochastic_obj = current_stochastic_obj.stochastic_parent
                         depth_idx += 1
 
-            generative_graph.add_node(
-                node,
-                **{
-                    "atomic_num": atomic_num,
-                    _AROMATIC_NAME: aromatic,
-                    "charge": charge,
-                    "num_explicit_h": int(num_explicit_h),
-                    "molecular_weight_distribution": MW_distribution_array,
-                    "mol_molecular_weight": mol_molecular_weight,
-                    "total_molecular_weight": total_molecular_weight,
-                    "unit_molar_amounts": molar_amount,
-                    "init_weight": float(init_weight),
-                    "gen_weight": float(gen_weight),
-                    "gen_hierarchy": 0,
-                    "stochastic_id_tree": stochastic_id_tree,
-                },
-            )
+            node_attributes = {
+                "atomic_num": atomic_num,
+                _AROMATIC_NAME: aromatic,
+                "charge": charge,
+                "num_explicit_h": int(num_explicit_h),
+                "molecular_weight_distribution": MW_distribution_array,
+                "mol_molecular_weight": mol_molecular_weight,
+                "total_molecular_weight": total_molecular_weight,
+                "unit_molar_amounts": molar_amount,
+                "init_weight": float(init_weight),
+                "gen_weight": float(gen_weight),
+                "gen_hierarchy": 0,
+                "stochastic_id_tree": stochastic_id_tree,
+            }
+            if atom_chiral_token is not None:
+                node_attributes[_ATOM_CHIRAL_TOKEN_NAME] = atom_chiral_token
+
+            generative_graph.add_node(node, **node_attributes)
 
         for u, v, _k, d in graph.edges(keys=True, data=True):
 
@@ -1246,7 +1260,10 @@ class GraphCreator:
             d.setdefault(_EDGE_STOCHASTIC_ID_NAME, -2)  # -2 = unassigned; real ids start at 0, -1 is the global level
 
             if _BOND_TYPE_NAME in d:
-                d[_BOND_TYPE_NAME] = smi_bond_mapping.get(str(d[_BOND_TYPE_NAME]), 1)
+                bond_symbol_raw = str(d[_BOND_TYPE_NAME])
+                if bond_symbol_raw in ("/", "\\"):
+                    d[_BOND_SYMBOL_RAW_NAME] = bond_symbol_raw
+                d[_BOND_TYPE_NAME] = smi_bond_mapping.get(bond_symbol_raw, 1)
             else:
                 d[_BOND_TYPE_NAME] = 1
             d.setdefault(_AROMATIC_NAME, False)

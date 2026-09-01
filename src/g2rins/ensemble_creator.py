@@ -1811,11 +1811,17 @@ class _UnitOccurrence:
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h"}
-    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME}
+    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", "atom_chiral_token"}
+    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME, "bond_symbol_raw"}
+    _MISSING_REQUIRED = object()
+    _SKIP_OPTIONAL = object()
     # Defaults for optional node attributes so a generative_graph built before an attribute
     # existed still yields an EnsembleCreator (required attributes stay strict).
-    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1}
+    _ATTR_DEFAULTS = {
+        "num_explicit_h": -1,
+        "atom_chiral_token": _SKIP_OPTIONAL,
+        "bond_symbol_raw": _SKIP_OPTIONAL,
+    }
 
     def __init__(
         self,
@@ -2169,8 +2175,12 @@ class _PartialAtomGraph:
             if k in dictionary:
                 new_dict[k] = dictionary[k]
             else:
-                # Missing optional attr -> its default; missing required attr -> KeyError.
-                new_dict[k] = _PartialAtomGraph._ATOM_ATTR_DEFAULTS[k]
+                default_value = _PartialAtomGraph._ATTR_DEFAULTS.get(k, _PartialAtomGraph._MISSING_REQUIRED)
+                if default_value is _PartialAtomGraph._MISSING_REQUIRED:
+                    raise KeyError(k)
+                if default_value is _PartialAtomGraph._SKIP_OPTIONAL:
+                    continue
+                new_dict[k] = default_value
         return new_dict
 
     def pop_target_open_half_bond(self, sto_atom_idx, target_idx) -> _HalfAtomBond:

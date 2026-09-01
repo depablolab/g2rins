@@ -6,6 +6,9 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Added
 
+- Generative-graph exports now preserve optional stereochemistry provenance:
+  `atom_chiral_token` on chiral bracket atoms and `bond_symbol_raw` for
+  slash/backslash directional single bonds.
 - Convergence-driven ensemble generation accepts
   `use_repeat_units_as_source=True`, enabling iterative sampling of polymers
   without an initiator.
@@ -24,6 +27,13 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Changed
 
+- `mol_graph_to_rdkit_mol` now applies preserved chirality and directional-bond
+  metadata before stereochemistry assignment, and tolerates duplicate directed
+  edges by ignoring already-added atom pairs.
+- Double-bond directional annotations that are incomplete, ambiguous, or
+  conflicting now emit explicit runtime warnings. Ambiguous/conflicting
+  directional stereoinformation is discarded, leaving E/Z stereochemistry
+  unspecified instead of silently forcing an interpretation.
 - Native crash-diagnostic recovery scans JSONL logs backward in bounded chunks
   instead of loading the complete file, and accepted private chain records are
   frozen before checkpoint retention.
@@ -77,6 +87,14 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Adjacent phantom connector nodes are now traversed as one component and
   collapsed using the realized junction's bond attributes, preserving the
   intended bond between their real-atom endpoints.
+- Large, ring-rich cyclic polymers now recover from RDKit's open-ring labeling
+  overflow during SMILES serialization by retrying with non-canonical traversal
+  and a root-aware atom ordering selection, preventing failures such as
+  "Too many rings open at once. SMILES cannot be generated." for cyclic monomer
+  inputs and long polymer chains.
+- Added explicit regression coverage for long cyclic-monomer generation and
+  RDKit serialization failures to prevent the issue from returning when new
+  generation or serialization logic is added.
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 - Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.

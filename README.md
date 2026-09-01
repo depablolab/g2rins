@@ -134,6 +134,24 @@ ordered results. `max_worker_restarts` controls the restart budget (default
 `2`); exhaustion raises `WorkerProcessFailure`, whose `native_state` contains
 the latest valid record from `native_diagnostics_path` when available.
 
+### Stereochemistry
+
+G2RINS preserves stereochemistry metadata through generative-graph export,
+sampling, and RDKit conversion:
+
+- Chiral bracket-atom tokens are carried as `atom_chiral_token`.
+- Directional bond tokens `/` and `\\` are carried as `bond_symbol_raw`.
+- `mol_graph_to_rdkit_mol` applies these tokens before RDKit stereo assignment.
+
+Currently supported atom-chirality tokens are `@`, `@@`, `@TH1`, and `@TH2`.
+Unsupported chirality tokens are left unset and emit a `RuntimeWarning`.
+
+For directional markers around double bonds, incomplete, ambiguous, or
+conflicting marker patterns emit a `RuntimeWarning`.
+When markers are ambiguous or conflicting, directional stereoinformation is
+discarded and E/Z stereochemistry is intentionally left unspecified instead
+of being guessed.
+
 Worked examples are in [`G2RINS_guide.ipynb`](G2RINS_guide.ipynb).
 
 ---

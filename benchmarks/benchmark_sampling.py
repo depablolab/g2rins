@@ -31,6 +31,7 @@ from rdkit.Chem import Descriptors
 import g2rins
 import g2rins.ensemble_creator as ensemble_module
 from g2rins.ensemble_creator import _GrowthTransaction, _PartialAtomGraph, _attempt_chain
+from g2rins.nx_rdkit_mol import rdkit_mol_to_smiles
 
 from .cases import CASES
 
@@ -125,7 +126,7 @@ def _worker(case_name: str, metadata: bool, termination: str, max_discards: int)
     graph = sample[0] if metadata else sample
     molecule, rdkit_construction_seconds = _elapsed(lambda: g2rins.mol_graph_to_rdkit_mol(graph))
     _, sanitization_seconds = _elapsed(lambda: Chem.SanitizeMol(molecule))
-    smiles, serialization_seconds = _elapsed(lambda: Chem.MolToSmiles(molecule, canonical=True))
+    smiles, serialization_seconds = _elapsed(lambda: rdkit_mol_to_smiles(molecule))
     payload, ipc_serialization_seconds = _elapsed(lambda: pickle.dumps(sample, protocol=pickle.HIGHEST_PROTOCOL))
 
     unit_occurrences = None

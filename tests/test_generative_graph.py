@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import networkx as nx
+import warnings
 
 import g2rins
 
@@ -11,12 +12,18 @@ import g2rins
 
 
 def node_match(node1_attrs, node2_attrs):
-    return node1_attrs == node2_attrs
+    ignored = {"atom_chiral_token"}
+    node1 = {k: v for k, v in node1_attrs.items() if k not in ignored}
+    node2 = {k: v for k, v in node2_attrs.items() if k not in ignored}
+    return node1 == node2
 
 
 # Define a custom edge matcher
 def edge_match(edge1_attrs, edge2_attrs):
-    return edge1_attrs == edge2_attrs
+    ignored = {"bond_symbol_raw"}
+    edge1 = {k: v for k, v in edge1_attrs.items() if k not in ignored}
+    edge2 = {k: v for k, v in edge2_attrs.items() if k not in ignored}
+    return edge1 == edge2
 
 
 def test_generative_graph_generation(graph_validation_dict):
@@ -52,3 +59,25 @@ def test_generative_graph_json_data_format_block():
     for node_dict in data["graph"]["nodes"]:
         assert node_dict["unit_id"] == labels.unit_id[node_dict["id"]]
         assert node_dict.get("bond_id") == labels.bond_id.get(node_dict["id"])
+
+
+def test_generative_graph_keeps_atom_chiral_token_when_written():
+    smi = "[C@H](F)Cl"
+    graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+
+    assert any(data.get("atom_chiral_token") == "@" for _node, data in graph.nodes(data=True))
+
+
+def test_directional_bond_symbol_is_preserved_in_generated_and_sampled_graphs():
+    smi = "C{[>][<]C/C=C/C[>];;[<]}|uniform(2,2)|[H]"
+    graph_creator = g2rins.G2rins.make(smi).get_graph_creator()
+
+    generative_graph = graph_creator.get_generative_graph(include_bond_connectors=False)
+    edge_attrs = [data for _u, _v, data in generative_graph.edges(data=True)]
+    assert any(data.get("bond_symbol_raw") in {"/", "\\"} and data["bond_type"] == 1 for data in edge_attrs)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        mol_graph = graph_creator.get_ensemble_creator().sample_mol_graph()
+    sampled_edge_attrs = [data for _u, _v, data in mol_graph.edges(data=True)]
+    assert any(data.get("bond_symbol_raw") in {"/", "\\"} and data["bond_type"] == 1 for data in sampled_edge_attrs)

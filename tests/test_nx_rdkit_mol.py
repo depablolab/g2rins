@@ -6,6 +6,8 @@ import threading
 import networkx as nx
 import pytest
 
+import g2rins
+
 pytest.importorskip("rdkit", reason="RDKit is an optional dependency")
 from rdkit import Chem
 
@@ -67,7 +69,10 @@ def test_rdkit_mol_to_smiles_falls_back_when_canonical_ring_labels_are_exhausted
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
     smiles = rdkit_mol_to_smiles(mol)
 
-    assert calls == [{}, {"canonical": False}]
+    assert calls and calls[0] == {}
+    assert calls[1]["canonical"] is False
+    root = calls[1].get("rootedAtAtom")
+    assert root is None or 0 <= root < mol.GetNumAtoms()
     assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
 
 
@@ -80,6 +85,29 @@ def test_rdkit_mol_to_smiles_does_not_mask_other_value_errors(monkeypatch):
     monkeypatch.setattr(Chem, "MolToSmiles", invalid_mol_to_smiles)
     with pytest.raises(ValueError, match="different serialization failure"):
         rdkit_mol_to_smiles(mol)
+
+
+def test_benchmark_worker_uses_safe_ring_overflow_fallback(monkeypatch):
+    import benchmarks.benchmark_sampling as benchmark_sampling
+
+    direct_mol_to_smiles = benchmark_sampling.Chem.MolToSmiles
+
+    def ring_limited_mol_to_smiles(value, **kwargs):
+        if kwargs.get("canonical", True):
+            raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(benchmark_sampling.Chem, "MolToSmiles", ring_limited_mol_to_smiles)
+
+    record = benchmark_sampling._worker(
+        "small-linear",
+        metadata=True,
+        termination="exact",
+        max_discards=20,
+    )
+
+    assert record["accepted"] is True
+    assert record["canonical_smiles_bytes"] > 0
 
 
 def test_rdkit_mol_to_smiles_falls_back_when_ring_overflow_is_runtime_error(monkeypatch):
@@ -96,7 +124,36 @@ def test_rdkit_mol_to_smiles_falls_back_when_ring_overflow_is_runtime_error(monk
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
     smiles = rdkit_mol_to_smiles(mol)
 
-    assert calls == [{}, {"canonical": False}]
+    assert calls and calls[0] == {}
+    assert calls[1]["canonical"] is False
+    root = calls[1].get("rootedAtAtom")
+    assert root is None or 0 <= root < mol.GetNumAtoms()
+    assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
+
+
+def test_rdkit_mol_to_smiles_handles_benzimidazole_like_cyclic_monomer(monkeypatch):
+    # This is the cyclic benzimidazole core extracted from the reported G2RINS
+    # input string {[] [>]c1nc2ccc([<])cc2[nH]1; ; []}|...|; the exact stochastic
+    # object cannot be sampled directly in isolation, but the monomer core itself
+    # exercises the same ring-heavy serialization path that previously failed.
+    mol = Chem.MolFromSmiles("c1nc2ccccc2[nH]1")
+    direct_mol_to_smiles = Chem.MolToSmiles
+    calls = []
+
+    def ring_limited_mol_to_smiles(value, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("canonical", True):
+            raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
+    smiles = rdkit_mol_to_smiles(mol)
+
+    assert calls and calls[0] == {}
+    assert calls[1]["canonical"] is False
+    root = calls[1].get("rootedAtAtom")
+    assert root is None or 0 <= root < mol.GetNumAtoms()
+    assert "[nH]" in smiles or "nH" in smiles
     assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
 
 
@@ -139,3 +196,85 @@ def test_mol_graph_to_smiles_huge_chain():
     n_atoms = 5000
     graph = _linear_carbon_graph(n_atoms)
     assert mol_graph_to_smiles(graph) == "C" * n_atoms
+
+
+def test_mol_graph_to_smiles_keeps_tetrahedral_chirality_from_graph_tokens():
+    source = "N[C@H](F)Cl"
+    graph = g2rins.G2rins.make(source).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    smiles = mol_graph_to_smiles(graph)
+
+    assert "@" in smiles
+    expected = Chem.MolToSmiles(Chem.MolFromSmiles(source))
+    actual = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
+    assert actual == expected
+
+
+def test_mol_graph_to_smiles_keeps_double_bond_geometry_from_direction_tokens():
+    source = "F/C=C/F"
+    graph = g2rins.G2rins.make(source).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    smiles = mol_graph_to_smiles(graph)
+
+    assert "/" in smiles or "\\" in smiles
+    expected = Chem.MolToSmiles(Chem.MolFromSmiles(source))
+    actual = Chem.MolToSmiles(Chem.MolFromSmiles(smiles))
+    assert actual == expected
+
+
+def test_mol_graph_to_rdkit_mol_warns_on_incomplete_double_bond_directional_markers():
+    graph = nx.MultiDiGraph()
+    graph.add_node(0, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(1, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(2, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(3, atomic_num=9, aromatic=False, charge=0)
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="/")
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False)
+
+    with pytest.warns(RuntimeWarning, match="Incomplete double-bond directional markers"):
+        mol = mol_graph_to_rdkit_mol(graph)
+    assert mol.GetNumBonds() == 3
+
+
+def test_mol_graph_to_rdkit_mol_warns_on_ambiguous_double_bond_directional_markers():
+    graph = nx.MultiDiGraph()
+    graph.add_node(0, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(1, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(2, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(3, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(4, atomic_num=17, aromatic=False, charge=0)
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="/")
+    graph.add_edge(4, 1, bond_type=1, aromatic=False, bond_symbol_raw="\\")
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False, bond_symbol_raw="/")
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="Ambiguous double-bond directional markers.*stereoinformation was discarded",
+    ):
+        mol = mol_graph_to_rdkit_mol(graph)
+    assert mol.GetNumBonds() == 4
+    double_bonds = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE]
+    assert len(double_bonds) == 1
+    assert double_bonds[0].GetStereo() == Chem.BondStereo.STEREONONE
+
+
+def test_mol_graph_to_rdkit_mol_warns_on_conflicting_double_bond_directional_markers():
+    graph = nx.MultiDiGraph()
+    graph.add_node(0, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(1, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(2, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(3, atomic_num=9, aromatic=False, charge=0)
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="/")
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="\\")
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False, bond_symbol_raw="/")
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="Conflicting double-bond directional markers.*stereoinformation was discarded",
+    ):
+        mol = mol_graph_to_rdkit_mol(graph)
+    assert mol.GetNumBonds() == 3
+    double_bonds = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE]
+    assert len(double_bonds) == 1
+    assert double_bonds[0].GetStereo() == Chem.BondStereo.STEREONONE

@@ -14,6 +14,186 @@ _BIG_STACK_SIZE = 0x0FFFF000  # just under CPython's 256 MiB Windows cap
 _STACK_SIZE_LOCK = threading.Lock()
 
 
+def _apply_atom_chirality_tokens(mol, mol_graph, graph_idx_to_mol_idx, chem):
+    """Apply parsed bracket-atom chirality markers to RDKit atom tags.
+
+    Only tetrahedral forms are mapped here. More exotic symbols stay unset
+    until explicitly implemented.
+    """
+    chiral_tag_by_token = {
+        "@": chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW,
+        "@@": chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
+        "@TH1": chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW,
+        "@TH2": chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
+    }
+    unsupported_tokens = set()
+
+    for graph_idx, data in mol_graph.nodes(data=True):
+        token = data.get("atom_chiral_token")
+        if token is None:
+            continue
+        if data.get("atomic_num", 0) <= 0:
+            continue
+
+        chiral_tag = chiral_tag_by_token.get(token)
+        if chiral_tag is None:
+            unsupported_tokens.add(token)
+            continue
+
+        atom = mol.GetAtomWithIdx(graph_idx_to_mol_idx[graph_idx])
+        atom.SetChiralTag(chiral_tag)
+
+    if unsupported_tokens:
+        warnings.warn(
+            "Unsupported atom chirality tokens were ignored: "
+            + ", ".join(sorted(unsupported_tokens)),
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def _apply_directional_bond_tokens(
+    mol,
+    mol_graph,
+    graph_idx_to_mol_idx,
+    chem,
+    suppressed_bond_keys=None,
+):
+    """Map slash/backslash bond tokens onto RDKit single-bond directions."""
+    bond_dir_by_token = {
+        "/": chem.rdchem.BondDir.ENDUPRIGHT,
+        "\\": chem.rdchem.BondDir.ENDDOWNRIGHT,
+    }
+    if suppressed_bond_keys is None:
+        suppressed_bond_keys = set()
+
+    for u_idx, v_idx, attr in mol_graph.edges(data=True):
+        if attr.get("bond_type", 1) != 1:
+            continue
+        if frozenset((u_idx, v_idx)) in suppressed_bond_keys:
+            continue
+        bond_symbol_raw = attr.get("bond_symbol_raw")
+        if bond_symbol_raw not in bond_dir_by_token:
+            continue
+
+        bond = mol.GetBondBetweenAtoms(
+            graph_idx_to_mol_idx[u_idx],
+            graph_idx_to_mol_idx[v_idx],
+        )
+        if bond is None:
+            continue
+        bond.SetBondDir(bond_dir_by_token[bond_symbol_raw])
+
+
+def _warn_on_ambiguous_directional_markers(mol_graph):
+    """Warn on unresolved directional markers and return single-bond markers to ignore.
+
+    Ambiguous or conflicting marker patterns are discarded (Option A) so E/Z
+    stereochemistry cannot be inferred from contradictory input.
+    """
+
+    def directional_token_sets(atom_idx, partner_idx):
+        tokens_by_bond = {}
+
+        def add_token(other_idx, edge_data):
+            if other_idx == partner_idx:
+                return
+            if edge_data.get("bond_type", 1) != 1:
+                return
+            token = edge_data.get("bond_symbol_raw")
+            if token not in {"/", "\\"}:
+                return
+            bond_key = frozenset((atom_idx, other_idx))
+            tokens_by_bond.setdefault(bond_key, set()).add(token)
+
+        if hasattr(mol_graph, "out_edges"):
+            for _u_idx, v_idx, _key, edge_data in mol_graph.out_edges(atom_idx, keys=True, data=True):
+                add_token(v_idx, edge_data)
+            for u_idx, _v_idx, _key, edge_data in mol_graph.in_edges(atom_idx, keys=True, data=True):
+                add_token(u_idx, edge_data)
+        else:
+            for neighbor in mol_graph.neighbors(atom_idx):
+                edge_bundle = mol_graph.get_edge_data(atom_idx, neighbor)
+                if edge_bundle is None:
+                    continue
+                if mol_graph.is_multigraph():
+                    for edge_data in edge_bundle.values():
+                        add_token(neighbor, edge_data)
+                else:
+                    add_token(neighbor, edge_bundle)
+
+        return tokens_by_bond
+
+    warned = set()
+    suppressed_bond_keys = set()
+    for u_idx, v_idx, edge_data in mol_graph.edges(data=True):
+        if edge_data.get("bond_type", 1) != 2:
+            continue
+
+        left_tokens_by_bond = directional_token_sets(u_idx, v_idx)
+        right_tokens_by_bond = directional_token_sets(v_idx, u_idx)
+        left_token_sets = list(left_tokens_by_bond.values())
+        right_token_sets = list(right_tokens_by_bond.values())
+
+        if not left_token_sets and not right_token_sets:
+            continue
+
+        bond_key = frozenset((u_idx, v_idx))
+        if bond_key in warned:
+            continue
+
+        if not left_token_sets or not right_token_sets:
+            warnings.warn(
+                (
+                    "Incomplete double-bond directional markers near atoms "
+                    f"{u_idx}-{v_idx}; E/Z stereochemistry is left unspecified."
+                ),
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            warned.add(bond_key)
+            continue
+
+        if len(left_token_sets) > 1 or len(right_token_sets) > 1:
+            suppressed_bond_keys.update(left_tokens_by_bond)
+            suppressed_bond_keys.update(right_tokens_by_bond)
+            warnings.warn(
+                (
+                    "Ambiguous double-bond directional markers near atoms "
+                    f"{u_idx}-{v_idx}; directional stereoinformation was discarded "
+                    "and E/Z stereochemistry is left unspecified."
+                ),
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            warned.add(bond_key)
+            continue
+
+        if any(len(token_set) > 1 for token_set in left_token_sets + right_token_sets):
+            suppressed_bond_keys.update(left_tokens_by_bond)
+            suppressed_bond_keys.update(right_tokens_by_bond)
+            warnings.warn(
+                (
+                    "Conflicting double-bond directional markers near atoms "
+                    f"{u_idx}-{v_idx}; directional stereoinformation was discarded "
+                    "and E/Z stereochemistry is left unspecified."
+                ),
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            warned.add(bond_key)
+
+    return suppressed_bond_keys
+
+
+def _assign_stereochemistry(mol, chem):
+    """Finalize atom and double-bond stereochemistry from current tags/directions."""
+    set_bond_stereo = getattr(chem, "SetBondStereoFromDirections", None)
+    if callable(set_bond_stereo):
+        set_bond_stereo(mol)
+    chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+
+
 def _run_with_big_stack(fn, *args):
     """Run fn(*args) on a daemon thread with a ~256 MiB stack.
 
@@ -119,7 +299,21 @@ def mol_graph_to_rdkit_mol(
         # counterion renders as a separate "." fragment.
         if attr["bond_type"] == 0:
             continue
-        mol.AddBond(graph_idx_to_mol_idx[u], graph_idx_to_mol_idx[v], convert_bond_type(attr))
+        u_mol_idx = graph_idx_to_mol_idx[u]
+        v_mol_idx = graph_idx_to_mol_idx[v]
+        if mol.GetBondBetweenAtoms(u_mol_idx, v_mol_idx) is not None:
+            continue
+        mol.AddBond(u_mol_idx, v_mol_idx, convert_bond_type(attr))
+
+    _apply_atom_chirality_tokens(mol, mol_graph, graph_idx_to_mol_idx, Chem)
+    suppressed_bond_keys = _warn_on_ambiguous_directional_markers(mol_graph)
+    _apply_directional_bond_tokens(
+        mol,
+        mol_graph,
+        graph_idx_to_mol_idx,
+        Chem,
+        suppressed_bond_keys=suppressed_bond_keys,
+    )
     if kekulize:
         if native_stage_callback is not None:
             native_stage_callback("sanitize")
@@ -127,6 +321,7 @@ def mol_graph_to_rdkit_mol(
         if native_stage_callback is not None:
             native_stage_callback("property-cache")
         mol.UpdatePropertyCache()
+        _assign_stereochemistry(mol, Chem)
     else:
         # Fragment mode (per-unit bookkeeping): a unit is a static-connected piece,
         # so an aromatic ring atom that bears an inter-unit (non-static) bond has a
@@ -139,6 +334,7 @@ def mol_graph_to_rdkit_mol(
         if native_stage_callback is not None:
             native_stage_callback("property-cache-fragment")
         mol.UpdatePropertyCache(strict=False)
+        _assign_stereochemistry(mol, Chem)
     return mol
 
 
@@ -168,6 +364,29 @@ def rdkit_mol_to_smiles(mol, native_stage_callback=None):
         except Exception as exc:
             if not _is_ring_label_overflow(exc):
                 raise
+
+            n_atoms = mol.GetNumAtoms()
+            roots = [0, 1, 2, 10]
+            if n_atoms > 1:
+                roots.extend(
+                    [
+                        n_atoms // 8,
+                        n_atoms // 4,
+                        n_atoms // 2,
+                        (3 * n_atoms) // 4,
+                        (7 * n_atoms) // 8,
+                        n_atoms - 1,
+                    ]
+                )
+            roots = [root for root in dict.fromkeys(root for root in roots if 0 <= root < n_atoms)]
+
+            for root in roots:
+                try:
+                    return Chem.MolToSmiles(mol, canonical=False, rootedAtAtom=root)
+                except Exception as root_exc:
+                    if not _is_ring_label_overflow(root_exc):
+                        raise
+
             return Chem.MolToSmiles(mol, canonical=False)
 
     if mol.GetNumAtoms() < _BIG_STACK_ATOM_THRESHOLD:
