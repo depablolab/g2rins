@@ -81,6 +81,11 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Fixed
 
+- Valid initiator-free homopolymers are now accepted when a single repeat unit
+  is genuinely self-initiating through a matching opposite bond-descriptor pair
+  such as `[<]`/`[>]`, `[<1]`/`[>1]`, or `[$]`/`[$]`. Empty or mismatched
+  repeat-unit source sets still raise `NoValidGenerationSource` rather than
+  silently falling back to another source mode.
 - Bond-connector removal no longer enumerates exponentially many impossible
   atom paths and invalid consecutive-transition routes when constructing
   branched, ring-containing initiator-free polymer graphs.

@@ -1400,6 +1400,52 @@ def test_empty_automatic_source_raises_domain_error(
     assert caught.value.use_repeat_units_as_source is use_repeat_units_as_source
 
 
+@pytest.mark.parametrize(
+    ("smi", "should_accept"),
+    (
+        pytest.param(
+            "{[] [<]CC[>]; ; [<][H] []}|uniform(40,40)|",
+            True,
+            id="self-initiating-repeat-unit-with-opposite-bond-connectors",
+        ),
+        pytest.param(
+            "{[] [<]CC[>]; ; []}|uniform(40,40)|",
+            True,
+            id="self-initiating-repeat-unit-without-termination",
+        ),
+        pytest.param(
+            "{[] [<]CC[>]; [>][H]; []}|uniform(40,40)|",
+            False,
+            id="empty-repeat-source-when-actual-initiation-is-missing",
+        ),
+    ),
+)
+def test_self_initiating_repeat_unit_source_requires_opposite_connectors(
+    smi,
+    should_accept,
+):
+    """A single repeat unit may initialize itself only when its bond
+    descriptors are opposite; otherwise there is no valid repeat-unit source."""
+    from g2rins.exception import NoValidGenerationSource
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+
+    if should_accept:
+        molecule = ensemble_creator.sample_mol_graph(
+            use_repeat_units_as_source=True,
+            rng=np.random.default_rng(0),
+        )
+        assert molecule.number_of_nodes() > 0
+    else:
+        with pytest.raises(NoValidGenerationSource):
+            ensemble_creator.sample_mol_graph(
+                use_repeat_units_as_source=True,
+                rng=np.random.default_rng(0),
+            )
+
+
 def test_create_ensemble_propagates_unexpected_value_error(monkeypatch):
     """Programming/input ValueErrors are not retryable sampling outcomes."""
     from g2rins.ensemble_creator import EnsembleCreator
