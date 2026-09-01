@@ -108,13 +108,13 @@ def test_create_ensemble_until_converged_stops_after_stable_window(monkeypatch):
     assert [kwargs["start_index"] for kwargs in calls] == [0, 2, 4]
     assert len(progress) == 3
     assert progress[0] == (
-        "Batch | Samples |             Mn |             Mw | Status\n"
-        "------|---------|----------------|----------------|-------\n"
-        "    1 |       2 |        17446.7 |        17446.7 | "
+        "Batch | Samples |         Mn |         Mw | Status\n"
+        "----- | ------- | ---------- | ---------- | ------\n"
+        "    1 |       2 |    17446.7 |    17446.7 | "
         "warming up window (2 more batch(es) before convergence can be checked)"
     )
     assert progress[-1] == (
-        "    3 |       6 |        17446.7 |        17446.7 | "
+        "    3 |       6 |    17446.7 |    17446.7 | "
         "mass_delta=0.0000/0.0020 contact_delta=0.0000/0.0100"
     )
 
@@ -146,6 +146,29 @@ def test_create_ensemble_until_converged_honors_max_samples(monkeypatch):
     assert len(result.chains) == 5
     assert result.n_batches == 3
     assert requested_sizes == [2, 2, 1]
+
+
+def test_create_ensemble_until_converged_defaults_to_1500_max_samples(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+
+    def iter_chain_records(**kwargs):
+        for index in range(kwargs["n_samples"]):
+            yield {
+                "chain_index": kwargs["start_index"] + index,
+                "record": _deferred(kwargs["start_index"] + index),
+                "discards": 0,
+                "reasons": (),
+                "first_cause": None,
+                "warnings": [],
+            }
+
+    monkeypatch.setattr(creator, "_iter_chain_records", iter_chain_records)
+    result = creator.create_ensemble_until_converged(window=10_000)
+
+    assert not result.converged
+    assert len(result.chains) == 1500
+    assert result.convergence_trace[-1]["n_samples"] == 1500
+    assert result.convergence_settings["max_samples"] == 1500
 
 
 def test_create_ensemble_until_converged_uses_repeat_units_as_sources(

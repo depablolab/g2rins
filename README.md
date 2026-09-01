@@ -54,7 +54,7 @@ Mn, Mw, and bond-contact frequencies stabilize, opt in explicitly:
 ```python
 ensemble = ensemble_creator.create_ensemble_until_converged(
 	batch_size=25,
-	max_samples=5000,
+	max_samples=1500,
 	window=4,
 	mass_tolerance=0.002,
 	contact_tolerance=0.01,
@@ -68,6 +68,8 @@ print(ensemble.converged, len(ensemble.chains), ensemble.convergence_trace)
 Convergence requires every adjacent cumulative snapshot in the trailing
 window to satisfy both tolerances. If the hard sample limit is reached first,
 the result is returned with `converged == False`.
+Both convergence thresholds (`mass_tolerance`, `contact_tolerance`) and the
+maximum number of generated chains (`max_samples`) are user-configurable.
 
 For polymers without an initiator, pass
 `use_repeat_units_as_source=True` to seed each iteratively generated chain

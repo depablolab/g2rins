@@ -155,11 +155,18 @@ def rdkit_mol_to_smiles(mol, native_stage_callback=None):
     if native_stage_callback is not None:
         native_stage_callback("smiles")
 
+    def _is_ring_label_overflow(exc):
+        # RDKit can surface this condition as ValueError or RuntimeError
+        # depending on version/build bindings; only match the known message.
+        if not isinstance(exc, (ValueError, RuntimeError)):
+            return False
+        return "rings open at once" in str(exc).lower()
+
     def serialize():
         try:
             return Chem.MolToSmiles(mol)
-        except ValueError as exc:
-            if "Too many rings open at once" not in str(exc):
+        except Exception as exc:
+            if not _is_ring_label_overflow(exc):
                 raise
             return Chem.MolToSmiles(mol, canonical=False)
 

@@ -5687,7 +5687,7 @@ class EnsembleCreator:
     def create_ensemble_until_converged(
         self,
         batch_size=25,
-        max_samples=5000,
+        max_samples=1500,
         window=4,
         mass_tolerance=0.002,
         contact_tolerance=0.01,
@@ -6057,12 +6057,12 @@ class EnsembleCreator:
             if progress_callback is not None:
                 progress_row = (
                     f"{batch_index:5d} | {accepted_count:7d} | "
-                    f"{mn:14.1f} | {mw:14.1f} | {tracker.progress()}"
+                    f"{mn:10.1f} | {mw:10.1f} | {tracker.progress()}"
                 )
                 if progress_header_pending:
                     progress_row = (
-                        "Batch | Samples |             Mn |             Mw | Status\n"
-                        "------|---------|----------------|----------------|-------\n"
+                        "Batch | Samples |         Mn |         Mw | Status\n"
+                        "----- | ------- | ---------- | ---------- | ------\n"
                         f"{progress_row}"
                     )
                     progress_header_pending = False

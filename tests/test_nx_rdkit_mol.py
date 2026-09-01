@@ -82,6 +82,24 @@ def test_rdkit_mol_to_smiles_does_not_mask_other_value_errors(monkeypatch):
         rdkit_mol_to_smiles(mol)
 
 
+def test_rdkit_mol_to_smiles_falls_back_when_ring_overflow_is_runtime_error(monkeypatch):
+    mol = Chem.MolFromSmiles("c1ccccc1")
+    direct_mol_to_smiles = Chem.MolToSmiles
+    calls = []
+
+    def ring_limited_mol_to_smiles(value, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("canonical", True):
+            raise RuntimeError("Too many rings open at once. SMILES cannot be generated.")
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
+    smiles = rdkit_mol_to_smiles(mol)
+
+    assert calls == [{}, {"canonical": False}]
+    assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
+
+
 def test_mol_graph_to_smiles_small():
     graph = _linear_carbon_graph(3)
     assert mol_graph_to_smiles(graph) == "CCC"
