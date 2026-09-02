@@ -1705,6 +1705,53 @@ def test_multifunctional_ports_compete_with_chain_continuation():
         assert len(tracked[1]) >= 2, f"seed {seed}: chain continuation lost every draw: {tracked[1]}"
 
 
+def test_converted_sites_never_file_under_a_terminated_owner():
+    """The transition sweep's owner resolution must file converted sites
+    under a LIVE instance of the fired level. The root/inter-object
+    continuation path fires transition_graph on a source terminate_graph has
+    already finalized; filing the bucket's remaining converted sites back
+    under that terminated instance strands them — no growth, rescue, or cap
+    pass ever reads a terminated parentless bucket again — silently dropping
+    the arms and end groups they carried."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+    from g2rins.generative_graph import _EDGE_STOCHASTIC_ID_NAME, _PROPAGATION_NAME, _TRANSITION_NAME
+
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    fired_gen = tree[0]
+    entry_ports = [
+        half_bond
+        for half_bond in partial._open_half_bond_map[sto_atom_id]
+        if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
+    ]
+    assert len(entry_ports) >= 2, "the initiator must expose multiple fired-level entry ports"
+
+    # Reproduce the continuation flow's order: the source is finalized first,
+    # then one of its remaining fired-level sites fires from its bucket.
+    tracker.terminate(sto_atom_id)
+    _new_id, success = partial.transition_graph(sto_atom_id, fired_gen, rng)
+    assert success
+
+    converted_homes = {
+        bucket_id
+        for bucket_id, bonds in partial._open_half_bond_map.items()
+        for half_bond in bonds
+        if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_PROPAGATION_NAME, []))
+    }
+    assert converted_homes, "the sweep converted no sibling sites"
+    stranded = sorted(bucket_id for bucket_id in converted_homes if tracker.is_terminated(bucket_id))
+    assert not stranded, f"converted sites filed under terminated instance(s) {stranded}"
+
+
 def test_transition_bond_selection_is_level_aware():
     """The dead-end verdict of transition bond selection must be
     deterministic: _pop_random_bond filters candidates by the requested

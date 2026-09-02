@@ -1662,7 +1662,7 @@ class _PartialAtomGraph:
 
         selected_target_sto_parent_id = self.generative_graph.nodes[selected_target_idx]["stochastic_id_tree"][1:]
 
-        new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
+        new_sto_atom_id, parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
 
         # Transfer the source bucket's remaining same-level transition bonds,
         # converted to propagation, to the instance OF THE FIRED LEVEL. When
@@ -1675,14 +1675,22 @@ class _PartialAtomGraph:
         # initiators, outer-level graft-from), keeping that behavior intact.
         if sto_gen_id < 0 or selected_target_sto_gen_id == sto_gen_id:
             owner_sto_atom_id = new_sto_atom_id
-        elif self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id] == sto_gen_id:
+        elif self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id] == sto_gen_id and not self.stochastic_tracker.is_terminated(sto_atom_id):
             owner_sto_atom_id = sto_atom_id
         else:
-            # Nearest ancestor instance at the fired level; fall back to the
-            # landing instance (pre-fix behavior) if none exists.
+            # Nearest LIVE instance at the fired level; fall back to the
+            # landing instance (pre-fix behavior) if none exists. Liveness is
+            # required: the root/inter-object continuation fires from a source
+            # terminate_graph has already finalized, and a terminated bucket
+            # is never grown, rescued, or capped again — filing the converted
+            # bonds there would strand them, termination modes and all. The
+            # source's ancestry serves the live cases; the landing target's
+            # freshly registered parent chain holds a live fired-level
+            # instance for the terminated-source continuation.
             owner_sto_atom_id = new_sto_atom_id
-            for ancestor in reversed(self.stochastic_tracker.parent_map.get(sto_atom_id, [])):
-                if self.stochastic_tracker._stochastic_atom_id_to_gen_id[ancestor] == sto_gen_id:
+            candidates = list(reversed(self.stochastic_tracker.parent_map.get(sto_atom_id, []))) + list(reversed(parent_list))
+            for ancestor in candidates:
+                if self.stochastic_tracker._stochastic_atom_id_to_gen_id[ancestor] == sto_gen_id and not self.stochastic_tracker.is_terminated(ancestor):
                     owner_sto_atom_id = ancestor
                     break
 
