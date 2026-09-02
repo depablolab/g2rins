@@ -8,6 +8,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
+- Conditional connectivity: bond connector symbols accept a per-symbol group suffix (`[<[<]1]` ladder, `[>,>1[]1]` exclusion, `[>[all]1]` all) that parses, round-trips and is validated; every generative-graph edge now carries `source_group`, `target_group` (-1 = none) and `source_rule`, `target_rule` (0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL), one edge per distinct pair of compatible symbols. Generation of strings that use group rules is not implemented yet and raises `NotImplementedError` from `EnsembleCreator`.
 
 ### Changed
 

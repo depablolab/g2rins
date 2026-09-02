@@ -36,6 +36,13 @@ _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
+_SOURCE_GROUP_NAME = "source_group"
+_SOURCE_RULE_NAME = "source_rule"
+_TARGET_GROUP_NAME = "target_group"
+_TARGET_RULE_NAME = "target_rule"
+# Group-rule attributes carried by EVERY edge (fixed schema); -1 = no group, 0 = GroupRule.NONE.
+_GROUP_EDGE_ATTR = (_SOURCE_GROUP_NAME, _SOURCE_RULE_NAME, _TARGET_GROUP_NAME, _TARGET_RULE_NAME)
+_GROUP_EDGE_SENTINELS = (-1, 0, -1, 0)
 _STOCHASTIC_TREE_DEPTH = 10
 
 
@@ -383,9 +390,6 @@ class GraphCreator:
                 bc_idx_set.add(node_idx)
         return bc_idx_set
 
-    def _has_group_suffixes(self):
-        return any(symbol.group_suffix is not None for node_idx in self._bc_idx_set for symbol in self.g.nodes[node_idx]["obj"].symbol or [])
-
     @staticmethod
     def _create_bracket_atom(string):
         from .atom import BracketAtom
@@ -628,6 +632,10 @@ class GraphCreator:
                             if w > 0:
                                 current_type = attr
                                 weight *= w
+                        # The bond-connector edge is the only one carrying group-rule attributes.
+                        for key in _GROUP_EDGE_ATTR:
+                            if key in d:
+                                data[key] = d[key]
                     else:
                         current_type = _STATIC_NAME
 
@@ -874,6 +882,10 @@ class GraphCreator:
         stochastic_id_name=_EDGE_STOCHASTIC_ID_NAME,
         aromatic_name=_AROMATIC_NAME,
         bond_type_name=_BOND_TYPE_NAME,
+        source_group_name=_SOURCE_GROUP_NAME,
+        source_rule_name=_SOURCE_RULE_NAME,
+        target_group_name=_TARGET_GROUP_NAME,
+        target_rule_name=_TARGET_RULE_NAME,
         smi_bond_mapping=smi_bond_mapping,
     )
     def get_generative_graph(self, include_bond_connectors=False, return_extra_graph_info=False):
@@ -903,6 +915,8 @@ class GraphCreator:
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
+        - **{source_group_name}**, **{target_group_name}**: int Group id declared by the bond connector symbol the bond leaves from, respectively arrives at (conditional connectivity). -1 when that symbol declares no group.
+        - **{source_rule_name}**, **{target_rule_name}**: int Group rule of that symbol: 0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL (the ``GroupRule`` encoding, stable across versions). Bonds not born from a pair of bond connector symbols (static bonds, bonds across nesting levels, and the terminal-descriptor side of a stochastic object's entry or exit) carry the sentinels -1 and 0. One bond per distinct pair of compatible symbols: a bond connector pair whose symbols match in two differently grouped ways yields two parallel bonds sharing that pair's weight.
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
@@ -918,14 +932,11 @@ class GraphCreator:
         **atomic_num**, **{aromatic_name}**, **charge**, **num_explicit_h**,
         **init_weight**, the **{static_name}** edge flag and the three
         non-static weights produces a graph that every consumer, including the
-        label derivation, can handle.
+        label derivation, can handle; consumers read absent group-rule
+        attributes as their sentinels (no group, rule NONE).
         """
 
         from .distribution import StochasticDistribution
-
-        # Temporary gate: this graph variant feeds generation and export, which cannot honor group rules yet.
-        if not include_bond_connectors and self._has_group_suffixes():
-            raise NotImplementedError("This string declares conditional connectivity (group rules); parsing and validation are supported, but generation lands in a later implementation phase.")
 
         extra_graph_info = {0: "None"}
         extra_graph_info_reverse = {"None": 0}
@@ -1064,6 +1075,8 @@ class GraphCreator:
             d.setdefault(_TERMINATION_NAME, 0)
             d.setdefault(_TRANSITION_NAME, 0)
             d.setdefault(_EDGE_STOCHASTIC_ID_NAME, -2)  # -2 = unassigned; real ids start at 0, -1 is the global level
+            for key, sentinel in zip(_GROUP_EDGE_ATTR, _GROUP_EDGE_SENTINELS):
+                d.setdefault(key, sentinel)
 
             if _BOND_TYPE_NAME in d:
                 d[_BOND_TYPE_NAME] = smi_bond_mapping.get(str(d[_BOND_TYPE_NAME]), 1)

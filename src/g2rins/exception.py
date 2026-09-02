@@ -590,3 +590,13 @@ class SingleMemberGroup(ParsingWarning):
 
     def __str__(self):
         return f"Group {self.group_id} ({self.rule_name}) in the unit {str(self.token)} has a single member; a one-member group has no effect."
+
+
+class IndistinguishableSymbolsInSite(ParsingWarning):
+    def __init__(self, symbol, bond_connector, owner):
+        super().__init__(owner)
+        self.symbol = symbol
+        self.bond_connector = bond_connector
+
+    def __str__(self):
+        return f"The bond connector {str(self.bond_connector)} in the unit {str(self.token)} lists the {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} beside a plain symbol with the same outer symbol and index; partners cannot tell the two apart, so bonds are drawn through either with equal odds."

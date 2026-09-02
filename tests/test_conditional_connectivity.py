@@ -1,12 +1,14 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Phase 0 tests for conditional connectivity (group rules).
+"""Tests for conditional connectivity (group rules).
 
-Covers the per-symbol group suffix: parsing and round-tripping of the three
-rules (ladder / exclusion / all), the compatibility matrix (ladder rigidity),
-the stochastic-object validation set, and the temporary generation gate that
-holds until the generation phases land.
+Phase 0 -- the per-symbol group suffix: parsing and round-tripping of the three
+rules (ladder / exclusion / all), the compatibility matrix (ladder rigidity) and
+the stochastic-object validation set. Phase 1 -- the generative-graph encoding:
+every edge carries the four group-rule attributes, one edge per distinct pair of
+compatible symbols, terminal-descriptor edges annotated on the unit side, and
+the temporary generation gate in EnsembleCreator.
 """
 
 import warnings
@@ -19,11 +21,16 @@ from g2rins import GroupRule
 from g2rins.exception import (
     ExclusionPartnerNotPlain,
     IncompatibleGroupPair,
+    IndistinguishableSymbolsInSite,
     MixedOuterSymbolsInGroup,
     MixedRulesInGroup,
     RepeatedGroupInSite,
     SingleMemberGroup,
 )
+
+GROUP_KEYS = ("source_group", "source_rule", "target_group", "target_rule")
+SENTINEL = (-1, 0, -1, 0)
+WEIGHT_KEYS = ("propagation_weight", "termination_weight", "transition_weight")
 
 ROUND_TRIP_CASES = [
     "[$[$1]1]",
@@ -116,6 +123,16 @@ def test_nonladder_rules_pair_with_plain():
     assert _single_symbol("[>[all]1]").is_compatible(_single_symbol("[<]"))
 
 
+def test_group_edge_attrs_one_entry_per_distinct_symbol_pair():
+    dual = g2rins.SimpleBondConnector.make("[<1, <[<]2]")
+    partner = g2rins.SimpleBondConnector.make("[>1, >[>]1]")
+    assert [tuple(entry[key] for key in GROUP_KEYS) for entry in dual.group_edge_attrs(partner)] == [SENTINEL, (2, 1, 1, 1)]
+    assert [tuple(entry[key] for key in GROUP_KEYS) for entry in partner.group_edge_attrs(dual)] == [SENTINEL, (1, 1, 2, 1)]
+    # Same-annotation duplicates collapse; incompatible pairs yield nothing.
+    assert len(g2rins.SimpleBondConnector.make("[>, >]").group_edge_attrs(g2rins.SimpleBondConnector.make("[<]"))) == 1
+    assert dual.group_edge_attrs(g2rins.SimpleBondConnector.make("[>3]")) == []
+
+
 VALIDATION_ERROR_CASES = [
     pytest.param(
         "{[] [<]C([>1[all]1])C([>2[]1])C[>]; ; [H][<] []}",
@@ -186,7 +203,7 @@ def test_single_member_group_warns():
 def test_ladder_only_chain_ends_raise_no_diagnostics():
     # Ladder-only sites may finish unreacted at conversion (implicit valence):
     # entry-side groups are consumed at engagement, initiator groups initiate,
-    # and incomplete chain-end groups are intended behavior — no diagnostics.
+    # and incomplete chain-end groups are intended behavior -- no diagnostics.
     text = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -195,17 +212,231 @@ def test_ladder_only_chain_ends_raise_no_diagnostics():
     assert not caught
 
 
-def test_generation_gate():
-    text = "{[] [<]C([>1[]1])C([>1[]1])C[>]; ; [H][<], [H][<1] []}|poisson(200)|"
+INDISTINGUISHABLE_CASES = [
+    pytest.param("{[<] [<]CC([>,>[all]1])C([>,>[all]1])[>]; ; [H][<] [<]}|poisson(200)|", id="plain-beside-all"),
+    pytest.param("{[] [<]CC([>,>[]1])C([>,>[]1])[>]; C[>]; [H][<] []}|poisson(200)|", id="plain-beside-exclusion"),
+]
+
+
+@pytest.mark.parametrize("text", INDISTINGUISHABLE_CASES)
+def test_indistinguishable_symbols_warn(text):
+    # A plain symbol with the same outer symbol and index as an all- or
+    # exclusion-typed one leaves partners no way to pick the channel.
+    with pytest.warns(IndistinguishableSymbolsInSite):
+        g2rins.StochasticObject.make(text)
+
+
+# --- Phase 1: generative-graph encoding ---------------------------------------
+
+EXCLUSION_TEXT = "{[] [>,>1[]1]N([>,>1[]1])CCN([>,>1[]2])[>,>1[]2], [<1]C(=O)CCCCCO[<1], [<]CCO[>]; O[>1]; [H][<], [H][<1] []}|poisson(500)|"
+LADDER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
+DUAL_CHANNEL_TEXT = "{[] [<1,<[<]2]OC(O[<1,<[<]2])CC(O[>1,>[>]1])O[>1,>[>]1]; C(O[>1,>[>]1])O[>1,>[>]1]; [<1][H] []}|poisson(1000)|"
+DUAL_CHANNEL_SWAPPED_TEXT = "{[] [<[<]2,<1]OC(O[<[<]2,<1])CC(O[>[>]1,>1])O[>[>]1,>1]; C(O[>[>]1,>1])O[>[>]1,>1]; [<1][H] []}|poisson(1000)|"
+ALL_TEXT = "{[] [<]CCO[>]; C(O[>[all]1])(CO[>[all]1])(CO[>[all]1]); [H][<] []}|poisson(300)|"
+
+
+def _graph_creator(text):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        stochastic_object = g2rins.StochasticObject.make(text)
-        graph_creator = stochastic_object.get_graph_creator()
-        with pytest.raises(NotImplementedError):
-            graph_creator.get_ensemble_creator()
-        # The bond-connector-free graph is the generation-bound product; it is
-        # gated too, so the direct EnsembleCreator(graph) path cannot bypass.
-        with pytest.raises(NotImplementedError):
-            graph_creator.get_generative_graph()
-        # The descriptor-level graph stays available (validation inspects it).
-        graph_creator.get_generative_graph(include_bond_connectors=True)
+        return g2rins.G2rins.make(text).get_graph_creator()
+
+
+def _generative_graph(graph_creator, include_bond_connectors=False):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return graph_creator.get_generative_graph(include_bond_connectors=include_bond_connectors)
+
+
+def _group_values(data):
+    return tuple(data[key] for key in GROUP_KEYS)
+
+
+def _mode(data):
+    return next(key for key in WEIGHT_KEYS if data[key] > 0)
+
+
+def _bond_connector_edges(text):
+    """(source text, target text, weight key, group values) of every edge between two bond connector nodes."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph, extra_graph_info = _graph_creator(text).get_generative_graph(include_bond_connectors=True, return_extra_graph_info=True)
+    edges = []
+    for u, v, data in graph.edges(data=True):
+        source, target = graph.nodes[u]["atomic_num"], graph.nodes[v]["atomic_num"]
+        if source < 0 and target < 0:  # bond connectors are the non-atom nodes
+            edges.append((extra_graph_info[source], extra_graph_info[target], _mode(data), _group_values(data)))
+    return edges
+
+
+def _non_static_parallel_pairs(graph):
+    pairs = []
+    for u in graph:
+        for v in graph[u]:
+            edges = [data for data in graph[u][v].values() if not data["static"]]  # key order = insertion order
+            if len(edges) > 1:
+                pairs.append(edges)
+    return pairs
+
+
+def test_every_edge_carries_group_schema(g2rins_list):
+    # The GNN guarantee: the same four int keys on every edge of every graph,
+    # sentinels for strings that declare no group rule.
+    for text in g2rins_list:
+        graph_creator = _graph_creator(text)
+        for include_bond_connectors in (True, False):
+            for _u, _v, data in _generative_graph(graph_creator, include_bond_connectors).edges(data=True):
+                values = _group_values(data)
+                assert all(type(value) is int for value in values)
+                assert values == SENTINEL
+
+
+def test_exclusion_edge_annotations():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make(EXCLUSION_TEXT)
+    assert not caught
+    edges = _bond_connector_edges(EXCLUSION_TEXT)
+    assert len(edges) == 37  # one compatible symbol pair per descriptor pair: no parallel edges
+    site = "[>, >1[]1]"
+    # Leaving through the group channel (growth AND termination) is group-typed on the source side ...
+    assert {(mode, values) for source, target, mode, values in edges if source == site and target == "[<1]"} == {("propagation_weight", (1, 2, -1, 0)), ("termination_weight", (1, 2, -1, 0))}
+    assert {values for source, target, mode, values in edges if source == "[>, >1[]2]" and target == "[<1]"} == {(2, 2, -1, 0)}
+    # ... entering it is group-typed on the target side ...
+    assert {values for source, target, mode, values in edges if source == "[<1]" and target == site} == {(-1, 0, 1, 2)}
+    # ... and the plain channel, the plain cap and the initiator stay plain.
+    assert {values for source, target, mode, values in edges if source == site and target == "[<]"} == {SENTINEL}
+    assert {values for source, target, mode, values in edges if source == "[>1]"} == {SENTINEL}
+
+
+def test_ladder_edge_annotations():
+    edges = _bond_connector_edges(LADDER_TEXT)
+    assert len(edges) == 12
+    # Ladder edges exist only between inner-conjugate groups, never between two
+    # group-1 sites; the plain cap is rigid-incompatible, so no termination edge.
+    assert {values for *_, values in edges} == {(2, 1, 1, 1), (1, 1, 2, 1)}
+    assert all(mode != "termination_weight" for _source, _target, mode, _values in edges)
+
+
+@pytest.mark.parametrize(
+    "text, expected_order",
+    [
+        pytest.param(DUAL_CHANNEL_TEXT, (SENTINEL, "ladder"), id="plain-first"),
+        pytest.param(DUAL_CHANNEL_SWAPPED_TEXT, ("ladder", SENTINEL), id="ladder-first"),
+    ],
+)
+def test_dual_channel_sites_yield_parallel_edges(text, expected_order):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make(text)
+    assert not caught
+    edges = _bond_connector_edges(text)
+    assert len(edges) == 26  # 12 descriptor pairs x (plain + ladder) + 2 plain termination edges
+    generative_graph = _generative_graph(_graph_creator(text))
+    parallel_pairs = _non_static_parallel_pairs(generative_graph)
+    assert len(parallel_pairs) == 12
+    for pair in parallel_pairs:
+        values = [_group_values(data) for data in pair]
+        ladder = (2, 1, 1, 1) if values[0] == (2, 1, 1, 1) or values[-1] == (2, 1, 1, 1) else (1, 1, 2, 1)
+        assert values == [ladder if entry == "ladder" else entry for entry in expected_order]
+        mode = _mode(pair[0])
+        # Parallel edges of one descriptor pair share its weight.
+        assert pair[0][mode] == pair[1][mode] > 0
+
+
+def test_all_edge_annotations():
+    generative_graph = _generative_graph(_graph_creator(ALL_TEXT))
+    annotated = [data for _u, _v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL]
+    assert len(annotated) == 3
+    assert all(_group_values(data) == (1, 3, -1, 0) and _mode(data) == "transition_weight" for data in annotated)
+
+
+def test_ladder_self_pair_beside_plain_channel_yields_parallel_self_loops():
+    text = "{[] [$[$]1, $]CC[$[$]1, $]; C[$]; [H][$] []}|poisson(100)|"
+    assert {values for source, target, _mode, values in _bond_connector_edges(text) if source == target == "[$[$]1, $]"} == {(1, 1, 1, 1), SENTINEL}
+    pairs = [[_group_values(data) for data in pair] for pair in _non_static_parallel_pairs(_generative_graph(_graph_creator(text)))]
+    assert pairs and all(sorted(pair) == sorted([(1, 1, 1, 1), SENTINEL]) for pair in pairs)
+
+
+def test_terminal_descriptor_edges_carry_unit_side_annotation():
+    # A repeat-unit site leaving the stochastic object through a group channel
+    # is a group-typed consumption; the terminal descriptor's own side is plain.
+    exit_edges = _bond_connector_edges("{[<] [<]CC([>,>1[]1])[>]; ; [H][<] [<1]}|poisson(200)|")
+    assert {values for source, target, _mode, values in exit_edges if target == "[<1]"} == {(1, 2, -1, 0)}
+    entry_edges = _bond_connector_edges("{[>1] [<,<1[]1]CC([<,<1[]1])[>]; ; [H][<] [>]}|poisson(200)|")
+    assert {values for source, target, _mode, values in entry_edges if source == "[>1]"} == {(-1, 0, 1, 2)}
+    # Embedded, the exit edge reaches the bond-connector-free graph and gates generation.
+    generative_graph = _generative_graph(_graph_creator("CC{[<] [<]CC([>,>1[]1])[>]; ; [H][<] [<1]}|poisson(200)|CC"))
+    annotated = [data for _u, _v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL]
+    assert [(_group_values(data), _mode(data)) for data in annotated] == [((1, 2, -1, 0), "transition_weight")]
+    with pytest.raises(NotImplementedError, match="EXCLUSION"):
+        g2rins.EnsembleCreator(generative_graph)
+
+
+def test_generation_gate():
+    text = "{[] [<]C([>1[]1])C([>1[]1])C[>]; ; [H][<], [H][<1] []}|poisson(200)|"
+    graph_creator = _graph_creator(text)
+    # The bond-connector-free graph is a complete, exportable product ...
+    generative_graph = _generative_graph(graph_creator)
+    assert (1, 2, -1, 0) in {_group_values(data) for _u, _v, data in generative_graph.edges(data=True)}
+    exported = g2rins.generative_graph_json_data(generative_graph)
+    assert all(set(GROUP_KEYS) <= set(edge) for edge in exported["graph"]["edges"])
+    # ... but sampling cannot honor group rules yet, whichever way the creator is built.
+    with pytest.raises(NotImplementedError, match="EXCLUSION"):
+        g2rins.EnsembleCreator(generative_graph)
+    with pytest.raises(NotImplementedError):
+        graph_creator.get_ensemble_creator()
+
+
+def test_consumers_read_absent_group_keys_as_sentinels():
+    generative_graph = _generative_graph(_graph_creator("{[] [<]CC([>])c1ccccc1; [>][H]; [<][H] []}|gauss(1000, 45)|"))
+    for _u, _v, data in generative_graph.edges(data=True):
+        for key in GROUP_KEYS:
+            data.pop(key)
+    g2rins.EnsembleCreator(generative_graph)
+
+
+# --- Real-life strings: regression fixtures for every phase (phase 1 pins the encoding) ---
+
+# Published ladder synthesis (Polym. Chem. 2026, 17(24), 2539-2547): regiospecific
+# inner classes, ladder-typed initiator and terminator with implicit group 0.
+LADDER_REFERENCE_TEXT = "{[] [>[>1]2]C(C(OC([>[>2]2])=O)=C1)=CC2=C1C([<[<2]1])=C([<[<1]1])C(O2)=O; O=C([>[>2]])OC1=C([>[>1]])C=C2C(CC(O2)=O)=C1; O=C(C([<[<1]])=C1[<[<2]])OC2=C1C=C3C(CC(O3)=O)=C2 []}|gauss(5000,1000)|"
+# Three-site initiator whose sites must all initiate before propagation (implicit group 0).
+ALL_STAR_TEXT = "{[] [<]C(C)C(=O)O[>], [<]CC(=O)O[>]; [>[all]]OCC(O[>[all]])CO[>[all]]; [<][H] []}|schulz_zimm(1800, 1200)|"
+
+
+def _assert_no_diagnostics(text):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make(text)
+    assert not caught
+
+
+def test_ladder_reference_string_encoding():
+    _assert_no_diagnostics(LADDER_REFERENCE_TEXT)
+    edges = _bond_connector_edges(LADDER_REFERENCE_TEXT)
+    # Every site has exactly one partner (inner classes 1 and 2 pair regiospecifically).
+    assert len(edges) == 8
+    assert set(edges) == {
+        ("[<[<1]1]", "[>[>1]2]", "propagation_weight", (1, 1, 2, 1)),
+        ("[<[<2]1]", "[>[>2]2]", "propagation_weight", (1, 1, 2, 1)),
+        ("[>[>1]2]", "[<[<1]1]", "propagation_weight", (2, 1, 1, 1)),
+        ("[>[>2]2]", "[<[<2]1]", "propagation_weight", (2, 1, 1, 1)),
+        ("[>[>1]2]", "[<[<1]]", "termination_weight", (2, 1, 0, 1)),
+        ("[>[>2]2]", "[<[<2]]", "termination_weight", (2, 1, 0, 1)),
+        ("[>[>1]]", "[<[<1]1]", "transition_weight", (0, 1, 1, 1)),
+        ("[>[>2]]", "[<[<2]1]", "transition_weight", (0, 1, 1, 1)),
+    }
+    with pytest.raises(NotImplementedError, match="LADDER"):
+        g2rins.EnsembleCreator(_generative_graph(_graph_creator(LADDER_REFERENCE_TEXT)))
+
+
+def test_all_star_string_encoding():
+    _assert_no_diagnostics(ALL_STAR_TEXT)
+    edges = _bond_connector_edges(ALL_STAR_TEXT)
+    assert len(edges) == 16
+    annotated = [edge for edge in edges if edge[3] != SENTINEL]
+    # Three initiator sites x two repeat units, all transitions through the all-group.
+    assert len(annotated) == 6
+    assert all(edge == ("[>[all]]", "[<]", "transition_weight", (0, 3, -1, 0)) for edge in annotated)
+    with pytest.raises(NotImplementedError, match="ALL"):
+        g2rins.EnsembleCreator(_generative_graph(_graph_creator(ALL_STAR_TEXT)))

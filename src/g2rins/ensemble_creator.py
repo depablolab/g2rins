@@ -21,6 +21,7 @@ import numpy as np
 from rdkit import Chem, rdBase
 
 from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
+from .bond import GroupRule
 from .chem_resource import (
     atom_color_mapping,
     atom_name_mapping,
@@ -49,6 +50,8 @@ from .generative_graph import (
     _EDGE_STOCHASTIC_ID_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
+    _SOURCE_RULE_NAME,
+    _TARGET_RULE_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
     derive_unit_labels,
@@ -1913,9 +1916,16 @@ class EnsembleCreator:
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
         # error but silently generate truncated, end-group-less molecules.
+        group_rules = set()
         for _u, _v, edge_data in self._generative_graph.edges(data=True):
             if _EDGE_STOCHASTIC_ID_NAME not in edge_data:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
+            for key in (_SOURCE_RULE_NAME, _TARGET_RULE_NAME):
+                if edge_data.get(key, 0):
+                    group_rules.add(GroupRule(edge_data[key]).name)
+        if group_rules:
+            # Temporary gate: sampling cannot honor group rules yet.
+            raise NotImplementedError(f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for group rules lands in a later implementation phase.")
 
         self._static_graph = self._create_static_graph(self.generative_graph)
         self._static_proof_supported = all(

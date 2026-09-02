@@ -12,7 +12,7 @@ except ImportError:
     from typing_extensions import Self
 
 from .core import G2rinsBase, GenerationBase
-from .generative_graph import _HalfBond, _PartialGraph
+from .generative_graph import _GROUP_EDGE_ATTR, _HalfBond, _PartialGraph
 
 
 class GroupRule(IntEnum):
@@ -114,6 +114,13 @@ class BondConnectorSymbolIdx(BondConnectorSymbol):
         if self._group_suffix is None:
             return None
         return self._group_suffix.group_id
+
+    @property
+    def group_edge_values(self):
+        """(group id, rule) as stored on generative-graph edges: -1 and 0 for a plain symbol."""
+        if self._group_suffix is None:
+            return (-1, 0)
+        return (self._group_suffix.group_id, int(self._group_suffix.rule))
 
     def attach_group_suffix(self, group_suffix):
         self._group_suffix = group_suffix
@@ -318,6 +325,17 @@ class BondConnector(G2rinsBase, GenerationBase):
         if self.symbol is None or other.symbol is None:
             return False
         return any(symbol.is_compatible(other_symbol) for symbol in self.symbol for other_symbol in other.symbol)
+
+    def group_edge_attrs(self, other):
+        """Group-rule edge attributes of every distinct compatible symbol pair (self = source), in parse order; empty when incompatible."""
+        attrs = []
+        for symbol in self.symbol or []:
+            for other_symbol in other.symbol or []:
+                if symbol.is_compatible(other_symbol):
+                    entry = dict(zip(_GROUP_EDGE_ATTR, symbol.group_edge_values + other_symbol.group_edge_values))
+                    if entry not in attrs:
+                        attrs.append(entry)
+        return attrs
 
     @property
     def bond_connectors(self):

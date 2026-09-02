@@ -22,6 +22,7 @@ from .exception import (
     ExclusionPartnerNotPlain,
     IncompatibleGroupPair,
     IncorrectNumberOfBondProbabilities,
+    IndistinguishableSymbolsInSite,
     MixedOuterSymbolsInGroup,
     MixedRulesInGroup,
     MonomerHasTwoOrMoreBondConnectors,
@@ -34,6 +35,8 @@ from .exception import (
     UndefinedDistribution,
 )
 from .generative_graph import (
+    _GROUP_EDGE_ATTR,
+    _GROUP_EDGE_SENTINELS,
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
@@ -65,6 +68,19 @@ def _inner_classes_conjugate(symbols_a, symbols_b):
         if counts_b.get(partner, 0) != count:
             return False
     return True
+
+
+def _terminal_edge_attrs(terminal_bc, unit_bc, unit_is_source):
+    """Group-rule edge attributes between a terminal descriptor and a unit's bond connector: the unit side comes from its compatible symbols, the terminal side is the sentinel."""
+    unit_values = []
+    for symbol in unit_bc.symbol or []:
+        if any(symbol.is_compatible(terminal_symbol) for terminal_symbol in terminal_bc.symbol or []) and symbol.group_edge_values not in unit_values:
+            unit_values.append(symbol.group_edge_values)
+    attrs = []
+    for values in unit_values:
+        ordered = values + _GROUP_EDGE_SENTINELS[2:] if unit_is_source else _GROUP_EDGE_SENTINELS[:2] + values
+        attrs.append(dict(zip(_GROUP_EDGE_ATTR, ordered)))
+    return attrs
 
 
 class StochasticObject(G2rinsBase, GenerationBase):
@@ -234,6 +250,17 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 if len(members) == 1:
                     warnings.warn(SingleMemberGroup(group_id, rule.name, owner), stacklevel=1)
 
+        # A plain symbol beside an exclusion- or all-typed one with the same outer symbol and index
+        # gives partners no way to pick the channel (ladder symbols are rigid, so never affected).
+        for owner, _table, symbols in scopes:
+            plain_keys = {}
+            for bc, symbol in symbols:
+                if symbol.group_suffix is None:
+                    plain_keys.setdefault(id(bc), set()).add((symbol.symbol_char, symbol.idx))
+            for bc, symbol in symbols:
+                if symbol.group_rule in (GroupRule.EXCLUSION, GroupRule.ALL) and (symbol.symbol_char, symbol.idx) in plain_keys.get(id(bc), ()):
+                    warnings.warn(IndistinguishableSymbolsInSite(symbol, bc, owner), stacklevel=1)
+
         for i, (owner_a, group_a, members_a) in enumerate(ladder_groups):
             for owner_b, group_b, members_b in ladder_groups[i:]:
                 if not members_a[0][1].outer_conjugate(members_b[0][1]):
@@ -368,12 +395,15 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 # Set weights to zero if bond are incompatible, note different lengths from above.
                 if prints:
                     print("before checking compatibility, probabilities are ", probabilities)
+                edge_attrs_per_target = []
                 for i in range(len(probabilities)):
                     bc_idx_b = full_idx[i]
                     obj_b = graph.nodes[bc_idx_b]["obj"]
                     if prints:
                         print("target node is: ", graph.nodes[bc_idx_b])
-                    if not obj_a.is_compatible(obj_b):
+                    # One edge per distinct compatible symbol pair; no pair = incompatible target.
+                    edge_attrs_per_target.append(obj_a.group_edge_attrs(obj_b))
+                    if not edge_attrs_per_target[i]:
                         probabilities[i] = 0
                 if prints:
                     print("after checking compatibility, probabilities are ", probabilities)
@@ -384,7 +414,12 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 for i, prob in enumerate(probabilities):
                     if prob > 0:
                         bc_idx_b = full_idx[i]
-                        graph.add_edge(bc_idx_a, bc_idx_b, **dict([(attr_name, prob)]))
+                        edge_attrs = edge_attrs_per_target[i]
+                        if len(edge_attrs) > 1:
+                            # Parallel edges of one descriptor pair share its probability.
+                            prob = prob / len(edge_attrs)
+                        for group_attrs in edge_attrs:
+                            graph.add_edge(bc_idx_a, bc_idx_b, **{attr_name: prob}, **group_attrs)
                 if prints:
                     print("At the end, probabilities are: ", probabilities)
                 if sum(probabilities) == 0:
@@ -560,7 +595,11 @@ class StochasticObject(G2rinsBase, GenerationBase):
             for i, prob in enumerate(probabilities):
                 if prob > 0:
                     node_idx = mono_idx_pos[i]
-                    graph.add_edge(left_idx, node_idx, **dict([(_TRANSITION_NAME, prob)]))
+                    edge_attrs = _terminal_edge_attrs(left_bc, graph.nodes[node_idx]["obj"], unit_is_source=False)
+                    if len(edge_attrs) > 1:
+                        prob = prob / len(edge_attrs)
+                    for group_attrs in edge_attrs:
+                        graph.add_edge(left_idx, node_idx, **{_TRANSITION_NAME: prob}, **group_attrs)
 
         # Add out-going bonds
 
@@ -609,7 +648,11 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 for i, prob in enumerate(probabilities):
                     if prob > 0:
                         bc_idx = full_bc_idx[i]
-                        graph.add_edge(bc_idx, right_idx, **dict([(_TRANSITION_NAME, prob)]))
+                        edge_attrs = _terminal_edge_attrs(right_terminal_bond_connector, graph.nodes[bc_idx]["obj"], unit_is_source=True)
+                        if len(edge_attrs) > 1:
+                            prob = prob / len(edge_attrs)
+                        for group_attrs in edge_attrs:
+                            graph.add_edge(bc_idx, right_idx, **{_TRANSITION_NAME: prob}, **group_attrs)
 
         # Add mol weight distribution to all nodes
         for node_idx in partial_graph.g:
