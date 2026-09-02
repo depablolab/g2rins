@@ -1718,7 +1718,11 @@ def test_converted_sites_never_file_under_a_terminated_owner():
     pass ever reads a terminated parentless bucket again — silently dropping
     the arms and end groups they carried."""
     from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
-    from g2rins.generative_graph import _EDGE_STOCHASTIC_ID_NAME, _PROPAGATION_NAME, _TRANSITION_NAME
+    from g2rins.generative_graph import (
+        _EDGE_STOCHASTIC_ID_NAME,
+        _PROPAGATION_NAME,
+        _TRANSITION_NAME,
+    )
 
     smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
     with warnings.catch_warnings():
@@ -1733,9 +1737,7 @@ def test_converted_sites_never_file_under_a_terminated_owner():
     partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
     fired_gen = tree[0]
     entry_ports = [
-        half_bond
-        for half_bond in partial._open_half_bond_map[sto_atom_id]
-        if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
+        half_bond for half_bond in partial._open_half_bond_map[sto_atom_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
     ]
     assert len(entry_ports) >= 2, "the initiator must expose multiple fired-level entry ports"
 

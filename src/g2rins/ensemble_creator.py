@@ -1066,9 +1066,7 @@ class _PartialAtomGraph:
         realized mass past the target by its weight."""
         tracker = self.stochastic_tracker
         return [sto_atom_id] + [
-            bucket_id
-            for bucket_id in self._open_half_bond_map
-            if bucket_id != sto_atom_id and tracker.is_terminated(bucket_id) and sto_atom_id in tracker.parent_map.get(bucket_id, [])
+            bucket_id for bucket_id in self._open_half_bond_map if bucket_id != sto_atom_id and tracker.is_terminated(bucket_id) and sto_atom_id in tracker.parent_map.get(bucket_id, [])
         ]
 
     def _get_level_termination_bonds(
