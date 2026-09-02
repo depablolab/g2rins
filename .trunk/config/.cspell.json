@@ -183,6 +183,7 @@
     "pyproject",
     "svg",
     "RINS",
-    "docstrings"
+    "docstrings",
+    "parentless"
   ]
 }
