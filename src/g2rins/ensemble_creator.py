@@ -210,6 +210,7 @@ def _sample_chain_job(
     native_diagnostics_path=None,
     defer_conversion=False,
     use_repeat_units_as_source=False,
+    strip_unresolved_directional_markers=False,
 ):
     """Execute one compact chain job using the creator initialized in-worker."""
     if _WORKER_ENSEMBLE_CREATOR is None:
@@ -225,6 +226,7 @@ def _sample_chain_job(
         native_diagnostics_path,
         defer_conversion,
         use_repeat_units_as_source,
+        strip_unresolved_directional_markers,
     )[0]
 
 
@@ -340,6 +342,8 @@ class _ParallelChainScheduler:
         native_diagnostics_path,
         defer_conversion,
         use_repeat_units_as_source=False,
+        strip_unresolved_directional_markers=False,
+        fallback_on_worker_crash=False,
     ):
         if self.executor is None:
             self._create_executor()
@@ -368,6 +372,7 @@ class _ParallelChainScheduler:
                             native_diagnostics_path,
                             defer_conversion,
                             use_repeat_units_as_source,
+                            strip_unresolved_directional_markers,
                         )
                         inflight[future] = chain_job
 
@@ -403,7 +408,54 @@ class _ParallelChainScheduler:
 
             if pool_broken is None:
                 return
-            self._restart(pool_broken)
+            try:
+                self._restart(pool_broken)
+            except WorkerProcessFailure as error:
+                if not fallback_on_worker_crash:
+                    raise
+
+                native_detail = ""
+                if error.native_state:
+                    native_detail = (
+                        " Last native state was chain="
+                        f"{error.native_state.get('chain_index')},"
+                        " stage="
+                        f"{error.native_state.get('native_stage')},"
+                        " atoms="
+                        f"{error.native_state.get('atom_count')},"
+                        " bonds="
+                        f"{error.native_state.get('bond_count')}."
+                    )
+                warnings.warn(
+                    (
+                        "Parallel sampling worker crash recovery was exhausted; "
+                        "continuing remaining chain jobs in serial mode."
+                        f"{native_detail}"
+                    ),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+                self.close(pool_broken=True)
+                for chain_index in ordered_indices[next_position:]:
+                    if chain_index in completed:
+                        yield completed.pop(chain_index)
+                        continue
+                    chain_job = (chain_index, jobs_by_index[chain_index])
+                    yield _sample_chain_batch(
+                        self.ensemble_creator,
+                        [chain_job],
+                        molecule_format,
+                        collect_info,
+                        max_discards,
+                        termination_flag,
+                        include_sequences,
+                        native_diagnostics_path,
+                        defer_conversion,
+                        use_repeat_units_as_source,
+                        strip_unresolved_directional_markers,
+                    )[0]
+                return
             pending = deque(
                 (chain_index, jobs_by_index[chain_index])
                 for chain_index in ordered_indices[next_position:]
@@ -425,6 +477,8 @@ def _parallel_chain_records(
     defer_conversion=False,
     scheduler=None,
     use_repeat_units_as_source=False,
+    strip_unresolved_directional_markers=False,
+    fallback_on_worker_crash=False,
 ):
     """Yield ordered records from bounded, restartable compact worker jobs."""
     if scheduler is not None:
@@ -438,6 +492,8 @@ def _parallel_chain_records(
             native_diagnostics_path,
             defer_conversion,
             use_repeat_units_as_source,
+            strip_unresolved_directional_markers,
+            fallback_on_worker_crash,
         )
         return
     with _ParallelChainScheduler(
@@ -456,6 +512,8 @@ def _parallel_chain_records(
             native_diagnostics_path,
             defer_conversion,
             use_repeat_units_as_source,
+            strip_unresolved_directional_markers,
+            fallback_on_worker_crash,
         )
 
 
@@ -1557,6 +1615,7 @@ def _convert_chain(
     seed_sequence=None,
     native_diagnostics_path=None,
     molecular_weight=None,
+    strip_unresolved_directional_markers=False,
 ):
     """Convert one accepted sample_mol_graph result into a chain record in the
     requested output format."""
@@ -1592,6 +1651,7 @@ def _convert_chain(
             native_stage_callback=lambda stage: publish_native_stage(
                 f"molecule-{stage}"
             ),
+            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
         )
     if needs_weight:
         molecular_weight = rdkit_mol_weight(
@@ -1630,6 +1690,7 @@ def _convert_chain(
                         native_stage_callback=lambda stage: publish_native_stage(
                             f"sequence-{stage}"
                         ),
+                        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
                     )
                     for unit in sequence
                 ]
@@ -1657,6 +1718,7 @@ def _defer_chain_conversion(
     chain_index=None,
     seed_sequence=None,
     native_diagnostics_path=None,
+    strip_unresolved_directional_markers=False,
 ):
     """Compute mandatory convergence statistics but defer output conversion."""
     metadata_mode = _metadata_level(collect_info)
@@ -1674,6 +1736,7 @@ def _defer_chain_conversion(
         native_stage_callback=lambda stage: publish_native_stage(
             f"molecule-{stage}"
         ),
+        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
     )
     molecular_weight = rdkit_mol_weight(
         rdkit_mol,
@@ -1695,6 +1758,7 @@ def _materialize_deferred_chain(
     molecule_format,
     collect_info,
     include_sequences,
+    strip_unresolved_directional_markers=False,
 ):
     return _convert_chain(
         deferred.sample,
@@ -1705,6 +1769,7 @@ def _materialize_deferred_chain(
         deferred.seed_sequence,
         deferred.native_diagnostics_path,
         molecular_weight=deferred.molecular_weight,
+        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
     )
 
 
@@ -1718,6 +1783,62 @@ def _portable_warning(caught):
     return (message, caught.category, caught.filename, caught.lineno)
 
 
+_DIRECTIONAL_STEREO_WARNING_PREFIXES = {
+    "incomplete": "Incomplete double-bond directional markers near atoms ",
+    "ambiguous": "Ambiguous double-bond directional markers near atoms ",
+    "conflicting": "Conflicting double-bond directional markers near atoms ",
+}
+
+
+def _classify_directional_stereo_warning(message, category):
+    if not issubclass(category, RuntimeWarning):
+        return None
+    text = str(message)
+    for kind, prefix in _DIRECTIONAL_STEREO_WARNING_PREFIXES.items():
+        if text.startswith(prefix):
+            return kind
+    return None
+
+
+def _emit_directional_stereo_warning_summary(
+    directional_warning_counts,
+    directional_warning_examples,
+    strip_unresolved_directional_markers,
+):
+    if not directional_warning_counts:
+        return
+
+    total = sum(directional_warning_counts.values())
+    summary = ", ".join(
+        f"{kind}={directional_warning_counts[kind]}"
+        for kind in ("incomplete", "ambiguous", "conflicting")
+        if directional_warning_counts.get(kind)
+    )
+    examples = "; ".join(
+        directional_warning_examples[kind]
+        for kind in ("incomplete", "ambiguous", "conflicting")
+        if kind in directional_warning_examples
+    )
+    strip_note = ""
+    if strip_unresolved_directional_markers:
+        strip_note = (
+            " Directional markers on unresolved bonds were stripped before "
+            "SMILES export."
+        )
+
+    warnings.warn(
+        (
+            "Encountered unresolved double-bond directional markers during "
+            f"ensemble conversion ({total} warning event(s): {summary})."
+            f"{strip_note}"
+            " Representative warning(s): "
+            f"{examples}"
+        ),
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
 def _sample_chain_batch(
     atom_graph,
     chain_jobs,
@@ -1729,6 +1850,7 @@ def _sample_chain_batch(
     native_diagnostics_path=None,
     defer_conversion=False,
     use_repeat_units_as_source=False,
+    strip_unresolved_directional_markers=False,
 ):
     """Sample a batch of chains in one worker process (module level so
     ProcessPoolExecutor can pickle it).
@@ -1761,24 +1883,29 @@ def _sample_chain_batch(
             )
             deferred_warnings.extend(attempt_warnings)
             if sample is not None:
-                if defer_conversion:
-                    record = _defer_chain_conversion(
-                        sample,
-                        collect_info,
-                        chain_index,
-                        seed_sequence,
-                        native_diagnostics_path,
-                    )
-                else:
-                    record = _convert_chain(
-                        sample,
-                        molecule_format,
-                        collect_info,
-                        include_sequences,
-                        chain_index,
-                        seed_sequence,
-                        native_diagnostics_path,
-                    )
+                with warnings.catch_warnings(record=True) as conversion_warnings:
+                    warnings.simplefilter("always")
+                    if defer_conversion:
+                        record = _defer_chain_conversion(
+                            sample,
+                            collect_info,
+                            chain_index,
+                            seed_sequence,
+                            native_diagnostics_path,
+                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                        )
+                    else:
+                        record = _convert_chain(
+                            sample,
+                            molecule_format,
+                            collect_info,
+                            include_sequences,
+                            chain_index,
+                            seed_sequence,
+                            native_diagnostics_path,
+                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                        )
+                deferred_warnings.extend(conversion_warnings)
                 break
             discards += 1
             reasons.update(attempt_reasons)
@@ -1812,7 +1939,12 @@ class _UnitOccurrence:
 
 class _PartialAtomGraph:
     _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", "atom_chiral_token"}
-    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME, "bond_symbol_raw"}
+    _BOND_ATTRS = {
+        _BOND_TYPE_NAME,
+        _AROMATIC_NAME,
+        "bond_symbol_raw",
+        "double_bond_stereo_defined",
+    }
     _MISSING_REQUIRED = object()
     _SKIP_OPTIONAL = object()
     # Defaults for optional node attributes so a generative_graph built before an attribute
@@ -1821,6 +1953,7 @@ class _PartialAtomGraph:
         "num_explicit_h": -1,
         "atom_chiral_token": _SKIP_OPTIONAL,
         "bond_symbol_raw": _SKIP_OPTIONAL,
+        "double_bond_stereo_defined": _SKIP_OPTIONAL,
     }
 
     def __init__(
@@ -5340,6 +5473,8 @@ class EnsembleCreator:
         defer_conversion=False,
         parallel_scheduler=None,
         use_repeat_units_as_source=False,
+        strip_unresolved_directional_markers=False,
+        fallback_on_worker_crash=False,
     ):
         """Yield ordered per-chain success/failure records.
 
@@ -5369,6 +5504,8 @@ class EnsembleCreator:
                 defer_conversion,
                 parallel_scheduler,
                 use_repeat_units_as_source,
+                strip_unresolved_directional_markers,
+                fallback_on_worker_crash,
             )
             return
 
@@ -5399,24 +5536,29 @@ class EnsembleCreator:
                         if seed_sequences is not None
                         else None
                     )
-                    if defer_conversion:
-                        record = _defer_chain_conversion(
-                            sample,
-                            collect_info,
-                            chain_index,
-                            seed_sequence,
-                            native_diagnostics_path,
-                        )
-                    else:
-                        record = _convert_chain(
-                            sample,
-                            molecule_format,
-                            collect_info,
-                            include_sequences,
-                            chain_index,
-                            seed_sequence,
-                            native_diagnostics_path,
-                        )
+                    with warnings.catch_warnings(record=True) as conversion_warnings:
+                        warnings.simplefilter("always")
+                        if defer_conversion:
+                            record = _defer_chain_conversion(
+                                sample,
+                                collect_info,
+                                chain_index,
+                                seed_sequence,
+                                native_diagnostics_path,
+                                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            )
+                        else:
+                            record = _convert_chain(
+                                sample,
+                                molecule_format,
+                                collect_info,
+                                include_sequences,
+                                chain_index,
+                                seed_sequence,
+                                native_diagnostics_path,
+                                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            )
+                    deferred_warnings.extend(conversion_warnings)
                     break
                 discards += 1
                 reasons.update(attempt_reasons)
@@ -5522,7 +5664,7 @@ class EnsembleCreator:
             molecular_weights=molecular_weights,
         )
 
-    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2):
+    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2, strip_unresolved_directional_markers=True, fallback_on_worker_crash=True):
         """Sample an ensemble while rejecting explicitly chain-local failures.
 
         ``max_number_of_discarded_chains`` limits consecutive rejected paths
@@ -5573,6 +5715,9 @@ class EnsembleCreator:
         updated immediately before each accepted-chain RDKit native stage.
         ``max_worker_restarts`` limits transparent process-pool rebuilds after
         worker death; completed ordered chain results are preserved.
+        ``fallback_on_worker_crash=True`` keeps completed parallel results and
+        rescues only unfinished chain jobs in serial mode when worker restart
+        recovery is exhausted.
         """
 
         supported_formats = {"smiles", "mol_graph"}
@@ -5602,6 +5747,8 @@ class EnsembleCreator:
         total_discards = 0
         discard_reasons = Counter()
         first_discard_cause = None
+        directional_warning_counts = Counter()
+        directional_warning_examples = {}
 
         records = []
         failed = False
@@ -5616,8 +5763,21 @@ class EnsembleCreator:
             seed=seed,
             native_diagnostics_path=native_diagnostics_path,
             max_worker_restarts=max_worker_restarts,
+            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+            fallback_on_worker_crash=fallback_on_worker_crash,
         ):
             for message, category, filename, lineno in chain_result["warnings"]:
+                warning_kind = _classify_directional_stereo_warning(
+                    message,
+                    category,
+                )
+                if warning_kind is not None:
+                    directional_warning_counts[warning_kind] += 1
+                    directional_warning_examples.setdefault(
+                        warning_kind,
+                        str(message),
+                    )
+                    continue
                 warnings.warn_explicit(message, category, filename, lineno)
             total_discards += chain_result["discards"]
             discard_reasons.update(dict(chain_result["reasons"]))
@@ -5644,6 +5804,12 @@ class EnsembleCreator:
                 DiscardedSamplingPaths(total_discards, tuple(discard_reasons.items())),
                 stacklevel=2,
             )
+
+        _emit_directional_stereo_warning_summary(
+            directional_warning_counts,
+            directional_warning_examples,
+            strip_unresolved_directional_markers,
+        )
 
         list_of_molecules = [record["molecule"] for record in records]
         if not collect_info:
@@ -5672,7 +5838,11 @@ class EnsembleCreator:
                     return nx.node_link_data(molecule, edges="edges")
 
                 def _sequence_unit_smiles(unit):
-                    return mol_graph_to_smiles(unit, kekulize=False)
+                    return mol_graph_to_smiles(
+                        unit,
+                        kekulize=False,
+                        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                    )
 
             saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
             json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
@@ -5719,6 +5889,8 @@ class EnsembleCreator:
         max_worker_restarts=2,
         checkpoint_policy="full",
         use_repeat_units_as_source=False,
+        strip_unresolved_directional_markers=True,
+        fallback_on_worker_crash=True,
     ):
         """Sample batches until cumulative mass and contact statistics stabilize.
 
@@ -5744,7 +5916,9 @@ class EnsembleCreator:
         payloads; ``'statistics'`` omits them from checkpoints and therefore
         returns no retained sample payload after resume. ``native_diagnostics_path`` has the same durable
         native-stage logging semantics as :meth:`create_ensemble`, as does the
-        ``max_worker_restarts`` recovery policy.
+        ``max_worker_restarts`` recovery policy. ``fallback_on_worker_crash``
+        keeps completed parallel results and rescues only unfinished jobs in
+        serial mode when restart recovery is exhausted.
         Set ``use_repeat_units_as_source=True`` to seed each chain from a
         repeat unit when the polymer has no initiator.
         """
@@ -5812,12 +5986,16 @@ class EnsembleCreator:
             "parallel": parallel,
             "n_workers": n_workers,
             "max_worker_restarts": max_worker_restarts,
+            "fallback_on_worker_crash": bool(fallback_on_worker_crash),
             "retain_chains": retain_chains,
             "retain_sequences": retain_sequences,
             "metadata": metadata,
             "reservoir_size": reservoir_size,
             "checkpoint_policy": checkpoint_policy,
             "use_repeat_units_as_source": bool(use_repeat_units_as_source),
+            "strip_unresolved_directional_markers": bool(
+                strip_unresolved_directional_markers
+            ),
         }
         reservoir_rng = None
         if retain_samples and reservoir_size is not None:
@@ -5846,6 +6024,7 @@ class EnsembleCreator:
                 getattr(checkpoint, "policy", "full"),
             )
             saved_settings.setdefault("use_repeat_units_as_source", False)
+            saved_settings.setdefault("fallback_on_worker_crash", True)
             if saved_settings != checkpoint_settings:
                 raise ValueError("checkpoint settings do not match this convergence run.")
             aggregate_unit_counts = Counter(
@@ -5882,6 +6061,8 @@ class EnsembleCreator:
 
         converged = tracker.converged()
         progress_header_pending = True
+        directional_warning_counts = Counter()
+        directional_warning_examples = {}
 
         while accepted_count < max_samples and not converged:
             current_batch_size = min(batch_size, max_samples - accepted_count)
@@ -5913,12 +6094,25 @@ class EnsembleCreator:
                 defer_conversion=True,
                 parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
                 use_repeat_units_as_source=use_repeat_units_as_source,
+                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                fallback_on_worker_crash=fallback_on_worker_crash,
             ):
                 next_chain_index = max(
                     next_chain_index,
                     chain_result["chain_index"] + 1,
                 )
                 for message, category, filename, lineno in chain_result["warnings"]:
+                    warning_kind = _classify_directional_stereo_warning(
+                        message,
+                        category,
+                    )
+                    if warning_kind is not None:
+                        directional_warning_counts[warning_kind] += 1
+                        directional_warning_examples.setdefault(
+                            warning_kind,
+                            str(message),
+                        )
+                        continue
                     warnings.warn_explicit(message, category, filename, lineno)
                 total_discards += chain_result["discards"]
                 discard_reasons.update(dict(chain_result["reasons"]))
@@ -5953,12 +6147,33 @@ class EnsembleCreator:
 
                     materialized = None
                     if sample_callback is not None:
-                        materialized = _materialize_deferred_chain(
-                            deferred,
-                            molecule_format,
-                            metadata_mode,
-                            True,
-                        )
+                        with warnings.catch_warnings(record=True) as callback_warnings:
+                            warnings.simplefilter("always")
+                            materialized = _materialize_deferred_chain(
+                                deferred,
+                                molecule_format,
+                                metadata_mode,
+                                True,
+                                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            )
+                        for caught in callback_warnings:
+                            warning_kind = _classify_directional_stereo_warning(
+                                caught.message,
+                                caught.category,
+                            )
+                            if warning_kind is not None:
+                                directional_warning_counts[warning_kind] += 1
+                                directional_warning_examples.setdefault(
+                                    warning_kind,
+                                    str(caught.message),
+                                )
+                                continue
+                            warnings.warn_explicit(
+                                caught.message,
+                                caught.category,
+                                caught.filename,
+                                caught.lineno,
+                            )
                         sample_callback(
                             chain_index,
                             materialized.callback_record(),
@@ -5981,12 +6196,33 @@ class EnsembleCreator:
                             and retain_checkpoint_payloads
                         ):
                             if materialized is None:
-                                materialized = _materialize_deferred_chain(
-                                    deferred,
-                                    molecule_format,
-                                    metadata_mode,
-                                    retain_sequences,
-                                )
+                                with warnings.catch_warnings(record=True) as retained_warnings:
+                                    warnings.simplefilter("always")
+                                    materialized = _materialize_deferred_chain(
+                                        deferred,
+                                        molecule_format,
+                                        metadata_mode,
+                                        retain_sequences,
+                                        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                                    )
+                                for caught in retained_warnings:
+                                    warning_kind = _classify_directional_stereo_warning(
+                                        caught.message,
+                                        caught.category,
+                                    )
+                                    if warning_kind is not None:
+                                        directional_warning_counts[warning_kind] += 1
+                                        directional_warning_examples.setdefault(
+                                            warning_kind,
+                                            str(caught.message),
+                                        )
+                                        continue
+                                    warnings.warn_explicit(
+                                        caught.message,
+                                        caught.category,
+                                        caught.filename,
+                                        caught.lineno,
+                                    )
                             retained_entry = (chain_index, materialized)
                             if retained_position == len(retained_records):
                                 retained_records.append(retained_entry)
@@ -6012,6 +6248,11 @@ class EnsembleCreator:
                 )
             if not batch_accepted:
                 if first_discard_cause is not None:
+                    _emit_directional_stereo_warning_summary(
+                        directional_warning_counts,
+                        directional_warning_examples,
+                        strip_unresolved_directional_markers,
+                    )
                     raise first_discard_cause
                 break
 
@@ -6084,6 +6325,11 @@ class EnsembleCreator:
                 break
 
         if not accepted_count:
+            _emit_directional_stereo_warning_summary(
+                directional_warning_counts,
+                directional_warning_examples,
+                strip_unresolved_directional_markers,
+            )
             return None
         retained_records.sort(key=lambda item: item[0])
         retained = [record for _index, record in retained_records]
@@ -6105,6 +6351,11 @@ class EnsembleCreator:
                     retained_mol_weights.setdefault(stochastic_id, []).extend(weights)
         mn = mass_sum / accepted_count
         mw = mass_square_sum / mass_sum
+        _emit_directional_stereo_warning_summary(
+            directional_warning_counts,
+            directional_warning_examples,
+            strip_unresolved_directional_markers,
+        )
         return ConvergedEnsembleData(
             chains=chains,
             units=(

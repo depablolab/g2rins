@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import threading
+import warnings
 
 import networkx as nx
 import pytest
@@ -233,6 +234,48 @@ def test_mol_graph_to_rdkit_mol_warns_on_incomplete_double_bond_directional_mark
     with pytest.warns(RuntimeWarning, match="Incomplete double-bond directional markers"):
         mol = mol_graph_to_rdkit_mol(graph)
     assert mol.GetNumBonds() == 3
+
+
+def test_mol_graph_to_rdkit_mol_can_strip_unresolved_directional_markers_on_incomplete_assignments():
+    graph = nx.MultiDiGraph()
+    graph.add_node(0, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(1, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(2, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(3, atomic_num=9, aromatic=False, charge=0)
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="/")
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False)
+
+    with pytest.warns(RuntimeWarning, match="Incomplete double-bond directional markers"):
+        mol = mol_graph_to_rdkit_mol(
+            graph,
+            strip_unresolved_directional_markers=True,
+        )
+
+    smiles = Chem.MolToSmiles(mol)
+    assert "/" not in smiles
+    assert "\\" not in smiles
+    double_bonds = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE]
+    assert len(double_bonds) == 1
+    assert double_bonds[0].GetStereo() == Chem.BondStereo.STEREONONE
+
+
+def test_mol_graph_to_rdkit_mol_does_not_warn_on_carbonyl_double_bonds_when_only_alkene_is_stereo_defined():
+    graph = g2rins.G2rins.make("O=C(/C=C\\C(=O)O)O").get_graph_creator().get_generative_graph(
+        include_bond_connectors=False
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        mol = mol_graph_to_rdkit_mol(graph)
+
+    directional_warnings = [
+        warning
+        for warning in caught
+        if "double-bond directional markers" in str(warning.message)
+    ]
+    assert not directional_warnings
+    assert "/C=C\\" in Chem.MolToSmiles(mol)
 
 
 def test_mol_graph_to_rdkit_mol_warns_on_ambiguous_double_bond_directional_markers():

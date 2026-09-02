@@ -125,9 +125,18 @@ def _warn_on_ambiguous_directional_markers(mol_graph):
         return tokens_by_bond
 
     warned = set()
+    provenance_key = "double_bond_stereo_defined"
+    has_source_stereo_provenance = any(
+        edge_data.get("bond_type", 1) == 2 and provenance_key in edge_data
+        for _u_idx, _v_idx, edge_data in mol_graph.edges(data=True)
+    )
     suppressed_bond_keys = set()
     for u_idx, v_idx, edge_data in mol_graph.edges(data=True):
         if edge_data.get("bond_type", 1) != 2:
+            continue
+        if has_source_stereo_provenance and not edge_data.get(provenance_key, False):
+            # Provenance-aware mode: only source-defined stereogenic double bonds
+            # are eligible for "stereo information lost" warnings.
             continue
 
         left_tokens_by_bond = directional_token_sets(u_idx, v_idx)
@@ -186,6 +195,69 @@ def _warn_on_ambiguous_directional_markers(mol_graph):
     return suppressed_bond_keys
 
 
+def _warn_and_collect_unresolved_directional_markers(
+    mol_graph,
+    strip_unresolved_directional_markers=False,
+):
+    """Warn on unresolved E/Z markers and return single-bond markers to ignore.
+
+    When ``strip_unresolved_directional_markers`` is true, single-bond
+    directional markers that belong to unresolved E/Z assignments are removed
+    from the exported molecule so SMILES output cannot retain dangling ``/`` or
+    ``\\`` tokens around unspecified double bonds.
+    """
+
+    suppressed_bond_keys = _warn_on_ambiguous_directional_markers(mol_graph)
+    if not strip_unresolved_directional_markers:
+        return suppressed_bond_keys
+
+    def neighboring_directional_bond_keys(atom_idx, partner_idx):
+        bond_keys = set()
+
+        def add_key(other_idx, edge_data):
+            if other_idx == partner_idx:
+                return
+            if edge_data.get("bond_type", 1) != 1:
+                return
+            token = edge_data.get("bond_symbol_raw")
+            if token not in {"/", "\\"}:
+                return
+            bond_keys.add(frozenset((atom_idx, other_idx)))
+
+        if hasattr(mol_graph, "out_edges"):
+            for _u_idx, v_idx, _key, edge_data in mol_graph.out_edges(atom_idx, keys=True, data=True):
+                add_key(v_idx, edge_data)
+            for u_idx, _v_idx, _key, edge_data in mol_graph.in_edges(atom_idx, keys=True, data=True):
+                add_key(u_idx, edge_data)
+        else:
+            for neighbor in mol_graph.neighbors(atom_idx):
+                edge_bundle = mol_graph.get_edge_data(atom_idx, neighbor)
+                if edge_bundle is None:
+                    continue
+                if mol_graph.is_multigraph():
+                    for edge_data in edge_bundle.values():
+                        add_key(neighbor, edge_data)
+                else:
+                    add_key(neighbor, edge_bundle)
+
+        return bond_keys
+
+    for u_idx, v_idx, edge_data in mol_graph.edges(data=True):
+        if edge_data.get("bond_type", 1) != 2:
+            continue
+        left_keys = neighboring_directional_bond_keys(u_idx, v_idx)
+        right_keys = neighboring_directional_bond_keys(v_idx, u_idx)
+        if not left_keys and not right_keys:
+            continue
+        if left_keys and right_keys:
+            # Fully directional context exists; keep these markers.
+            continue
+        suppressed_bond_keys.update(left_keys)
+        suppressed_bond_keys.update(right_keys)
+
+    return suppressed_bond_keys
+
+
 def _assign_stereochemistry(mol, chem):
     """Finalize atom and double-bond stereochemistry from current tags/directions."""
     set_bond_stereo = getattr(chem, "SetBondStereoFromDirections", None)
@@ -240,6 +312,7 @@ def mol_graph_to_rdkit_mol(
     kekulize=True,
     native_stage_callback=None,
     _on_big_stack=False,
+    strip_unresolved_directional_markers=False,
 ):
     try:
         from rdkit import Chem
@@ -256,6 +329,7 @@ def mol_graph_to_rdkit_mol(
             kekulize,
             native_stage_callback,
             True,
+            strip_unresolved_directional_markers,
         )
 
     def convert_bond_type(bond_attr):
@@ -306,7 +380,10 @@ def mol_graph_to_rdkit_mol(
         mol.AddBond(u_mol_idx, v_mol_idx, convert_bond_type(attr))
 
     _apply_atom_chirality_tokens(mol, mol_graph, graph_idx_to_mol_idx, Chem)
-    suppressed_bond_keys = _warn_on_ambiguous_directional_markers(mol_graph)
+    suppressed_bond_keys = _warn_and_collect_unresolved_directional_markers(
+        mol_graph,
+        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+    )
     _apply_directional_bond_tokens(
         mol,
         mol_graph,
@@ -405,13 +482,19 @@ def rdkit_mol_weight(mol, native_stage_callback=None):
     return _run_with_big_stack(Descriptors.MolWt, mol)
 
 
-def mol_graph_to_smiles(mol_graph, kekulize=True, native_stage_callback=None):
+def mol_graph_to_smiles(
+    mol_graph,
+    kekulize=True,
+    native_stage_callback=None,
+    strip_unresolved_directional_markers=False,
+):
     """Convert a mol graph to a canonical SMILES string; safe for very large graphs."""
     return rdkit_mol_to_smiles(
         mol_graph_to_rdkit_mol(
             mol_graph,
             kekulize=kekulize,
             native_stage_callback=native_stage_callback,
+            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
         ),
         native_stage_callback=native_stage_callback,
     )

@@ -90,6 +90,214 @@ def test_single_worker_hatch_spawns_no_pool(monkeypatch):
     assert ensemble_creator.create_ensemble(2, parallel=True, n_workers=1) == [molecule, molecule]
 
 
+def test_create_ensemble_rescues_remaining_jobs_after_worker_crash(monkeypatch):
+    submission_count = 0
+
+    class MidStreamBrokenExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            nonlocal submission_count
+            submission_count += 1
+            future = Future()
+            if submission_count == 3:
+                future.set_exception(BrokenProcessPool("simulated worker death"))
+            else:
+                future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        MidStreamBrokenExecutor,
+    )
+    ensemble_creator = EnsembleCreator.__new__(EnsembleCreator)
+    monkeypatch.setattr(ensemble_creator, "sample_mol_graph", lambda **_kwargs: "MOL")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chain_results = list(
+            ensemble_creator._iter_chain_records(
+                n_samples=5,
+                molecule_format="mol_graph",
+                collect_info=False,
+                max_discards=2,
+                termination_flag=None,
+                parallel=True,
+                n_workers=2,
+                seed=6,
+                max_worker_restarts=0,
+                fallback_on_worker_crash=True,
+            )
+        )
+        result = ensemble_creator.create_ensemble(
+            5,
+            output_format="mol_graph",
+            parallel=True,
+            n_workers=2,
+            seed=6,
+            max_worker_restarts=0,
+        )
+
+    assert [entry["chain_index"] for entry in chain_results] == [0, 1, 2, 3, 4]
+    assert len(result) == 5
+    assert result == ["MOL"] * 5
+    assert any(
+        "continuing remaining chain jobs in serial mode" in str(w.message)
+        for w in caught
+    )
+
+
+def test_create_ensemble_can_disable_worker_crash_fallback(monkeypatch):
+    class BrokenExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            initializer(*initargs)
+
+        def submit(self, _function, *_args):
+            future = Future()
+            future.set_exception(BrokenProcessPool("simulated worker death"))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        BrokenExecutor,
+    )
+    ensemble_creator = EnsembleCreator.__new__(EnsembleCreator)
+    monkeypatch.setattr(ensemble_creator, "sample_mol_graph", lambda **_kwargs: "MOL")
+
+    with pytest.raises(WorkerProcessFailure):
+        ensemble_creator.create_ensemble(
+            2,
+            parallel=True,
+            n_workers=2,
+            max_worker_restarts=0,
+            fallback_on_worker_crash=False,
+        )
+
+
+def test_convergence_rescues_remaining_jobs_after_worker_crash(monkeypatch):
+    submission_count = 0
+
+    class MidStreamBrokenExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            initializer(*initargs)
+
+        def submit(self, function, *args):
+            nonlocal submission_count
+            submission_count += 1
+            future = Future()
+            if submission_count == 4:
+                future.set_exception(BrokenProcessPool("simulated worker death"))
+            else:
+                future.set_result(function(*args))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        MidStreamBrokenExecutor,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        creator = (
+            g2rins.G2rins.make(FAST_SMI)
+            .get_graph_creator()
+            .get_ensemble_creator()
+        )
+        result = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=4,
+            window=10,
+            output_format="smiles",
+            seed=57,
+            parallel=True,
+            n_workers=2,
+            max_worker_restarts=0,
+            fallback_on_worker_crash=True,
+        )
+
+    assert len(result.chains) == 4
+    assert any(
+        "continuing remaining chain jobs in serial mode" in str(w.message)
+        for w in caught
+    )
+
+
+def test_create_ensemble_aggregates_directional_stereo_warnings(monkeypatch):
+    ensemble_creator = EnsembleCreator.__new__(EnsembleCreator)
+
+    chain_result = {
+        "chain_index": 0,
+        "record": {"molecule": "MOL"},
+        "discards": 0,
+        "reasons": (),
+        "first_cause": None,
+        "warnings": [
+            (
+                "Incomplete double-bond directional markers near atoms 0-1; E/Z stereochemistry is left unspecified.",
+                RuntimeWarning,
+                __file__,
+                1,
+            ),
+            (
+                "Incomplete double-bond directional markers near atoms 2-3; E/Z stereochemistry is left unspecified.",
+                RuntimeWarning,
+                __file__,
+                1,
+            ),
+            (
+                "Ambiguous double-bond directional markers near atoms 4-5; directional stereoinformation was discarded and E/Z stereochemistry is left unspecified.",
+                RuntimeWarning,
+                __file__,
+                1,
+            ),
+            ("transported non-directional warning", UserWarning, __file__, 1),
+        ],
+    }
+
+    monkeypatch.setattr(
+        ensemble_creator,
+        "_iter_chain_records",
+        lambda **_kwargs: iter([chain_result]),
+    )
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        molecules = ensemble_creator.create_ensemble(1, output_format="smiles")
+
+    assert molecules == ["MOL"]
+
+    runtime_warnings = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, RuntimeWarning)
+    ]
+    assert len(runtime_warnings) == 1
+    summary = str(runtime_warnings[0].message)
+    assert summary.startswith(
+        "Encountered unresolved double-bond directional markers during ensemble conversion"
+    )
+    assert "incomplete=2" in summary
+    assert "ambiguous=1" in summary
+
+    user_warnings = [
+        warning for warning in caught if issubclass(warning.category, UserWarning)
+    ]
+    assert len(user_warnings) == 1
+    assert str(user_warnings[0].message) == "transported non-directional warning"
+
+
 def test_sample_chain_batch_budget_and_failure_records(monkeypatch):
     """The worker function counts a per-chain consecutive-discard budget,
     preserves chain indices and order, returns failure entries (record=None,

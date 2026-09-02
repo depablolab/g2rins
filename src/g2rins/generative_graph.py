@@ -41,6 +41,7 @@ _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
 _ATOM_CHIRAL_TOKEN_NAME = "atom_chiral_token"
 _BOND_SYMBOL_RAW_NAME = "bond_symbol_raw"
+_DOUBLE_BOND_STEREO_DEFINED_NAME = "double_bond_stereo_defined"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 10
 
@@ -53,6 +54,49 @@ def is_static_edge(edge_data):
         if attr in edge_data:
             weight += edge_data[attr]
     return not weight > 0
+
+
+def _mark_defined_double_bond_stereochemistry(generative_graph):
+    """Annotate double bonds that have complete source directional context.
+
+    A bond is marked true only when exactly one slash/backslash-bearing
+    neighboring single bond exists on each side and each of those neighbors has
+    a single unambiguous token. This captures source-defined E/Z intent and
+    lets downstream conversion warn only if that information is later lost.
+    """
+
+    def directional_token_sets(atom_idx, partner_idx):
+        tokens_by_bond = {}
+
+        def add_token(other_idx, edge_data):
+            if other_idx == partner_idx:
+                return
+            if edge_data.get(_BOND_TYPE_NAME, 1) != 1:
+                return
+            token = edge_data.get(_BOND_SYMBOL_RAW_NAME)
+            if token not in {"/", "\\"}:
+                return
+            bond_key = frozenset((atom_idx, other_idx))
+            tokens_by_bond.setdefault(bond_key, set()).add(token)
+
+        for _u_idx, v_idx, _key, edge_data in generative_graph.out_edges(atom_idx, keys=True, data=True):
+            add_token(v_idx, edge_data)
+        for u_idx, _v_idx, _key, edge_data in generative_graph.in_edges(atom_idx, keys=True, data=True):
+            add_token(u_idx, edge_data)
+
+        return tokens_by_bond
+
+    for u_idx, v_idx, edge_data in generative_graph.edges(data=True):
+        if edge_data.get(_BOND_TYPE_NAME, 1) != 2:
+            continue
+
+        left_token_sets = list(directional_token_sets(u_idx, v_idx).values())
+        right_token_sets = list(directional_token_sets(v_idx, u_idx).values())
+        edge_data[_DOUBLE_BOND_STEREO_DEFINED_NAME] = (
+            len(left_token_sets) == 1
+            and len(right_token_sets) == 1
+            and all(len(token_set) == 1 for token_set in left_token_sets + right_token_sets)
+        )
 
 
 _DERIVED_NODE_FIELDS = ("unit_id", "bond_id")
@@ -1269,6 +1313,8 @@ class GraphCreator:
             d.setdefault(_AROMATIC_NAME, False)
 
             generative_graph.add_edge(u, v, **d)
+
+        _mark_defined_double_bond_stereochemistry(generative_graph)
 
         if not include_bond_connectors:
             for node in generative_graph.nodes():

@@ -34,6 +34,10 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
   conflicting now emit explicit runtime warnings. Ambiguous/conflicting
   directional stereoinformation is discarded, leaving E/Z stereochemistry
   unspecified instead of silently forcing an interpretation.
+- Generative graphs now retain `double_bond_stereo_defined` provenance for each
+  double bond and parallel ensemble creation aggregates directional stereochemistry
+  warnings across worker failures and accepted chains without dropping the
+  underlying signal.
 - Native crash-diagnostic recovery scans JSONL logs backward in bounded chunks
   instead of loading the complete file, and accepted private chain records are
   frozen before checkpoint retention.
