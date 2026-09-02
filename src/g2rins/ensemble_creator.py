@@ -1055,6 +1055,22 @@ class _PartialAtomGraph:
 
         return chosen, non_used_half_bonds
 
+    def _custody_bucket_ids(self, sto_atom_id):
+        """The instance's own bucket plus its terminated descendants' buckets:
+        the custody set one level's termination acts on (a frontier can end
+        inside a deeper terminated instance — the rescue flavor).
+        terminate_graph, cap_junction_bonds and promote_level_transitions all
+        compose their scans over this set, and the average-cap estimates must
+        price the same set: a cap fired from a descendant's bucket after the
+        parking decision would otherwise arrive unpriced and bias the
+        realized mass past the target by its weight."""
+        tracker = self.stochastic_tracker
+        return [sto_atom_id] + [
+            bucket_id
+            for bucket_id in self._open_half_bond_map
+            if bucket_id != sto_atom_id and tracker.is_terminated(bucket_id) and sto_atom_id in tracker.parent_map.get(bucket_id, [])
+        ]
+
     def _get_level_termination_bonds(
         self,
         owner_sto_atom_id,
@@ -1145,12 +1161,20 @@ class _PartialAtomGraph:
             del stochastic_object_tracker
             return terminator_atom_graph
 
-        termination_bonds = self._get_level_termination_bonds(
-            owner_sto_atom_id,
-            level_sto_atom_id,
-            include_transition_bonds=include_transition_bonds,
-            require_transition_bonds=require_transition_bonds,
-        )
+        # Price the same custody set the terminate/cap passes fire from: the
+        # owner's bucket plus its terminated descendants'. A cap held in a
+        # descendant's bucket is attached at finalization, so leaving it out
+        # of the margin let heavy end groups overshoot the target mass.
+        termination_bonds = [
+            half_bond
+            for bucket_id in self._custody_bucket_ids(owner_sto_atom_id)
+            for half_bond in self._get_level_termination_bonds(
+                bucket_id,
+                level_sto_atom_id,
+                include_transition_bonds=include_transition_bonds,
+                require_transition_bonds=require_transition_bonds,
+            )
+        ]
         avg_termination_mw = 0
         # The source endpoint's hydrogen loss only depends on the attach order,
         # not on which terminator fires: share it across candidates.
@@ -1257,11 +1281,7 @@ class _PartialAtomGraph:
             # instance). Composing the per-bucket scan over those buckets is
             # safe: a consumed bond is popped from its holding bucket and
             # never re-added, so nothing double-caps.
-            bucket_ids = [sto_atom_id] + [
-                bucket_id
-                for bucket_id in terminated_graph._open_half_bond_map
-                if bucket_id != sto_atom_id and tracker.is_terminated(bucket_id) and sto_atom_id in tracker.parent_map.get(bucket_id, [])
-            ]
+            bucket_ids = terminated_graph._custody_bucket_ids(sto_atom_id)
             pairs = []
             for bucket_id in bucket_ids:
                 for half_bond in terminated_graph._get_level_termination_bonds(bucket_id, sto_atom_id):
@@ -1376,11 +1396,7 @@ class _PartialAtomGraph:
         junction bond (the termination flavor of the transition rescue)."""
         tracker = self.stochastic_tracker
         gen_sto_id = tracker._stochastic_atom_id_to_gen_id[level_sto_atom_id]
-        bucket_ids = [owner_sto_atom_id] + [
-            bucket_id
-            for bucket_id in self._open_half_bond_map
-            if bucket_id != owner_sto_atom_id and tracker.is_terminated(bucket_id) and owner_sto_atom_id in tracker.parent_map.get(bucket_id, [])
-        ]
+        bucket_ids = self._custody_bucket_ids(owner_sto_atom_id)
         for bucket_id in bucket_ids:
             bucket = self._open_half_bond_map.get(bucket_id, [])
             for half_bond in list(bucket):
@@ -1556,18 +1572,20 @@ class _PartialAtomGraph:
         level convert; transition edges of shallower levels ride along
         unchanged and are promoted, in turn, at their own level's hand-off.
         Termination modes ride along too, so a site the owner never draws is
-        capped by the owner's own terminate pass (a parked owner included).
+        capped by the owner's own terminate pass when it carries owner-level
+        terminators (a parked owner included). A promoted bond retaining a -1
+        or live-other-level transition edge is deliberately NOT capped there
+        — that continuation is still owed and the bond travels onward at its
+        own level's turn — and a channel with neither terminators nor
+        retained transitions is retired unfired by the terminate-time wipe,
+        the weighted competition's legal zero-growth outcome.
         The finished level's own propagation modes are dropped: that level is
         decided. Scans the child's bucket plus its terminated descendants'
         buckets (a frontier can end inside a deeper instance), the same
         custody set terminate_graph composes.
         """
         tracker = self.stochastic_tracker
-        bucket_ids = [child_sto_atom_id] + [
-            bucket_id
-            for bucket_id in self._open_half_bond_map
-            if bucket_id != child_sto_atom_id and tracker.is_terminated(bucket_id) and child_sto_atom_id in tracker.parent_map.get(bucket_id, [])
-        ]
+        bucket_ids = self._custody_bucket_ids(child_sto_atom_id)
         owner_parents = tracker.parent_map.get(owner_sto_atom_id, [])
         # Pool-native parent tag: a promoted option must rank exactly like
         # the owner's own bonds under the prefer_parent filter.
@@ -1757,10 +1775,12 @@ class _PartialAtomGraph:
                     new_stochastic_bond._mode_target_molar_amounts_map[_TERMINATION_NAME] = list(half_bond._mode_target_molar_amounts_map[_TERMINATION_NAME])
 
             if not new_stochastic_bond.has_any_bonds():
-                # Hierarchy-filtered or non-used old-SO bonds: their
-                # fired-level edges are deliberately dropped with the source
-                # entry; a mode-less duplicate serves no consumer and pollutes
-                # the owner bucket.
+                # Hierarchy-filtered or non-used old-SO bonds are retired
+                # whole: the fired-level edges are deliberately dropped with
+                # the source entry, and (as on main) any termination modes or
+                # other levels' transition edges they carried die with them —
+                # the mode-less copy serves no consumer and would pollute the
+                # owner bucket.
                 continue
             new_stochastic_bond.parent = owner_native_parent
             list_of_new_bonds.append(new_stochastic_bond)
@@ -3263,9 +3283,12 @@ class EnsembleCreator:
                     checkpoints.pop(crossing_sto_atom_id, None)
                 # Parking changes control state only, not the mass epoch. An
                 # unconsumed promoted continuation site in the parked
-                # instance's pool needs no redirect: it carries its
-                # termination modes and is capped by the instance's own
-                # terminate pass at finalization.
+                # instance's pool needs no redirect: owner-level terminators
+                # riding it fire in the instance's own terminate pass at
+                # finalization, a retained -1 or live-other-level transition
+                # edge keeps the bond alive past that pass for its own
+                # level's turn, and a channel carrying neither is retired
+                # unfired — the weighted competition's zero-growth outcome.
                 pending_termination.add(crossing_sto_atom_id)
 
             else:

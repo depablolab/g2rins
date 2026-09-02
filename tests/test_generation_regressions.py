@@ -1700,7 +1700,11 @@ def test_multifunctional_ports_compete_with_chain_continuation():
         # chain unit, gen 2 the arm SO entered through the [>1] ports.
         assert dist[2] == "|poisson(100.0)|"
         arm_masses = tracked[2]
-        assert len(arm_masses) == 3, f"seed {seed}: expected one arm per initiator port, got {arm_masses}"
+        # Not == 3: a port losing every owner-level draw before the outer
+        # target crosses is a legal outcome of the weighted competition, so
+        # exactly-three pins the RNG stream rather than the fix. The broken
+        # hand-off deterministically grew exactly one arm, so >= 2 trips on it.
+        assert len(arm_masses) >= 2, f"seed {seed}: ports never competed with the continuation, got {arm_masses}"
         assert min(arm_masses) > 40.0, f"seed {seed}: empty arm: {arm_masses}"
         assert len(tracked[1]) >= 2, f"seed {seed}: chain continuation lost every draw: {tracked[1]}"
 
@@ -1750,6 +1754,34 @@ def test_converted_sites_never_file_under_a_terminated_owner():
     assert converted_homes, "the sweep converted no sibling sites"
     stranded = sorted(bucket_id for bucket_id in converted_homes if tracker.is_terminated(bucket_id))
     assert not stranded, f"converted sites filed under terminated instance(s) {stranded}"
+
+
+def test_migrated_heavy_caps_are_priced_into_the_crossing():
+    """Declared end groups whose custody ends in terminated descendants'
+    buckets (side-chain ends of a nested stochastic object used as a repeat
+    unit) must be PRICED by the owner's average-cap estimate as well as
+    delivered by its terminate pass. The estimate used to scan only the
+    owner's own bucket while termination fired the composed custody set, so
+    heavy caps attached after the parking decision arrived unpriced: with Br
+    in place of [H] on this string the realized outer mass overshot its
+    target by ~20% systematically (with ~1 Da hydrogen caps the same bias is
+    invisible)."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; " "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; " "[<2]Br []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    masses = []
+    for seed in range(12):
+        _reset_rngs(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        assert any(data.get("atomic_num") == 35 for _node, data in mol_graph.nodes(data=True)), f"seed {seed}: no Br cap delivered"
+        outer_id = next(i for i, d in dist.items() if d == "|poisson(2000.0)|")
+        masses.append(sum(tracked[outer_id]))
+    mean_mass = sum(masses) / len(masses)
+    assert mean_mass < 2000.0 * 1.12, f"unpriced caps: mean outer mass {mean_mass:.0f} systematically overshoots the 2000 Da target"
+    assert mean_mass > 2000.0 * 0.85, f"mean outer mass {mean_mass:.0f} fell far below target"
 
 
 def test_transition_bond_selection_is_level_aware():

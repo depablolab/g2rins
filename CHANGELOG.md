@@ -15,7 +15,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
-- When a nested stochastic object finishes, its continuation and the level's remaining entry sites compete in one weighted draw at the owning level, instead of the continuation firing unconditionally.
+- When a nested stochastic object finishes, its continuation competes in one weighted draw with all of the owning level's growth options — remaining entry sites and other frontier bonds alike — instead of firing unconditionally. A continuation the owner never draws before reaching its target is capped by the owner's declared end groups, or retired unfired when its channel declares none; architectures whose owning level has several simultaneous growth options therefore sample different (statistically equivalent per-option) sequences than before.
 
 ### Fixed
 
@@ -23,7 +23,9 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 - Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.
 - Open sites handed to another level's custody lost their termination modes, silently dropping declared end groups from finished molecules.
+- The transition sweep no longer transfers mode-less copies of bonds it does not convert; such copies could mask a bucket's real growth bonds and end the chain before its terminators fired.
 - Open sites converted after a root-level continuation could be filed under the already-terminated source instance, silently dropping the arms and end groups they carried.
+- Average termination-mass estimates now price end groups held in terminated descendants' custody, matching what termination actually attaches; heavy declared end groups no longer systematically overshoot the target mass.
 
 ## [1.0.0] - 2026-08-08
 
