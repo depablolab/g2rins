@@ -527,3 +527,66 @@ class IncompleteStochasticGeneration(G2RINSError):
         if num_bonds == 0:
             return f"Incomplete Stochastic Generation: since there are {num_bonds} open bonds this may be intended. You can catch this exception and use the `atom_graph` property as a result."
         return f"Incomplete Stochastic Generation: {num_bonds} are still unaccounted for this is likely an imprecise G2RINS string or a bug."
+
+
+class MixedRulesInGroup(ParsingError):
+    def __init__(self, group_id, owner, stochastic_obj):
+        self.group_id = group_id
+        self.owner = owner
+        self.stochastic_obj = stochastic_obj
+
+    def __str__(self):
+        return f"All members of group {self.group_id} in the unit {str(self.owner)} of the stochastic object {str(self.stochastic_obj)} must declare the same group rule, but the group mixes rules."
+
+
+class MixedOuterSymbolsInGroup(ParsingError):
+    def __init__(self, group_id, owner, stochastic_obj):
+        self.group_id = group_id
+        self.owner = owner
+        self.stochastic_obj = stochastic_obj
+
+    def __str__(self):
+        return f"All members of ladder group {self.group_id} in the unit {str(self.owner)} of the stochastic object {str(self.stochastic_obj)} must carry the same outer bond connector symbol and index. A self-connecting group uses '$'; mixed '<'/'>' outer symbols within one group are not allowed."
+
+
+class RepeatedGroupInSite(ParsingError):
+    def __init__(self, group_id, bond_connector, stochastic_obj):
+        self.group_id = group_id
+        self.bond_connector = bond_connector
+        self.stochastic_obj = stochastic_obj
+
+    def __str__(self):
+        return f"The bond connector {str(self.bond_connector)} in the stochastic object {str(self.stochastic_obj)} lists group {self.group_id} on more than one of its symbols; a site may join a group at most once."
+
+
+class IncompatibleGroupPair(ParsingError):
+    def __init__(self, group_a, owner_a, group_b, owner_b, stochastic_obj, reason):
+        self.group_a = group_a
+        self.owner_a = owner_a
+        self.group_b = group_b
+        self.owner_b = owner_b
+        self.stochastic_obj = stochastic_obj
+        self.reason = reason
+
+    def __str__(self):
+        return f"Ladder group {self.group_a} of unit {str(self.owner_a)} and ladder group {self.group_b} of unit {str(self.owner_b)} in the stochastic object {str(self.stochastic_obj)} have conjugate outer symbols but cannot complete: {self.reason}."
+
+
+class ExclusionPartnerNotPlain(ParsingError):
+    def __init__(self, symbol, partner_symbol, stochastic_obj):
+        self.symbol = symbol
+        self.partner_symbol = partner_symbol
+        self.stochastic_obj = stochastic_obj
+
+    def __str__(self):
+        return f"The exclusion-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {str(self.partner_symbol)}, which also carries a group suffix. Exclusion channels must point at plain bond connector symbols."
+
+
+class SingleMemberGroup(ParsingWarning):
+    def __init__(self, group_id, rule_name, owner):
+        super().__init__(owner)
+        self.group_id = group_id
+        self.rule_name = rule_name
+
+    def __str__(self):
+        return f"Group {self.group_id} ({self.rule_name}) in the unit {str(self.token)} has a single member; a one-member group has no effect."

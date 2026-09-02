@@ -89,8 +89,7 @@
     "{[] [<]CC(C[NH3+])[>].[Cl-]|2.0|; C[>]; [<][H] []}|poisson(500.0)|"
   ],
   "big_smiles_features_unsupported_by_g2rins": [
-    "C([<1[<1]1])F(C[<1[<1]1])(N[>1[>1]2])N[>1[>1]2]",
-    "CC([$1[$1]1])COc1ccccc1(CC(N)[$1[$1]1])(CC[$1[$1]2])CC(N)[$1[$1]2]"
+    "{[] [$]CC[$]; ; [$:][H] []}"
   ],
   "todo_big_smiles_features_to_rewrite": [
     "{[][$]CC(C)([#R])[$][]}.{#R=C(=O)OCC12CC(C3)CC(C1)CC3C2}",

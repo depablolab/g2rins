@@ -10,6 +10,7 @@ import numpy as np
 from .g2rins_molecule import G2rinsMolecule
 from .bond import (
     BondConnector,
+    GroupRule,
     TerminalBondConnectorList,
 )
 from .core import G2rinsBase, GenerationBase
@@ -18,11 +19,17 @@ from .exception import (
     ConcatenatedBondConnectors,
     EmptyBondConnectorInTerminalBondConnectorList,
     EndGroupHasBondConnectors,
+    ExclusionPartnerNotPlain,
+    IncompatibleGroupPair,
     IncorrectNumberOfBondProbabilities,
+    MixedOuterSymbolsInGroup,
+    MixedRulesInGroup,
     MonomerHasTwoOrMoreBondConnectors,
     NoExplicitInitiation,
     NoExplicitTermination,
     NoInitiationForStochasticObject,
+    RepeatedGroupInSite,
+    SingleMemberGroup,
     StochasticMissingPath,
     UndefinedDistribution,
 )
@@ -35,6 +42,29 @@ from .generative_graph import (
     is_static_edge,
 )
 from .smiles import Counterion, Smiles, _attach_counterions_to_partial_graph
+
+
+def _inner_class_counts(symbols):
+    """Count one ladder group's members per inner pairing class (symbol char, idx)."""
+    counts = {}
+    for symbol in symbols:
+        inner = symbol.group_suffix.inner_symbol
+        key = (inner.symbol_char, inner.idx)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _inner_classes_conjugate(symbols_a, symbols_b):
+    """True iff class-wise matching between the two member sets can never strand a member."""
+    counts_a = _inner_class_counts(symbols_a)
+    counts_b = _inner_class_counts(symbols_b)
+    if sum(counts_a.values()) != sum(counts_b.values()):
+        return False
+    for (char, idx), count in counts_a.items():
+        partner = ("$", idx) if char == "$" else ((">", idx) if char == "<" else ("<", idx))
+        if counts_b.get(partner, 0) != count:
+            return False
+    return True
 
 
 class StochasticObject(G2rinsBase, GenerationBase):
@@ -158,6 +188,70 @@ class StochasticObject(G2rinsBase, GenerationBase):
         if len(self._right_terminal_bc_list.terminal_bond_connectors) > 1:
             if None in [bond_connector.symbol for bond_connector in self._right_terminal_bc_list.terminal_bond_connectors]:
                 raise EmptyBondConnectorInTerminalBondConnectorList(self._right_terminal_bc_list, self)
+
+        self._validate_group_rules()
+
+    def _collect_group_symbols(self, bond_connectors):
+        """Group table (group id -> [(bond connector, symbol)]) plus all symbols of one unit text."""
+        table = {}
+        symbols = []
+        for bc in bond_connectors:
+            seen_in_site = set()
+            for symbol in bc.symbol or []:
+                symbols.append((bc, symbol))
+                suffix = symbol.group_suffix
+                if suffix is None:
+                    continue
+                if suffix.group_id in seen_in_site:
+                    raise RepeatedGroupInSite(suffix.group_id, bc, self)
+                seen_in_site.add(suffix.group_id)
+                table.setdefault(suffix.group_id, []).append((bc, symbol))
+        return table, symbols
+
+    def _validate_group_rules(self):
+        scopes = []
+        for residue in self._repeat_residues + self._initiation_residues + self._termination_residues:
+            scopes.append((residue,) + self._collect_group_symbols(residue.bond_connectors))
+        for tbc_list in (self._left_terminal_bc_list, self._right_terminal_bc_list):
+            for bc in tbc_list.terminal_bond_connectors:
+                scopes.append((bc,) + self._collect_group_symbols([bc]))
+
+        if not any(table for _owner, table, _symbols in scopes):
+            return
+
+        ladder_groups = []
+        for owner, table, _symbols in scopes:
+            for group_id, members in table.items():
+                rules = {symbol.group_rule for _bc, symbol in members}
+                if len(rules) > 1:
+                    raise MixedRulesInGroup(group_id, owner, self)
+                rule = next(iter(rules))
+                if rule == GroupRule.LADDER:
+                    outers = {(symbol.symbol_char, symbol.idx) for _bc, symbol in members}
+                    if len(outers) > 1:
+                        raise MixedOuterSymbolsInGroup(group_id, owner, self)
+                    ladder_groups.append((owner, group_id, members))
+                if len(members) == 1:
+                    warnings.warn(SingleMemberGroup(group_id, rule.name, owner), stacklevel=1)
+
+        for i, (owner_a, group_a, members_a) in enumerate(ladder_groups):
+            for owner_b, group_b, members_b in ladder_groups[i:]:
+                if not members_a[0][1].outer_conjugate(members_b[0][1]):
+                    continue
+                if len(members_a) != len(members_b):
+                    raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the member counts differ")
+                if not _inner_classes_conjugate([symbol for _bc, symbol in members_a], [symbol for _bc, symbol in members_b]):
+                    raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the inner class multisets are not conjugate")
+
+        every_symbol = [symbol for _owner, _table, symbols in scopes for _bc, symbol in symbols]
+        for _owner, table, _symbols in scopes:
+            for members in table.values():
+                for _bc, symbol in members:
+                    if symbol.group_rule != GroupRule.EXCLUSION:
+                        continue
+                    for other in every_symbol:
+                        if other.group_suffix is not None and symbol.is_compatible(other):
+                            raise ExclusionPartnerNotPlain(symbol, other, self)
 
     def _residue_string(self, residue, extension: bool) -> str:
         string = residue.generate_string(extension)

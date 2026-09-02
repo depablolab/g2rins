@@ -64,20 +64,22 @@ bond_connector_symbol: "$"
 
 bond_connector_symbol_idx: bond_connector_symbol INT?
 
+?grouped_symbol: bond_connector_symbol_idx group_suffix?
+group_suffix: "[" _group_rule? "]" INT?
+_group_rule: bond_connector_symbol_idx | rule_keyword
+# future group-rule keywords join as alternatives here
+rule_keyword: "all"
+
 bond_connector_generation: "|" WS_INLINE* NUMBER WS_INLINE* "|"
   | "|" WS_INLINE* NUMBER  _number_list_repeat* WS_INLINE* "|"
 
-ladder_bond_connector: "[" inner_ambi_covalent_connector simple_bond_connector INT? "]"
-  | "[" inner_ambi_covalent_connector non_covalent_bond_connector INT? "]"
-
-inner_bond_connector: bond_connector_symbol_idx (WS_INLINE* "," WS_INLINE* bond_connector_symbol_idx)* bond_connector_generation?
+inner_bond_connector: grouped_symbol (WS_INLINE* "," WS_INLINE* grouped_symbol)* bond_connector_generation?
 inner_non_covalent_connector: bond_connector_symbol ":" INT? _non_covalent_context?
-inner_ambi_covalent_connector: inner_bond_connector | inner_non_covalent_connector
 
 simple_bond_connector: "[" inner_bond_connector "]"
 non_covalent_bond_connector: "[" inner_non_covalent_connector "]"
 
-bond_connector: simple_bond_connector | ladder_bond_connector | non_covalent_bond_connector
+bond_connector: simple_bond_connector | non_covalent_bond_connector
 bond_connector_list: bond_connector ("|" bond_connector)*
 terminal_bond_connector: "[" inner_bond_connector? "]"
 terminal_bond_connector_list: terminal_bond_connector ("|" terminal_bond_connector)*

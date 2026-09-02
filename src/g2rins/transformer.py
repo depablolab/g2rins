@@ -29,14 +29,14 @@ class G2RINSTransformer(lark.Transformer):
     def fragment_declaration(self, children):
         raise UnsupportedBigSMILES("fragment_declaration", children)
 
-    def ladder_bond_connector(self, children):
-        raise UnsupportedBigSMILES("ladder_bond_connector", children)
+    def grouped_symbol(self, children):
+        # Only reached when a group suffix is present; suffix-less symbols inline.
+        symbol = children[0]
+        symbol.attach_group_suffix(children[1])
+        return symbol
 
     def inner_non_covalent_connector(self, children):
         raise UnsupportedBigSMILES("inner_non_covalent_connector", children)
-
-    def inner_ambi_covalent_connector(self, children):
-        raise UnsupportedBigSMILES("inner_ambi_covalent_connector", children)
 
     def non_covalent_bond_connector(self, children):
         raise UnsupportedBigSMILES("non_covalent_bond_connector", children)

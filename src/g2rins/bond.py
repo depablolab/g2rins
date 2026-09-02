@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import uuid
+from enum import IntEnum
 
 import networkx as nx
 
@@ -12,6 +13,15 @@ except ImportError:
 
 from .core import G2rinsBase, GenerationBase
 from .generative_graph import _HalfBond, _PartialGraph
+
+
+class GroupRule(IntEnum):
+    """Group rules of conditional connectivity; values are stable graph-feature encodings."""
+
+    NONE = 0
+    LADDER = 1
+    EXCLUSION = 2
+    ALL = 3
 
 
 class BondSymbol(G2rinsBase):
@@ -77,6 +87,7 @@ class BondConnectorSymbolIdx(BondConnectorSymbol):
     def __init__(self, children):
         super().__init__(children)
         self._idx = 0
+        self._group_suffix = None
         if len(self._children) > 1:
             self._idx = int(self._children[1])
 
@@ -84,14 +95,51 @@ class BondConnectorSymbolIdx(BondConnectorSymbol):
     def idx(self):
         return self._idx
 
+    @property
+    def symbol_char(self):
+        return str(self._children[0])
+
+    @property
+    def group_suffix(self):
+        return self._group_suffix
+
+    @property
+    def group_rule(self):
+        if self._group_suffix is None:
+            return GroupRule.NONE
+        return self._group_suffix.rule
+
+    @property
+    def group_id(self):
+        if self._group_suffix is None:
+            return None
+        return self._group_suffix.group_id
+
+    def attach_group_suffix(self, group_suffix):
+        self._group_suffix = group_suffix
+
     def generate_string(self, extension):
         string = super().generate_string(extension)
         if self.idx != 0:
             string += str(self.idx)
+        if self._group_suffix is not None:
+            string += self._group_suffix.generate_string(extension)
         return string
 
     def generable(self):
         return True
+
+    def outer_conjugate(self, other):
+        if self.idx != other.idx:
+            return False
+
+        self_str = self.symbol_char
+        other_str = other.symbol_char
+
+        if self_str == "$" and other_str == "$":
+            return True
+
+        return self_str in ("<", ">") and other_str in ("<", ">") and self_str != other_str
 
     def is_compatible(self, other):
         if other is None:
@@ -99,19 +147,82 @@ class BondConnectorSymbolIdx(BondConnectorSymbol):
         if not isinstance(other, BondConnectorSymbolIdx):
             raise RuntimeError(f"Only BondConnectorSymbolIdx can be compared for compatibility. But 'other' is of type {type(other)}.")
 
-        if self.idx != other.idx:
+        self_ladder = self.group_rule == GroupRule.LADDER
+        # Ladder channels are rigid: they pair only with ladder channels.
+        if self_ladder != (other.group_rule == GroupRule.LADDER):
             return False
 
-        self_str = str(self._children[0])
-        other_str = str(other._children[0])
+        if not self.outer_conjugate(other):
+            return False
 
-        if self_str == "$" and other_str == "$":
-            return True
+        if self_ladder:
+            return self._group_suffix.inner_symbol.is_compatible(other._group_suffix.inner_symbol)
 
-        if self_str in ("<", ">") and other_str in ("<", ">") and self_str != other_str:
-            return True
+        return True
 
-        return False
+
+class RuleKeyword(G2rinsBase):
+    # Future group-rule keywords register here alongside the grammar rule alternatives.
+    _KEYWORD_RULES = {"all": GroupRule.ALL}
+
+    def __init__(self, children):
+        super().__init__(children)
+        self._keyword = str(self._children[0])
+
+    @property
+    def rule(self):
+        return self._KEYWORD_RULES[self._keyword]
+
+    def generate_string(self, extension):
+        return self._keyword
+
+    def generable(self):
+        return True
+
+
+class GroupSuffix(G2rinsBase):
+    def __init__(self, children):
+        super().__init__(children)
+        self._inner_symbol = None
+        self._rule_keyword = None
+        self._group_id = 0
+        for child in self._children:
+            if isinstance(child, BondConnectorSymbolIdx):
+                self._inner_symbol = child
+            elif isinstance(child, RuleKeyword):
+                self._rule_keyword = child
+            elif isinstance(child, int):
+                self._group_id = child
+
+    @property
+    def rule(self):
+        if self._inner_symbol is not None:
+            return GroupRule.LADDER
+        if self._rule_keyword is not None:
+            return self._rule_keyword.rule
+        return GroupRule.EXCLUSION
+
+    @property
+    def group_id(self):
+        return self._group_id
+
+    @property
+    def inner_symbol(self):
+        return self._inner_symbol
+
+    def generate_string(self, extension):
+        string = "["
+        if self._inner_symbol is not None:
+            string += self._inner_symbol.generate_string(extension)
+        elif self._rule_keyword is not None:
+            string += self._rule_keyword.generate_string(extension)
+        string += "]"
+        if self._group_id != 0:
+            string += str(self._group_id)
+        return string
+
+    def generable(self):
+        return True
 
 
 class BondConnectorGeneration(G2rinsBase):

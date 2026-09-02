@@ -383,6 +383,9 @@ class GraphCreator:
                 bc_idx_set.add(node_idx)
         return bc_idx_set
 
+    def _has_group_suffixes(self):
+        return any(symbol.group_suffix is not None for node_idx in self._bc_idx_set for symbol in self.g.nodes[node_idx]["obj"].symbol or [])
+
     @staticmethod
     def _create_bracket_atom(string):
         from .atom import BracketAtom
@@ -919,6 +922,10 @@ class GraphCreator:
         """
 
         from .distribution import StochasticDistribution
+
+        # Temporary gate: this graph variant feeds generation and export, which cannot honor group rules yet.
+        if not include_bond_connectors and self._has_group_suffixes():
+            raise NotImplementedError("This string declares conditional connectivity (group rules); parsing and validation are supported, but generation lands in a later implementation phase.")
 
         extra_graph_info = {0: "None"}
         extra_graph_info_reverse = {"None": 0}
