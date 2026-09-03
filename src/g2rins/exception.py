@@ -569,7 +569,7 @@ class IncompatibleGroupPair(ParsingError):
         self.reason = reason
 
     def __str__(self):
-        return f"Ladder group {self.group_a} of unit {str(self.owner_a)} and ladder group {self.group_b} of unit {str(self.owner_b)} in the stochastic object {str(self.stochastic_obj)} have conjugate outer symbols but cannot complete: {self.reason}."
+        return f"Ladder group {self.group_a} of unit {str(self.owner_a)} and ladder group {self.group_b} of unit {str(self.owner_b)} in the stochastic object {str(self.stochastic_obj)} can engage through a compatible symbol pair but cannot complete: {self.reason}."
 
 
 class ExclusionPartnerNotPlain(ParsingError):

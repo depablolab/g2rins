@@ -160,6 +160,13 @@ VALIDATION_ERROR_CASES = [
         id="group-pair-inner-classes-differ",
     ),
     pytest.param(
+        # One compatible member pair makes the groups partners; the other members
+        # could never complete the rung.
+        "{[] [<]C([<[<1]1])C([<[<2]1])C[>], [<]C([>[>1]2])C([>[>3]2])C[>]; ; [H][<] []}",
+        IncompatibleGroupPair,
+        id="group-pair-partial-inner-overlap",
+    ),
+    pytest.param(
         "{[] [<]C([>1[]1])C([>1[]1])C[>], [<]C([<1[]2])C([<1[]2])C[>]; ; [H][<] []}",
         ExclusionPartnerNotPlain,
         id="exclusion-partner-not-plain",
@@ -193,6 +200,20 @@ def test_exclusion_beside_ladder_idx_reuse_is_legal():
         warnings.simplefilter("always")
         g2rins.StochasticObject.make(text)
     assert not caught
+
+
+def test_disjoint_ladder_channels_are_not_partners():
+    # Groups 1/2 pair through inner channel 1 and groups 3/4 through inner
+    # channel 2; conjugate outer symbols alone (1 vs 4, 3 vs 2) make no partner.
+    text = "{[] [<]C([<[<1]1])C([<[<1]1])C[>], [<]C([>[>1]2])C([>[>1]2])C[>], [<]C([<[<2]3])C([<[<2]3])C[>], [<]C([>[>2]4])C([>[>2]4])C[>]; ; [H][<] []}|poisson(400)|"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.StochasticObject.make(text)  # no IncompatibleGroupPair
+    # The string declares no initiator, so only the initiation warnings may fire.
+    assert not [caught_warning for caught_warning in caught if issubclass(caught_warning.category, (SingleMemberGroup, IndistinguishableSymbolsInSite))]
+    edges = _bond_connector_edges(text)
+    ladder_edges = {(source, target) for source, target, _mode, values in edges if values != SENTINEL}
+    assert ladder_edges == {("[<[<1]1]", "[>[>1]2]"), ("[>[>1]2]", "[<[<1]1]"), ("[<[<2]3]", "[>[>2]4]"), ("[>[>2]4]", "[<[<2]3]")}
 
 
 def test_single_member_group_warns():
@@ -263,7 +284,9 @@ def _bond_connector_edges(text):
     edges = []
     for u, v, data in graph.edges(data=True):
         source, target = graph.nodes[u]["atomic_num"], graph.nodes[v]["atomic_num"]
-        if source < 0 and target < 0:  # bond connectors are the non-atom nodes
+        # Bond connectors are the non-atom nodes; a nested object adjacent to a bond
+        # connector also yields static edges between two of them, which carry no rule.
+        if source < 0 and target < 0 and not data["static"]:
             edges.append((extra_graph_info[source], extra_graph_info[target], _mode(data), _group_values(data)))
     return edges
 
@@ -370,6 +393,27 @@ def test_terminal_descriptor_edges_carry_unit_side_annotation():
     assert [(_group_values(data), _mode(data)) for data in annotated] == [((1, 2, -1, 0), "transition_weight")]
     with pytest.raises(NotImplementedError, match="EXCLUSION"):
         g2rins.EnsembleCreator(generative_graph)
+
+
+def test_multilevel_group_rules_rejected_when_contracting():
+    # Group 2 couples the two sites that wrap the nested object, group 1 the two
+    # entry sites inside it, so one bond carries a rule at each level. The
+    # contracted bond has room for one group and rule per side.
+    text = "{[] [<[all]2]{[>] [<[all]1]CC(C[<[all]1])O[>]; ; [<]F [<]}|poisson(100)|[>[all]2]; [<][H]; [<][H] []}|poisson(400)|"
+    graph_creator = _graph_creator(text)
+    # The graph with bond connectors keeps every level's annotation ...
+    edges = _bond_connector_edges(text)
+    assert {values for *_, values in edges} >= {(2, 3, 2, 3), (-1, 0, 1, 3)}
+    # ... while contracting them into one bond is refused instead of dropping one.
+    with pytest.raises(NotImplementedError, match="more than one|2 stochastic object levels"):
+        _generative_graph(graph_creator)
+
+
+def test_group_rules_at_one_level_survive_nesting():
+    # A bond crossing a level carries at most one annotation here, so it contracts.
+    text = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
+    generative_graph = _generative_graph(_graph_creator(text))
+    assert {(-1, 0, 0, 2), (0, 2, -1, 0), (-1, 0, 1, 2), (1, 2, -1, 0)} <= {_group_values(data) for _u, _v, data in generative_graph.edges(data=True)}
 
 
 def test_generation_gate():

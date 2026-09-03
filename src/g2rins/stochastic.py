@@ -263,7 +263,9 @@ class StochasticObject(G2rinsBase, GenerationBase):
 
         for i, (owner_a, group_a, members_a) in enumerate(ladder_groups):
             for owner_b, group_b, members_b in ladder_groups[i:]:
-                if not members_a[0][1].outer_conjugate(members_b[0][1]):
+                # Partners are groups that can engage: some member pair is compatible (outer AND inner);
+                # groups with disjoint inner channels never meet, however their outer symbols conjugate.
+                if not any(symbol_a.is_compatible(symbol_b) for _bc_a, symbol_a in members_a for _bc_b, symbol_b in members_b):
                     continue
                 if len(members_a) != len(members_b):
                     raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the member counts differ")

@@ -246,6 +246,24 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     return UnitLabels(unit_id=unit_id, bond_id=bond_id)
 
 
+def _reject_multilevel_group_rules(bond_connector_path):
+    """Refuse to contract a bond that carries group rules from more than one stochastic object level.
+
+    Conditional connectivity is defined within one level. A bond connector path
+    that crosses a nesting level contracts one bond connector edge per level,
+    while the contracted bond holds one group and one rule per side, so the
+    outer level's annotation would be silently dropped.
+    """
+    annotations = bond_connector_path.group_annotations
+    if len(annotations) > 1:
+        raise NotImplementedError(
+            f"This bond connects bond connector symbols that declare group rules at {len(annotations)} stochastic object levels "
+            f"(group and rule per side, outermost first: {annotations}). Conditional connectivity is defined within one level; "
+            "group rules across levels land in a later implementation phase. The graph with bond connectors "
+            "(include_bond_connectors=True) carries every level's annotation and stays available."
+        )
+
+
 def generative_graph_json_data(generative_graph):
     """
     JSON-serializable dict for a generative graph: a self-describing ``format`` block
@@ -632,7 +650,9 @@ class GraphCreator:
                             if w > 0:
                                 current_type = attr
                                 weight *= w
-                        # The bond-connector edge is the only one carrying group-rule attributes.
+                        # Group rules ride the bond connector edges the path contracts. A path
+                        # crossing a nesting level holds one such edge per level, but the
+                        # contracted bond has room for one group and rule per side.
                         for key in _GROUP_EDGE_ATTR:
                             if key in d:
                                 data[key] = d[key]
@@ -737,6 +757,16 @@ class GraphCreator:
                 return len(self.node_path)
 
             @property
+            def group_annotations(self):
+                """Group-rule attributes of every bond connector edge on the path that declares a rule."""
+                annotations = []
+                for d in self.data_path:
+                    values = tuple(d.get(key, sentinel) for key, sentinel in zip(_GROUP_EDGE_ATTR, _GROUP_EDGE_SENTINELS))
+                    if values != _GROUP_EDGE_SENTINELS:
+                        annotations.append(values)
+                return annotations
+
+            @property
             def only_bond_connectors(self):
                 return len(self.node_path) > 2 and set(self.node_path[1:len(self.node_path)-1]).issubset(bc_idx_set)
 
@@ -829,6 +859,7 @@ class GraphCreator:
                         for path in all_paths:
                             bond_connector_path = BondConnectorPath(path, graph)
                             if bond_connector_path.valid(bc_idx):
+                                _reject_multilevel_group_rules(bond_connector_path)
                                 data = bond_connector_path.combined_attr
                                 edges_to_add.append((in_idx, target, data))
                                 if bond_connector_path.init_weight is not None:
@@ -850,6 +881,7 @@ class GraphCreator:
                                 path = [(in_u, in_v, in_k), loop_edge, (out_u, out_v, out_k)]
                                 bond_connector_path = BondConnectorPath(path, graph)
                                 if bond_connector_path.valid(bc_idx):
+                                    _reject_multilevel_group_rules(bond_connector_path)
                                     data = bond_connector_path.combined_attr
                                     edges_to_add.append((in_u, out_v, data))
 
