@@ -138,7 +138,9 @@ class IncorrectNumberOfBondConnectors(ParsingError):
         self.expected_number_of_bond_connectors = expected_number_of_bond_connectors
 
     def __str__(self):
-        return f"Incorrect Number of BondConnectors we expected {self.expected_number_of_bond_connectors} but the object {str(self.obj)} of type {type(self.obj)} has {len(self.obj.bond_connectors)}."
+        return (
+            f"Incorrect Number of BondConnectors we expected {self.expected_number_of_bond_connectors} but the object {str(self.obj)} of type {type(self.obj)} has {len(self.obj.bond_connectors)}."
+        )
 
 
 class SmilesHasNonZeroBondConnectors(IncorrectNumberOfBondConnectors):
@@ -289,10 +291,7 @@ class InvalidGenerationSource(G2RINSError):
         super().__init__(source)
 
     def __str__(self):
-        return (
-            f"Attempt to create an atom graph from source node_idx {self.source!r}, "
-            f"which is not one of the {len(self.nodes)} node idx of the generative graph."
-        )
+        return f"Attempt to create an atom graph from source node_idx {self.source!r}, " f"which is not one of the {len(self.nodes)} node idx of the generative graph."
 
 
 class NoValidGenerationSource(G2RINSError):
@@ -303,15 +302,8 @@ class NoValidGenerationSource(G2RINSError):
         super().__init__(self.use_repeat_units_as_source)
 
     def __str__(self):
-        mode = (
-            "repeat-unit"
-            if self.use_repeat_units_as_source
-            else "default"
-        )
-        return (
-            f"No valid automatic generation source is available in {mode} source mode. "
-            "Supply an explicit valid source or revise the G2RINS initiation paths."
-        )
+        mode = "repeat-unit" if self.use_repeat_units_as_source else "default"
+        return f"No valid automatic generation source is available in {mode} source mode. " "Supply an explicit valid source or revise the G2RINS initiation paths."
 
 
 class PossibleNonRepresentativePolymerChain(G2RINSWarning):
@@ -460,15 +452,11 @@ class DiscardedSamplingPaths(G2RINSWarning):
 
     def __init__(self, discarded_count, reasons):
         self.discarded_count = int(discarded_count)
-        self.reasons = tuple(
-            sorted((str(reason), int(count)) for reason, count in reasons)
-        )
+        self.reasons = tuple(sorted((str(reason), int(count)) for reason, count in reasons))
         Warning.__init__(self, self.discarded_count, self.reasons)
 
     def __str__(self):
-        reason_text = ", ".join(
-            f"{reason}: {count}" for reason, count in self.reasons
-        )
+        reason_text = ", ".join(f"{reason}: {count}" for reason, count in self.reasons)
         return (
             f"Discarded {self.discarded_count} chain-local sampling path(s) "
             f"while generating the ensemble ({reason_text}). The returned "

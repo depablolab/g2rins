@@ -12,7 +12,6 @@ import g2rins
 from g2rins.ensemble_creator import EnsembleCreator
 from g2rins.exception import InvalidUnitPSmiles, NoValidGenerationSource
 
-
 PEI = "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(200)|"
 HYPERBRANCHED_CH = "{[] [<][CH]([>])[>]; [<][H]; [>][H] []}|poisson(100)|"
 
@@ -84,10 +83,7 @@ def test_hyperbranched_unit_psmiles_uses_placeholders_as_stars(text, reference, 
     assert sorted(atom.GetAtomMapNum() for atom in dummy_atoms) == [1, 2, 3]
     assert all(atom.GetDegree() == 1 for atom in dummy_atoms)
     assert sum(atom.GetAtomicNum() > 0 for atom in mol.GetAtoms()) == expected_real_atoms
-    assert {
-        atom.GetAtomMapNum(): atom.GetNeighbors()[0].GetAtomicNum()
-        for atom in dummy_atoms
-    } == expected_neighbor_atomic_nums
+    assert {atom.GetAtomMapNum(): atom.GetNeighbors()[0].GetAtomicNum() for atom in dummy_atoms} == expected_neighbor_atomic_nums
     _assert_public_unit_contract(creator, result)
 
 
@@ -98,11 +94,7 @@ def test_unit_star_renderer_does_not_mutate_sampled_snapshot():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         units = creator.sample_mol_graph(rng=np.random.default_rng(0), molecule_info=True)[1]
-    repeat_unit = next(
-        unit
-        for unit in units
-        if labels.unit_id[next(iter(unit.nodes(data=True)))[1]["origin_idx"]] == "R0"
-    )
+    repeat_unit = next(unit for unit in units if labels.unit_id[next(iter(unit.nodes(data=True)))[1]["origin_idx"]] == "R0")
     nodes_before = [(node, dict(data)) for node, data in repeat_unit.nodes(data=True)]
     edges_before = [(u, v, dict(data)) for u, v, data in repeat_unit.edges(data=True)]
 
@@ -118,23 +110,14 @@ def test_placeholder_bond_ids_and_bond_records_remain_unchanged():
     creator = _make_creator(PEI)
     labels = g2rins.derive_unit_labels(creator._generative_graph)
     graph_data = g2rins.generative_graph_json_data(creator._generative_graph)
-    placeholder_bond_ids = sorted(
-        node["bond_id"]
-        for node in graph_data["graph"]["nodes"]
-        if node["unit_id"] == "R0" and node["atomic_num"] == 0
-    )
+    placeholder_bond_ids = sorted(node["bond_id"] for node in graph_data["graph"]["nodes"] if node["unit_id"] == "R0" and node["atomic_num"] == 0)
     assert placeholder_bond_ids == [2, 3]
     assert sorted(labels.bond_id[node] for node, data in creator._generative_graph.nodes(data=True) if labels.unit_id[node] == "R0" and data["atomic_num"] == 0) == [2, 3]
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
-    r0_endpoints = {
-        endpoint
-        for record in result.bonds
-        for endpoint in record["between"]
-        if endpoint.startswith("R0.")
-    }
+    r0_endpoints = {endpoint for record in result.bonds for endpoint in record["between"] if endpoint.startswith("R0.")}
     assert {"R0.2", "R0.3"} <= r0_endpoints
 
 
