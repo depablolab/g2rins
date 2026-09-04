@@ -11,6 +11,7 @@ from .g2rins_molecule import G2rinsMolecule
 from .bond import (
     BondConnector,
     GroupRule,
+    TerminalBondConnector,
     TerminalBondConnectorList,
 )
 from .core import G2rinsBase, GenerationBase
@@ -19,7 +20,9 @@ from .exception import (
     ConcatenatedBondConnectors,
     EmptyBondConnectorInTerminalBondConnectorList,
     EndGroupHasBondConnectors,
-    ExclusionPartnerNotPlain,
+    GroupPartnerNotPlain,
+    GroupRuleOnNestedObjectBondConnector,
+    GroupRuleOnTerminalBondConnector,
     IncompatibleGroupPair,
     IncorrectNumberOfBondProbabilities,
     IndistinguishableSymbolsInSite,
@@ -37,6 +40,7 @@ from .exception import (
 from .generative_graph import (
     _GROUP_EDGE_ATTR,
     _GROUP_EDGE_SENTINELS,
+    _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
@@ -170,6 +174,8 @@ class StochasticObject(G2rinsBase, GenerationBase):
                                 stochastic_id = generative_graph.nodes(data=True)[v]["stochastic_id_tree"][0]
                                 if (v in graph_creator._bc_idx_set) and (data["stochastic_id_tree"][0] == stochastic_id):
                                     raise ConcatenatedBondConnectors(element, self)
+                if element is not self:
+                    self._reject_group_rules_on_nested_object_bond_connectors(element, graph_creator)
         except UndefinedDistribution:
             pass
 
@@ -205,7 +211,26 @@ class StochasticObject(G2rinsBase, GenerationBase):
             if None in [bond_connector.symbol for bond_connector in self._right_terminal_bc_list.terminal_bond_connectors]:
                 raise EmptyBondConnectorInTerminalBondConnectorList(self._right_terminal_bc_list, self)
 
+        for tbc_list in (self._left_terminal_bc_list, self._right_terminal_bc_list):
+            for bond_connector in tbc_list.terminal_bond_connectors:
+                if any(symbol.group_suffix is not None for symbol in bond_connector.symbol or []):
+                    raise GroupRuleOnTerminalBondConnector(bond_connector, self)
+
         self._validate_group_rules()
+
+    def _reject_group_rules_on_nested_object_bond_connectors(self, residue, graph_creator):
+        """A bond connector that attaches a nested stochastic object relays bonds between levels and stays plain."""
+        graph = graph_creator.g
+        for u, v, data in graph.edges(data=True):
+            if u not in graph_creator._bc_idx_set or v not in graph_creator._bc_idx_set or any(attr in data for attr in _NON_STATIC_ATTR):
+                continue
+            # Static bond connector adjacency arises only where a nested object's terminal descriptor meets the enclosing unit text.
+            for node in (u, v):
+                bond_connector = graph.nodes[node]["obj"]
+                if isinstance(bond_connector, TerminalBondConnector):
+                    continue
+                if any(symbol.group_suffix is not None for symbol in bond_connector.symbol or []):
+                    raise GroupRuleOnNestedObjectBondConnector(bond_connector, residue, self)
 
     def _collect_group_symbols(self, bond_connectors):
         """Group table (group id -> [(bond connector, symbol)]) plus all symbols of one unit text."""
@@ -226,17 +251,19 @@ class StochasticObject(G2rinsBase, GenerationBase):
 
     def _validate_group_rules(self):
         scopes = []
-        for residue in self._repeat_residues + self._initiation_residues + self._termination_residues:
-            scopes.append((residue,) + self._collect_group_symbols(residue.bond_connectors))
-        for tbc_list in (self._left_terminal_bc_list, self._right_terminal_bc_list):
-            for bc in tbc_list.terminal_bond_connectors:
-                scopes.append((bc,) + self._collect_group_symbols([bc]))
+        for kind, residues in (("repeat", self._repeat_residues), ("initiation", self._initiation_residues), ("termination", self._termination_residues)):
+            for residue in residues:
+                scopes.append((residue, kind) + self._collect_group_symbols(residue.bond_connectors))
 
-        if not any(table for _owner, table, _symbols in scopes):
+        if not any(table for _owner, _kind, table, _symbols in scopes):
             return
 
+        def can_bond(kind_a, kind_b):
+            # Initiators never bond to initiators and terminators never to terminators.
+            return kind_a != kind_b or kind_a == "repeat"
+
         ladder_groups = []
-        for owner, table, _symbols in scopes:
+        for owner, kind, table, _symbols in scopes:
             for group_id, members in table.items():
                 rules = {symbol.group_rule for _bc, symbol in members}
                 if len(rules) > 1:
@@ -246,13 +273,13 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     outers = {(symbol.symbol_char, symbol.idx) for _bc, symbol in members}
                     if len(outers) > 1:
                         raise MixedOuterSymbolsInGroup(group_id, owner, self)
-                    ladder_groups.append((owner, group_id, members))
+                    ladder_groups.append((owner, kind, group_id, members))
                 if len(members) == 1:
                     warnings.warn(SingleMemberGroup(group_id, rule.name, owner), stacklevel=1)
 
         # A plain symbol beside an exclusion- or all-typed one with the same outer symbol and index
         # gives partners no way to pick the channel (ladder symbols are rigid, so never affected).
-        for owner, _table, symbols in scopes:
+        for owner, _kind, _table, symbols in scopes:
             plain_keys = {}
             for bc, symbol in symbols:
                 if symbol.group_suffix is None:
@@ -261,26 +288,26 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 if symbol.group_rule in (GroupRule.EXCLUSION, GroupRule.ALL) and (symbol.symbol_char, symbol.idx) in plain_keys.get(id(bc), ()):
                     warnings.warn(IndistinguishableSymbolsInSite(symbol, bc, owner), stacklevel=1)
 
-        for i, (owner_a, group_a, members_a) in enumerate(ladder_groups):
-            for owner_b, group_b, members_b in ladder_groups[i:]:
+        for i, (owner_a, kind_a, group_a, members_a) in enumerate(ladder_groups):
+            for owner_b, kind_b, group_b, members_b in ladder_groups[i:]:
                 # Partners are groups that can engage: some member pair is compatible (outer AND inner);
                 # groups with disjoint inner channels never meet, however their outer symbols conjugate.
-                if not any(symbol_a.is_compatible(symbol_b) for _bc_a, symbol_a in members_a for _bc_b, symbol_b in members_b):
+                if not can_bond(kind_a, kind_b) or not any(symbol_a.is_compatible(symbol_b) for _bc_a, symbol_a in members_a for _bc_b, symbol_b in members_b):
                     continue
                 if len(members_a) != len(members_b):
                     raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the member counts differ")
                 if not _inner_classes_conjugate([symbol for _bc, symbol in members_a], [symbol for _bc, symbol in members_b]):
                     raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the inner class multisets are not conjugate")
 
-        every_symbol = [symbol for _owner, _table, symbols in scopes for _bc, symbol in symbols]
-        for _owner, table, _symbols in scopes:
+        every_symbol = [(kind, symbol) for _owner, kind, _table, symbols in scopes for _bc, symbol in symbols]
+        for _owner, kind, table, _symbols in scopes:
             for members in table.values():
                 for _bc, symbol in members:
-                    if symbol.group_rule != GroupRule.EXCLUSION:
+                    if symbol.group_rule not in (GroupRule.EXCLUSION, GroupRule.ALL):
                         continue
-                    for other in every_symbol:
-                        if other.group_suffix is not None and symbol.is_compatible(other):
-                            raise ExclusionPartnerNotPlain(symbol, other, self)
+                    for other_kind, other in every_symbol:
+                        if other.group_suffix is not None and can_bond(kind, other_kind) and symbol.is_compatible(other):
+                            raise GroupPartnerNotPlain(symbol, other, self)
 
     def _residue_string(self, residue, extension: bool) -> str:
         string = residue.generate_string(extension)

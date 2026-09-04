@@ -572,14 +572,33 @@ class IncompatibleGroupPair(ParsingError):
         return f"Ladder group {self.group_a} of unit {str(self.owner_a)} and ladder group {self.group_b} of unit {str(self.owner_b)} in the stochastic object {str(self.stochastic_obj)} can engage through a compatible symbol pair but cannot complete: {self.reason}."
 
 
-class ExclusionPartnerNotPlain(ParsingError):
+class GroupPartnerNotPlain(ParsingError):
     def __init__(self, symbol, partner_symbol, stochastic_obj):
         self.symbol = symbol
         self.partner_symbol = partner_symbol
         self.stochastic_obj = stochastic_obj
 
     def __str__(self):
-        return f"The exclusion-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {str(self.partner_symbol)}, which also carries a group suffix. Exclusion channels must point at plain bond connector symbols."
+        return f"The {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {str(self.partner_symbol)}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
+
+
+class GroupRuleOnTerminalBondConnector(ParsingError):
+    def __init__(self, bond_connector, stochastic_obj):
+        self.bond_connector = bond_connector
+        self.stochastic_obj = stochastic_obj
+
+    def __str__(self):
+        return f"The terminal bond connector {str(self.bond_connector)} of the stochastic object {str(self.stochastic_obj)} carries a group suffix. A terminal bond connector only relays bonds to the enclosing level and must be plain; group rules belong to the bond connectors of units."
+
+
+class GroupRuleOnNestedObjectBondConnector(ParsingError):
+    def __init__(self, bond_connector, owner, stochastic_obj):
+        self.bond_connector = bond_connector
+        self.owner = owner
+        self.stochastic_obj = stochastic_obj
+
+    def __str__(self):
+        return f"The bond connector {str(self.bond_connector)} in the unit {str(self.owner)} of the stochastic object {str(self.stochastic_obj)} attaches a nested stochastic object and carries a group suffix. Such a bond connector only relays bonds between levels and must be plain; a bond carries the group rules of the units at its two ends."
 
 
 class SingleMemberGroup(ParsingWarning):
@@ -600,3 +619,16 @@ class IndistinguishableSymbolsInSite(ParsingWarning):
 
     def __str__(self):
         return f"The bond connector {str(self.bond_connector)} in the unit {str(self.token)} lists the {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} beside a plain symbol with the same outer symbol and index; partners cannot tell the two apart, so bonds are drawn through either with equal odds."
+
+
+class GroupRulesOnBothPathEnds(G2RINSError):
+    def __init__(self, source_bond_connector, source_values, target_bond_connector, target_values):
+        self.source_bond_connector = source_bond_connector
+        self.source_values = source_values
+        self.target_bond_connector = target_bond_connector
+        self.target_values = target_values
+
+    def __str__(self):
+        from .bond import GroupRule
+
+        return f"The bond from the bond connector {self.source_bond_connector} to the bond connector {self.target_bond_connector} crosses a nesting level and both ends declare a group rule (group {self.source_values[0]} {GroupRule(self.source_values[1]).name} and group {self.target_values[0]} {GroupRule(self.target_values[1]).name}). Exclusion and all channels must point at plain bond connector symbols, so a bond connector path may carry a group rule at one end only."

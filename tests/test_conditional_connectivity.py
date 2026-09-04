@@ -19,7 +19,10 @@ import pytest
 import g2rins
 from g2rins import GroupRule
 from g2rins.exception import (
-    ExclusionPartnerNotPlain,
+    GroupPartnerNotPlain,
+    GroupRuleOnNestedObjectBondConnector,
+    GroupRuleOnTerminalBondConnector,
+    GroupRulesOnBothPathEnds,
     IncompatibleGroupPair,
     IndistinguishableSymbolsInSite,
     MixedOuterSymbolsInGroup,
@@ -69,9 +72,9 @@ def test_implicit_group_zero_is_omitted():
     assert str(bond_connector) == "[>[all]]"
 
 
-def test_terminal_bond_connector_carries_group_suffix():
-    # The grammar accepts the suffix on terminal bond connectors; validation
-    # treats each terminal as a one-site scope (always a single-member group).
+def test_terminal_bond_connector_parses_group_suffix():
+    # The grammar accepts the suffix on any bond connector; a stochastic object
+    # refuses it on its terminal bond connectors (see VALIDATION_ERROR_CASES).
     terminal = g2rins.TerminalBondConnector.make("[<[$]1]")
     assert str(terminal) == "[<[$]1]"
     (symbol,) = terminal.symbol
@@ -168,15 +171,44 @@ VALIDATION_ERROR_CASES = [
     ),
     pytest.param(
         "{[] [<]C([>1[]1])C([>1[]1])C[>], [<]C([<1[]2])C([<1[]2])C[>]; ; [H][<] []}",
-        ExclusionPartnerNotPlain,
+        GroupPartnerNotPlain,
         id="exclusion-partner-not-plain",
     ),
     pytest.param(
         # A '$' exclusion channel is compatible with its own symbol on the next
         # unit instance, which is a group-typed partner too.
         "{[] [$[]1]CC[$]; C[$]; [H][$] []}",
-        ExclusionPartnerNotPlain,
+        GroupPartnerNotPlain,
         id="exclusion-self-pair-not-plain",
+    ),
+    pytest.param(
+        "{[] [<]C([<[all]1])C([<[all]1])C[>], [<]C([>[all]2])C([>[all]2])C[>]; ; [H][<] []}",
+        GroupPartnerNotPlain,
+        id="all-partner-not-plain",
+    ),
+    pytest.param(
+        # An initiator channel does bond to a repeat unit's channel.
+        "{[] [$]CC[$[]1]; C[$[]1]; [H][$] []}",
+        GroupPartnerNotPlain,
+        id="exclusion-initiator-vs-repeat-not-plain",
+    ),
+    pytest.param(
+        "{[<[]1] [<]CC([>])[>]; ; [H][<] []}",
+        GroupRuleOnTerminalBondConnector,
+        id="group-rule-on-terminal-bond-connector",
+    ),
+    pytest.param(
+        # The bond connector after the nested object relays its exits to this level.
+        "{[] [<]CC[>], [<]{[>] [<]CC(C)O[>]; ; [<]F [<]}|poisson(100)|[>[]1]; [<][H]; [<][H] []}|poisson(400)|",
+        GroupRuleOnNestedObjectBondConnector,
+        id="group-rule-on-nested-object-bond-connector",
+    ),
+    pytest.param(
+        # Formerly the multilevel fixture: group 2 sits on the two bond connectors
+        # that attach the nested object, interior to every bond connector path.
+        "{[] [<[all]2]{[>] [<[all]1]CC(C[<[all]1])O[>]; ; [<]F [<]}|poisson(100)|[>[all]2]; [<][H]; [<][H] []}|poisson(400)|",
+        GroupRuleOnNestedObjectBondConnector,
+        id="group-rule-on-nested-object-bond-connector-all",
     ),
 ]
 
@@ -190,6 +222,32 @@ def test_validation_errors(text, expected_error):
                 g2rins.StochasticObject.make(text)
             except lark.exceptions.VisitError as exc:
                 raise exc.__context__  # trunk-ignore(ruff/B904)
+
+
+END_GROUP_ONLY_PAIR_CASES = [
+    # Initiators never bond to initiators and terminators never to terminators, so
+    # group-typed symbols that conjugate only across such pairs have no partner to check.
+    pytest.param("{[] [$]CC[$]; C([$[all]1])([$[all]1])([$[all]1]); [$][H] []}|poisson(300)|", id="dollar-star-all-initiator"),
+    pytest.param("{[] [$]CC[$]; C([$[]1])([$[]1]); [$][H] []}|poisson(300)|", id="dollar-exclusion-initiator"),
+    pytest.param("{[] [$]CC[$]; C[$]; [$[]1][H], [$[]1]F []}|poisson(300)|", id="dollar-exclusion-terminators"),
+    pytest.param("{[] [<]CC[>]; C([>[>]1])([>[>]1]), C([>[>]1])([>[>]1])([>[>]1]); [H][<] []}|poisson(300)|", id="ladder-groups-on-two-initiators"),
+]
+
+
+@pytest.mark.parametrize("text", END_GROUP_ONLY_PAIR_CASES)
+def test_end_group_only_pairs_are_not_partners(text):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g2rins.StochasticObject.make(text)
+
+
+def test_dollar_star_all_initiator_encoding():
+    text = "{[] [$]CC[$]; C([$[all]1])([$[all]1])([$[all]1]); [$][H] []}|poisson(300)|"
+    _assert_no_diagnostics(text)
+    annotated = [edge for edge in _bond_connector_edges(text) if edge[3] != SENTINEL]
+    # Three initiator sites x the two sites of the repeat unit, all through the all-group.
+    assert len(annotated) == 6
+    assert all(edge == ("[$[all]1]", "[$]", "transition_weight", (1, 3, -1, 0)) for edge in annotated)
 
 
 def test_exclusion_beside_ladder_idx_reuse_is_legal():
@@ -395,17 +453,45 @@ def test_terminal_descriptor_edges_carry_unit_side_annotation():
         g2rins.EnsembleCreator(generative_graph)
 
 
-def test_multilevel_group_rules_rejected_when_contracting():
-    # Group 2 couples the two sites that wrap the nested object, group 1 the two
-    # entry sites inside it, so one bond carries a rule at each level. The
-    # contracted bond has room for one group and rule per side.
-    text = "{[] [<[all]2]{[>] [<[all]1]CC(C[<[all]1])O[>]; ; [<]F [<]}|poisson(100)|[>[all]2]; [<][H]; [<][H] []}|poisson(400)|"
+MULTILEVEL_EXCLUSION_TEXT = "{[] [<,<2]C(=O)CC[>2]; {[] [<1]CC[>1]; {[] [<1]CCN([>1,>[]])([>1,>[]]), [<1]CCO[>1]; O[>1]; [<]|[<1]}|poisson(1000)|[>]|[>1]; [<]}|poisson(3000)|[>]; [<1][H] []}|poisson(5000)|"
+
+
+def test_group_rule_survives_bond_connector_path_across_levels():
+    # The exclusion channel of the level-2 unit exits through a terminal bond
+    # connector, a level-1 bond connector, another terminal bond connector and a
+    # level-0 bond connector before reaching the level-0 unit. Every relay is
+    # plain, so the bond carries the rule of the unit it leaves.
+    _assert_no_diagnostics(MULTILEVEL_EXCLUSION_TEXT)
+    generative_graph = _generative_graph(_graph_creator(MULTILEVEL_EXCLUSION_TEXT))
+    annotated = [(u, v, _mode(data), _group_values(data)) for u, v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL]
+    assert len(annotated) == 2  # one per site of the level-2 unit
+    for u, v, mode, values in annotated:
+        assert (mode, values) == ("transition_weight", (0, 2, -1, 0))
+        # From a split node of the level-2 nitrogen to the level-0 carbonyl carbon.
+        assert generative_graph.nodes[u]["atomic_num"] == 0
+        assert 7 in {generative_graph.nodes[w]["atomic_num"] for w in generative_graph.neighbors(u)}
+        assert generative_graph.nodes[v]["atomic_num"] == 6
+    with pytest.raises(NotImplementedError, match="EXCLUSION"):
+        g2rins.EnsembleCreator(generative_graph)
+
+
+def test_group_rule_exit_into_enclosing_object_reaches_gate():
+    # A ruled exit followed by plain relays used to contract to sentinels and
+    # slip past the generation gate.
+    text = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F [<1]}|poisson(100)|[>]; [>][H]; [<][H] []}|poisson(400)|"
+    generative_graph = _generative_graph(_graph_creator(text))
+    assert {_group_values(data) for _u, _v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL} == {(1, 2, -1, 0)}
+    with pytest.raises(NotImplementedError, match="EXCLUSION"):
+        g2rins.EnsembleCreator(generative_graph)
+
+
+def test_group_rules_on_both_path_ends_are_refused():
+    # The level-1 exclusion channel exits into a level-0 exclusion channel: one
+    # bond would carry a rule in two unit instances.
+    text = "{[] [<,<1[]1]CC[>]; {[] [<]CC([>,>1[]1])[>]; ; [<]F [<1]}|poisson(100)|[>1]; [<][H] []}|poisson(400)|"
     graph_creator = _graph_creator(text)
-    # The graph with bond connectors keeps every level's annotation ...
-    edges = _bond_connector_edges(text)
-    assert {values for *_, values in edges} >= {(2, 3, 2, 3), (-1, 0, 1, 3)}
-    # ... while contracting them into one bond is refused instead of dropping one.
-    with pytest.raises(NotImplementedError, match="more than one|2 stochastic object levels"):
+    _generative_graph(graph_creator, include_bond_connectors=True)
+    with pytest.raises(GroupRulesOnBothPathEnds):
         _generative_graph(graph_creator)
 
 
