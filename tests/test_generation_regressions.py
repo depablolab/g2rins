@@ -1823,6 +1823,94 @@ def test_transition_from_a_finished_level_without_a_live_instance_raises():
         partial.transition_graph(sto_atom_id, tree[0], rng)
 
 
+def test_site_draw_frequencies_follow_bond_descriptor_weights():
+    """The site to grow at an owner's step is drawn among its open sites in
+    proportion to their bond-descriptor weights, normalized over the sites open
+    at that moment (molar amounts act only on the incoming unit). A branching
+    unit with a heavy and a light site is entered from a single-port initiator,
+    so the state after the first unit is deterministic; from that state the
+    heavy site must be chosen with frequency 3/4."""
+    import copy
+
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    smi = "{[] [<]CC([>|3.0|])C[>|1.0|]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    _new_id, success = partial.transition_graph(sto_atom_id, tree[0], rng)
+    assert success
+    open_sites = {(half_bond.atom_idx, float(half_bond.weight)) for half_bond in partial._open_half_bond_map[sto_atom_id]}
+    assert sorted(weight for _atom, weight in open_sites) == [1.0, 3.0], f"unexpected basis of open sites: {open_sites}"
+
+    draws = 400
+    heavy = 0
+    for seed in range(draws):
+        trial = copy.deepcopy(partial)
+        trial.propagate_graph(sto_atom_id, np.random.default_rng(seed), True)
+        remaining = {(half_bond.atom_idx, float(half_bond.weight)) for half_bond in trial._open_half_bond_map[sto_atom_id]}
+        (chosen,) = open_sites - remaining
+        heavy += chosen[1] == 3.0
+    frequency = heavy / draws
+    # Binomial 3-sigma band around 3/4 at 400 draws is about +-0.065.
+    assert abs(frequency - 0.75) < 0.07, f"heavy site chosen with frequency {frequency:.3f}, expected 0.75"
+
+
+def test_promoted_site_keeps_its_descriptor_weight_and_owner_tag():
+    """A finished nested instance's owner-level exit is promoted into the
+    owner's pool as an ordinary propagation site: it keeps the descriptor
+    weight of the inner atom it sits on (that is the weight it competes
+    with), carries the owner's native parent tag so the prefer_parent tier
+    ranks it like the owner's own sites, and its owner-level transition edges
+    become propagation edges while the finished level's own propagation modes
+    are dropped."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+    from g2rins.generative_graph import (
+        _EDGE_STOCHASTIC_ID_NAME,
+        _PROPAGATION_NAME,
+        _TRANSITION_NAME,
+    )
+
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], [<1]{[>] [<]CCO[>|2.0|];; [<]}|poisson(100)|[>]; C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    owner_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, owner_id, rng)
+    owner_gen = tree[0]
+    # The initial fire enters one arm and registers its instance under the owner.
+    arm_id, success = partial.transition_graph(owner_id, owner_gen, rng)
+    assert success and arm_id != owner_id
+    exits = [half_bond for half_bond in partial._open_half_bond_map[arm_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == owner_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
+    assert len(exits) == 1, "the arm's frontier must carry exactly one owner-level exit"
+    exit_weight = float(exits[0].weight)
+    assert exit_weight == 2.0, "the exit sits on the inner atom carrying [>|2.0|]"
+    owner_pool_before = list(partial._open_half_bond_map[owner_id])
+
+    tracker.terminate(arm_id)
+    assert partial.promote_level_transitions(arm_id, owner_id, owner_gen) == 1
+    promoted = [half_bond for half_bond in partial._open_half_bond_map[owner_id] if half_bond not in owner_pool_before]
+    assert len(promoted) == 1
+    (site,) = promoted
+    assert float(site.weight) == exit_weight
+    assert site.parent == owner_pool_before[0].parent, "a promoted site must rank like the owner's own sites"
+    assert site.has_mode_bonds(_PROPAGATION_NAME) and not site.has_mode_bonds(_TRANSITION_NAME)
+    assert all(attr.get(_EDGE_STOCHASTIC_ID_NAME) == owner_gen for attr in site._mode_attr_map[_PROPAGATION_NAME]), "the finished level's own propagation modes are dropped"
+    assert exits[0] not in partial._open_half_bond_map[arm_id]
+
+
 def test_migrated_heavy_caps_are_priced_into_the_crossing():
     """Declared end groups whose custody ends in terminated descendants'
     buckets (side-chain ends of a nested stochastic object used as a repeat

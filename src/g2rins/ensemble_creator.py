@@ -1566,6 +1566,17 @@ class _PartialAtomGraph:
         deterministic continuation fire — the multifunctional initiation
         principle generalized to every level of the nested tree.
 
+        The draw's contract: at each owner step the site to grow is drawn
+        among the owner's open propagation-capable sites in proportion to
+        their bond-descriptor weights (``gen_weight`` of the atom carrying
+        the site), normalized over the sites open at that moment; the unit
+        the chosen site adds is then drawn by propagation weight times the
+        target unit's molar amount, so molar amounts describe the reservoir
+        and never bias which site grows. A promoted site keeps the
+        descriptor weight of the inner atom it sits on; a weight written on
+        the nested unit's exit port has no effect there, since that exit has
+        a single target. The number of owner steps is set by the mass rule.
+
         Promotion is per-edge and lazy: only edges declared at the owner's
         level convert; transition edges of shallower levels ride along
         unchanged and are promoted, in turn, at their own level's hand-off.
