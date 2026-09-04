@@ -70,6 +70,8 @@ from .generative_graph import (
 )
 from .util import _determine_darkness_from_hex, get_global_rng
 
+_SEQUENCE_SMILES_CACHE_MAXSIZE = 4096
+
 # Lazy-snapshot tuning. The sample loop only deepcopies + terminates the partial
 # graph (for the undershoot reference used in stochastic MW rounding) when the
 # NEXT growth step could cross the active SO's target MW. The lookahead is
@@ -211,6 +213,7 @@ def _sample_chain_job(
     defer_conversion=False,
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
+    smiles_policy="auto",
 ):
     """Execute one compact chain job using the creator initialized in-worker."""
     if _WORKER_ENSEMBLE_CREATOR is None:
@@ -227,6 +230,7 @@ def _sample_chain_job(
         defer_conversion,
         use_repeat_units_as_source,
         strip_unresolved_directional_markers,
+        smiles_policy,
     )[0]
 
 
@@ -344,6 +348,7 @@ class _ParallelChainScheduler:
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=False,
         fallback_on_worker_crash=False,
+        smiles_policy="auto",
     ):
         if self.executor is None:
             self._create_executor()
@@ -373,6 +378,7 @@ class _ParallelChainScheduler:
                             defer_conversion,
                             use_repeat_units_as_source,
                             strip_unresolved_directional_markers,
+                            smiles_policy,
                         )
                         inflight[future] = chain_job
 
@@ -454,6 +460,7 @@ class _ParallelChainScheduler:
                         defer_conversion,
                         use_repeat_units_as_source,
                         strip_unresolved_directional_markers,
+                        smiles_policy,
                     )[0]
                 return
             pending = deque(
@@ -479,6 +486,7 @@ def _parallel_chain_records(
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
     fallback_on_worker_crash=False,
+    smiles_policy="auto",
 ):
     """Yield ordered records from bounded, restartable compact worker jobs."""
     if scheduler is not None:
@@ -494,6 +502,7 @@ def _parallel_chain_records(
             use_repeat_units_as_source,
             strip_unresolved_directional_markers,
             fallback_on_worker_crash,
+            smiles_policy,
         )
         return
     with _ParallelChainScheduler(
@@ -514,6 +523,7 @@ def _parallel_chain_records(
             use_repeat_units_as_source,
             strip_unresolved_directional_markers,
             fallback_on_worker_crash,
+            smiles_policy,
         )
 
 
@@ -1385,6 +1395,7 @@ class _SampledMolecule:
     distributions: dict
     legacy_units: dict | None = None
     legacy_sequences: list | None = None
+    molecular_weight: float | None = None
 
     def __getitem__(self, index):
         legacy = (
@@ -1435,6 +1446,7 @@ class _DeferredChainRecord:
     chain_index: int | None
     seed_sequence: Any
     native_diagnostics_path: Any
+    materialized: _ChainRecord | None = None
 
 
 def _bond_endpoint_sort_key(endpoint):
@@ -1616,6 +1628,8 @@ def _convert_chain(
     native_diagnostics_path=None,
     molecular_weight=None,
     strip_unresolved_directional_markers=False,
+    smiles_policy="auto",
+    sequence_smiles_cache=None,
 ):
     """Convert one accepted sample_mol_graph result into a chain record in the
     requested output format."""
@@ -1628,6 +1642,8 @@ def _convert_chain(
         mol_weights = sample.mol_weights
         distributions = sample.distributions
         legacy_units = sample.legacy_units
+        if molecular_weight is None:
+            molecular_weight = sample.molecular_weight
     else:
         mol_graph = sample
         unit_counts = bonds = contact_counts = mol_weights = distributions = legacy_units = None
@@ -1667,6 +1683,7 @@ def _convert_chain(
             native_stage_callback=lambda stage: publish_native_stage(
                 f"molecule-{stage}"
             ),
+            smiles_policy=smiles_policy,
         )
     else:
         molecule = mol_graph
@@ -1682,15 +1699,18 @@ def _convert_chain(
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
         if molecule_format == "smiles":
+            if sequence_smiles_cache is None:
+                sequence_smiles_cache = OrderedDict()
             converted_sequences = [
                 [
-                    mol_graph_to_smiles(
+                    _sequence_unit_to_smiles(
                         unit,
-                        kekulize=False,
+                        sequence_smiles_cache,
                         native_stage_callback=lambda stage: publish_native_stage(
                             f"sequence-{stage}"
                         ),
                         strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                        smiles_policy=smiles_policy,
                     )
                     for unit in sequence
                 ]
@@ -1712,6 +1732,110 @@ def _convert_chain(
     )
 
 
+def _freeze_sequence_cache_value(value):
+    """Return an exact hashable representation of supported graph metadata."""
+    if isinstance(value, dict):
+        return tuple(
+            sorted(
+                (
+                    _freeze_sequence_cache_value(key),
+                    _freeze_sequence_cache_value(item),
+                )
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_sequence_cache_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(
+            sorted(_freeze_sequence_cache_value(item) for item in value)
+        )
+    try:
+        hash(value)
+    except TypeError:
+        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    return value
+
+
+def _sequence_unit_cache_key(unit):
+    """Capture graph order and all attributes that can affect SMILES output."""
+    nodes = tuple(
+        (
+            _freeze_sequence_cache_value(node),
+            _freeze_sequence_cache_value(attributes),
+        )
+        for node, attributes in unit.nodes(data=True)
+    )
+    if unit.is_multigraph():
+        edges = tuple(
+            (
+                _freeze_sequence_cache_value(left),
+                _freeze_sequence_cache_value(right),
+                _freeze_sequence_cache_value(key),
+                _freeze_sequence_cache_value(attributes),
+            )
+            for left, right, key, attributes in unit.edges(keys=True, data=True)
+        )
+    else:
+        edges = tuple(
+            (
+                _freeze_sequence_cache_value(left),
+                _freeze_sequence_cache_value(right),
+                _freeze_sequence_cache_value(attributes),
+            )
+            for left, right, attributes in unit.edges(data=True)
+        )
+    return (
+        unit.is_directed(),
+        unit.is_multigraph(),
+        _freeze_sequence_cache_value(unit.graph),
+        nodes,
+        edges,
+    )
+
+
+def _sequence_unit_to_smiles(unit, cache, **conversion_options):
+    """Serialize identical realized units once when their metadata is cacheable."""
+    try:
+        cache_key = (
+            _sequence_unit_cache_key(unit),
+            _freeze_sequence_cache_value(
+                {
+                    key: value
+                    for key, value in conversion_options.items()
+                    if key != "native_stage_callback"
+                }
+            ),
+        )
+    except (
+        AttributeError,
+        OverflowError,
+        RecursionError,
+        TypeError,
+        ValueError,
+        pickle.PickleError,
+    ):
+        # Caching is an optimization, not a new restriction on graph metadata.
+        # Preserve conversion behavior for heterogeneous or non-picklable
+        # extension attributes that cannot form a deterministic cache key.
+        return mol_graph_to_smiles(unit, kekulize=False, **conversion_options)
+    try:
+        smiles = cache[cache_key]
+    except KeyError:
+        smiles = mol_graph_to_smiles(unit, kekulize=False, **conversion_options)
+        cache[cache_key] = smiles
+        if len(cache) > _SEQUENCE_SMILES_CACHE_MAXSIZE:
+            try:
+                cache.popitem(last=False)
+            except TypeError:
+                del cache[next(iter(cache))]
+    else:
+        move_to_end = getattr(cache, "move_to_end", None)
+        if move_to_end is not None:
+            move_to_end(cache_key)
+    return smiles
+
+
 def _defer_chain_conversion(
     sample,
     collect_info,
@@ -1719,37 +1843,61 @@ def _defer_chain_conversion(
     seed_sequence=None,
     native_diagnostics_path=None,
     strip_unresolved_directional_markers=False,
+    molecule_format=None,
+    include_sequences=False,
+    materialize_output=False,
+    smiles_policy="auto",
+    sequence_smiles_cache=None,
 ):
     """Compute mandatory convergence statistics but defer output conversion."""
     metadata_mode = _metadata_level(collect_info)
     if metadata_mode is _MetadataLevel.NONE:
         raise ValueError("deferred conversion requires chain metadata")
-    publish_native_stage = _native_state_publisher(
-        chain_index,
-        seed_sequence,
-        sample.graph,
-        native_diagnostics_path,
-    )
-    _enable_native_faulthandler()
-    rdkit_mol = mol_graph_to_rdkit_mol(
-        sample.graph,
-        native_stage_callback=lambda stage: publish_native_stage(
-            f"molecule-{stage}"
-        ),
-        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-    )
-    molecular_weight = rdkit_mol_weight(
-        rdkit_mol,
-        native_stage_callback=lambda stage: publish_native_stage(
-            f"molecule-{stage}"
-        ),
-    )
+    molecular_weight = sample.molecular_weight
+    if molecular_weight is None:
+        publish_native_stage = _native_state_publisher(
+            chain_index,
+            seed_sequence,
+            sample.graph,
+            native_diagnostics_path,
+        )
+        _enable_native_faulthandler()
+        rdkit_mol = mol_graph_to_rdkit_mol(
+            sample.graph,
+            native_stage_callback=lambda stage: publish_native_stage(
+                f"molecule-{stage}"
+            ),
+            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+        )
+        molecular_weight = rdkit_mol_weight(
+            rdkit_mol,
+            native_stage_callback=lambda stage: publish_native_stage(
+                f"molecule-{stage}"
+            ),
+        )
+
+    materialized = None
+    if materialize_output:
+        materialized = _convert_chain(
+            sample,
+            molecule_format,
+            collect_info,
+            include_sequences,
+            chain_index,
+            seed_sequence,
+            native_diagnostics_path,
+            molecular_weight=molecular_weight,
+            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+            smiles_policy=smiles_policy,
+            sequence_smiles_cache=sequence_smiles_cache,
+        )
     return _DeferredChainRecord(
         sample,
         molecular_weight,
         chain_index,
         seed_sequence,
         native_diagnostics_path,
+        materialized,
     )
 
 
@@ -1759,7 +1907,11 @@ def _materialize_deferred_chain(
     collect_info,
     include_sequences,
     strip_unresolved_directional_markers=False,
+    smiles_policy="auto",
+    sequence_smiles_cache=None,
 ):
+    if deferred.materialized is not None:
+        return deferred.materialized
     return _convert_chain(
         deferred.sample,
         molecule_format,
@@ -1770,6 +1922,8 @@ def _materialize_deferred_chain(
         deferred.native_diagnostics_path,
         molecular_weight=deferred.molecular_weight,
         strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+        smiles_policy=smiles_policy,
+        sequence_smiles_cache=sequence_smiles_cache,
     )
 
 
@@ -1851,6 +2005,7 @@ def _sample_chain_batch(
     defer_conversion=False,
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
+    smiles_policy="auto",
 ):
     """Sample a batch of chains in one worker process (module level so
     ProcessPoolExecutor can pickle it).
@@ -1893,6 +2048,15 @@ def _sample_chain_batch(
                             seed_sequence,
                             native_diagnostics_path,
                             strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            molecule_format=molecule_format,
+                            include_sequences=include_sequences,
+                            materialize_output=defer_conversion == "materialize",
+                            smiles_policy=smiles_policy,
+                            sequence_smiles_cache=getattr(
+                                atom_graph,
+                                "_sequence_smiles_cache",
+                                None,
+                            ),
                         )
                     else:
                         record = _convert_chain(
@@ -1904,6 +2068,12 @@ def _sample_chain_batch(
                             seed_sequence,
                             native_diagnostics_path,
                             strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            smiles_policy=smiles_policy,
+                            sequence_smiles_cache=getattr(
+                                atom_graph,
+                                "_sequence_smiles_cache",
+                                None,
+                            ),
                         )
                 deferred_warnings.extend(conversion_warnings)
                 break
@@ -3712,6 +3882,7 @@ class EnsembleCreator:
         self._static_graph = self._create_static_graph(self.generative_graph)
         self._static_source_templates = self._prepare_static_source_templates()
         self._canonical_unit_info = self._prepare_canonical_unit_info(labels)
+        self._sequence_smiles_cache = OrderedDict()
         self._termination_fragment_masses = _prepare_termination_fragment_masses(
             self._generative_graph,
             self._static_graph,
@@ -3779,6 +3950,17 @@ class EnsembleCreator:
                 np.asarray(self._repeat_unit_starting_node_weight) > 0.0
             ) > 1,
         }
+
+    def __getstate__(self):
+        """Exclude transient sequence strings from worker initialization IPC."""
+        state = self.__dict__.copy()
+        state["_sequence_smiles_cache"] = OrderedDict()
+        return state
+
+    def __setstate__(self, state):
+        """Restore creators pickled before the transient cache was introduced."""
+        self.__dict__.update(state)
+        self.__dict__.setdefault("_sequence_smiles_cache", OrderedDict())
 
     def _prepare_distributions(self):
         """Deserialize immutable distribution templates once per creator."""
@@ -5393,6 +5575,11 @@ class EnsembleCreator:
 
         if not collect_info:
             return partial_atom_graph.atom_graph
+        molecular_weight = sum(
+            atomic_masses[data["atomic_num"]]
+            + data["credited_h"] * atomic_masses[1]
+            for _node, data in partial_atom_graph.atom_graph.nodes(data=True)
+        )
         actual_mol_weights = {}
         for instance_id in partial_atom_graph.stochastic_tracker.sto_atom_id_actual_molw:
             stochastic_id = partial_atom_graph.stochastic_tracker._stochastic_atom_id_to_gen_id[instance_id]
@@ -5426,6 +5613,7 @@ class EnsembleCreator:
                 distributions,
                 legacy_units,
                 legacy_sequences,
+                molecular_weight,
             )
 
         units, bonds, sequences = partial_atom_graph.materialize_legacy_metadata()
@@ -5475,6 +5663,7 @@ class EnsembleCreator:
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=False,
         fallback_on_worker_crash=False,
+        smiles_policy="auto",
     ):
         """Yield ordered per-chain success/failure records.
 
@@ -5506,6 +5695,7 @@ class EnsembleCreator:
                 use_repeat_units_as_source,
                 strip_unresolved_directional_markers,
                 fallback_on_worker_crash,
+                smiles_policy,
             )
             return
 
@@ -5546,6 +5736,12 @@ class EnsembleCreator:
                                 seed_sequence,
                                 native_diagnostics_path,
                                 strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                                smiles_policy=smiles_policy,
+                                sequence_smiles_cache=getattr(
+                                    self,
+                                    "_sequence_smiles_cache",
+                                    None,
+                                ),
                             )
                         else:
                             record = _convert_chain(
@@ -5557,6 +5753,12 @@ class EnsembleCreator:
                                 seed_sequence,
                                 native_diagnostics_path,
                                 strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                                smiles_policy=smiles_policy,
+                                sequence_smiles_cache=getattr(
+                                    self,
+                                    "_sequence_smiles_cache",
+                                    None,
+                                ),
                             )
                     deferred_warnings.extend(conversion_warnings)
                     break
@@ -5664,7 +5866,7 @@ class EnsembleCreator:
             molecular_weights=molecular_weights,
         )
 
-    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2, strip_unresolved_directional_markers=True, fallback_on_worker_crash=True):
+    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2, strip_unresolved_directional_markers=True, fallback_on_worker_crash=True, smiles_policy="auto"):
         """Sample an ensemble while rejecting explicitly chain-local failures.
 
         ``max_number_of_discarded_chains`` limits consecutive rejected paths
@@ -5718,12 +5920,19 @@ class EnsembleCreator:
         ``fallback_on_worker_crash=True`` keeps completed parallel results and
         rescues only unfinished chain jobs in serial mode when worker restart
         recovery is exhausted.
+        ``smiles_policy`` is ``"auto"`` by default, ``"canonical"`` to
+        disable overflow fallbacks, or ``"fast"`` to prefer deterministic
+        non-canonical output without attempting canonical serialization.
         """
 
         supported_formats = {"smiles", "mol_graph"}
         molecule_format = output_format.lower()
         if molecule_format not in supported_formats:
             raise ValueError(f"Unsupported format: '{output_format}'. " f"Please choose from {list(supported_formats)}.")
+        if smiles_policy not in {"auto", "canonical", "fast"}:
+            raise ValueError(
+                "smiles_policy must be 'auto', 'canonical', or 'fast'."
+            )
 
         if n_workers is not None and not parallel:
             raise ValueError("n_workers only applies to parallel=True; the default mode is serial.")
@@ -5765,6 +5974,7 @@ class EnsembleCreator:
             max_worker_restarts=max_worker_restarts,
             strip_unresolved_directional_markers=strip_unresolved_directional_markers,
             fallback_on_worker_crash=fallback_on_worker_crash,
+            smiles_policy=smiles_policy,
         ):
             for message, category, filename, lineno in chain_result["warnings"]:
                 warning_kind = _classify_directional_stereo_warning(
@@ -5824,6 +6034,11 @@ class EnsembleCreator:
         if json_file is not None:
             # The file's chains follow output_format (the caller's format
             # choice decides the file size); sequences are always SMILES.
+            sequence_smiles_cache = getattr(
+                self,
+                "_sequence_smiles_cache",
+                OrderedDict(),
+            )
             if molecule_format == "smiles":
 
                 def _chain_json(molecule):
@@ -5838,10 +6053,11 @@ class EnsembleCreator:
                     return nx.node_link_data(molecule, edges="edges")
 
                 def _sequence_unit_smiles(unit):
-                    return mol_graph_to_smiles(
+                    return _sequence_unit_to_smiles(
                         unit,
-                        kekulize=False,
+                        sequence_smiles_cache,
                         strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                        smiles_policy=smiles_policy,
                     )
 
             saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
@@ -5869,7 +6085,7 @@ class EnsembleCreator:
         batch_size=25,
         max_samples=1500,
         window=4,
-        mass_tolerance=0.002,
+        mass_tolerance=0.01,
         contact_tolerance=0.01,
         output_format="mol_graph",
         max_number_of_discarded_chains=100,
@@ -5891,6 +6107,7 @@ class EnsembleCreator:
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=True,
         fallback_on_worker_crash=True,
+        smiles_policy="auto",
     ):
         """Sample batches until cumulative mass and contact statistics stabilize.
 
@@ -5921,6 +6138,7 @@ class EnsembleCreator:
         serial mode when restart recovery is exhausted.
         Set ``use_repeat_units_as_source=True`` to seed each chain from a
         repeat unit when the polymer has no initiator.
+        ``smiles_policy`` follows :meth:`create_ensemble`.
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
@@ -5950,6 +6168,10 @@ class EnsembleCreator:
             raise ValueError(
                 f"Unsupported format: '{output_format}'. "
                 f"Please choose from {list(supported_formats)}."
+            )
+        if smiles_policy not in {"auto", "canonical", "fast"}:
+            raise ValueError(
+                "smiles_policy must be 'auto', 'canonical', or 'fast'."
             )
         if n_workers is not None and not parallel:
             raise ValueError(
@@ -5996,6 +6218,7 @@ class EnsembleCreator:
             "strip_unresolved_directional_markers": bool(
                 strip_unresolved_directional_markers
             ),
+            "smiles_policy": smiles_policy,
         }
         reservoir_rng = None
         if retain_samples and reservoir_size is not None:
@@ -6025,6 +6248,7 @@ class EnsembleCreator:
             )
             saved_settings.setdefault("use_repeat_units_as_source", False)
             saved_settings.setdefault("fallback_on_worker_crash", True)
+            saved_settings.setdefault("smiles_policy", "auto")
             if saved_settings != checkpoint_settings:
                 raise ValueError("checkpoint settings do not match this convergence run.")
             aggregate_unit_counts = Counter(
@@ -6091,11 +6315,17 @@ class EnsembleCreator:
                 include_sequences=retain_sequences or sample_callback is not None,
                 native_diagnostics_path=native_diagnostics_path,
                 max_worker_restarts=max_worker_restarts,
-                defer_conversion=True,
+                defer_conversion=(
+                    "materialize"
+                    if sample_callback is not None
+                    or (retain_samples and reservoir_size is None)
+                    else True
+                ),
                 parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
                 use_repeat_units_as_source=use_repeat_units_as_source,
                 strip_unresolved_directional_markers=strip_unresolved_directional_markers,
                 fallback_on_worker_crash=fallback_on_worker_crash,
+                smiles_policy=smiles_policy,
             ):
                 next_chain_index = max(
                     next_chain_index,
@@ -6155,6 +6385,12 @@ class EnsembleCreator:
                                 metadata_mode,
                                 True,
                                 strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                                smiles_policy=smiles_policy,
+                                sequence_smiles_cache=getattr(
+                                    self,
+                                    "_sequence_smiles_cache",
+                                    None,
+                                ),
                             )
                         for caught in callback_warnings:
                             warning_kind = _classify_directional_stereo_warning(
@@ -6204,6 +6440,12 @@ class EnsembleCreator:
                                         metadata_mode,
                                         retain_sequences,
                                         strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                                        smiles_policy=smiles_policy,
+                                        sequence_smiles_cache=getattr(
+                                            self,
+                                            "_sequence_smiles_cache",
+                                            None,
+                                        ),
                                     )
                                 for caught in retained_warnings:
                                     warning_kind = _classify_directional_stereo_warning(
@@ -6390,6 +6632,7 @@ class EnsembleCreator:
                 "use_repeat_units_as_source": bool(
                     use_repeat_units_as_source
                 ),
+                "smiles_policy": smiles_policy,
             },
             convergence_trace=tracker.history,
             number_average_molecular_weight=mn,

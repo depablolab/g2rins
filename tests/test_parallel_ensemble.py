@@ -676,7 +676,6 @@ def test_native_diagnostics_record_chain_seed_versions_and_stages(tmp_path):
             "molecule-build",
             "molecule-sanitize",
             "molecule-property-cache",
-            "molecule-descriptor-molwt",
             "molecule-smiles",
         ]
         assert chain_states[0]["seed"]["entropy"] == 7

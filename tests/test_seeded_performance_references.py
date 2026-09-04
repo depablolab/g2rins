@@ -4,6 +4,7 @@
 """Behavioral guardrails for performance-focused sampler rewrites."""
 
 import json
+import pickle
 
 import networkx as nx
 import numpy as np
@@ -100,6 +101,67 @@ def test_deferred_canonical_unit_conversion_is_cached(monkeypatch):
     }
     assert calls_after_materialization == calls_after_construction + 1
     assert fragment_calls == calls_after_materialization
+
+
+def test_repeated_sequence_smiles_conversion_is_cached(monkeypatch):
+    calls = 0
+    original = ensemble_module.mol_graph_to_smiles
+
+    def counted_conversion(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "mol_graph_to_smiles",
+        counted_conversion,
+    )
+    creator = g2rins.G2rins.make(
+        "C{[>][<]CC(C)[>];;[<]}|poisson(900)|[H]"
+    ).get_graph_creator().get_ensemble_creator()
+    result = creator.create_ensemble(
+        1,
+        output_format="smiles",
+        ensemble_info=True,
+        seed=0,
+    )
+    calls_after_first_chain = calls
+    repeated = creator.create_ensemble(
+        1,
+        output_format="smiles",
+        ensemble_info=True,
+        seed=0,
+    )
+
+    sequence_units = [
+        unit
+        for sequence in result.sequences[0]
+        for unit in sequence
+    ]
+    assert len(sequence_units) > calls
+    assert calls == len(set(sequence_units))
+    assert calls == calls_after_first_chain
+    assert repeated.sequences == result.sequences
+    assert creator._sequence_smiles_cache
+    restored = pickle.loads(pickle.dumps(creator))
+    assert not restored._sequence_smiles_cache
+
+
+def test_sequence_cache_bypasses_non_picklable_extension_metadata():
+    class NonPicklable:
+        __hash__ = None
+
+        def __reduce__(self):
+            raise AttributeError("local extension metadata cannot be pickled")
+
+    unit = nx.Graph()
+    unit.add_node(0, atomic_num=6, aromatic=False, charge=0)
+    unit.graph["extension_metadata"] = NonPicklable()
+    cache = {}
+
+    assert ensemble_module._sequence_unit_to_smiles(unit, cache) == "C"
+    assert cache == {}
 
 
 def test_creator_prepares_distributions_once(monkeypatch):

@@ -19,6 +19,8 @@ from g2rins.ensemble_creator import (
     _DeferredChainRecord,
     _PartialAtomGraph,
     _SampledMolecule,
+    _defer_chain_conversion,
+    _materialize_deferred_chain,
 )
 
 
@@ -41,6 +43,45 @@ def _deferred(index, molecular_weight=100.0):
         distributions={0: "uniform(100,100)"},
     )
     return _DeferredChainRecord(sample, molecular_weight, index, None, None)
+
+
+def test_deferred_conversion_uses_reconciled_sampler_weight(monkeypatch):
+    deferred = _deferred(3, molecular_weight=123.5)
+    deferred.sample.molecular_weight = 123.5
+
+    def unexpected_rdkit_conversion(*_args, **_kwargs):
+        raise AssertionError("tracked mass should avoid RDKit conversion")
+
+    monkeypatch.setattr(
+        ensemble_creator_module,
+        "mol_graph_to_rdkit_mol",
+        unexpected_rdkit_conversion,
+    )
+
+    result = _defer_chain_conversion(deferred.sample, collect_info=True)
+
+    assert result.molecular_weight == 123.5
+
+
+def test_worker_materialized_deferred_output_is_reused(monkeypatch):
+    deferred = _deferred(4, molecular_weight=91.0)
+    deferred.sample.molecular_weight = 91.0
+    conversions = []
+
+    def convert_once(*args, **kwargs):
+        conversions.append((args, kwargs))
+        return "materialized"
+
+    monkeypatch.setattr(ensemble_creator_module, "_convert_chain", convert_once)
+    result = _defer_chain_conversion(
+        deferred.sample,
+        collect_info=True,
+        molecule_format="smiles",
+        materialize_output=True,
+    )
+
+    assert _materialize_deferred_chain(result, "smiles", True, False) == "materialized"
+    assert len(conversions) == 1
 
 
 def test_tracker_requires_complete_stable_window():
@@ -115,7 +156,7 @@ def test_create_ensemble_until_converged_stops_after_stable_window(monkeypatch):
     )
     assert progress[-1] == (
         "    3 |       6 |    17446.7 |    17446.7 | "
-        "mass_delta=0.0000/0.0020 contact_delta=0.0000/0.0100"
+        "mass_delta=0.0000/0.0100 contact_delta=0.0000/0.0100"
     )
 
 
@@ -148,7 +189,7 @@ def test_create_ensemble_until_converged_honors_max_samples(monkeypatch):
     assert requested_sizes == [2, 2, 1]
 
 
-def test_create_ensemble_until_converged_defaults_to_1500_max_samples(monkeypatch):
+def test_create_ensemble_until_converged_defaults(monkeypatch):
     creator = EnsembleCreator.__new__(EnsembleCreator)
 
     def iter_chain_records(**kwargs):
@@ -169,6 +210,7 @@ def test_create_ensemble_until_converged_defaults_to_1500_max_samples(monkeypatc
     assert len(result.chains) == 1500
     assert result.convergence_trace[-1]["n_samples"] == 1500
     assert result.convergence_settings["max_samples"] == 1500
+    assert result.convergence_settings["mass_tolerance"] == 0.01
 
 
 def test_create_ensemble_until_converged_uses_repeat_units_as_sources(
@@ -707,7 +749,7 @@ def test_checkpoint_policy_mismatch_is_rejected():
         )
 
 
-def test_legacy_full_checkpoint_without_policy_remains_resumable():
+def test_legacy_full_checkpoint_without_new_settings_remains_resumable():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         creator = (
@@ -725,6 +767,9 @@ def test_legacy_full_checkpoint_without_policy_remains_resumable():
         )
         checkpoint = checkpoints[-1]
         checkpoint.settings.pop("checkpoint_policy")
+        checkpoint.settings.pop("fallback_on_worker_crash")
+        checkpoint.settings.pop("use_repeat_units_as_source")
+        checkpoint.settings.pop("smiles_policy")
         del checkpoint.policy
         resumed = creator.create_ensemble_until_converged(
             batch_size=1,

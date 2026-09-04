@@ -17,7 +17,7 @@ class ConvergenceTracker:
     """
 
     window: int = 4
-    mass_tolerance: float = 0.002
+    mass_tolerance: float = 0.01
     contact_tolerance: float = 0.01
     history: list[dict[str, Any]] = field(default_factory=list)
 

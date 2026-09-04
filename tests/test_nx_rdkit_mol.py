@@ -30,6 +30,11 @@ def _linear_carbon_graph(n_atoms):
     return graph
 
 
+def _direct_writer_unsupported_mol():
+    """Return a molecule whose dative bond deliberately needs RDKit output."""
+    return Chem.MolFromSmiles("[NH3]->[Cu+2].C1CCCCC1C2CCCCC2")
+
+
 def test_run_with_big_stack_returns_result():
     assert _run_with_big_stack(lambda a, b: a + b, 2, 3) == 5
 
@@ -71,10 +76,287 @@ def test_rdkit_mol_to_smiles_falls_back_when_canonical_ring_labels_are_exhausted
     smiles = rdkit_mol_to_smiles(mol)
 
     assert calls and calls[0] == {}
-    assert calls[1]["canonical"] is False
-    root = calls[1].get("rootedAtAtom")
-    assert root is None or 0 <= root < mol.GetNumAtoms()
-    assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
+    assert len(calls) == 1
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
+
+
+def test_rdkit_mol_to_smiles_tries_alternate_roots_after_noncanonical_overflow(monkeypatch):
+    mol = _direct_writer_unsupported_mol()
+    direct_mol_to_smiles = Chem.MolToSmiles
+    successful_root = mol.GetNumAtoms() // 2
+    calls = []
+
+    def traversal_limited_mol_to_smiles(value, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("canonical", True) or kwargs.get("rootedAtAtom") != successful_root:
+            raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(Chem, "MolToSmiles", traversal_limited_mol_to_smiles)
+    smiles = rdkit_mol_to_smiles(mol)
+
+    assert calls[0] == {}
+    assert all(call.get("canonical") is False for call in calls[1:])
+    assert [call.get("rootedAtAtom") for call in calls[1:]][-1] == successful_root
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
+
+
+def test_rdkit_mol_to_smiles_renumbers_atoms_when_every_original_root_overflows(monkeypatch):
+    mol = _direct_writer_unsupported_mol()
+    direct_mol_to_smiles = Chem.MolToSmiles
+    calls = []
+
+    def atom_order_limited_mol_to_smiles(value, **kwargs):
+        calls.append((value, kwargs))
+        if kwargs.get("canonical", True) or value is mol:
+            raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(Chem, "MolToSmiles", atom_order_limited_mol_to_smiles)
+    smiles = rdkit_mol_to_smiles(mol)
+
+    assert calls[0] == (mol, {})
+    assert any(value is not mol for value, _kwargs in calls)
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
+
+
+def test_rdkit_mol_to_smiles_uses_seeded_random_traversal_for_large_overflow(monkeypatch):
+    import g2rins.nx_rdkit_mol as nx_rdkit_mol
+    from rdkit import rdBase
+
+    mol = _direct_writer_unsupported_mol()
+    direct_mol_to_smiles = Chem.MolToSmiles
+    random_seeds = []
+    reset_seeds = []
+
+    def traversal_limited_mol_to_smiles(_value, **_kwargs):
+        raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+
+    def seeded_random_smiles(value, count, randomSeed):
+        assert value is mol
+        assert count == 1
+        assert randomSeed == 0
+        random_seeds.append(randomSeed)
+        if len(random_seeds) == 1:
+            raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+        return [direct_mol_to_smiles(value, canonical=False)]
+
+    monkeypatch.setattr(nx_rdkit_mol, "_BIG_STACK_ATOM_THRESHOLD", 1)
+    monkeypatch.setattr(Chem, "MolToSmiles", traversal_limited_mol_to_smiles)
+    monkeypatch.setattr(Chem, "MolToRandomSmilesVect", seeded_random_smiles)
+    monkeypatch.setattr(rdBase, "SeedRandomNumberGenerator", reset_seeds.append)
+
+    smiles = rdkit_mol_to_smiles(mol)
+
+    assert reset_seeds == [1, 2]
+    assert random_seeds == [0, 0]
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
+
+
+def test_rdkit_mol_to_smiles_fast_policy_skips_canonical_call(monkeypatch):
+    mol = Chem.MolFromSmiles("C1CCCCC1")
+
+    def unexpected_rdkit_smiles(*_args, **_kwargs):
+        raise AssertionError("fast policy must use the deterministic direct writer")
+
+    monkeypatch.setattr(Chem, "MolToSmiles", unexpected_rdkit_smiles)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="fast")
+
+    assert Chem.MolFromSmiles(smiles) is not None
+
+
+def test_rdkit_mol_to_smiles_fast_policy_uses_noncanonical_rdkit_for_unsupported_features(monkeypatch):
+    mol = _direct_writer_unsupported_mol()
+    direct_mol_to_smiles = Chem.MolToSmiles
+    calls = []
+
+    def recorded_smiles(value, **kwargs):
+        calls.append(kwargs)
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(Chem, "MolToSmiles", recorded_smiles)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="fast")
+
+    assert calls == [{"canonical": False}]
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
+
+
+def test_rdkit_mol_to_smiles_canonical_policy_disables_fallback(monkeypatch):
+    mol = Chem.MolFromSmiles("C1CCCCC1")
+
+    def ring_limited_smiles(*_args, **_kwargs):
+        raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
+    with pytest.raises(ValueError, match="rings open at once"):
+        rdkit_mol_to_smiles(mol, smiles_policy="canonical")
+
+
+def test_rdkit_mol_to_smiles_rejects_unknown_policy():
+    with pytest.raises(ValueError, match="Unsupported SMILES policy"):
+        rdkit_mol_to_smiles(Chem.MolFromSmiles("CC"), smiles_policy="quickish")
+
+
+def test_rdkit_mol_to_smiles_uses_extended_ring_labels_after_random_overflow(monkeypatch):
+    import g2rins.nx_rdkit_mol as nx_rdkit_mol
+
+    mol = Chem.MolFromSmiles("c1ccc(-c2ccccc2)cc1")
+
+    def ring_limited_smiles(_value, *_args, **_kwargs):
+        raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+
+    monkeypatch.setattr(nx_rdkit_mol, "_BIG_STACK_ATOM_THRESHOLD", 1)
+    monkeypatch.setattr(nx_rdkit_mol, "_RANDOM_SMILES_ATTEMPTS", 1)
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
+    monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
+
+    smiles = rdkit_mol_to_smiles(mol)
+    reparsed = Chem.MolFromSmiles(smiles)
+
+    assert reparsed is not None
+    assert reparsed.GetNumAtoms() == mol.GetNumAtoms()
+    assert reparsed.GetNumBonds() == mol.GetNumBonds()
+
+
+@pytest.mark.parametrize(
+    "isomeric_smiles",
+    [
+        "O[C@H]1[C@@H](O)[C@H](O)[C@@H](CO)O[C@@H]1O",
+        "[C@](F)(Cl)(Br)I",
+        "[C@H](F)(Cl)Br",
+        "F/C=C/F",
+        "F/C=C\\F",
+    ],
+)
+def test_extended_ring_label_writer_preserves_stereochemistry(
+    monkeypatch,
+    isomeric_smiles,
+):
+    import g2rins.nx_rdkit_mol as nx_rdkit_mol
+
+    mol = Chem.MolFromSmiles(isomeric_smiles)
+    direct_mol_to_smiles = Chem.MolToSmiles
+
+    def ring_limited_smiles(_value, *_args, **_kwargs):
+        raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+
+    monkeypatch.setattr(nx_rdkit_mol, "_BIG_STACK_ATOM_THRESHOLD", 1)
+    monkeypatch.setattr(nx_rdkit_mol, "_RANDOM_SMILES_ATTEMPTS", 1)
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
+    monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
+
+    n_atoms = mol.GetNumAtoms()
+    atom_orders = [
+        list(range(n_atoms)),
+        list(reversed(range(n_atoms))),
+        list(range(1, n_atoms)) + [0],
+    ]
+    for atom_order in atom_orders:
+        reordered = Chem.RenumberAtoms(mol, atom_order)
+        smiles = rdkit_mol_to_smiles(reordered)
+        reparsed = Chem.MolFromSmiles(smiles)
+
+        assert reparsed is not None
+        assert direct_mol_to_smiles(
+            reparsed,
+            canonical=True,
+            isomericSmiles=True,
+        ) == direct_mol_to_smiles(
+            reordered,
+            canonical=True,
+            isomericSmiles=True,
+        )
+
+
+def test_extended_ring_label_writer_preserves_stereocyclic_polymer(monkeypatch):
+    import g2rins.nx_rdkit_mol as nx_rdkit_mol
+
+    repeat = Chem.MolFromSmiles("N[C@H]1CCCO1")
+    repeat_size = repeat.GetNumAtoms()
+    mol = repeat
+    for _ in range(23):
+        mol = Chem.CombineMols(mol, repeat)
+    editable = Chem.RWMol(mol)
+    for repeat_index in range(23):
+        linker = editable.AddAtom(Chem.Atom(6))
+        editable.AddBond(
+            repeat_index * repeat_size,
+            linker,
+            Chem.BondType.SINGLE,
+        )
+        editable.AddBond(
+            linker,
+            (repeat_index + 1) * repeat_size,
+            Chem.BondType.SINGLE,
+        )
+    mol = editable.GetMol()
+    Chem.SanitizeMol(mol)
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
+    direct_mol_to_smiles = Chem.MolToSmiles
+
+    def ring_limited_smiles(_value, *_args, **_kwargs):
+        raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+
+    monkeypatch.setattr(nx_rdkit_mol, "_BIG_STACK_ATOM_THRESHOLD", 1)
+    monkeypatch.setattr(nx_rdkit_mol, "_RANDOM_SMILES_ATTEMPTS", 1)
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
+    monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
+
+    smiles = rdkit_mol_to_smiles(mol)
+    reparsed = Chem.MolFromSmiles(smiles)
+
+    assert reparsed is not None
+    assert smiles.count("@") == 24
+    assert direct_mol_to_smiles(
+        reparsed,
+        canonical=True,
+        isomericSmiles=True,
+    ) == direct_mol_to_smiles(
+        mol,
+        canonical=True,
+        isomericSmiles=True,
+    )
+
+
+def test_extended_ring_label_writer_preserves_starch_like_maltose(monkeypatch):
+    """The forced overflow fallback preserves an alpha-linked glucose motif."""
+    import g2rins.nx_rdkit_mol as nx_rdkit_mol
+    from rdkit.Chem import rdMolDescriptors
+
+    # Maltose is the alpha-1,4-linked glucose disaccharide motif repeated in
+    # amylose and in the linear segments of amylopectin (starch).
+    maltose = Chem.MolFromSmiles(
+        "OC[C@H]1O[C@@H](O[C@H]2[C@@H](CO)O[C@H](O)[C@H](O)[C@H]2O)"
+        "[C@H](O)[C@@H](O)[C@@H]1O"
+    )
+    direct_mol_to_smiles = Chem.MolToSmiles
+
+    def ring_limited_smiles(_value, *_args, **_kwargs):
+        raise ValueError("Too many rings open at once. SMILES cannot be generated.")
+
+    monkeypatch.setattr(nx_rdkit_mol, "_BIG_STACK_ATOM_THRESHOLD", 1)
+    monkeypatch.setattr(nx_rdkit_mol, "_RANDOM_SMILES_ATTEMPTS", 1)
+    monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
+    monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
+
+    smiles = rdkit_mol_to_smiles(maltose)
+    reparsed = Chem.MolFromSmiles(smiles)
+
+    assert reparsed is not None
+    assert rdMolDescriptors.CalcMolFormula(reparsed) == "C12H22O11"
+    assert sum(
+        atom.GetChiralTag() != Chem.ChiralType.CHI_UNSPECIFIED
+        for atom in reparsed.GetAtoms()
+    ) == 10
+    assert direct_mol_to_smiles(
+        reparsed,
+        canonical=True,
+        isomericSmiles=True,
+    ) == direct_mol_to_smiles(
+        maltose,
+        canonical=True,
+        isomericSmiles=True,
+    )
 
 
 def test_rdkit_mol_to_smiles_does_not_mask_other_value_errors(monkeypatch):
@@ -126,10 +408,8 @@ def test_rdkit_mol_to_smiles_falls_back_when_ring_overflow_is_runtime_error(monk
     smiles = rdkit_mol_to_smiles(mol)
 
     assert calls and calls[0] == {}
-    assert calls[1]["canonical"] is False
-    root = calls[1].get("rootedAtAtom")
-    assert root is None or 0 <= root < mol.GetNumAtoms()
-    assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
+    assert len(calls) == 1
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
 
 
 def test_rdkit_mol_to_smiles_handles_benzimidazole_like_cyclic_monomer(monkeypatch):
@@ -151,17 +431,46 @@ def test_rdkit_mol_to_smiles_handles_benzimidazole_like_cyclic_monomer(monkeypat
     smiles = rdkit_mol_to_smiles(mol)
 
     assert calls and calls[0] == {}
-    assert calls[1]["canonical"] is False
-    root = calls[1].get("rootedAtAtom")
-    assert root is None or 0 <= root < mol.GetNumAtoms()
+    assert len(calls) == 1
     assert "[nH]" in smiles or "nH" in smiles
-    assert Chem.MolToSmiles(Chem.MolFromSmiles(smiles), canonical=False) == smiles
+    assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
 
 
 def test_mol_graph_to_smiles_small():
     graph = _linear_carbon_graph(3)
     assert mol_graph_to_smiles(graph) == "CCC"
     assert mol_graph_to_smiles(graph) == Chem.MolToSmiles(mol_graph_to_rdkit_mol(graph))
+
+
+def test_large_ring_fast_path_avoids_symmetric_ring_sanitization(monkeypatch):
+    import g2rins.nx_rdkit_mol as nx_rdkit_mol
+
+    graph = nx.Graph()
+    for atom_index in range(4):
+        graph.add_node(
+            atom_index,
+            atomic_num=6,
+            aromatic=False,
+            charge=0,
+        )
+    for left, right in ((0, 1), (1, 2), (2, 0), (1, 3), (3, 2)):
+        graph.add_edge(left, right, bond_type=1, aromatic=False)
+
+    def unexpected_full_sanitization(*_args, **_kwargs):
+        raise AssertionError("large ring fast path must not run SymmSSSR")
+
+    monkeypatch.setattr(nx_rdkit_mol, "_FAST_RING_ATOM_THRESHOLD", 1)
+    monkeypatch.setattr(nx_rdkit_mol, "_FAST_RING_EXCESS_THRESHOLD", 1)
+    monkeypatch.setattr(Chem, "SanitizeMol", unexpected_full_sanitization)
+
+    mol = mol_graph_to_rdkit_mol(graph)
+    smiles = rdkit_mol_to_smiles(mol)
+    reparsed = Chem.MolFromSmiles(smiles, sanitize=False)
+
+    assert mol.HasProp(nx_rdkit_mol._PREFER_DIRECT_SMILES_PROPERTY)
+    assert reparsed is not None
+    assert reparsed.GetNumAtoms() == graph.number_of_nodes()
+    assert reparsed.GetNumBonds() == graph.number_of_edges()
 
 
 def test_mol_graph_to_smiles_publishes_every_native_stage():
@@ -234,6 +543,44 @@ def test_mol_graph_to_rdkit_mol_warns_on_incomplete_double_bond_directional_mark
     with pytest.warns(RuntimeWarning, match="Incomplete double-bond directional markers"):
         mol = mol_graph_to_rdkit_mol(graph)
     assert mol.GetNumBonds() == 3
+
+
+def test_mol_graph_to_rdkit_mol_handles_directed_graph_incomplete_double_bond_markers():
+    graph = nx.DiGraph()
+    graph.add_node(0, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(1, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(2, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(3, atomic_num=9, aromatic=False, charge=0)
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="/")
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False)
+
+    with pytest.warns(RuntimeWarning, match="Incomplete double-bond directional markers"):
+        mol = mol_graph_to_rdkit_mol(graph)
+    assert mol.GetNumBonds() == 3
+
+
+def test_mol_graph_to_rdkit_mol_handles_directed_graph_ambiguous_double_bond_markers():
+    graph = nx.DiGraph()
+    graph.add_node(0, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(1, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(2, atomic_num=6, aromatic=False, charge=0)
+    graph.add_node(3, atomic_num=9, aromatic=False, charge=0)
+    graph.add_node(4, atomic_num=17, aromatic=False, charge=0)
+    graph.add_edge(0, 1, bond_type=1, aromatic=False, bond_symbol_raw="/")
+    graph.add_edge(4, 1, bond_type=1, aromatic=False, bond_symbol_raw="\\")
+    graph.add_edge(1, 2, bond_type=2, aromatic=False)
+    graph.add_edge(2, 3, bond_type=1, aromatic=False, bond_symbol_raw="/")
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="Ambiguous double-bond directional markers.*stereoinformation was discarded",
+    ):
+        mol = mol_graph_to_rdkit_mol(graph)
+    assert mol.GetNumBonds() == 4
+    double_bonds = [bond for bond in mol.GetBonds() if bond.GetBondType() == Chem.BondType.DOUBLE]
+    assert len(double_bonds) == 1
+    assert double_bonds[0].GetStereo() == Chem.BondStereo.STEREONONE
 
 
 def test_mol_graph_to_rdkit_mol_can_strip_unresolved_directional_markers_on_incomplete_assignments():

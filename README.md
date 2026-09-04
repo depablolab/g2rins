@@ -56,7 +56,7 @@ ensemble = ensemble_creator.create_ensemble_until_converged(
 	batch_size=25,
 	max_samples=1500,
 	window=4,
-	mass_tolerance=0.002,
+	mass_tolerance=0.01,
 	contact_tolerance=0.01,
 	output_format="smiles",
 	seed=7,
@@ -70,6 +70,12 @@ window to satisfy both tolerances. If the hard sample limit is reached first,
 the result is returned with `converged == False`.
 Both convergence thresholds (`mass_tolerance`, `contact_tolerance`) and the
 maximum number of generated chains (`max_samples`) are user-configurable.
+
+SMILES output uses `smiles_policy="auto"`: canonical serialization is tried
+first, with deterministic recovery for large ring-rich molecules. Use
+`smiles_policy="fast"` when canonical text is unnecessary and deterministic
+non-canonical output is preferred, or `smiles_policy="canonical"` to disable
+overflow fallbacks.
 
 For polymers without an initiator, pass
 `use_repeat_units_as_source=True` to seed each iteratively generated chain

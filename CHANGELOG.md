@@ -65,6 +65,10 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
   and dynamic target probabilities instead of constructing temporary graphs.
 - Parallel ensembles now initialize one persistent creator per worker, submit compact chain jobs with at most twice the worker count in flight, cap numerical-library threads, and recycle workers where supported. Broken pools preserve completed ordered results and restart up to `max_worker_restarts`, then raise `WorkerProcessFailure` with the last valid native diagnostic state.
 - Accepted chains now construct and sanitize one RDKit molecule and reuse it for molecular weight and requested canonical SMILES. Optional durable native-stage diagnostics include chain/seed context and library versions, `faulthandler` is enabled automatically, and enlarged-stack protection covers construction, sanitization, descriptors, and SMILES generation for large molecules.
+- Convergence uses the sampler's final hydrogen-reconciled molecular weight
+  instead of rebuilding an RDKit molecule solely for `MolWt`. Retained and
+  callback outputs are materialized once in their sampling worker rather than
+  rebuilt and sanitized again serially in the coordinator.
 - Fixed-size and convergence-driven ensemble creation now share one ordered per-chain sampling engine. Convergence updates molecular-weight moments and contact frequencies online instead of rescanning all accumulated samples after every batch.
 - Ensemble sampling now tracks unit counts, contacts, and branching sequences with compact IDs and direct atom indexes, materializing the legacy graph-valued metadata only when returning it. This removes per-unit molecule scans and per-occurrence NetworkX copies without changing the public output.
 - Exact stochastic rounding now restores rejected growth steps through sparse first-write mutation journals and append watermarks instead of copying the partial molecule, frontier, stochastic tracker, and compact metadata at checkpoint capture. The consumed random stream is deliberately not rewound.
@@ -97,13 +101,35 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
   collapsed using the realized junction's bond attributes, preserving the
   intended bond between their real-atom endpoints.
 - Large, ring-rich cyclic polymers now recover from RDKit's open-ring labeling
-  overflow during SMILES serialization by retrying with non-canonical traversal
-  and a root-aware atom ordering selection, preventing failures such as
-  "Too many rings open at once. SMILES cannot be generated." for cyclic monomer
-  inputs and long polymer chains.
+  overflow during SMILES serialization by retrying non-canonical traversals
+  from multiple atom roots and, when necessary, deterministic breadth-first
+  atom orderings, independently seeded randomized traversals, and a
+  stereo-aware direct writer using RDKit's extended ring-label syntax. The
+  direct writer adjusts tetrahedral parity for its emitted neighbor order and
+  preserves directional alkene bonds, supporting cyclic chiral biopolymers
+  while preventing failures such as "Too many rings open at once. SMILES cannot
+  be generated."
+- Added forced-fallback compatibility coverage for the alpha-1,4-linked maltose
+  motif found in starch, including molecular formula and all ten stereocenters.
 - Added explicit regression coverage for long cyclic-monomer generation and
   RDKit serialization failures to prevent the issue from returning when new
   generation or serialization logic is added.
+- Extremely large, non-stereochemical fused-ring polymers bypass RDKit's
+  pathological symmetric-SSSR and canonical-ranking paths. Their existing
+  aromatic graph assignments are validated through RDKit's strict property
+  cache, rings are initialized with `FastFindRings`, and the bounded direct
+  writer emits an equivalent non-canonical SMILES with extended ring labels.
+- Repeated sequence-unit graphs are now serialized once per distinct realized
+  structure instead of invoking RDKit for every occurrence. After canonical
+  ring-label overflow, the deterministic extended-label writer is attempted
+  before randomized and renumbered RDKit traversals.
+- SMILES-producing APIs accept `smiles_policy="auto"` (canonical with safe
+  fallback), `"canonical"` (strict canonical output), or `"fast"`
+  (deterministic non-canonical output without an initial canonical-ranking
+  attempt).
+- The default ensemble-convergence mass tolerance is now 1% instead of 0.2%,
+  allowing broad molecular-mass distributions to stabilize within the default
+  1,500-sample cap; callers can still request stricter tolerances explicitly.
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 - Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.
