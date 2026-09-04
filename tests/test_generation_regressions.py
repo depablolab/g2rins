@@ -1746,7 +1746,9 @@ def test_converted_sites_never_file_under_a_terminated_owner():
     already finalized; filing the bucket's remaining converted sites back
     under that terminated instance strands them — no growth, rescue, or cap
     pass ever reads a terminated parentless bucket again — silently dropping
-    the arms and end groups they carried."""
+    the arms and end groups they carried. The home must be the PRE-EXISTING
+    live instance of the fired level, not a freshly registered one with its
+    own mass draw (that would start a second timeline of the same level)."""
     from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
     from g2rins.generative_graph import (
         _EDGE_STOCHASTIC_ID_NAME,
@@ -1770,6 +1772,9 @@ def test_converted_sites_never_file_under_a_terminated_owner():
         half_bond for half_bond in partial._open_half_bond_map[sto_atom_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
     ]
     assert len(entry_ports) >= 2, "the initiator must expose multiple fired-level entry ports"
+    # The live instance of the fired level that must take custody.
+    live_sibling, _sibling_parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:], reuse_existing=False)
+    assert live_sibling != sto_atom_id and not tracker.is_terminated(live_sibling)
 
     # Reproduce the continuation flow's order: the source is finalized first,
     # then one of its remaining fired-level sites fires from its bucket.
@@ -1786,6 +1791,36 @@ def test_converted_sites_never_file_under_a_terminated_owner():
     assert converted_homes, "the sweep converted no sibling sites"
     stranded = sorted(bucket_id for bucket_id in converted_homes if tracker.is_terminated(bucket_id))
     assert not stranded, f"converted sites filed under terminated instance(s) {stranded}"
+    assert converted_homes == {live_sibling}, f"converted sites filed under {sorted(converted_homes)}, not the pre-existing live instance {live_sibling}"
+    assert tracker._stochastic_atom_id_to_gen_id[live_sibling] == fired_gen
+    assert tracker._stochastic_gen_id_to_atom_id[fired_gen] == {sto_atom_id, live_sibling}, "the fire registered a fresh instance of the fired level"
+
+
+def test_transition_from_a_finished_level_without_a_live_instance_raises():
+    """A same-level transition fired from a finished instance whose target is
+    NOT under the fired level (a sibling nested object) leaves no live
+    instance of that level to take custody of the bucket's remaining sites.
+    No valid string reaches this today; the sweep must fail loudly instead of
+    filing the sites under the landing instance's level, where propagation
+    would fire them as that level's own growth."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    # A unit of the first nested object; its exit site carries the join to
+    # the second object, stamped at the first object's own level.
+    source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    tracker.terminate(sto_atom_id)
+    with pytest.raises(RuntimeError, match="no live instance of that level"):
+        partial.transition_graph(sto_atom_id, tree[0], rng)
 
 
 def test_migrated_heavy_caps_are_priced_into_the_crossing():

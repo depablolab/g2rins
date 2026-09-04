@@ -24,7 +24,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.
 - Open sites handed to another level's custody lost their termination modes, silently dropping declared end groups from finished molecules.
 - The transition sweep no longer transfers mode-less copies of bonds it does not convert; such copies could mask a bucket's real growth bonds and end the chain before its terminators fired.
-- Open sites converted after a root-level continuation could be filed under the already-terminated source instance, silently dropping the arms and end groups they carried.
+- Open sites converted after a root-level continuation could be filed under the already-terminated source instance, silently dropping the arms and end groups they carried. When no live instance of the fired level exists at all, the sampler now raises instead of filing them under another level's bucket.
 - Average termination-mass estimates now price end groups held in terminated descendants' custody, matching what termination actually attaches; heavy declared end groups no longer systematically overshoot the target mass.
 
 ## [1.0.0] - 2026-08-08

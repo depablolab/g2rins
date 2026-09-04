@@ -1698,21 +1698,31 @@ class _PartialAtomGraph:
         elif self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id] == sto_gen_id and not self.stochastic_tracker.is_terminated(sto_atom_id):
             owner_sto_atom_id = sto_atom_id
         else:
-            # Nearest LIVE instance at the fired level; fall back to the
-            # landing instance (pre-fix behavior) if none exists. Liveness is
-            # required: the root/inter-object continuation fires from a source
+            # Nearest LIVE instance at the fired level. Liveness is required:
+            # the root/inter-object continuation fires from a source
             # terminate_graph has already finalized, and a terminated bucket
             # is never grown, rescued, or capped again — filing the converted
             # bonds there would strand them, termination modes and all. The
-            # source's ancestry serves the live cases; the landing target's
-            # freshly registered parent chain holds a live fired-level
-            # instance for the terminated-source continuation.
-            owner_sto_atom_id = new_sto_atom_id
+            # source's ancestry serves the live cases (the rescue flavor); the
+            # landing target's freshly registered parent chain serves a
+            # terminated source whose target lies under the fired level. No
+            # live instance at all means the level fired after its last
+            # instance finished. No valid string reaches that today (only
+            # initiator buckets ever hold own-level transition sites, and
+            # sampling consumes those at its first step), so fail loudly
+            # rather than file the sites under another level's bucket, where
+            # propagation would fire them as that level's own growth.
+            owner_sto_atom_id = None
             candidates = list(reversed(self.stochastic_tracker.parent_map.get(sto_atom_id, []))) + list(reversed(parent_list))
             for ancestor in candidates:
                 if self.stochastic_tracker._stochastic_atom_id_to_gen_id[ancestor] == sto_gen_id and not self.stochastic_tracker.is_terminated(ancestor):
                     owner_sto_atom_id = ancestor
                     break
+            if owner_sto_atom_id is None:
+                raise RuntimeError(
+                    f"A level-{sto_gen_id} transition fired from a finished instance and no live instance of that level exists, "
+                    "in the source's ancestry or the target's parent chain, to take custody of its remaining sites. This is a bug, please report on github."
+                )
 
         # Converted bonds become ordinary members of the owner's pool: tag
         # them with the owner level's native parent value so prefer_parent
