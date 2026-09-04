@@ -184,6 +184,7 @@
     "svg",
     "RINS",
     "docstrings",
-    "parentless"
+    "parentless",
+    "xfail"
   ]
 }

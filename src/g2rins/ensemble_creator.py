@@ -1576,7 +1576,11 @@ class _PartialAtomGraph:
         — that continuation is still owed and the bond travels onward at its
         own level's turn — and a channel with neither terminators nor
         retained transitions is retired unfired by the terminate-time wipe,
-        the weighted competition's legal zero-growth outcome.
+        the weighted competition's legal zero-growth outcome. A literal exit
+        (the finished object's terminal bond connector bonded straight to the
+        enclosing unit's plain SMILES) is promoted like any other owner-level
+        transition and can be retired the same way; firing such exits
+        unconditionally is a planned change (see CHANGELOG).
         The finished level's own propagation modes are dropped: that level is
         decided. Scans the child's bucket plus its terminated descendants'
         buckets (a frontier can end inside a deeper instance), the same

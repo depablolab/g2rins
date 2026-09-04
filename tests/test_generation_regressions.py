@@ -1709,6 +1709,36 @@ def test_multifunctional_ports_compete_with_chain_continuation():
         assert len(tracked[1]) >= 2, f"seed {seed}: chain continuation lost every draw: {tracked[1]}"
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="a literal exit after a nested stochastic object competes with the owner's growth options; unconditional firing is a planned change (see CHANGELOG)",
+)
+def test_literal_tail_after_nested_object_is_delivered_on_every_instance():
+    """A unit that writes plain SMILES directly after a nested stochastic
+    object (an exit through the object's terminal bond connector with no bond
+    connector of the enclosing level on the path) must deliver that tail on
+    EVERY realized instance of the object: it is literal chemistry of the
+    unit, not a stochastic choice. The exit is encoded as an owner-level
+    transition, so promotion turns it into a competing growth option and an
+    owner that parks first retires it; before promotion it fired as soon as
+    the object finished but was still lost when the owner had already parked.
+    A hydrogen tail hides the loss (RDKit restores it as an implicit H), hence
+    the heavy tail here. Expected to fail until such exits fire
+    unconditionally."""
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(12):
+        _reset_rngs(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        nested_gen = next(i for i, d in dist.items() if d == "|poisson(80.0)|")
+        tails = sum(1 for _node, data in mol_graph.nodes(data=True) if data.get("atomic_num") == 35)
+        assert tails == len(tracked[nested_gen]), f"seed {seed}: {len(tracked[nested_gen])} nested instances but {tails} tail(s) delivered"
+
+
 def test_converted_sites_never_file_under_a_terminated_owner():
     """The transition sweep's owner resolution must file converted sites
     under a LIVE instance of the fired level. The root/inter-object
