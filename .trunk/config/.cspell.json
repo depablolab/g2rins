@@ -17,6 +17,7 @@
     "token",
     "(OCCC)",
     "OCCC",
+    "CCCO",
     "(COOC)",
     "COOC",
     "networkx",
@@ -195,6 +196,8 @@
     "pyproject",
     "svg",
     "RINS",
-    "docstrings"
+    "docstrings",
+    "parentless",
+    "xfail"
   ]
 }

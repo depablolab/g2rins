@@ -126,15 +126,15 @@ def test_generation_regression(smi, target_mw, band):
         Chem.SanitizeMol(mol)
 
         mol_weight = Descriptors.MolWt(mol)
-        assert lower * target_mw <= mol_weight <= upper * target_mw, (
-            f"seed {seed}: MW {mol_weight:.0f} outside [{lower:g}, {upper:g}] x target {target_mw:g}"
-        )
+        assert lower * target_mw <= mol_weight <= upper * target_mw, f"seed {seed}: MW {mol_weight:.0f} outside [{lower:g}, {upper:g}] x target {target_mw:g}"
 
 
 # Monofunctional inner stochastic object (right terminal "[]"): the generating
 # graph splits in two, chains seed inside the graft and dead-end below the
 # outer target, so every sample is a truncated chain.
-TRUNCATING_SMI = "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+TRUNCATING_SMI = (
+    "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+)
 
 
 def test_truncated_chain_contract():
@@ -239,7 +239,10 @@ EXAMPLE_ENSEMBLE_CASES = [
     pytest.param(
         # Methanol-initiated PEG/PPO random copolymer.
         "{[] [<|0.8|]CCO[>|0.8|], [<|0.2|]CC(C)O[>|0.2|]; CO[>]; [<][H] []}|log_normal(1400.0, 1.15)|",
-        1400.0, 0.12, 250, None,
+        1400.0,
+        0.12,
+        250,
+        None,
         id="peg-ppo-copolymer",
     ),
     pytest.param(
@@ -247,14 +250,20 @@ EXAMPLE_ENSEMBLE_CASES = [
         # Br-terminated. Before the nested-MW-accounting fix this sampled ~3x
         # the outer target; the whole molecule must land near 10000, not 30000.
         "{[] [<]CC([>])C(=O)OC(C)(C)C; {[] [<]CC([>])(C)C(=O)OCCO; {[] [<]CCO[>]; CO[>];  [<]}|poisson(3000.0)|CCOC(=O)C(C)(C)[>];  [<]}|poisson(6000.0)|[>]; [<]Br []}|poisson(10000.0)|",
-        10000.0, 0.10, 25, None,
+        10000.0,
+        0.10,
+        25,
+        None,
         id="nested-graft",
     ),
     pytest.param(
         # Hyperbranched poly(ethyleneimine): the AB2 monomer [<]CCN([>])[>]
         # branches at every nitrogen.
         "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(2000.0)|",
-        2000.0, 0.10, 10, None,
+        2000.0,
+        0.10,
+        10,
+        None,
         id="hyperbranched",
     ),
     pytest.param(
@@ -263,7 +272,10 @@ EXAMPLE_ENSEMBLE_CASES = [
         # the distribution (~1.5); the min-D guard catches a Schulz-Zimm
         # regression (which would pull it toward 1.33).
         "{[] [<]C(C)C(=O)O[>], [<]CC(=O)O[>]; [>]OCC(O[>])CO[>]; [<][H] []}|schulz_zimm(1800.0, 1200.0)|",
-        1200.0, 0.12, 400, 1.40,
+        1200.0,
+        0.12,
+        400,
+        1.40,
         id="star-plga",
     ),
 ]
@@ -384,9 +396,7 @@ def test_bare_bracket_atom_keeps_inferred_hydrogens():
     Chem.SanitizeMol(mol)
     # the internal carbanion carbons have 2 backbone bonds; with charge -1 (valence
     # 3) each carries one inferred H, so the chain is not a bare-carbon skeleton.
-    carbanions_with_h = sum(
-        1 for atom in mol.GetAtoms() if atom.GetSymbol() == "C" and atom.GetFormalCharge() == -1 and atom.GetTotalNumHs() > 0
-    )
+    carbanions_with_h = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "C" and atom.GetFormalCharge() == -1 and atom.GetTotalNumHs() > 0)
     assert carbanions_with_h > 0, "bare bracket [C-] was force-locked to zero H"
 
 
@@ -426,9 +436,7 @@ def test_create_ensemble_aromatic_core_unit():
         for output_format in ("mol_graph", "mol", "smiles"):
             for with_info in (False, True):
                 _reset_rngs(0)
-                result = ensemble_creator.create_ensemble(
-                    n_samples=2, output_format=output_format, ensemble_info=with_info
-                )
+                result = ensemble_creator.create_ensemble(n_samples=2, output_format=output_format, ensemble_info=with_info)
                 molecules = result.chains if with_info else result
                 assert molecules is not None and len(molecules) == 2
                 if with_info:
@@ -448,11 +456,7 @@ def test_star_initiator_has_three_arms():
         generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
     unit_labels = g2rins.derive_unit_labels(generative_graph).unit_id
     initiator_nodes = {n for n in generative_graph.nodes() if unit_labels[n].startswith("I")}
-    arm_source_atoms = {
-        u
-        for u, _v, data in generative_graph.out_edges(initiator_nodes, data=True)
-        if data.get("transition_weight", 0) > 0
-    }
+    arm_source_atoms = {u for u, _v, data in generative_graph.out_edges(initiator_nodes, data=True) if data.get("transition_weight", 0) > 0}
     assert len(arm_source_atoms) == 3, f"expected 3 arms, found {len(arm_source_atoms)}"
 
 
@@ -486,11 +490,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
     Returning the requested ensemble conditions it on avoiding the dead path,
     so the rejection must also be surfaced in a summary warning.
     """
-    smi = (
-        "{[] [<]CC[>], "
-        "[<|0.05|]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])"
-        "[>|0.05|]; [<][H]; [>][H] []}|poisson(600)|"
-    )
+    smi = "{[] [<]CC[>], " "[<|0.05|]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])" "[>|0.05|]; [<][H]; [>][H] []}|poisson(600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -505,11 +505,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
         )
 
     assert molecules is not None and len(molecules) == 1
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert summaries and summaries[0].discarded_count > 0
     assert any("DeadSamplingPath" in reason for reason, _count in summaries[0].reasons)
 
@@ -527,15 +523,9 @@ def test_undershoot_rollback_preserves_conditional_provenance(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(
-            "C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]"
-        ).get_graph_creator().get_ensemble_creator()
+        ensemble_creator = g2rins.G2rins.make("C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]").get_graph_creator().get_ensemble_creator()
 
-    source = next(
-        node
-        for node, data in ensemble_creator.generative_graph.nodes(data=True)
-        if data["stochastic_id_tree"][0] == 0 and data["gen_weight"] > 0
-    )
+    source = next(node for node, data in ensemble_creator.generative_graph.nodes(data=True) if data["stochastic_id_tree"][0] == 0 and data["gen_weight"] > 0)
     original_terminate = _PartialAtomGraph.terminate_graph
 
     def inject_post_rollback_dead_end(self, sto_atom_id, rng):
@@ -617,11 +607,7 @@ def test_unavoidable_nested_all_zero_after_branch_fails_fast(monkeypatch):
     """
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])[>], "
-        "[<]OO({[<] [<]SS[>]|0|;; [>]}|poisson(80)|[H])[>]; "
-        "[<][H]; [>][H] []}|poisson(600)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])[>], " "[<]OO({[<] [<]SS[>]|0|;; [>]}|poisson(80)|[H])[>]; " "[<][H]; [>][H] []}|poisson(600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -692,16 +678,10 @@ def test_zero_target_does_not_bypass_unavoidable_zero_terminator(
     """A real zero target still requires the architecture's declared caps."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "C{[>1][<1]CC[>2];;[<2][H]|0| []}|"
-        f"{distribution}|"
-    )
+    smi = "C{[>1][<1]CC[>2];;[<2][H]|0| []}|" f"{distribution}|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
     with warnings.catch_warnings():
@@ -743,10 +723,7 @@ def test_unavoidable_zero_terminator_from_repeat_source_fails_fast():
     smi = "{[] [<]CC[>];;[<][H]|0| []}|uniform(80,80)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._automatic_zero_support_is_unavoidable[True]
     with warnings.catch_warnings():
@@ -774,16 +751,10 @@ def test_unavoidable_empty_nested_mw_support_fails_fast(monkeypatch):
         EmptyTruncatedDistributionSupport,
     )
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(500,600)|[H])CC[>]; "
-        "[<][H]; [>][H] []}|uniform(100,200)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(500,600)|[H])CC[>]; " "[<][H]; [>][H] []}|uniform(100,200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._statically_empty_nested_mw_sto_gen_ids == frozenset({1})
     assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
@@ -815,16 +786,10 @@ def test_overlapping_nested_mw_support_stays_retryable():
     """A budget-dependent empty support remains a chain-local rejection."""
     from g2rins.exception import EmptyTruncatedDistributionSupport
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(150,600)|[H])CC[>]; "
-        "[<][H]; [>][H] []}|uniform(100,200)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(150,600)|[H])CC[>]; " "[<][H]; [>][H] []}|uniform(100,200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert not ensemble_creator._statically_empty_nested_mw_sto_gen_ids
     assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
@@ -839,9 +804,7 @@ def test_overlapping_nested_mw_support_stays_retryable():
             if successes and rejections:
                 break
             try:
-                molecule = ensemble_creator.sample_mol_graph(
-                    rng=np.random.default_rng(seed)
-                )
+                molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
             except EmptyTruncatedDistributionSupport:
                 rejections += 1
             else:
@@ -859,17 +822,10 @@ def test_zero_molar_initiation_raises_domain_error():
     """
     from g2rins.exception import NoValidGenerationSource
 
-    smi = (
-        "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; "
-        "CC(C)[>1]|0|, CC(C)[>2]|0|; "
-        "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
-    )
+    smi = "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; " "CC(C)[>1]|0|, CC(C)[>2]|0|; " "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._starting_node_idx == []
     with pytest.raises(NoValidGenerationSource):
@@ -882,23 +838,14 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
     """A dead cap route remains local when another initiator can complete."""
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
-    smi = (
-        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; "
-        "[<1][H]|0|, [<2][H] []}|uniform(80,80)|"
-    )
+    smi = "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; " "[<1][H]|0|, [<2][H] []}|uniform(80,80)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    sources_by_unit = {
-        unit_labels[source]: source
-        for source in ensemble_creator._starting_node_idx
-    }
+    sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
     assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
 
     with warnings.catch_warnings():
@@ -924,16 +871,10 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
 
 def test_zero_target_global_arm_does_not_skip_dead_sibling():
     """Finishing a zero-target arm cannot hide another declared dead arm."""
-    smi = (
-        "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)"
-        "(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
-    )
+    smi = "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)" "(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
 
@@ -954,11 +895,7 @@ def test_zero_probability_productive_source_does_not_mask_fatal_routes(monkeypat
     """An unreachable source cannot make the reachable dead routes retryable."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], N[>1], O[>2]|0|; "
-        "[<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], N[>1], O[>2]|0|; " "[<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -1049,16 +986,10 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
         frozenset(("child_entry",)),
         frozenset(("dead_leaf",)),
     )
-    probe._node_to_static_component = {
-        node: component_id
-        for component_id, component in enumerate(probe._static_components)
-        for node in component
-    }
+    probe._node_to_static_component = {node: component_id for component_id, component in enumerate(probe._static_components) for node in component}
     probe._statically_empty_nested_mw_sto_gen_ids = frozenset()
 
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 1 in immediate_components
     assert (0, "outer_entry") not in dead_states
     assert (0, "outer_other") in dead_states
@@ -1066,17 +997,13 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
     # Positive nested support is normalized, but gen_weight=0 drops the
     # half-bond before nested_transition can follow its dead child.
     graph.nodes["outer_entry"]["gen_weight"] = 0.0
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 0 not in immediate_components
     assert (0, "outer_other") not in dead_states
 
     # Empty support fails during construction, before either drop or pop.
     graph.nodes["child_entry"]["unit_molar_amounts"][1] = 0.0
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 0 in immediate_components
     assert (0, "outer_entry") in dead_states
     assert (0, "outer_other") in dead_states
@@ -1148,17 +1075,13 @@ def test_asymmetric_static_graph_disables_fatal_template_proof():
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        generative_graph = g2rins.G2rins.make(
-            "C{[>][<]CC[>]|0|;;[<]}|poisson(100)|[H]"
-        ).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+        generative_graph = g2rins.G2rins.make("C{[>][<]CC[>]|0|;;[<]}|poisson(100)|[H]").get_graph_creator().get_generative_graph(include_bond_connectors=False)
 
     reverse_removed = False
     for u, v, _key, data in list(generative_graph.edges(keys=True, data=True)):
         if u == v or not data.get("static") or not generative_graph.has_edge(v, u):
             continue
-        for reverse_key, reverse_data in list(
-            generative_graph.get_edge_data(v, u).items()
-        ):
+        for reverse_key, reverse_data in list(generative_graph.get_edge_data(v, u).items()):
             if reverse_data.get("static"):
                 generative_graph.remove_edge(v, u, reverse_key)
                 reverse_removed = True
@@ -1175,20 +1098,14 @@ def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch
     """A dead initiator is chain-local when another initiator is productive."""
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    sources_by_unit = {
-        unit_labels[source]: source
-        for source in ensemble_creator._starting_node_idx
-    }
+    sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
 
     # Force each automatic-source outcome so the provenance assertion does not
     # depend on NumPy's seed-to-choice mapping or template node order.
@@ -1217,21 +1134,14 @@ def test_explicit_dead_source_is_fatal_when_automatic_mode_can_retry():
     """An explicit source fixes the route, so its structural error is fatal."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    dead_source = next(
-        source
-        for source in ensemble_creator._starting_node_idx
-        if unit_labels[source] == "I0"
-    )
+    dead_source = next(source for source in ensemble_creator._starting_node_idx if unit_labels[source] == "I0")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1248,9 +1158,7 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(
-            "{[] [<]CC[>]; [<][H]; [>][H], [>]N []}|uniform(200, 200)|"
-        ).get_graph_creator().get_ensemble_creator()
+        ensemble_creator = g2rins.G2rins.make("{[] [<]CC[>]; [<][H]; [>][H], [>]N []}|uniform(200, 200)|").get_graph_creator().get_ensemble_creator()
 
     original_estimate = _PartialAtomGraph.get_average_termination_mw
     observations = []
@@ -1282,24 +1190,15 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
         )
 
     assert observations
-    assert all(
-        before_rng == after_rng
-        for (_before_flag, before_rng), (_after_flag, after_rng) in observations
-    ), "termination-MW estimation advanced the live RNG"
-    assert all(
-        before_flag == after_flag
-        for (before_flag, _before_rng), (after_flag, _after_rng) in observations
-    ), "termination-MW estimation changed live path provenance"
+    assert all(before_rng == after_rng for (_before_flag, before_rng), (_after_flag, after_rng) in observations), "termination-MW estimation advanced the live RNG"
+    assert all(before_flag == after_flag for (before_flag, _before_rng), (after_flag, _after_rng) in observations), "termination-MW estimation changed live path provenance"
 
 
 @pytest.mark.parametrize(
     ("smi", "use_repeat_units_as_source"),
     (
         pytest.param(
-            (
-                "{[>|1 1 0 0|] [<|0 0 0 0|]CC[<|0 0 0 0|], "
-                "[>|1 1 0 0|]OO[>|1 1 0 0|];; [<]}|uniform(300, 400)|"
-            ),
+            ("{[>|1 1 0 0|] [<|0 0 0 0|]CC[<|0 0 0 0|], " "[>|1 1 0 0|]OO[>|1 1 0 0|];; [<]}|uniform(300, 400)|"),
             False,
             id="default-source-mode",
         ),
@@ -1403,11 +1302,7 @@ def test_create_ensemble_retries_chain_local_error_with_diagnostic(monkeypatch):
 
     assert molecules == [first_molecule, second_molecule]
     assert calls == 3
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert len(summaries) == 1
     assert summaries[0].discarded_count == 1
     assert summaries[0].reasons == (("EmptyTruncatedDistributionSupport", 1),)
@@ -1522,11 +1417,7 @@ def test_create_ensemble_total_failure_emits_discard_summary(monkeypatch):
                 max_number_of_discarded_chains=3,
             )
 
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert len(summaries) == 1
     assert summaries[0].discarded_count == 3
     assert summaries[0].reasons == (("EmptyTruncatedDistributionSupport", 3),)
@@ -1671,15 +1562,15 @@ def test_legacy_edge_schema_rejected():
     [
         (15, +1, 0, 4),  # P+ fills to PH4+ — the old single-default-valence math gave 6
         (15, +1, 3, 1),  # R3PH+ phosphonium
-        (15, 0, 0, 3),   # PH3, not PH5 (chem_resource stores P as 5)
-        (15, 0, 3, 0),   # R3P phosphine, no phantom H
-        (16, 0, 3, 1),   # S climbs to its tetravalent tier
-        (16, 0, 2, 0),   # thioether
-        (7, +1, 0, 4),   # NH4+
-        (8, -1, 1, 0),   # alkoxide
-        (5, -1, 1, 3),   # borohydride-like B-
-        (6, +1, 1, 2),   # carbocation
-        (26, 0, 0, 0),   # metals get no implicit H
+        (15, 0, 0, 3),  # PH3, not PH5 (chem_resource stores P as 5)
+        (15, 0, 3, 0),  # R3P phosphine, no phantom H
+        (16, 0, 3, 1),  # S climbs to its tetravalent tier
+        (16, 0, 2, 0),  # thioether
+        (7, +1, 0, 4),  # NH4+
+        (8, -1, 1, 0),  # alkoxide
+        (5, -1, 1, 3),  # borohydride-like B-
+        (6, +1, 1, 2),  # carbocation
+        (26, 0, 0, 0),  # metals get no implicit H
     ],
 )
 def test_hydrogen_inference_matches_chemistry(atomic_num, charge, bonds, expected_h):
@@ -1696,9 +1587,9 @@ def test_hydrogen_inference_matches_chemistry(atomic_num, charge, bonds, expecte
 @pytest.mark.parametrize(
     ("atomic_num", "expected_h"),
     [
-        (6, 1),   # benzene carbon keeps its ring hydrogen
-        (7, 0),   # pyridine nitrogen
-        (8, 0),   # furan oxygen
+        (6, 1),  # benzene carbon keeps its ring hydrogen
+        (7, 0),  # pyridine nitrogen
+        (8, 0),  # furan oxygen
         (16, 0),  # thiophene sulfur — NOT the tetravalent tier of non-aromatic S(3)
         (34, 0),  # selenophene selenium
     ],
@@ -1751,6 +1642,303 @@ def test_phosphonium_tracked_mw_matches_rdkit():
     assert abs(rdkit_mw - tracked_mw) < 1.0, f"tracked {tracked_mw:.1f} vs RDKit {rdkit_mw:.1f}"
 
 
+def test_nested_side_chain_so_gets_one_instance_per_junction():
+    """A nested stochastic object with its own MW distribution used as a
+    repeat unit (graft side chains entered through backbone ports) grows one
+    instance with one independent draw per junction. The transition sweep
+    used to file the converted sibling ports under the LANDING instance
+    instead of the fired-level instance: every graft pooled into that single
+    poisson(200) draw, side chains never propagated past the junction unit,
+    the unfired ports were destroyed with the instance's terminate-time wipe,
+    and the outer target became unreachable — every chain was discarded as
+    non-representative."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; " "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; " "[<2][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        _reset_rngs(seed)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        bad = [w.category.__name__ for w in caught if issubclass(w.category, (PossibleNonRepresentativePolymerChain, DiscardedSamplingPaths))]
+        assert not bad, f"seed {seed}: graft chain flagged non-representative: {bad}"
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        side_id = next(i for i, d in dist.items() if d == "|poisson(200.0)|")
+        side_masses = tracked[side_id]
+        assert len(side_masses) >= 2, f"seed {seed}: grafts pooled into {len(side_masses)} side-chain instance(s): {side_masses}"
+        # The crossing rounding is all-or-nothing: a kept side chain always
+        # carries the junction plus repeat units. A bare ~59 Da junction means
+        # the ports were captured into a nested instance again.
+        assert min(side_masses) > 90.0, f"seed {seed}: bare junction graft survived: {side_masses}"
+
+
+def test_multifunctional_ports_compete_with_chain_continuation():
+    """A multifunctional initiator's [>1] ports enter a nested arm SO while
+    the chain also continues through units embedding another nested SO. Port
+    initiation and chain continuation must COMPETE in the owner's weighted
+    draw (the multifunctional initiation principle generalized to nested
+    levels): every port grows its own arm with its own MW draw. The deferred
+    continuation used to fire directly from the finished child's bucket,
+    bypassing the owner's pool entirely, so exactly one arm ever grew and the
+    remaining ports were silently wiped at the outer termination."""
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        _reset_rngs(seed)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        bad = [w.category.__name__ for w in caught if issubclass(w.category, (PossibleNonRepresentativePolymerChain, DiscardedSamplingPaths))]
+        assert not bad, f"seed {seed}: chain flagged non-representative: {bad}"
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        # Construction order is parse-stable: gen 1 is the SO embedded in the
+        # chain unit, gen 2 the arm SO entered through the [>1] ports.
+        assert dist[2] == "|poisson(100.0)|"
+        arm_masses = tracked[2]
+        # Not == 3: a port losing every owner-level draw before the outer
+        # target crosses is a legal outcome of the weighted competition, so
+        # exactly-three pins the RNG stream rather than the fix. The broken
+        # hand-off deterministically grew exactly one arm, so >= 2 trips on it.
+        assert len(arm_masses) >= 2, f"seed {seed}: ports never competed with the continuation, got {arm_masses}"
+        assert min(arm_masses) > 40.0, f"seed {seed}: empty arm: {arm_masses}"
+        assert len(tracked[1]) >= 2, f"seed {seed}: chain continuation lost every draw: {tracked[1]}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a literal exit after a nested stochastic object competes with the owner's growth options; unconditional firing is a planned change (see CHANGELOG)",
+)
+def test_literal_tail_after_nested_object_is_delivered_on_every_instance():
+    """A unit that writes plain SMILES directly after a nested stochastic
+    object (an exit through the object's terminal bond connector with no bond
+    connector of the enclosing level on the path) must deliver that tail on
+    EVERY realized instance of the object: it is literal chemistry of the
+    unit, not a stochastic choice. The exit is encoded as an owner-level
+    transition, so promotion turns it into a competing growth option and an
+    owner that parks first retires it; before promotion it fired as soon as
+    the object finished but was still lost when the owner had already parked.
+    A hydrogen tail hides the loss (RDKit restores it as an implicit H), hence
+    the heavy tail here. Expected to fail until such exits fire
+    unconditionally."""
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(12):
+        _reset_rngs(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        nested_gen = next(i for i, d in dist.items() if d == "|poisson(80.0)|")
+        tails = sum(1 for _node, data in mol_graph.nodes(data=True) if data.get("atomic_num") == 35)
+        assert tails == len(tracked[nested_gen]), f"seed {seed}: {len(tracked[nested_gen])} nested instances but {tails} tail(s) delivered"
+
+
+def test_converted_sites_never_file_under_a_terminated_owner():
+    """The transition sweep's owner resolution must file converted sites
+    under a LIVE instance of the fired level. The root/inter-object
+    continuation path fires transition_graph on a source terminate_graph has
+    already finalized; filing the bucket's remaining converted sites back
+    under that terminated instance strands them — no growth, rescue, or cap
+    pass ever reads a terminated parentless bucket again — silently dropping
+    the arms and end groups they carried. The home must be the PRE-EXISTING
+    live instance of the fired level, not a freshly registered one with its
+    own mass draw (that would start a second timeline of the same level)."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+    from g2rins.generative_graph import (
+        _EDGE_STOCHASTIC_ID_NAME,
+        _PROPAGATION_NAME,
+        _TRANSITION_NAME,
+    )
+
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    fired_gen = tree[0]
+    entry_ports = [
+        half_bond for half_bond in partial._open_half_bond_map[sto_atom_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
+    ]
+    assert len(entry_ports) >= 2, "the initiator must expose multiple fired-level entry ports"
+    # The live instance of the fired level that must take custody.
+    live_sibling, _sibling_parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:], reuse_existing=False)
+    assert live_sibling != sto_atom_id and not tracker.is_terminated(live_sibling)
+
+    # Reproduce the continuation flow's order: the source is finalized first,
+    # then one of its remaining fired-level sites fires from its bucket.
+    tracker.terminate(sto_atom_id)
+    _new_id, success = partial.transition_graph(sto_atom_id, fired_gen, rng)
+    assert success
+
+    converted_homes = {
+        bucket_id
+        for bucket_id, bonds in partial._open_half_bond_map.items()
+        for half_bond in bonds
+        if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_PROPAGATION_NAME, []))
+    }
+    assert converted_homes, "the sweep converted no sibling sites"
+    stranded = sorted(bucket_id for bucket_id in converted_homes if tracker.is_terminated(bucket_id))
+    assert not stranded, f"converted sites filed under terminated instance(s) {stranded}"
+    assert converted_homes == {live_sibling}, f"converted sites filed under {sorted(converted_homes)}, not the pre-existing live instance {live_sibling}"
+    assert tracker._stochastic_atom_id_to_gen_id[live_sibling] == fired_gen
+    assert tracker._stochastic_gen_id_to_atom_id[fired_gen] == {sto_atom_id, live_sibling}, "the fire registered a fresh instance of the fired level"
+
+
+def test_transition_from_a_finished_level_without_a_live_instance_raises():
+    """A same-level transition fired from a finished instance whose target is
+    NOT under the fired level (a sibling nested object) leaves no live
+    instance of that level to take custody of the bucket's remaining sites.
+    No valid string reaches this today; the sweep must fail loudly instead of
+    filing the sites under the landing instance's level, where propagation
+    would fire them as that level's own growth."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    # A unit of the first nested object; its exit site carries the join to
+    # the second object, stamped at the first object's own level.
+    source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    tracker.terminate(sto_atom_id)
+    with pytest.raises(RuntimeError, match="no live instance of that level"):
+        partial.transition_graph(sto_atom_id, tree[0], rng)
+
+
+def test_site_draw_frequencies_follow_bond_descriptor_weights():
+    """The site to grow at an owner's step is drawn among its open sites in
+    proportion to their bond-descriptor weights, normalized over the sites open
+    at that moment (molar amounts act only on the incoming unit). A branching
+    unit with a heavy and a light site is entered from a single-port initiator,
+    so the state after the first unit is deterministic; from that state the
+    heavy site must be chosen with frequency 3/4."""
+    import copy
+
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    smi = "{[] [<]CC([>|3.0|])C[>|1.0|]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    _new_id, success = partial.transition_graph(sto_atom_id, tree[0], rng)
+    assert success
+    open_sites = {(half_bond.atom_idx, float(half_bond.weight)) for half_bond in partial._open_half_bond_map[sto_atom_id]}
+    assert sorted(weight for _atom, weight in open_sites) == [1.0, 3.0], f"unexpected basis of open sites: {open_sites}"
+
+    draws = 400
+    heavy = 0
+    for seed in range(draws):
+        trial = copy.deepcopy(partial)
+        trial.propagate_graph(sto_atom_id, np.random.default_rng(seed), True)
+        remaining = {(half_bond.atom_idx, float(half_bond.weight)) for half_bond in trial._open_half_bond_map[sto_atom_id]}
+        (chosen,) = open_sites - remaining
+        heavy += chosen[1] == 3.0
+    frequency = heavy / draws
+    # Binomial 3-sigma band around 3/4 at 400 draws is about +-0.065.
+    assert abs(frequency - 0.75) < 0.07, f"heavy site chosen with frequency {frequency:.3f}, expected 0.75"
+
+
+def test_promoted_site_keeps_its_descriptor_weight_and_owner_tag():
+    """A finished nested instance's owner-level exit is promoted into the
+    owner's pool as an ordinary propagation site: it keeps the descriptor
+    weight of the inner atom it sits on (that is the weight it competes
+    with), carries the owner's native parent tag so the prefer_parent tier
+    ranks it like the owner's own sites, and its owner-level transition edges
+    become propagation edges while the finished level's own propagation modes
+    are dropped."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+    from g2rins.generative_graph import (
+        _EDGE_STOCHASTIC_ID_NAME,
+        _PROPAGATION_NAME,
+        _TRANSITION_NAME,
+    )
+
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], [<1]{[>] [<]CCO[>|2.0|];; [<]}|poisson(100)|[>]; C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    owner_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, owner_id, rng)
+    owner_gen = tree[0]
+    # The initial fire enters one arm and registers its instance under the owner.
+    arm_id, success = partial.transition_graph(owner_id, owner_gen, rng)
+    assert success and arm_id != owner_id
+    exits = [half_bond for half_bond in partial._open_half_bond_map[arm_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == owner_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
+    assert len(exits) == 1, "the arm's frontier must carry exactly one owner-level exit"
+    exit_weight = float(exits[0].weight)
+    assert exit_weight == 2.0, "the exit sits on the inner atom carrying [>|2.0|]"
+    owner_pool_before = list(partial._open_half_bond_map[owner_id])
+
+    tracker.terminate(arm_id)
+    assert partial.promote_level_transitions(arm_id, owner_id, owner_gen) == 1
+    promoted = [half_bond for half_bond in partial._open_half_bond_map[owner_id] if half_bond not in owner_pool_before]
+    assert len(promoted) == 1
+    (site,) = promoted
+    assert float(site.weight) == exit_weight
+    assert site.parent == owner_pool_before[0].parent, "a promoted site must rank like the owner's own sites"
+    assert site.has_mode_bonds(_PROPAGATION_NAME) and not site.has_mode_bonds(_TRANSITION_NAME)
+    assert all(attr.get(_EDGE_STOCHASTIC_ID_NAME) == owner_gen for attr in site._mode_attr_map[_PROPAGATION_NAME]), "the finished level's own propagation modes are dropped"
+    assert exits[0] not in partial._open_half_bond_map[arm_id]
+
+
+def test_migrated_heavy_caps_are_priced_into_the_crossing():
+    """Declared end groups whose custody ends in terminated descendants'
+    buckets (side-chain ends of a nested stochastic object used as a repeat
+    unit) must be PRICED by the owner's average-cap estimate as well as
+    delivered by its terminate pass. The estimate used to scan only the
+    owner's own bucket while termination fired the composed custody set, so
+    heavy caps attached after the parking decision arrived unpriced: with Br
+    in place of [H] on this string the realized outer mass overshot its
+    target by ~20% systematically (with ~1 Da hydrogen caps the same bias is
+    invisible)."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; " "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; " "[<2]Br []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    masses = []
+    for seed in range(12):
+        _reset_rngs(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        assert any(data.get("atomic_num") == 35 for _node, data in mol_graph.nodes(data=True)), f"seed {seed}: no Br cap delivered"
+        outer_id = next(i for i, d in dist.items() if d == "|poisson(2000.0)|")
+        masses.append(sum(tracked[outer_id]))
+    mean_mass = sum(masses) / len(masses)
+    assert mean_mass < 2000.0 * 1.12, f"unpriced caps: mean outer mass {mean_mass:.0f} systematically overshoots the 2000 Da target"
+    assert mean_mass > 2000.0 * 0.85, f"mean outer mass {mean_mass:.0f} fell far below target"
+
+
 def test_transition_bond_selection_is_level_aware():
     """The dead-end verdict of transition bond selection must be
     deterministic: _pop_random_bond filters candidates by the requested
@@ -1782,11 +1970,7 @@ def test_transition_bond_selection_is_level_aware():
     assert bond is None and non_used == [] and bucket == before
 
     # A level that IS served must always be found.
-    served_levels = {
-        attr.get(_EDGE_STOCHASTIC_ID_NAME)
-        for half_bond in bucket
-        for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
-    }
+    served_levels = {attr.get(_EDGE_STOCHASTIC_ID_NAME) for half_bond in bucket for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])}
     assert served_levels, "test string must expose at least one transition level"
     level = next(iter(served_levels))
     bond, _non_used = partial._pop_random_bond(bucket, sto_atom_id, level, rng)
@@ -1846,11 +2030,7 @@ def test_hyperbranched_molecule_branches():
         mol_graph = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().sample_mol_graph()
     mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
     Chem.SanitizeMol(mol)
-    branch_points = sum(
-        1
-        for atom in mol.GetAtoms()
-        if atom.GetSymbol() == "N" and sum(1 for nb in atom.GetNeighbors() if nb.GetSymbol() == "C") >= 3
-    )
+    branch_points = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "N" and sum(1 for nb in atom.GetNeighbors() if nb.GetSymbol() == "C") >= 3)
     assert branch_points > 3, f"expected a branched network, found {branch_points} branch points"
 
 
@@ -1919,10 +2099,12 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     cap, counted as explicit H NODES in the mol graph (SMILES and MolWt are
     blind to a lost cap: it is one implicit hydrogen), even when an arm's
     terminal bond sits parked in a terminated nested instance's bucket at
-    root termination. Chains whose initiator port never grew are skipped —
-    initiator ports carry no termination edges yet — and the seed range stops
-    before 14, whose cap is destroyed earlier by the transition-conversion
-    hand-off; both are known gaps of the follow-up custody change."""
+    root termination, and even when it reaches the root through a
+    transition-conversion hand-off — that path used to rebuild the converted
+    copy without its termination modes, shedding the cap permanently (seed 14
+    was the last such loss). Chains whose initiator port never grew are
+    skipped: initiator ports carry no termination edges, which is the one
+    remaining gap."""
     smi = "{[] [<]PP[>], [<]{[>] [<]{[>] [<]CC[>], [<]{[>] [<]NN[>];; [<]}|poisson(100)|[>];; [<]}|poisson(300)|[>], [<]OO[>]; ;[<]}|poisson(1000)|[>]; O([>])[>]; [<][H] []}|poisson(4000)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1931,7 +2113,7 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
     assert len(central) == 1, f"expected one difunctional initiator oxygen, found {len(central)}"
     central_origin = str(central[0])
-    for seed in range(14):
+    for seed in range(30):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
