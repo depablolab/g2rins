@@ -37,6 +37,7 @@ from .exception import (
     IncompatibleGenerativeGraphSchema,
     IncompleteStochasticGeneration,
     InvalidGenerationSource,
+    InvalidUnitPSmiles,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
     TooManyDiscardedChains,
@@ -3461,6 +3462,12 @@ class EnsembleCreator:
                         pending_termination.clear()
                         break
 
+        # TODO: replace this legacy clique closure in a focused follow-up. It
+        # selects placeholders by ``atomic_num`` below but attempts to traverse
+        # them via the absent ``num`` attribute. Pairwise closure happens to
+        # recover today's single-bond cases, but a placeholder-to-placeholder
+        # junction can inherit a static placeholder edge's attributes instead
+        # of the realized junction edge's attributes.
         def find_non_phantom_endpoints(G, phantom_node):
 
             visited = set()
@@ -3546,6 +3553,15 @@ class EnsembleCreator:
                 data["occupied_valence"] = occupied
                 partial_atom_graph.stochastic_tracker.credit_hydrogen_delta(data["owner_sto_atom_id"], delta)
 
+        # Sequence fragments are independent snapshots made before the whole
+        # molecule's phantom collapse. Normalize them once here, before any of
+        # create_ensemble's mol-graph/RDKit/SMILES conversion paths. Synthetic
+        # sequence stubs copy every attribute of the far-side atom, so for a
+        # split connector they even copy the placeholder's origin_idx; only the
+        # ``connection`` key distinguishes a retained stub from an internal
+        # phantom placeholder.
+        self._contract_sequence_phantoms(partial_atom_graph.sequence)
+
         # Only report an unavailable explicit undershoot when it survives all
         # descendant rounding and final hydrogen reconciliation. Nested
         # first-step overshoots are structural quantization that a live
@@ -3581,21 +3597,88 @@ class EnsembleCreator:
 
 
     @staticmethod
+    def _contract_sequence_phantoms(sequences):
+        """Remove internal split-atom placeholders from sequence unit graphs.
+
+        Mapped sequence connection stubs are retained and, when they hang from
+        a placeholder, reattached directly to that placeholder's real anchor
+        with the realized junction edge attributes preserved.
+        """
+        for sequence in sequences:
+            for unit_graph in sequence:
+                phantom_nodes = {
+                    node
+                    for node, data in unit_graph.nodes(data=True)
+                    if data.get("atomic_num") == 0 and "connection" not in data
+                }
+                for component in list(nx.connected_components(unit_graph.subgraph(phantom_nodes))):
+                    real_anchors = set()
+                    connection_edges = []
+                    for phantom_node in component:
+                        for neighbor in list(unit_graph.neighbors(phantom_node)):
+                            if neighbor in component:
+                                continue
+                            neighbor_data = unit_graph.nodes[neighbor]
+                            if neighbor_data.get("atomic_num", 0) > 0:
+                                real_anchors.add(neighbor)
+                            elif neighbor_data.get("atomic_num") == 0 and "connection" in neighbor_data:
+                                connection_edges.append((neighbor, deepcopy(unit_graph[phantom_node][neighbor])))
+                            else:
+                                raise RuntimeError("A sequence phantom has an unsupported boundary node. Please report this bug.")
+
+                    if len(real_anchors) != 1:
+                        raise RuntimeError(
+                            f"A sequence phantom component must have exactly one real anchor, found {len(real_anchors)}. Please report this bug."
+                        )
+                    real_anchor = next(iter(real_anchors))
+                    for connection_node, edge_data in connection_edges:
+                        if unit_graph.has_edge(real_anchor, connection_node):
+                            raise RuntimeError("A sequence connection is already attached to its phantom's real anchor. Please report this bug.")
+                        unit_graph.add_edge(real_anchor, connection_node, **edge_data)
+                    unit_graph.remove_nodes_from(component)
+
+    @staticmethod
     def _unit_graph_with_stars(unit_graph, origin_bond_id):
         """
-        Copy of `unit_graph` with a star atom bonded to every atom whose origin
-        is a connection atom (has a derived bond id); the star's map number is
-        that bond id, so the P-SMILES prints numbered stars ``[*:n]``.
+        Copy of `unit_graph` with one mapped star for every template bond id.
+        A split-atom phantom already is the connection star, while a real
+        connection atom receives a new star. Bond ids deliberately remain on
+        placeholder nodes in the generative graph and its JSON export.
         """
         star_graph = unit_graph.copy()
         for node, data in unit_graph.nodes(data=True):
             bond_id = origin_bond_id.get(data["origin_idx"])
             if bond_id is not None:
-                star_node = ("star", node)
                 # The converter renders map numbers as connection + 1.
-                star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
-                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
+                if data["atomic_num"] == 0:
+                    star_graph.nodes[node]["connection"] = bond_id - 1
+                else:
+                    star_node = ("star", node)
+                    star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
+                    star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
         return star_graph
+
+    @staticmethod
+    def _validate_unit_psmiles_mol(unit_id, star_mol, expected_maps, expected_real_atom_count):
+        """Validate a rendered unit against independent template-derived data."""
+        dummy_atoms = [atom for atom in star_mol.GetAtoms() if atom.GetAtomicNum() == 0]
+        actual_maps = sorted(atom.GetAtomMapNum() for atom in dummy_atoms)
+        invalid_dummy_degrees = tuple(
+            (atom.GetIdx(), atom.GetAtomMapNum(), atom.GetDegree())
+            for atom in dummy_atoms
+            if atom.GetDegree() != 1
+        )
+        actual_real_atom_count = sum(atom.GetAtomicNum() > 0 for atom in star_mol.GetAtoms())
+        expected_maps = sorted(expected_maps)
+        if actual_maps != expected_maps or invalid_dummy_degrees or actual_real_atom_count != expected_real_atom_count:
+            raise InvalidUnitPSmiles(
+                unit_id,
+                expected_maps,
+                actual_maps,
+                invalid_dummy_degrees,
+                expected_real_atom_count,
+                actual_real_atom_count,
+            )
 
     def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None):
         """Sample an ensemble while rejecting explicitly chain-local failures.
@@ -3802,6 +3885,21 @@ class EnsembleCreator:
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
 
+        # The public unit representation is validated against the immutable
+        # template rather than the sampled unit snapshot it renders. Besides
+        # renderer defects, this catches snapshots that lost a real atom or
+        # connection site at a merge watermark. This template-only contract
+        # could move to a pre-flight check in a future change.
+        template_unit_bond_ids = {unit_id: [] for unit_id in set(labels.unit_id.values())}
+        template_unit_real_atom_counts = {unit_id: 0 for unit_id in template_unit_bond_ids}
+        for node, data in self._generative_graph.nodes(data=True):
+            unit_id = labels.unit_id[node]
+            if data["atomic_num"] > 0:
+                template_unit_real_atom_counts[unit_id] += 1
+            bond_id = labels.bond_id.get(node)
+            if bond_id is not None:
+                template_unit_bond_ids[unit_id].append(bond_id)
+
         # unit_g2rins was composed against the same derivation at parse time;
         # if the graph was mutated since, omit the texts rather than mislabel.
         unit_g2rins = self._generative_graph.graph.get("unit_g2rins", {})
@@ -3815,6 +3913,12 @@ class EnsembleCreator:
             # isolation).
             star_mol = mol_graph_to_rdkit_mol(self._unit_graph_with_stars(unit_graph, origin_bond_id), kekulize=False)
             unit_id = origin_unit_id[next(iter(unit_graph.nodes(data=True)))[1]["origin_idx"]]
+            self._validate_unit_psmiles_mol(
+                unit_id,
+                star_mol,
+                template_unit_bond_ids[unit_id],
+                template_unit_real_atom_counts[unit_id],
+            )
             canonical_units[unit_id] = {"psmiles": rdkit_mol_to_smiles(star_mol), "g2rins": unit_g2rins.get(unit_id, ""), "frequency": frequency}
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))
 

@@ -81,6 +81,30 @@ class GenerationError(G2RINSError):
     pass
 
 
+class InvalidUnitPSmiles(GenerationError):
+    """The generated unit pSMILES violates its template-derived contract."""
+
+    def __init__(
+        self,
+        unit_id,
+        expected_maps,
+        actual_maps,
+        invalid_dummy_degrees,
+        expected_real_atom_count,
+        actual_real_atom_count,
+    ):
+        self.unit_id = unit_id
+        self.expected_maps = tuple(expected_maps)
+        self.actual_maps = tuple(actual_maps)
+        self.invalid_dummy_degrees = tuple(invalid_dummy_degrees)
+        self.expected_real_atom_count = int(expected_real_atom_count)
+        self.actual_real_atom_count = int(actual_real_atom_count)
+        super().__init__(unit_id)
+
+    def __str__(self):
+        return f"Invalid unit pSMILES generated for {self.unit_id}; this is an implementation error. Please report it."
+
+
 class DoubleBondSymbolDefinition(GenerationError):
     def __init__(self, partial_graph, symbol, bond_attributes):
         self.partial_graph = partial_graph

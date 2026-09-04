@@ -18,6 +18,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Fixed
 
+- Hyperbranched units with several connection sites on one atom no longer emit extra unmapped dummy atoms in ensemble unit pSMILES or sequence fragments. Split-atom placeholders now become the mapped pSMILES stars, and sequence-only connection stubs are reattached directly to their real atom during finalization. Completed chain structures, template/JSON bond ids on placeholder nodes, and bond records such as `R0.2` and `R0.3` are unchanged. Malformed unit pSMILES now raises an internal generation error instead of being exported.
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 
