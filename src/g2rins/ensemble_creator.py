@@ -1574,8 +1574,9 @@ class _PartialAtomGraph:
         target unit's molar amount, so molar amounts describe the reservoir
         and never bias which site grows. A promoted site keeps the
         descriptor weight of the inner atom it sits on; a weight written on
-        the nested unit's exit port has no effect there, since that exit has
-        a single target. The number of owner steps is set by the mass rule.
+        the port after the object's closing brace is ignored by the graph
+        creator (no atom carries it and no edge arrives at it). The number
+        of owner steps is set by the mass rule.
 
         Promotion is per-edge and lazy: only edges declared at the owner's
         level convert; transition edges of shallower levels ride along
@@ -1718,11 +1719,12 @@ class _PartialAtomGraph:
             # landing target's freshly registered parent chain serves a
             # terminated source whose target lies under the fired level. No
             # live instance at all means the level fired after its last
-            # instance finished. No valid string reaches that today (only
-            # initiator buckets ever hold own-level transition sites, and
-            # sampling consumes those at its first step), so fail loudly
-            # rather than file the sites under another level's bucket, where
-            # propagation would fire them as that level's own growth.
+            # instance finished. No valid string reaches that today (the
+            # own-level transition sites a bucket can hold are an initiator's,
+            # consumed at sampling's first step, or a block-to-block join that
+            # nothing fires yet), so fail loudly rather than file the sites
+            # under another level's bucket, where propagation would fire them
+            # as that level's own growth.
             owner_sto_atom_id = None
             candidates = list(reversed(self.stochastic_tracker.parent_map.get(sto_atom_id, []))) + list(reversed(parent_list))
             for ancestor in candidates:
