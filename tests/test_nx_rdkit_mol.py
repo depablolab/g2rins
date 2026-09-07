@@ -56,9 +56,22 @@ def test_run_with_big_stack_falls_back_inline_with_warning(monkeypatch):
         assert _run_with_big_stack(lambda a, b: a + b, 2, 3) == 5
 
 
-def test_rdkit_mol_to_smiles_matches_direct():
+def test_rdkit_mol_to_smiles_defaults_to_native_noncanonical(monkeypatch):
     mol = Chem.MolFromSmiles("CCO")
-    assert rdkit_mol_to_smiles(mol) == Chem.MolToSmiles(mol)
+    direct_mol_to_smiles = Chem.MolToSmiles
+    calls = []
+
+    def recorded_smiles(value, **kwargs):
+        calls.append(kwargs)
+        return direct_mol_to_smiles(value, **kwargs)
+
+    monkeypatch.setattr(Chem, "MolToSmiles", recorded_smiles)
+
+    assert rdkit_mol_to_smiles(mol) == direct_mol_to_smiles(
+        mol,
+        canonical=False,
+    )
+    assert calls == [{"canonical": False}]
 
 
 def test_rdkit_mol_to_smiles_falls_back_when_canonical_ring_labels_are_exhausted(monkeypatch):
@@ -73,7 +86,7 @@ def test_rdkit_mol_to_smiles_falls_back_when_canonical_ring_labels_are_exhausted
         return direct_mol_to_smiles(value, **kwargs)
 
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
 
     assert calls and calls[0] == {}
     assert len(calls) == 1
@@ -93,7 +106,7 @@ def test_rdkit_mol_to_smiles_tries_alternate_roots_after_noncanonical_overflow(m
         return direct_mol_to_smiles(value, **kwargs)
 
     monkeypatch.setattr(Chem, "MolToSmiles", traversal_limited_mol_to_smiles)
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
 
     assert calls[0] == {}
     assert all(call.get("canonical") is False for call in calls[1:])
@@ -113,7 +126,7 @@ def test_rdkit_mol_to_smiles_renumbers_atoms_when_every_original_root_overflows(
         return direct_mol_to_smiles(value, **kwargs)
 
     monkeypatch.setattr(Chem, "MolToSmiles", atom_order_limited_mol_to_smiles)
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
 
     assert calls[0] == (mol, {})
     assert any(value is not mol for value, _kwargs in calls)
@@ -146,22 +159,26 @@ def test_rdkit_mol_to_smiles_uses_seeded_random_traversal_for_large_overflow(mon
     monkeypatch.setattr(Chem, "MolToRandomSmilesVect", seeded_random_smiles)
     monkeypatch.setattr(rdBase, "SeedRandomNumberGenerator", reset_seeds.append)
 
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
 
     assert reset_seeds == [1, 2]
     assert random_seeds == [0, 0]
     assert direct_mol_to_smiles(Chem.MolFromSmiles(smiles)) == direct_mol_to_smiles(mol)
 
 
-def test_rdkit_mol_to_smiles_fast_policy_skips_canonical_call(monkeypatch):
+def test_rdkit_mol_to_smiles_fast_policy_uses_native_noncanonical_call(monkeypatch):
     mol = Chem.MolFromSmiles("C1CCCCC1")
+    direct_mol_to_smiles = Chem.MolToSmiles
+    calls = []
 
-    def unexpected_rdkit_smiles(*_args, **_kwargs):
-        raise AssertionError("fast policy must use the deterministic direct writer")
+    def recorded_smiles(value, **kwargs):
+        calls.append(kwargs)
+        return direct_mol_to_smiles(value, **kwargs)
 
-    monkeypatch.setattr(Chem, "MolToSmiles", unexpected_rdkit_smiles)
+    monkeypatch.setattr(Chem, "MolToSmiles", recorded_smiles)
     smiles = rdkit_mol_to_smiles(mol, smiles_policy="fast")
 
+    assert calls == [{"canonical": False}]
     assert Chem.MolFromSmiles(smiles) is not None
 
 
@@ -210,7 +227,7 @@ def test_rdkit_mol_to_smiles_uses_extended_ring_labels_after_random_overflow(mon
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
     monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
 
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
     reparsed = Chem.MolFromSmiles(smiles)
 
     assert reparsed is not None
@@ -253,7 +270,7 @@ def test_extended_ring_label_writer_preserves_stereochemistry(
     ]
     for atom_order in atom_orders:
         reordered = Chem.RenumberAtoms(mol, atom_order)
-        smiles = rdkit_mol_to_smiles(reordered)
+        smiles = rdkit_mol_to_smiles(reordered, smiles_policy="auto")
         reparsed = Chem.MolFromSmiles(smiles)
 
         assert reparsed is not None
@@ -302,7 +319,7 @@ def test_extended_ring_label_writer_preserves_stereocyclic_polymer(monkeypatch):
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
     monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
 
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
     reparsed = Chem.MolFromSmiles(smiles)
 
     assert reparsed is not None
@@ -339,7 +356,7 @@ def test_extended_ring_label_writer_preserves_starch_like_maltose(monkeypatch):
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_smiles)
     monkeypatch.setattr(Chem, "MolToRandomSmilesVect", ring_limited_smiles)
 
-    smiles = rdkit_mol_to_smiles(maltose)
+    smiles = rdkit_mol_to_smiles(maltose, smiles_policy="auto")
     reparsed = Chem.MolFromSmiles(smiles)
 
     assert reparsed is not None
@@ -405,7 +422,7 @@ def test_rdkit_mol_to_smiles_falls_back_when_ring_overflow_is_runtime_error(monk
         return direct_mol_to_smiles(value, **kwargs)
 
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
 
     assert calls and calls[0] == {}
     assert len(calls) == 1
@@ -428,7 +445,7 @@ def test_rdkit_mol_to_smiles_handles_benzimidazole_like_cyclic_monomer(monkeypat
         return direct_mol_to_smiles(value, **kwargs)
 
     monkeypatch.setattr(Chem, "MolToSmiles", ring_limited_mol_to_smiles)
-    smiles = rdkit_mol_to_smiles(mol)
+    smiles = rdkit_mol_to_smiles(mol, smiles_policy="auto")
 
     assert calls and calls[0] == {}
     assert len(calls) == 1

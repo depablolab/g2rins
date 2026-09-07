@@ -80,7 +80,10 @@ def build_reference(case_name: str) -> dict:
     graph = result.chains[0]
     return {
         "seed": case.seed,
-        "canonical_smiles": g2rins.mol_graph_to_smiles(graph),
+        "canonical_smiles": g2rins.mol_graph_to_smiles(
+            graph,
+            smiles_policy="auto",
+        ),
         "graph": _graph_signature(graph),
         "molecular_weight": round(float(result.molecular_weights[0]), 9),
         "units": {
@@ -96,7 +99,14 @@ def build_reference(case_name: str) -> dict:
             for record in result.bonds
         ],
         "sequences": [
-            [g2rins.mol_graph_to_smiles(unit, kekulize=False) for unit in sequence]
+            [
+                g2rins.mol_graph_to_smiles(
+                    unit,
+                    kekulize=False,
+                    smiles_policy="auto",
+                )
+                for unit in sequence
+            ]
             for sequence in result.sequences[0]
         ],
         "warnings": [warning.category.__name__ for warning in caught],

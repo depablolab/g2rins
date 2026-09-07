@@ -7,6 +7,7 @@ import faulthandler
 import functools
 import inspect
 import json
+import math
 import multiprocessing.spawn
 import os
 import pickle
@@ -213,7 +214,7 @@ def _sample_chain_job(
     defer_conversion=False,
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
 ):
     """Execute one compact chain job using the creator initialized in-worker."""
     if _WORKER_ENSEMBLE_CREATOR is None:
@@ -285,6 +286,7 @@ class _ParallelChainScheduler:
         self.executor = None
         self.pool_broken = False
         self._contexts = None
+        self._isolation_fallback_used = False
 
     def __enter__(self):
         self._contexts = ExitStack()
@@ -348,7 +350,7 @@ class _ParallelChainScheduler:
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=False,
         fallback_on_worker_crash=False,
-        smiles_policy="auto",
+        smiles_policy="fast",
     ):
         if self.executor is None:
             self._create_executor()
@@ -417,7 +419,7 @@ class _ParallelChainScheduler:
             try:
                 self._restart(pool_broken)
             except WorkerProcessFailure as error:
-                if not fallback_on_worker_crash:
+                if not fallback_on_worker_crash or self._isolation_fallback_used:
                     raise
 
                 native_detail = ""
@@ -435,34 +437,24 @@ class _ParallelChainScheduler:
                 warnings.warn(
                     (
                         "Parallel sampling worker crash recovery was exhausted; "
-                        "continuing remaining chain jobs in serial mode."
+                        "retrying remaining chain jobs in a fresh isolated "
+                        "one-worker pool."
                         f"{native_detail}"
                     ),
                     RuntimeWarning,
                     stacklevel=2,
                 )
 
-                self.close(pool_broken=True)
-                for chain_index in ordered_indices[next_position:]:
-                    if chain_index in completed:
-                        yield completed.pop(chain_index)
-                        continue
-                    chain_job = (chain_index, jobs_by_index[chain_index])
-                    yield _sample_chain_batch(
-                        self.ensemble_creator,
-                        [chain_job],
-                        molecule_format,
-                        collect_info,
-                        max_discards,
-                        termination_flag,
-                        include_sequences,
-                        native_diagnostics_path,
-                        defer_conversion,
-                        use_repeat_units_as_source,
-                        strip_unresolved_directional_markers,
-                        smiles_policy,
-                    )[0]
-                return
+                # A native fault may recur in exactly the same RDKit call. Do
+                # not run that call in the parent process, where another
+                # SIGSEGV would terminate the application. Preserve completed
+                # results and retry unfinished jobs in a disposable worker.
+                self._isolation_fallback_used = True
+                self.n_workers = 1
+                max_inflight = 2
+                self.restart_count = 0
+                self._create_executor()
+                self.pool_broken = False
             pending = deque(
                 (chain_index, jobs_by_index[chain_index])
                 for chain_index in ordered_indices[next_position:]
@@ -486,7 +478,7 @@ def _parallel_chain_records(
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
     fallback_on_worker_crash=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
 ):
     """Yield ordered records from bounded, restartable compact worker jobs."""
     if scheduler is not None:
@@ -1309,6 +1301,7 @@ class ConvergedEnsembleData(EnsembleData):
     number_average_molecular_weight: float
     weight_average_molecular_weight: float
     dispersity: float
+    representative_counts: list | None = None
 
 
 @dataclass
@@ -1330,6 +1323,61 @@ class ConvergenceCheckpoint:
     reservoir_rng_state: dict | None
     settings: dict
     policy: str = "full"
+    representative_features: tuple = ()
+    representative_counts: tuple = ()
+
+
+@dataclass(frozen=True)
+class _RepresentativeFeature:
+    """Compact coordinates for representative coverage."""
+
+    molecular_weight: float
+    total_units: int
+    unit_fractions: tuple
+    contact_fractions: tuple
+
+
+def _normalized_sparse_counts(counts):
+    total = sum(counts.values())
+    if not total:
+        return ()
+    return tuple(sorted((key, count / total) for key, count in counts.items()))
+
+
+def _representative_feature(deferred):
+    metadata = deferred.sample.metadata
+    contacts = Counter()
+    for pair, count in metadata.labeled_bond_counts.items():
+        contacts["|".join(label for label, _node in pair)] += count
+    return _RepresentativeFeature(
+        molecular_weight=deferred.molecular_weight,
+        total_units=sum(metadata.unit_counts.values()),
+        unit_fractions=_normalized_sparse_counts(metadata.unit_counts),
+        contact_fractions=_normalized_sparse_counts(contacts),
+    )
+
+
+def _total_variation(left, right):
+    left = dict(left)
+    right = dict(right)
+    return 0.5 * sum(
+        abs(left.get(key, 0.0) - right.get(key, 0.0))
+        for key in left.keys() | right.keys()
+    )
+
+
+def _representative_distance(left, right):
+    """Maximum normalized difference across size, composition, and contacts."""
+    mw_distance = abs(math.log(left.molecular_weight / right.molecular_weight))
+    unit_count_distance = abs(
+        math.log((left.total_units + 1) / (right.total_units + 1))
+    )
+    return max(
+        mw_distance,
+        unit_count_distance,
+        _total_variation(left.unit_fractions, right.unit_fractions),
+        _total_variation(left.contact_fractions, right.contact_fractions),
+    )
 
 
 class _MetadataLevel(IntEnum):
@@ -1628,7 +1676,7 @@ def _convert_chain(
     native_diagnostics_path=None,
     molecular_weight=None,
     strip_unresolved_directional_markers=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
     sequence_smiles_cache=None,
 ):
     """Convert one accepted sample_mol_graph result into a chain record in the
@@ -1846,7 +1894,7 @@ def _defer_chain_conversion(
     molecule_format=None,
     include_sequences=False,
     materialize_output=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
     sequence_smiles_cache=None,
 ):
     """Compute mandatory convergence statistics but defer output conversion."""
@@ -1907,7 +1955,7 @@ def _materialize_deferred_chain(
     collect_info,
     include_sequences,
     strip_unresolved_directional_markers=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
     sequence_smiles_cache=None,
 ):
     if deferred.materialized is not None:
@@ -2005,7 +2053,7 @@ def _sample_chain_batch(
     defer_conversion=False,
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
 ):
     """Sample a batch of chains in one worker process (module level so
     ProcessPoolExecutor can pickle it).
@@ -4075,7 +4123,10 @@ class EnsembleCreator:
                         ),
                         kekulize=False,
                     )
-                    psmiles = rdkit_mol_to_smiles(star_mol)
+                    psmiles = rdkit_mol_to_smiles(
+                        star_mol,
+                        smiles_policy="auto",
+                    )
             except Exception:
                 # Historically unit conversion happened only after a chain was
                 # accepted. Do not reject a model at creator construction for
@@ -5663,7 +5714,7 @@ class EnsembleCreator:
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=False,
         fallback_on_worker_crash=False,
-        smiles_policy="auto",
+        smiles_policy="fast",
     ):
         """Yield ordered per-chain success/failure records.
 
@@ -5801,7 +5852,13 @@ class EnsembleCreator:
                     ),
                     kekulize=False,
                 )
-                psmiles = rdkit_mol_to_smiles(star_mol)
+                # P-SMILES is stable unit metadata rather than a potentially
+                # enormous sampled-chain payload; keep it canonical even
+                # though chain serialization defaults to the fast policy.
+                psmiles = rdkit_mol_to_smiles(
+                    star_mol,
+                    smiles_policy="auto",
+                )
                 info["psmiles"] = psmiles
             canonical_units[unit_id] = {
                 **info,
@@ -5866,7 +5923,7 @@ class EnsembleCreator:
             molecular_weights=molecular_weights,
         )
 
-    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2, strip_unresolved_directional_markers=True, fallback_on_worker_crash=True, smiles_policy="auto"):
+    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2, strip_unresolved_directional_markers=True, fallback_on_worker_crash=True, smiles_policy="fast"):
         """Sample an ensemble while rejecting explicitly chain-local failures.
 
         ``max_number_of_discarded_chains`` limits consecutive rejected paths
@@ -5918,11 +5975,12 @@ class EnsembleCreator:
         ``max_worker_restarts`` limits transparent process-pool rebuilds after
         worker death; completed ordered chain results are preserved.
         ``fallback_on_worker_crash=True`` keeps completed parallel results and
-        rescues only unfinished chain jobs in serial mode when worker restart
-        recovery is exhausted.
-        ``smiles_policy`` is ``"auto"`` by default, ``"canonical"`` to
-        disable overflow fallbacks, or ``"fast"`` to prefer deterministic
-        non-canonical output without attempting canonical serialization.
+        retries only unfinished chain jobs in a fresh isolated one-worker pool
+        when normal worker restart recovery is exhausted.
+        ``smiles_policy`` is ``"fast"`` by default for deterministic
+        non-canonical output without canonical ranking. Use ``"auto"`` to
+        request canonical output with overflow fallbacks, or ``"canonical"``
+        to request strict canonical output without fallbacks.
         """
 
         supported_formats = {"smiles", "mol_graph"}
@@ -6098,6 +6156,7 @@ class EnsembleCreator:
         retain_sequences=True,
         metadata=True,
         reservoir_size=None,
+        representative_distance=None,
         sample_callback=None,
         checkpoint=None,
         checkpoint_callback=None,
@@ -6107,7 +6166,7 @@ class EnsembleCreator:
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=True,
         fallback_on_worker_crash=True,
-        smiles_policy="auto",
+        smiles_policy="fast",
     ):
         """Sample batches until cumulative mass and contact statistics stabilize.
 
@@ -6124,8 +6183,15 @@ class EnsembleCreator:
         Statistics always include every accepted chain. ``retain_chains`` and
         ``retain_sequences`` control which sample-level outputs are kept;
         ``metadata`` controls returned aggregate unit/contact metadata.
-        ``reservoir_size`` bounds retained samples with independent reservoir
-        sampling, without changing generation RNG streams. ``sample_callback``
+        ``representative_distance`` enables an online feature-space cover:
+        retained representatives differ by more than the threshold in at least
+        one of log molecular weight, log building-block count, building-block
+        composition, or contact frequencies. A useful starting value is 0.15.
+        ``representative_counts`` reports how many accepted chains each
+        retained chain represents. Alternatively, ``reservoir_size`` bounds
+        retained samples with independent uniform reservoir sampling, without
+        changing generation RNG streams. The two modes are mutually exclusive.
+        ``sample_callback``
         receives ``(global_chain_index, record)`` for every accepted chain.
         To resume at a batch boundary, pass a :class:`ConvergenceCheckpoint`
         previously received by ``checkpoint_callback``. Exact resume requires
@@ -6134,8 +6200,8 @@ class EnsembleCreator:
         returns no retained sample payload after resume. ``native_diagnostics_path`` has the same durable
         native-stage logging semantics as :meth:`create_ensemble`, as does the
         ``max_worker_restarts`` recovery policy. ``fallback_on_worker_crash``
-        keeps completed parallel results and rescues only unfinished jobs in
-        serial mode when restart recovery is exhausted.
+        keeps completed parallel results and retries only unfinished jobs in a
+        fresh isolated one-worker pool when restart recovery is exhausted.
         Set ``use_repeat_units_as_source=True`` to seed each chain from a
         repeat unit when the polymer has no initiator.
         ``smiles_policy`` follows :meth:`create_ensemble`.
@@ -6147,6 +6213,15 @@ class EnsembleCreator:
         if reservoir_size is not None and reservoir_size < 0:
             raise ValueError(
                 f"reservoir_size must be non-negative, got {reservoir_size}."
+            )
+        if representative_distance is not None and representative_distance < 0:
+            raise ValueError(
+                "representative_distance must be non-negative, got "
+                f"{representative_distance}."
+            )
+        if reservoir_size is not None and representative_distance is not None:
+            raise ValueError(
+                "reservoir_size and representative_distance are mutually exclusive."
             )
         if sample_callback is not None and not callable(sample_callback):
             raise TypeError("sample_callback must be callable or None.")
@@ -6213,6 +6288,7 @@ class EnsembleCreator:
             "retain_sequences": retain_sequences,
             "metadata": metadata,
             "reservoir_size": reservoir_size,
+            "representative_distance": representative_distance,
             "checkpoint_policy": checkpoint_policy,
             "use_repeat_units_as_source": bool(use_repeat_units_as_source),
             "strip_unresolved_directional_markers": bool(
@@ -6238,6 +6314,8 @@ class EnsembleCreator:
             contact_total = 0
             retained_records = []
             retained_seen = 0
+            representative_features = []
+            representative_counts = []
         else:
             if checkpoint.seed != seed:
                 raise ValueError("checkpoint seed does not match seed.")
@@ -6248,7 +6326,11 @@ class EnsembleCreator:
             )
             saved_settings.setdefault("use_repeat_units_as_source", False)
             saved_settings.setdefault("fallback_on_worker_crash", True)
-            saved_settings.setdefault("smiles_policy", "auto")
+            saved_settings.setdefault("representative_distance", None)
+            # Checkpoints written before the policy was persisted inherit the
+            # caller's current choice. Explicitly recorded policies remain
+            # strict resume settings.
+            saved_settings.setdefault("smiles_policy", smiles_policy)
             if saved_settings != checkpoint_settings:
                 raise ValueError("checkpoint settings do not match this convergence run.")
             aggregate_unit_counts = Counter(
@@ -6274,6 +6356,12 @@ class EnsembleCreator:
             tracker.history = deepcopy(checkpoint.convergence_history)
             retained_records = list(deepcopy(checkpoint.retained_records))
             retained_seen = checkpoint.retained_seen
+            representative_features = list(
+                deepcopy(getattr(checkpoint, "representative_features", ()))
+            )
+            representative_counts = list(
+                getattr(checkpoint, "representative_counts", ())
+            )
             if reservoir_rng is not None and checkpoint.reservoir_rng_state is not None:
                 reservoir_rng.bit_generator.state = deepcopy(
                     checkpoint.reservoir_rng_state
@@ -6318,7 +6406,11 @@ class EnsembleCreator:
                 defer_conversion=(
                     "materialize"
                     if sample_callback is not None
-                    or (retain_samples and reservoir_size is None)
+                    or (
+                        retain_samples
+                        and reservoir_size is None
+                        and representative_distance is None
+                    )
                     else True
                 ),
                 parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
@@ -6417,7 +6509,22 @@ class EnsembleCreator:
                     if retain_samples:
                         retained_seen += 1
                         retained_position = None
-                        if reservoir_size is None:
+                        if representative_distance is not None:
+                            feature = _representative_feature(deferred)
+                            for position, representative in enumerate(
+                                representative_features
+                            ):
+                                if (
+                                    _representative_distance(feature, representative)
+                                    <= representative_distance
+                                ):
+                                    representative_counts[position] += 1
+                                    break
+                            else:
+                                retained_position = len(representative_features)
+                                representative_features.append(feature)
+                                representative_counts.append(1)
+                        elif reservoir_size is None:
                             retained_position = len(retained_records)
                         elif retained_seen <= reservoir_size:
                             retained_position = retained_seen - 1
@@ -6544,6 +6651,10 @@ class EnsembleCreator:
                         ),
                         settings=dict(checkpoint_settings),
                         policy=checkpoint_policy,
+                        representative_features=tuple(
+                            deepcopy(representative_features)
+                        ),
+                        representative_counts=tuple(representative_counts),
                     )
                 )
 
@@ -6573,7 +6684,21 @@ class EnsembleCreator:
                 strip_unresolved_directional_markers,
             )
             return None
-        retained_records.sort(key=lambda item: item[0])
+        returned_representative_counts = None
+        if (
+            representative_distance is not None
+            and len(representative_counts) == len(retained_records)
+        ):
+            retained_with_counts = sorted(
+                zip(retained_records, representative_counts),
+                key=lambda item: item[0][0],
+            )
+            retained_records = [entry for entry, _count in retained_with_counts]
+            returned_representative_counts = [
+                count for _entry, count in retained_with_counts
+            ]
+        else:
+            retained_records.sort(key=lambda item: item[0])
         retained = [record for _index, record in retained_records]
         chains = [record.molecule for record in retained] if retain_chains else []
         sequences = (
@@ -6628,6 +6753,7 @@ class EnsembleCreator:
                 "retain_sequences": retain_sequences,
                 "metadata": metadata,
                 "reservoir_size": reservoir_size,
+                "representative_distance": representative_distance,
                 "checkpoint_policy": checkpoint_policy,
                 "use_repeat_units_as_source": bool(
                     use_repeat_units_as_source
@@ -6638,4 +6764,5 @@ class EnsembleCreator:
             number_average_molecular_weight=mn,
             weight_average_molecular_weight=mw,
             dispersity=mw / mn,
+            representative_counts=returned_representative_counts,
         )

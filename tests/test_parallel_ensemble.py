@@ -147,7 +147,7 @@ def test_create_ensemble_rescues_remaining_jobs_after_worker_crash(monkeypatch):
     assert len(result) == 5
     assert result == ["MOL"] * 5
     assert any(
-        "continuing remaining chain jobs in serial mode" in str(w.message)
+        "fresh isolated one-worker pool" in str(w.message)
         for w in caught
     )
 
@@ -181,6 +181,48 @@ def test_create_ensemble_can_disable_worker_crash_fallback(monkeypatch):
             max_worker_restarts=0,
             fallback_on_worker_crash=False,
         )
+
+
+def test_create_ensemble_does_not_run_persistent_native_failure_in_parent(monkeypatch):
+    executor_count = 0
+
+    class BrokenExecutor:
+        def __init__(self, *, initializer, initargs, **_kwargs):
+            nonlocal executor_count
+            executor_count += 1
+            initializer(*initargs)
+
+        def submit(self, _function, *_args):
+            future = Future()
+            future.set_exception(BrokenProcessPool("persistent worker death"))
+            return future
+
+        def shutdown(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(
+        ensemble_module.concurrent.futures,
+        "ProcessPoolExecutor",
+        BrokenExecutor,
+    )
+    ensemble_creator = EnsembleCreator.__new__(EnsembleCreator)
+
+    def fail_if_run_in_parent(**_kwargs):
+        raise AssertionError("native sampling must remain process-isolated")
+
+    monkeypatch.setattr(ensemble_creator, "sample_mol_graph", fail_if_run_in_parent)
+
+    with pytest.warns(RuntimeWarning, match="fresh isolated one-worker pool"):
+        with pytest.raises(WorkerProcessFailure):
+            ensemble_creator.create_ensemble(
+                2,
+                parallel=True,
+                n_workers=2,
+                max_worker_restarts=0,
+                fallback_on_worker_crash=True,
+            )
+
+    assert executor_count == 2
 
 
 def test_convergence_rescues_remaining_jobs_after_worker_crash(monkeypatch):
@@ -229,7 +271,7 @@ def test_convergence_rescues_remaining_jobs_after_worker_crash(monkeypatch):
 
     assert len(result.chains) == 4
     assert any(
-        "continuing remaining chain jobs in serial mode" in str(w.message)
+        "fresh isolated one-worker pool" in str(w.message)
         for w in caught
     )
 

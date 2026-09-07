@@ -18,6 +18,11 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
   remains `full`.
 - Sampling benchmarks support concise median-only matrices and sampling-only CPU attribution by implementation category; the post-optimization profile documents why NetworkX remains the internal graph backend for now.
 - Convergence sampling supports bounded chain/sequence reservoirs, per-chain streaming callbacks, optional returned metadata, and serializable seeded checkpoints for exact batch-boundary resume.
+- Convergence sampling supports an optional feature-space representative cover
+  over molecular weight, building-block count/composition, and contact
+  frequencies. Returned representatives include aligned population counts;
+  `0.15` is the recommended initial distance. The fixed-size uniform reservoir
+  remains available as a mutually exclusive alternative.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
 - Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, and `MissingTermination`. The canonical configuration — a site capped in the step that grows it — stays silent.
@@ -27,6 +32,11 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Changed
 
+- SMILES-producing APIs now default to `smiles_policy="fast"`, using RDKit's
+  native non-canonical writer for ordinary molecules and retaining the
+  extended-label direct writer for huge ring-rich molecules and ring-label
+  overflow. Pass `smiles_policy="auto"` or `"canonical"` when canonical text
+  is required.
 - `mol_graph_to_rdkit_mol` now applies preserved chirality and directional-bond
   metadata before stereochemistry assignment, and tolerates duplicate directed
   edges by ignoring already-added atom pairs.
@@ -64,6 +74,9 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
   creator; boundary lookahead now evaluates only live endpoint hydrogen loss
   and dynamic target probabilities instead of constructing temporary graphs.
 - Parallel ensembles now initialize one persistent creator per worker, submit compact chain jobs with at most twice the worker count in flight, cap numerical-library threads, and recycle workers where supported. Broken pools preserve completed ordered results and restart up to `max_worker_restarts`, then raise `WorkerProcessFailure` with the last valid native diagnostic state.
+- Worker-crash fallback now retries unfinished chains in a fresh isolated
+  one-worker pool instead of executing native sampling in the caller process;
+  a repeated native fault raises `WorkerProcessFailure` safely.
 - Accepted chains now construct and sanitize one RDKit molecule and reuse it for molecular weight and requested canonical SMILES. Optional durable native-stage diagnostics include chain/seed context and library versions, `faulthandler` is enabled automatically, and enlarged-stack protection covers construction, sanitization, descriptors, and SMILES generation for large molecules.
 - Convergence uses the sampler's final hydrogen-reconciled molecular weight
   instead of rebuilding an RDKit molecule solely for `MolWt`. Retained and

@@ -102,6 +102,11 @@ def test_tracker_requires_complete_stable_window():
         ({"mass_tolerance": -0.1}, "mass_tolerance"),
         ({"contact_tolerance": -0.1}, "contact_tolerance"),
         ({"checkpoint_policy": "compact"}, "checkpoint_policy"),
+        ({"representative_distance": -0.1}, "representative_distance"),
+        (
+            {"reservoir_size": 1, "representative_distance": 0.15},
+            "mutually exclusive",
+        ),
     ),
 )
 def test_converged_ensemble_validates_settings(kwargs, match):
@@ -543,6 +548,126 @@ def test_convergence_reservoir_is_bounded_and_generation_independent():
     assert reservoir.number_average_molecular_weight == pytest.approx(
         full.number_average_molecular_weight
     )
+
+
+def test_convergence_representative_cover_counts_assigned_chains(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    molecular_weights = [100.0, 105.0, 130.0]
+    materialized_indices = []
+
+    def materialize_representative(deferred, *args, **kwargs):
+        materialized_indices.append(deferred.chain_index)
+        return _materialize_deferred_chain(deferred, *args, **kwargs)
+
+    def iter_chain_records(**kwargs):
+        for index in range(kwargs["n_samples"]):
+            chain_index = kwargs["start_index"] + index
+            yield {
+                "chain_index": chain_index,
+                "record": _deferred(
+                    chain_index,
+                    molecular_weight=molecular_weights[chain_index],
+                ),
+                "discards": 0,
+                "reasons": (),
+                "first_cause": None,
+                "warnings": [],
+            }
+
+    monkeypatch.setattr(creator, "_iter_chain_records", iter_chain_records)
+    monkeypatch.setattr(
+        ensemble_creator_module,
+        "_materialize_deferred_chain",
+        materialize_representative,
+    )
+    result = creator.create_ensemble_until_converged(
+        batch_size=3,
+        max_samples=3,
+        window=10,
+        representative_distance=0.15,
+    )
+
+    assert len(result.chains) == 2
+    assert result.molecular_weights == [100.0, 130.0]
+    assert result.representative_counts == [2, 1]
+    assert sum(result.representative_counts) == 3
+    assert materialized_indices == [0, 2]
+    assert result.convergence_settings["representative_distance"] == 0.15
+
+
+def test_representative_cover_distinguishes_composition_and_contacts(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    alternate_pair = (("R0.1", "left"), ("T0.1", "right"))
+
+    def iter_chain_records(**kwargs):
+        for index in range(kwargs["n_samples"]):
+            chain_index = kwargs["start_index"] + index
+            deferred = _deferred(chain_index)
+            if chain_index == 1:
+                deferred.sample.metadata.unit_counts = {"R1": 1}
+            elif chain_index == 2:
+                deferred.sample.metadata.labeled_bond_counts = {
+                    alternate_pair: 1
+                }
+            yield {
+                "chain_index": chain_index,
+                "record": deferred,
+                "discards": 0,
+                "reasons": (),
+                "first_cause": None,
+                "warnings": [],
+            }
+
+    monkeypatch.setattr(creator, "_iter_chain_records", iter_chain_records)
+    result = creator.create_ensemble_until_converged(
+        batch_size=3,
+        max_samples=3,
+        window=10,
+        metadata=False,
+        representative_distance=0.15,
+    )
+
+    assert len(result.chains) == 3
+    assert result.representative_counts == [1, 1, 1]
+
+
+def test_seeded_representative_cover_checkpoint_resumes_exactly():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        checkpoints = []
+        creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=2,
+            window=10,
+            output_format="smiles",
+            seed=53,
+            representative_distance=0.15,
+            checkpoint_callback=checkpoints.append,
+        )
+        checkpoint = pickle.loads(pickle.dumps(checkpoints[-1]))
+        resumed = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=53,
+            representative_distance=0.15,
+            checkpoint=checkpoint,
+        )
+        uninterrupted = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=6,
+            window=10,
+            output_format="smiles",
+            seed=53,
+            representative_distance=0.15,
+        )
+
+    assert resumed.chains == uninterrupted.chains
+    assert resumed.molecular_weights == uninterrupted.molecular_weights
+    assert resumed.representative_counts == uninterrupted.representative_counts
+    assert sum(resumed.representative_counts) == 6
 
 
 def test_convergence_can_omit_returned_metadata():

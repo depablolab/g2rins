@@ -71,18 +71,21 @@ the result is returned with `converged == False`.
 Both convergence thresholds (`mass_tolerance`, `contact_tolerance`) and the
 maximum number of generated chains (`max_samples`) are user-configurable.
 
-SMILES output uses `smiles_policy="auto"`: canonical serialization is tried
-first, with deterministic recovery for large ring-rich molecules. Use
-`smiles_policy="fast"` when canonical text is unnecessary and deterministic
-non-canonical output is preferred, or `smiles_policy="canonical"` to disable
+SMILES output defaults to `smiles_policy="fast"`, producing deterministic
+non-canonical text without canonical ranking. This is substantially faster for
+large polymers and retains the complete molecular structure for later parsing,
+selection, or canonicalization. Use `smiles_policy="auto"` to request canonical
+serialization with deterministic recovery for large ring-rich molecules, or
+`smiles_policy="canonical"` to require strict canonical output and disable
 overflow fallbacks.
 
 For polymers without an initiator, pass
 `use_repeat_units_as_source=True` to seed each iteratively generated chain
 from a repeat unit.
 
-For long runs, statistics can cover every accepted chain while sample-level
-outputs remain bounded:
+For long runs, statistics can cover every accepted chain while only a
+feature-diverse representative set is converted and retained. A recommended
+starting distance is `0.15`:
 
 ```python
 checkpoints = []
@@ -91,29 +94,44 @@ ensemble = ensemble_creator.create_ensemble_until_converged(
 	max_samples=100_000,
 	output_format="smiles",
 	seed=7,
-	reservoir_size=100,
+	representative_distance=0.15,
 	retain_sequences=False,
-	sample_callback=lambda index, record: print(index, record["molecule"]),
 	checkpoint_callback=checkpoints.append,
 )
 
-# Resume from a serialized batch-boundary checkpoint. The sampling and
-# independent reservoir streams continue exactly when an integer seed is used.
+# Counts are positionally aligned with the representative SMILES.
+for smiles, count in zip(ensemble.chains, ensemble.representative_counts):
+	print(count, smiles)
+
+# Resume from a serialized batch-boundary checkpoint.
 ensemble = ensemble_creator.create_ensemble_until_converged(
 	batch_size=25,
 	max_samples=100_000,
 	output_format="smiles",
 	seed=7,
-	reservoir_size=100,
+	representative_distance=0.15,
 	retain_sequences=False,
 	checkpoint=checkpoints[-1],
 )
 ```
 
+The distance is the maximum of four dimensionless differences: log molecular
+weight, log building-block count, total-variation distance between
+building-block compositions, and total-variation distance between contact
+frequencies. Thus `0.15` allows roughly a 16% size ratio and at most 0.15
+total-variation distance in either normalized distribution. Every accepted
+chain is within the threshold of the representative whose count it increments.
+Selection is deterministic and online, but the resulting cover is not
+guaranteed to be the smallest possible cover.
+
 Set both `retain_chains=False` and `retain_sequences=False` for no retained
 sample records. `metadata=False` omits returned unit/contact metadata without
-changing the statistics used for convergence. `reservoir_size` uses an
-independent random stream, so retention never changes generated chemistry.
+changing the statistics used for convergence. Leave
+`representative_distance=None` to retain every sample. Alternatively,
+`reservoir_size=100` enables the previous fixed-size uniform reservoir;
+`reservoir_size` and `representative_distance` cannot be combined. Reservoir
+retention uses an independent random stream, so it never changes generated
+chemistry, but it does not provide representative population counts.
 Checkpoints are serializable with `pickle` and require an integer `seed` for
 exact resume. The default `checkpoint_policy="full"` embeds retained chains
 and sequences for exact output reconstruction. For much smaller checkpoints,

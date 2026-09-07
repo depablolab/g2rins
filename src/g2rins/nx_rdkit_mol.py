@@ -468,13 +468,14 @@ def mol_graph_to_rdkit_mol(
 def rdkit_mol_to_smiles(
     mol,
     native_stage_callback=None,
-    smiles_policy="auto",
+    smiles_policy="fast",
 ):
     """Serialize ``mol`` to SMILES, with large-molecule RDKit safeguards.
 
     ``smiles_policy="auto"`` first requests canonical output and recovers from
     ring-label overflow. ``"canonical"`` disables recovery, while ``"fast"``
-    first uses the deterministic non-canonical extended-label writer.
+    first uses RDKit's deterministic non-canonical writer. Huge ring-rich
+    molecules and ring-label overflow use the extended-label writer directly.
 
     Canonical traversal can exhaust RDKit's finite set of simultaneously open
     ring labels for large, ring-rich polymers even though the molecule is
@@ -634,6 +635,7 @@ def rdkit_mol_to_smiles(
             ring_neighbors[second].append(first)
 
         atom_token_cache = {}
+        chiral_atom_token_cache = {}
 
         def atom_token(atom_idx):
             atom = mol.GetAtomWithIdx(atom_idx)
@@ -673,13 +675,33 @@ def rdkit_mol_to_smiles(
                 )
                 if inversions % 2:
                     marker = "@" if marker == "@@" else "@@"
-                token = atom.GetSmarts()
                 original_marker = (
                     "@@"
                     if chiral_tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW
                     else "@"
                 )
-                return token.replace(original_marker, marker, 1)
+                key = (
+                    atom.GetAtomicNum(),
+                    atom.GetIsAromatic(),
+                    atom.GetIsotope(),
+                    atom.GetFormalCharge(),
+                    atom.GetNumExplicitHs(),
+                    atom.GetNumImplicitHs(),
+                    atom.GetNoImplicit(),
+                    atom.GetNumRadicalElectrons(),
+                    atom.GetAtomMapNum(),
+                    original_marker,
+                    marker,
+                )
+                token = chiral_atom_token_cache.get(key)
+                if token is None:
+                    token = atom.GetSmarts().replace(
+                        original_marker,
+                        marker,
+                        1,
+                    )
+                    chiral_atom_token_cache[key] = token
+                return token
             key = (
                 atom.GetAtomicNum(),
                 atom.GetIsAromatic(),
@@ -754,11 +776,8 @@ def rdkit_mol_to_smiles(
         if smiles_policy == "canonical":
             return Chem.MolToSmiles(mol)
         if (
-            smiles_policy == "fast"
-            or (
-                mol.HasProp(_PREFER_DIRECT_SMILES_PROPERTY)
-                and mol.GetBoolProp(_PREFER_DIRECT_SMILES_PROPERTY)
-            )
+            mol.HasProp(_PREFER_DIRECT_SMILES_PROPERTY)
+            and mol.GetBoolProp(_PREFER_DIRECT_SMILES_PROPERTY)
         ):
             direct = _direct_smiles_with_extended_ring_labels()
             if direct is not None:
@@ -915,7 +934,7 @@ def mol_graph_to_smiles(
     kekulize=True,
     native_stage_callback=None,
     strip_unresolved_directional_markers=False,
-    smiles_policy="auto",
+    smiles_policy="fast",
 ):
     """Convert a mol graph to SMILES; safe for very large graphs.
 
