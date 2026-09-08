@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "g2rins"
-description = "Implementation of G2RINS, a line-and-graph representation of polymers. Grammar validation, generative graph construction, and molecular ensemble generation."
+description = "Implementation of G2RINS, a string-and-graph representation of polymers. Grammar validation, generative graph construction, and molecular ensemble generation."
 authors = [
   { name = "Gervasio Zaldivar", email = "g.zaldivar@nyu.edu" },
   { name = "Yuan Tian", email = "yuan.tian@nyu.edu" },
