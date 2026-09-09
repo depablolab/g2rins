@@ -38,6 +38,12 @@ The repository uses [Trunk](https://docs.trunk.io) for linting and formatting; i
 ./trunk check
 ```
 
-## Bugs and feature requests
+## Discussions, bugs, and feature requests
 
-Please use the issue forms on the [issue tracker](https://github.com/depablolab/g2rins/issues). For bugs, a minimal reproducer and the G²RINS input string (when applicable) make fixes much faster.
+Use [GitHub Discussions](https://github.com/depablolab/g2rins/discussions) when the topic would benefit from community input before it becomes implementation work:
+
+- **Q&A** for usage questions, troubleshooting, and help understanding G²RINS behavior.
+- **Ideas** for early feature concepts, notation improvements, workflows, and research directions.
+- **Show and tell** for sharing projects, notebooks, datasets, experiments, and research using G²RINS.
+
+Please use the [issue tracker](https://github.com/depablolab/g2rins/issues) for reproducible bugs and concrete, actionable feature requests. For bugs, a minimal reproducer and the G²RINS input string (when applicable) make fixes much faster.
