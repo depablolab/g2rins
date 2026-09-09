@@ -1,0 +1,39 @@
+title: "[Q&A] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for using G²RINS! Use this category for usage questions, troubleshooting, and help understanding G²RINS behavior.
+
+        If you have a reproducible bug, please open an issue instead: https://github.com/depablolab/g2rins/issues
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: Describe the polymer, workflow, or result you are trying to represent or generate.
+      placeholder: I am trying to...
+    validations:
+      required: true
+  - type: textarea
+    id: input
+    attributes:
+      label: G²RINS input or minimal example
+      description: Share the smallest G²RINS string or Python snippet that shows the question, when applicable.
+      render: text
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried?
+      description: Include relevant output, error messages, or approaches you already tested.
+  - type: input
+    id: version
+    attributes:
+      label: G²RINS version
+      description: For example, v1.0.0 or the commit/branch if you installed from GitHub.
+      placeholder: v1.0.0
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Optional. Include Python version and operating system if they may matter.
+      placeholder: Python 3.12, Linux
