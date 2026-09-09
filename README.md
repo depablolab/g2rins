@@ -90,11 +90,23 @@ G²RINS builds on G-BigSMILES, which extends the [BigSMILES line notation](https
 
 ---
 
+## Community and support
+
+Use [GitHub Discussions](https://github.com/depablolab/g2rins/discussions) for community conversations:
+
+- **Q&A** for usage questions, troubleshooting, and help understanding G²RINS behavior.
+- **Ideas** for early feature concepts, representation improvements, workflows, and research directions.
+- **Show and tell** for sharing projects, notebooks, datasets, experiments, and research using G²RINS.
+
+For a reproducible bug or a concrete, actionable feature request, use the [issue tracker](https://github.com/depablolab/g2rins/issues).
+
+---
+
 ## Contributing
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and contribution guidelines.
 
-Report bugs or request features through the [issue tracker](https://github.com/depablolab/g2rins/issues). Notable changes are documented in [CHANGELOG.md](CHANGELOG.md) and on the [releases page](https://github.com/depablolab/g2rins/releases).
+Notable changes are documented in [CHANGELOG.md](CHANGELOG.md) and on the [releases page](https://github.com/depablolab/g2rins/releases).
 
 ---
 
