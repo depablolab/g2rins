@@ -13,6 +13,24 @@ from g2rins.atom import AtomSymbol
 
 @pytest.mark.parametrize(
     "diagnostic",
+    [
+        g2rins.exception.ParsingError("missing symbol"),
+        g2rins.exception.MissingAtomSymbol("Atom"),
+        g2rins.exception.TooManyTokens("Atom", "C", "N"),
+        g2rins.exception.UnsupportedBondDescriptor("[<]", "O=[<]C[>]", 2),
+    ],
+)
+@pytest.mark.parametrize("copy_method", ["pickle", "deepcopy"])
+def test_parser_and_descriptor_diagnostics_preserve_context(diagnostic, copy_method):
+    restored = pickle.loads(pickle.dumps(diagnostic)) if copy_method == "pickle" else copy.deepcopy(diagnostic)
+    assert type(restored) is type(diagnostic)
+    assert restored.args == diagnostic.args
+    assert vars(restored) == vars(diagnostic)
+    assert str(restored) == str(diagnostic)
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
     (
         g2rins.exception.DeadSamplingPath("nested target"),
         g2rins.exception.EmptyTruncatedDistributionSupport(
@@ -203,23 +221,6 @@ def test_undefined_distribution(smi):
 
 
 # TODO: implement tests for IncorrectNumberOfBondProbabilities and EmptyBondConnectorInTerminalBondConnectorList. Add nested examples.
-
-
-@pytest.mark.parametrize(
-    "diagnostic",
-    [
-        g2rins.exception.ParsingError("missing symbol"),
-        g2rins.exception.MissingAtomSymbol("Atom"),
-        g2rins.exception.TooManyTokens("Atom", "C", "N"),
-    ],
-)
-@pytest.mark.parametrize("copy_method", ["pickle", "deepcopy"])
-def test_parser_diagnostics_preserve_context(diagnostic, copy_method):
-    restored = pickle.loads(pickle.dumps(diagnostic)) if copy_method == "pickle" else copy.deepcopy(diagnostic)
-    assert type(restored) is type(diagnostic)
-    assert restored.args == diagnostic.args
-    assert vars(restored) == vars(diagnostic)
-    assert str(restored) == str(diagnostic)
 
 
 def test_too_many_tokens_round_trips_with_atom_symbol_tokens():

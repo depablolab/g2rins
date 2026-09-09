@@ -1,7 +1,11 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
 
+import copy
+import json
+import pickle
 import warnings
+from pathlib import Path
 
 import networkx as nx
 import numpy as np
@@ -14,6 +18,27 @@ from g2rins.exception import InvalidUnitPSmiles, NoValidGenerationSource
 
 PEI = "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(200)|"
 HYPERBRANCHED_CH = "{[] [<][CH]([>])[>]; [<][H]; [>][H] []}|poisson(100)|"
+PARTNERLESS_INITIATOR = "{[] [<]CCO[>]; N([>])([>])[>1]; [<][H] []}|poisson(300)|"
+PARTNERLESS_REPEAT = "{[] [<]CCN([>])[>1]; O[>]; [<][H] []}|poisson(300)|"
+PARTNERLESS_SINGLE_SITE = "{[] [<]CC([>1])O[>]; CO[>]; [<][H] []}|poisson(300)|"
+PARTNERLESS_CASES = [
+    pytest.param(PARTNERLESS_INITIATOR, "I0", "N([*:1])[*:2]", id="B1-split-initiator"),
+    pytest.param(PARTNERLESS_REPEAT, "R0", "C(C[*:1])N[*:2]", id="B5-split-repeat"),
+    pytest.param(PARTNERLESS_SINGLE_SITE, "R0", "C(C[*:1])O[*:2]", id="B4-single-site-control"),
+]
+
+# Keep every input, including ordinary units that can expose an over-strict
+# validator. Names and expected outcomes are keyed by input text, so reordering
+# smi.json cannot move the expected failure onto a different input.
+CORPUS_CASES = json.loads(Path(__file__).with_name("unit_psmiles_corpus.json").read_text(encoding="utf-8"))
+CORPUS_TEXTS = json.loads(Path(__file__).with_name("smi.json").read_text(encoding="utf-8"))["g2rins"]
+CORPUS_ERRORS = {None: None, "NoValidGenerationSource": NoValidGenerationSource}
+
+
+def test_corpus_metadata_covers_inputs():
+    assert set(CORPUS_CASES) == set(CORPUS_TEXTS), "Give every corpus input a descriptive test ID and expected outcome."
+    assert all(isinstance(case, dict) and isinstance(case.get("id"), str) for case in CORPUS_CASES.values()), "Each corpus case needs a string test ID."
+    assert len({case["id"] for case in CORPUS_CASES.values()}) == len(CORPUS_CASES), "Corpus test IDs must be unique."
 
 
 def _make_creator(text):
@@ -87,8 +112,9 @@ def test_hyperbranched_unit_psmiles_uses_placeholders_as_stars(text, reference, 
     _assert_public_unit_contract(creator, result)
 
 
-def test_unit_star_renderer_does_not_mutate_sampled_snapshot():
-    creator = _make_creator(PEI)
+@pytest.mark.parametrize("text", [PEI, PARTNERLESS_REPEAT], ids=["active-sites", "inactive-site"])
+def test_unit_star_renderer_does_not_mutate_sampled_snapshot(text):
+    creator = _make_creator(text)
     labels = g2rins.derive_unit_labels(creator._generative_graph)
     origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
     with warnings.catch_warnings():
@@ -124,8 +150,8 @@ def test_placeholder_bond_ids_and_bond_records_remain_unchanged():
 def test_sequence_phantom_contraction_preserves_junction_edge_attributes():
     unit = nx.Graph()
     unit.add_node("real", atomic_num=7)
-    unit.add_node("phantom", atomic_num=0, origin_idx="split-site")
-    unit.add_node("C0", atomic_num=0, connection=0, origin_idx="far-side-placeholder")
+    unit.add_node("phantom", atomic_num=0, is_connector_placeholder=True, origin_idx="split-site")
+    unit.add_node("C0", atomic_num=0, is_connector_placeholder=False, connection=0, origin_idx="far-side-placeholder")
     unit.add_edge("real", "phantom", bond_type=1, aromatic=False, source="static")
     unit.add_edge("phantom", "C0", bond_type=2, aromatic=False, source="junction")
 
@@ -135,32 +161,45 @@ def test_sequence_phantom_contraction_preserves_junction_edge_attributes():
     assert unit.has_edge("real", "C0")
     assert unit["real"]["C0"] == {"bond_type": 2, "aromatic": False, "source": "junction"}
     assert unit.nodes["C0"]["connection"] == 0
+    assert unit.nodes["C0"]["is_connector_placeholder"] is False
 
     edges_after_first_pass = list(unit.edges(data=True))
     EnsembleCreator._contract_sequence_phantoms([[unit]])
     assert list(unit.edges(data=True)) == edges_after_first_pass
 
 
-def test_generated_sequence_graphs_have_only_mapped_connection_dummies():
+def test_generated_sequence_graphs_mark_every_connection_site():
     result = _create_one(PEI, output_format="mol_graph")
-    dummy_count = 0
+    mapped_count = 0
+    unmapped_count = 0
     for chain_sequences in result.sequences:
         for sequence in chain_sequences:
             for unit in sequence:
                 for node, data in unit.nodes(data=True):
                     if data.get("atomic_num") != 0:
                         continue
-                    dummy_count += 1
-                    assert "connection" in data
+                    # Both kinds are degree-one dummies hanging off a real atom.
                     assert unit.degree[node] == 1
                     neighbor = next(iter(unit.neighbors(node)))
                     assert unit.nodes[neighbor]["atomic_num"] > 0
-    assert dummy_count > 0
+                    if "connection" in data:
+                        mapped_count += 1
+                        assert data["is_connector_placeholder"] is False
+                        assert set(data) == {"atomic_num", "is_connector_placeholder", "aromatic", "charge", "num_explicit_h", "origin_idx", "connection"}
+                    else:
+                        # A split site with no recorded connection keeps its
+                        # placeholder: dropping it would render an interior
+                        # fragment as a complete small molecule.
+                        unmapped_count += 1
+                        assert data["is_connector_placeholder"] is True
+    assert mapped_count > 0
+    assert unmapped_count > 0
 
 
 @pytest.mark.parametrize("output_format", ["mol", "smiles"])
-def test_converted_sequence_units_have_only_mapped_degree_one_dummies(output_format):
+def test_converted_sequence_units_have_degree_one_dummies(output_format):
     result = _create_one(PEI, output_format=output_format)
+    mapped_count = 0
     for chain_sequences in result.sequences:
         for sequence in chain_sequences:
             for unit in sequence:
@@ -168,13 +207,28 @@ def test_converted_sequence_units_have_only_mapped_degree_one_dummies(output_for
                 assert mol is not None
                 for atom in mol.GetAtoms():
                     if atom.GetAtomicNum() == 0:
-                        assert atom.GetAtomMapNum() > 0
                         assert atom.GetDegree() == 1
+                        mapped_count += atom.GetAtomMapNum() > 0
+    assert mapped_count > 0
 
 
 def test_unit_psmiles_validator_accepts_the_reference_structure():
     mol = Chem.MolFromSmiles("[*:1]CCN([*:2])[*:3]")
     EnsembleCreator._validate_unit_psmiles_mol("R0", mol, [1, 2, 3], 3)
+
+
+@pytest.mark.parametrize("copy_method", ["pickle", "deepcopy"])
+def test_invalid_unit_psmiles_preserves_normalized_diagnostics(copy_method):
+    error = InvalidUnitPSmiles("R0", iter([1, 2]), iter([0, 1, 2]), iter([(3, 0, 2)]), np.int64(4), np.int64(3))
+    expected_args = ("R0", (1, 2), (0, 1, 2), ((3, 0, 2),), 4, 3)
+    assert error.args == expected_args
+    assert type(error.args[-2]) is int and type(error.args[-1]) is int
+    restored = pickle.loads(pickle.dumps(error)) if copy_method == "pickle" else copy.deepcopy(error)
+    assert restored.args == expected_args
+    assert vars(restored) == vars(error)
+    assert str(restored) == str(error)
+    for field in ("unit_id", "expected_maps", "actual_maps", "invalid_dummy_degrees", "expected_real_atom_count", "actual_real_atom_count"):
+        assert f"{field}={getattr(error, field)!r}" in str(error)
 
 
 @pytest.mark.parametrize(
@@ -211,21 +265,162 @@ def test_json_export_stops_before_writing_invalid_unit_psmiles(tmp_path, monkeyp
     assert not json_path.exists()
 
 
-def test_corpus_unit_psmiles_follow_template_contract(g2rins_list):
-    for text in g2rins_list:
-        creator = _make_creator(text)
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                result = creator.create_ensemble(
-                    1,
-                    output_format="mol_graph",
-                    ensemble_info=True,
-                    max_number_of_discarded_chains=2,
-                    seed=0,
-                )
-        except NoValidGenerationSource:
-            # Some corpus entries intentionally have no default automatic source.
-            continue
-        assert result is not None
-        _assert_public_unit_contract(creator, result)
+@pytest.mark.parametrize(("text", "unit_id", "reference"), PARTNERLESS_CASES)
+def test_partnerless_connector_unit_psmiles(text, unit_id, reference):
+    creator = _make_creator(text)
+    result = creator.create_ensemble(1, output_format="mol_graph", ensemble_info=True, seed=0)
+    assert _canonical(result.units[unit_id]["psmiles"]) == _canonical(reference)
+    _assert_public_unit_contract(creator, result)
+    assert all(data["atomic_num"] > 0 for chain in result.chains for _, data in chain.nodes(data=True))
+    dummy_count = 0
+    for sequence in result.sequences[0]:
+        for unit in sequence:
+            for node, data in unit.nodes(data=True):
+                if data["atomic_num"] != 0:
+                    continue
+                dummy_count += 1
+                assert unit.degree[node] == 1
+                assert unit.nodes[next(iter(unit.neighbors(node)))]["atomic_num"] > 0
+    assert dummy_count > 0
+
+
+@pytest.mark.parametrize("output_format", ["mol", "smiles"])
+def test_partnerless_repeat_converted_outputs(output_format):
+    creator = _make_creator(PARTNERLESS_REPEAT)
+    result = creator.create_ensemble(1, output_format=output_format, ensemble_info=True, seed=0)
+    _assert_public_unit_contract(creator, result)
+    dummy_count = 0
+    for sequence in result.sequences[0]:
+        for unit in sequence:
+            mol = unit if output_format == "mol" else _parse_with_explicit_hydrogens(unit)
+            assert mol is not None
+            for atom in mol.GetAtoms():
+                if atom.GetAtomicNum() == 0:
+                    dummy_count += 1
+                    assert atom.GetDegree() == 1
+    assert dummy_count > 0
+
+
+@pytest.mark.parametrize(("text", "unit_id", "reference"), PARTNERLESS_CASES)
+def test_partnerless_connector_json_only_export(text, unit_id, reference, tmp_path):
+    creator = _make_creator(text)
+    path = tmp_path / "ensemble.json"
+    chains = creator.create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    exported = json.loads(path.read_text())
+    assert exported["ensemble"]["chains"] == chains
+    assert _canonical(exported["ensemble"]["units"][unit_id]["psmiles"]) == _canonical(reference)
+    placeholders = [node for node in exported["graph"]["nodes"] if node["atomic_num"] == 0]
+    if text == PARTNERLESS_SINGLE_SITE:
+        assert not placeholders
+    else:
+        assert placeholders and all(node["is_connector_placeholder"] for node in placeholders)
+        assert len([node for node in placeholders if "bond_id" not in node]) == 1
+    assert creator.create_ensemble(1, output_format="smiles", seed=0) == chains
+
+
+def test_partnerless_initiator_parallel_matches_serial():
+    creator = _make_creator(PARTNERLESS_INITIATOR)
+    serial = creator.create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+    parallel = creator.create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0, parallel=True, n_workers=2)
+    assert parallel == serial
+    _assert_public_unit_contract(creator, parallel)
+
+
+def test_unit_renderer_drops_only_identified_inactive_placeholders():
+    unit = nx.Graph()
+    unit.add_node("real", atomic_num=7, origin_idx="real", is_connector_placeholder=False)
+    unit.add_node("inactive", atomic_num=0, origin_idx="inactive", is_connector_placeholder=True)
+    unit.add_node("wildcard", atomic_num=0, origin_idx="wildcard", is_connector_placeholder=False)
+    unit.add_edges_from([("real", "inactive"), ("real", "wildcard")])
+    rendered = EnsembleCreator._unit_graph_with_stars(unit, {})
+    assert set(rendered) == {"real", "wildcard"}
+    assert rendered.has_edge("real", "wildcard")
+    assert set(unit) == {"real", "inactive", "wildcard"}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [pytest.param(text, id=case["id"] if isinstance(case, dict) and isinstance(case.get("id"), str) else f"corpus-{index}") for index, (text, case) in enumerate(CORPUS_CASES.items())],
+)
+def test_corpus_unit_psmiles_follow_template_contract(text):
+    case = CORPUS_CASES[text]
+    assert isinstance(case, dict), "Corpus case metadata must be an object."
+    error_name = case.get("expected_error")
+    assert error_name is None or isinstance(error_name, str), "Expected error must be a known name."
+    assert error_name in CORPUS_ERRORS, f"Unknown expected error: {error_name!r}"
+    expected_error = CORPUS_ERRORS[error_name]
+    creator = _make_creator(text)
+    if expected_error is not None:
+        # This input intentionally has no default source. Any unexpected
+        # NoValidGenerationSource from another case must fail the test.
+        with pytest.raises(expected_error):
+            creator.create_ensemble(1, ensemble_info=True, seed=0)
+        return
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = creator.create_ensemble(1, output_format="mol_graph", ensemble_info=True, max_number_of_discarded_chains=2, seed=0)
+    assert result is not None
+    _assert_public_unit_contract(creator, result)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("{[] [<][NH2+]C[>]; [>][H]; [<][H] []}|uniform(100,100)|", id="charged-neighbor"),
+        # poisson(600): a chain long enough that a junction between two ring
+        # atoms is realized, which is what puts an aromatic bond on a stub.
+        pytest.param("{[] [<]c1ccc([>])cc1[>]; [<][H]; [>][H] []}|poisson(600)|", id="aromatic-neighbor"),
+    ],
+)
+@pytest.mark.parametrize("output_format", ["mol_graph", "mol", "smiles"])
+def test_sequence_stubs_are_neutral_and_non_aromatic(text, output_format):
+    creator = _make_creator(text)
+    result = creator.create_ensemble(1, output_format=output_format, ensemble_info=True, seed=0)
+    stub_count = 0
+    for sequence in result.sequences[0]:
+        for unit in sequence:
+            if output_format == "mol_graph":
+                for node, data in unit.nodes(data=True):
+                    if "connection" in data:
+                        stub_count += 1
+                        assert data["atomic_num"] == 0
+                        assert data["charge"] == 0
+                        assert data["aromatic"] is False
+                        assert data["num_explicit_h"] == -1
+                        source = creator.generative_graph.nodes[data["origin_idx"]]
+                        assert source["charge"] > 0 or source["aromatic"]
+                        for neighbor in unit.neighbors(node):
+                            assert unit[node][neighbor]["aromatic"] is False
+            else:
+                mol = unit if output_format == "mol" else _parse_with_explicit_hydrogens(unit)
+                assert mol is not None
+                # A stub bond left aromatic survives fragment-mode conversion and
+                # only fails here, on the kekulizing sanitization a caller runs.
+                Chem.SanitizeMol(Chem.Mol(mol))
+                for atom in mol.GetAtoms():
+                    if atom.GetAtomicNum() == 0 and atom.GetAtomMapNum() > 0:
+                        stub_count += 1
+                        assert atom.GetFormalCharge() == 0
+                        assert not atom.GetIsAromatic()
+    assert stub_count > 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "collapsed"),
+    [
+        pytest.param("{[] [$][C-][$]; [$][H];[$][H] []}|gauss(300.,20.)|", "*[CH-]*", "[CH3-]", id="divalent-carbanion"),
+        pytest.param("{[] [<]CC[>], [<]C(F)(F)[>]; [<][H]; [>][H] []}|poisson(200)|", "*C(*)(F)F", "FCF", id="difluoro-comonomer"),
+    ],
+)
+def test_interior_sequence_fragments_keep_their_connection_sites(text, expected, collapsed):
+    """An interior unit must not render as a complete small molecule.
+
+    Dropping a split site the sampler did not record turns a divalent carbanion
+    into methanide, inflating its hydrogen count, so composition computed from
+    sequences is wrong while chains stay correct.
+    """
+    creator = _make_creator(text)
+    result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    fragments = {unit for group in result.sequences[0] for unit in group}
+    assert expected in fragments
+    assert collapsed not in fragments

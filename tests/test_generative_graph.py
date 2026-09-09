@@ -10,6 +10,7 @@ import pytest
 from rdkit import Chem
 
 import g2rins
+from g2rins.exception import UnsupportedBondDescriptor
 
 # graph_validation.json holds nx.adjacency_data of get_generative_graph(include_bond_connectors=False)
 # for every tests/smi.json g2rins string; regenerate it whenever the generative-graph
@@ -45,7 +46,7 @@ def test_generative_graph_json_data_format_block():
     generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
     data = g2rins.generative_graph_json_data(generative_graph)
 
-    assert data["format"]["version"] == 1
+    assert data["format"]["version"] == 2
     declared = set(data["format"]["derived_node_fields"])
     stored_attrs = {key for _node, attrs in generative_graph.nodes(data=True) for key in attrs}
     injected = {key for node_dict in data["graph"]["nodes"] for key in node_dict} - stored_attrs - {"id"}
@@ -60,15 +61,32 @@ def test_generative_graph_json_data_format_block():
         assert node_dict.get("bond_id") == labels.bond_id.get(node_dict["id"])
 
 
-@pytest.mark.parametrize(("text", "atomic_num"), [("c1cc[se]c1", 34), ("c1cc[as]cc1", 33)])
-def test_aromatic_two_letter_elements_keep_their_atomic_number(text, atomic_num):
-    creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
-    atoms = [data["atomic_num"] for _, data in creator.generative_graph.nodes(data=True)]
-    assert atoms.count(atomic_num) == 1
-    assert all(number > 0 for number in atoms)
-    molecule = creator.create_ensemble(1, output_format="mol", seed=0)[0]
-    Chem.SanitizeMol(molecule)
-    assert sum(atom.GetAtomicNum() == atomic_num for atom in molecule.GetAtoms()) == 1
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{[] [<]C(=[>])C[>]; [<][H]; O=[<]C[>], [<][H] []}|poisson(200.0)|",
+        "{[] [<]CC[>]; [>]CO; C[<]O []}|poisson(200.0)|",
+    ],
+)
+def test_descriptor_between_unit_atoms_rejected_before_graph_generation(text, tmp_path):
+    parsed = g2rins.G2rins.make(text)
+    assert str(parsed) == text
+    creator = parsed.get_graph_creator()
+    assert creator.get_generative_graph(include_bond_connectors=True).number_of_nodes() > 0
+    assert creator.get_dot_string(include_bond_connectors=True)
+    for build in (creator.get_generative_graph, creator.get_ensemble_creator, creator.get_dot_string):
+        with pytest.raises(UnsupportedBondDescriptor) as caught:
+            build()
+        assert caught.value.descriptor == "[<]"
+        assert caught.value.neighbor_count == 2
+        assert caught.value.unit_text in text
+        assert "single atom" in str(caught.value)
+        assert "report" not in str(caught.value)
+    path = tmp_path / "existing-graph.json"
+    path.write_text("keep existing data", encoding="utf-8")
+    with pytest.raises(UnsupportedBondDescriptor):
+        creator.write_generative_graph_json(path)
+    assert path.read_text(encoding="utf-8") == "keep existing data"
 
 
 def test_export_payload_is_detached_from_nested_graph_attributes():
@@ -82,6 +100,17 @@ def test_export_payload_is_detached_from_nested_graph_attributes():
     payload["nodes"][0]["unit_molar_amounts"][0] = 99
     next(edge for edge in payload["edges"] if "metadata" in edge)["metadata"]["values"].append(3)
     assert nx.utils.graphs_equal(graph, before)
+
+
+@pytest.mark.parametrize(("text", "atomic_num"), [("c1cc[se]c1", 34), ("c1cc[as]cc1", 33)])
+def test_aromatic_two_letter_elements_keep_their_atomic_number(text, atomic_num):
+    creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    atoms = [data["atomic_num"] for _, data in creator.generative_graph.nodes(data=True)]
+    assert atoms.count(atomic_num) == 1
+    assert all(number > 0 for number in atoms)
+    molecule = creator.create_ensemble(1, output_format="mol", seed=0)[0]
+    Chem.SanitizeMol(molecule)
+    assert sum(atom.GetAtomicNum() == atomic_num for atom in molecule.GetAtoms()) == 1
 
 
 @pytest.mark.parametrize("location", ["node", "edge", "graph"])

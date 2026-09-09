@@ -96,6 +96,41 @@ class GenerationError(G2RINSError):
     pass
 
 
+class UnsupportedBondDescriptor(G2RINSError):
+    """A descriptor embedded between atoms cannot identify a single bond site."""
+
+    def __init__(self, descriptor, unit_text, neighbor_count):
+        self.descriptor = str(descriptor)
+        self.unit_text = str(unit_text)
+        self.neighbor_count = int(neighbor_count)
+        super().__init__(self.descriptor, self.unit_text, self.neighbor_count)
+
+    def __str__(self):
+        return (
+            f"Bond descriptor {self.descriptor!r} in unit {self.unit_text!r} has {self.neighbor_count} atom neighbors. "
+            "A descriptor must attach to a single atom in its unit; ring-closure digits on a descriptor also count as neighbors. "
+            "Place it at a unit end or in a branch on the intended connection atom."
+        )
+
+
+class UnsupportedWildcardGeneration(GenerationError):
+    """User wildcard atoms can be represented but not sampled as molecules."""
+
+    def __init__(self, node_id, unit_id=None, unit_text=None):
+        self.node_id = node_id
+        self.unit_id = unit_id
+        self.unit_text = unit_text
+        super().__init__(self.node_id, self.unit_id, self.unit_text)
+
+    def __str__(self):
+        return (
+            "Ensemble generation does not support user-specified wildcard atoms ('*' or '[*]'). "
+            "Replace them with explicit atoms or end groups (for example, '[<][H]' for a hydrogen terminator). "
+            "Parsing and graph export remain supported. "
+            f"node_id={self.node_id!r}, unit_id={self.unit_id!r}, unit_text={self.unit_text!r}."
+        )
+
+
 class InvalidUnitPSmiles(GenerationError):
     """The generated unit pSMILES violates its template-derived contract."""
 
@@ -114,10 +149,23 @@ class InvalidUnitPSmiles(GenerationError):
         self.invalid_dummy_degrees = tuple(invalid_dummy_degrees)
         self.expected_real_atom_count = int(expected_real_atom_count)
         self.actual_real_atom_count = int(actual_real_atom_count)
-        super().__init__(unit_id)
+        super().__init__(
+            self.unit_id,
+            self.expected_maps,
+            self.actual_maps,
+            self.invalid_dummy_degrees,
+            self.expected_real_atom_count,
+            self.actual_real_atom_count,
+        )
 
     def __str__(self):
-        return f"Invalid unit pSMILES generated for {self.unit_id}; this is an implementation error. Please report it."
+        return (
+            "Invalid unit pSMILES generated; this is an implementation error. "
+            f"unit_id={self.unit_id!r}, expected_maps={self.expected_maps!r}, actual_maps={self.actual_maps!r}, "
+            f"invalid_dummy_degrees={self.invalid_dummy_degrees!r}, "
+            f"expected_real_atom_count={self.expected_real_atom_count!r}, actual_real_atom_count={self.actual_real_atom_count!r}. "
+            "Please report it."
+        )
 
 
 class DoubleBondSymbolDefinition(GenerationError):
@@ -501,22 +549,34 @@ class TooManyStochasticObjects(G2RINSError):
 
 
 class IncompatibleGenerativeGraphSchema(G2RINSError):
-    """A generative graph misses attributes the sampler requires.
+    """A generative graph lacks valid attributes the sampler requires.
 
     Sampling silently generates truncated, end-group-less molecules when edges
     lack the per-edge 'stochastic_id', so an explicit check rejects graphs
-    built against an older schema.
+    built against an older schema. Zero-number nodes also require explicit
+    placeholder identification to distinguish them from user wildcard atoms.
     """
 
-    def __init__(self, missing_attribute):
+    def __init__(self, missing_attribute, location="edges", node_id=None, reason="missing", detail=None):
         self.missing_attribute = missing_attribute
-        super().__init__(missing_attribute)
+        self.location = location
+        self.node_id = node_id
+        self.reason = reason
+        self.detail = detail
+        super().__init__(self.missing_attribute, self.location, self.node_id, self.reason, self.detail)
 
     def __str__(self):
-        return (
-            f"The provided generative_graph has edges without the '{self.missing_attribute}' attribute "
-            "that generation requires. It was probably serialized or built against an older "
-            "graph schema (which used per-edge 'hierarchy'); regenerate it with "
+        message = f"The '{self.missing_attribute}' attribute is {self.reason} on {self.location} in the provided generative_graph"
+        if self.node_id is not None:
+            message += f" (node_id={self.node_id!r})"
+        message += ". "
+        if self.detail:
+            message += self.detail + " "
+        if self.reason == "invalid":
+            return message + "Correct this attribute in the graph or its producer."
+        return message + (
+            "Supply the required attribute in the graph producer. If this is an older parsed graph, "
+            "rebuild it from the original G2RINS string with "
             "get_graph_creator().get_generative_graph(include_bond_connectors=False)."
         )
 
