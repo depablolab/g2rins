@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import json
+import math
 import uuid
 import warnings
 from collections import defaultdict
@@ -9,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import networkx as nx
+import numpy as np
 from scipy.stats import rankdata
 
 try:
@@ -233,6 +235,63 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     return UnitLabels(unit_id=unit_id, bond_id=bond_id)
 
 
+def _validate_json_numpy_dtype(dtype, path):
+    """Reject date/time fields before NumPy discards their type information."""
+    if dtype.kind in "Mm":
+        raise TypeError(f"Unsupported JSON value at {path}: {dtype.name}")
+    if dtype.subdtype is not None:
+        _validate_json_numpy_dtype(dtype.subdtype[0], path)
+    elif dtype.names is not None:
+        for name in dtype.names:
+            _validate_json_numpy_dtype(dtype.fields[name][0], f"{path}[{name!r}]")
+
+
+def _json_safe(value, path="$"):
+    """Recursively convert NumPy data to Python JSON types.
+
+    NumPy integers, real floats, booleans and strings have native JSON
+    equivalents; arrays and structured scalars become nested lists. Types with
+    no JSON equivalent (including complex numbers, bytes and datetimes) raise
+    TypeError identifying their location instead of silently becoming strings.
+    Non-finite floats and keys that collide when encoded raise ValueError.
+    """
+    if isinstance(value, (np.generic, np.ndarray)):
+        # item()/tolist() can turn timestamps into integers or None, including
+        # fields nested inside structured records and subarrays.
+        _validate_json_numpy_dtype(value.dtype, path)
+    if isinstance(value, np.floating):
+        # longdouble.item() can return another NumPy scalar on platforms with
+        # extended precision, so convert explicitly to Python's JSON float.
+        return _json_safe(float(value), path)
+    if isinstance(value, np.generic):
+        native_value = value.item()
+        if isinstance(native_value, np.generic):
+            raise TypeError(f"Unsupported JSON value at {path}: {type(value).__name__}")
+        return _json_safe(native_value, path)
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist(), path)
+    if isinstance(value, dict):
+        result = {}
+        encoded_keys = set()
+        for key, item in value.items():
+            native_key = _json_safe(key, path)
+            if native_key is not None and not isinstance(native_key, (str, int, float, bool)):
+                raise TypeError(f"Unsupported JSON key at {path}: {type(native_key).__name__}")
+            encoded_key = native_key if isinstance(native_key, str) else json.dumps(native_key, allow_nan=False)
+            if encoded_key in encoded_keys:
+                raise ValueError(f"Duplicate JSON key at {path}: {encoded_key!r}")
+            encoded_keys.add(encoded_key)
+            result[native_key] = _json_safe(item, f"{path}[{native_key!r}]")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"Non-finite JSON value at {path}: {value!r}")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Unsupported JSON value at {path}: {type(value).__name__}")
+
+
 def generative_graph_json_data(generative_graph):
     """
     JSON-serializable dict for a generative graph: a self-describing ``format`` block
@@ -243,11 +302,23 @@ def generative_graph_json_data(generative_graph):
     Load the graph back with
     ``networkx.node_link_graph(data["graph"], edges="edges")``; strip the
     ``derived_node_fields`` before ML training.
+
+    The returned payload is detached, including nested attributes. NumPy scalars
+    with JSON equivalents and arrays are normalized recursively. Unsupported
+    values (including datetime fields in structured records) raise TypeError
+    with their location. Non-finite floats and colliding JSON keys raise
+    ValueError. Unavailable NaN charges on negative descriptor IDs become null.
     """
-    labels = derive_unit_labels(generative_graph)
+    # node_link_data builds fresh top-level node dictionaries. Only those are
+    # edited here; _json_safe detaches every nested container before returning.
     data = nx.node_link_data(generative_graph, edges="edges")
+    labels = derive_unit_labels(generative_graph)
     for node_dict in data["nodes"]:
         node = node_dict["id"]
+        charge = node_dict.get("charge")
+        atomic_num = node_dict["atomic_num"]
+        if isinstance(atomic_num, (int, np.integer)) and atomic_num < 0 and isinstance(charge, (float, np.floating)) and np.isnan(charge):
+            node_dict["charge"] = None
         node_dict["unit_id"] = labels.unit_id[node]
         if node in labels.bond_id:
             node_dict["bond_id"] = labels.bond_id[node]
@@ -262,7 +333,7 @@ def generative_graph_json_data(generative_graph):
                 " before ML training."
             ),
         },
-        "graph": data,
+        "graph": _json_safe(data),
     }
 
 
@@ -1205,8 +1276,9 @@ class GraphCreator:
         Load the graph back with
         ``networkx.node_link_graph(json.load(fp)["graph"], edges="edges")``.
         """
+        data = generative_graph_json_data(self.get_generative_graph())
         with open(filename, "w") as file_handle:
-            json.dump(generative_graph_json_data(self.get_generative_graph()), file_handle, indent=2)
+            json.dump(data, file_handle, indent=2)
 
     _DEFAULT_EDGE_COLOR = {
         _STATIC_NAME: "#000000",

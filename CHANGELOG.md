@@ -18,6 +18,8 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Fixed
 
+- JSON export normalizes NumPy integer, real floating-point, boolean, and string scalars throughout node, edge, and graph metadata, including nested arrays. Raw descriptor graphs retain negative atomic numbers and export unavailable descriptor charges as `null`. Unsupported types, other non-finite values, and dictionary keys that would collide in JSON raise errors identifying their location. Exported containers remain detached from the input.
+- Generative-graph export payloads are detached from the input, including nested node, edge, and graph attributes. Editing a payload no longer changes its source graph.
 - Aromatic selenium and arsenic symbols now map to atomic numbers 34 and 33 instead of negative graph-object IDs, through the aromatic aliases of `atom_name_num`.
 - `ParsingError` and `TooManyTokens` preserve their context when pickled or deep-copied. Atoms without a symbol are rejected during construction with `MissingAtomSymbol`, a `ParsingError` subclass.
 - Bare wildcard atoms (`*`) retain their symbol when a parsed G2RINS string is serialized or exported, instead of incorrectly becoming `None`.

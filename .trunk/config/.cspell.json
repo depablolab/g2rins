@@ -204,6 +204,10 @@
     "pyrrole",
     "PYTHONHASHSEED",
     "rankdata",
-    "valent"
+    "valent",
+    "clongdouble",
+    "subdtype",
+    "subarray",
+    "subarrays"
   ]
 }
