@@ -1,0 +1,35 @@
+title: "[Show & Tell] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share how you are using G²RINS in research, teaching, simulation workflows, datasets, or tooling. Screenshots, figures, notebooks, and links are welcome when you are able to share them.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What did you build or explore?
+      description: Give the community a short overview of your use case or result.
+      placeholder: We used G²RINS to...
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: How did you use G²RINS?
+      description: Share the relevant representation, workflow, code, or modeling approach.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What did you learn or produce?
+      description: Share results, lessons learned, limitations, or interesting observations.
+  - type: input
+    id: links
+    attributes:
+      label: Links
+      description: Optional. Add a paper, repository, notebook, dataset, or project page.
+      placeholder: https://...
+  - type: textarea
+    id: feedback
+    attributes:
+      label: What feedback would be useful?
+      description: Optional. Tell the community what kinds of comments, comparisons, or suggestions you would like.
