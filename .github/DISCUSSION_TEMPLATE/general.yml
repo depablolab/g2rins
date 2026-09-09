@@ -1,0 +1,19 @@
+title: "[Discussion] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use General for G²RINS topics that do not fit Q&A, Ideas, or Show and tell. For reproducible bugs and concrete implementation requests, please use the issue tracker instead.
+  - type: textarea
+    id: topic
+    attributes:
+      label: What would you like to discuss?
+      description: Give enough context for other community members to understand and join the conversation.
+      placeholder: I would like to discuss...
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Optional. Add relevant G²RINS strings, code, papers, links, figures, or background.
