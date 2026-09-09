@@ -134,11 +134,7 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     # Propagation bonds the generation can form, as unordered connection-atom
     # pairs (mirrored directions collapse; without initiators nothing prunes).
     used_edges = GraphCreator._used_nonstatic_edges(generative_graph, node_to_unit)
-    propagation_bonds = {
-        frozenset((u, v))
-        for u, v, k, d in generative_graph.edges(keys=True, data=True)
-        if d.get(_PROPAGATION_NAME, 0) > 0 and (used_edges is None or (u, v, k) in used_edges)
-    }
+    propagation_bonds = {frozenset((u, v)) for u, v, k, d in generative_graph.edges(keys=True, data=True) if d.get(_PROPAGATION_NAME, 0) > 0 and (used_edges is None or (u, v, k) in used_edges)}
 
     # Walk states per connection atom: "bonded" = arrived through a bond,
     # "crossed" = arrived through the unit interior. A propagation path back
@@ -175,9 +171,7 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     unit_role = []
     for unit_index, unit_nodes in enumerate(units):
         is_initiator = any(generative_graph.nodes[n]["init_weight"] > 0 for n in unit_nodes)
-        has_outgoing_non_static = any(
-            not is_static_edge(d) for n in unit_nodes for _u, _v, d in generative_graph.out_edges(n, data=True)
-        )
+        has_outgoing_non_static = any(not is_static_edge(d) for n in unit_nodes for _u, _v, d in generative_graph.out_edges(n, data=True))
         if is_initiator:
             unit_role.append("I")
         elif not has_outgoing_non_static:
@@ -673,7 +667,7 @@ class GraphCreator:
                     if max_rank == 0 and last_rank < 0:
                         first_descendant_so_id = None
                         parent_bc_present = False
-                        for bc_node in self.node_path[1:len(self.node_path)-1]:
+                        for bc_node in self.node_path[1 : len(self.node_path) - 1]:
                             if "stochastic_obj" not in graph.nodes[bc_node]:
                                 continue
                             bc_so_id = self._stochastic_id_map[id(graph.nodes[bc_node]["stochastic_obj"])]
@@ -727,7 +721,7 @@ class GraphCreator:
 
             @property
             def only_bond_connectors(self):
-                return len(self.node_path) > 2 and set(self.node_path[1:len(self.node_path)-1]).issubset(bc_idx_set)
+                return len(self.node_path) > 2 and set(self.node_path[1 : len(self.node_path) - 1]).issubset(bc_idx_set)
 
             def contains_bc(self, bc_idx):
                 return bc_idx in self.node_path
@@ -760,7 +754,7 @@ class GraphCreator:
                     except KeyError:
                         stochastic_id = -1
 
-                    if len(stochastic_id_list) == 0 or stochastic_id_list[len(stochastic_id_list)-1] != stochastic_id:
+                    if len(stochastic_id_list) == 0 or stochastic_id_list[len(stochastic_id_list) - 1] != stochastic_id:
                         stochastic_id_list += [stochastic_id]
 
                 return stochastic_id_list
@@ -948,9 +942,8 @@ class GraphCreator:
                 aromatic = obj.aromatic
             except AttributeError:
                 aromatic = False
+            # atom_name_num carries the lowercase aromatic aliases (c, n, se, ...).
             atomic_symbol = str(obj.symbol)
-            if aromatic:
-                atomic_symbol = atomic_symbol.upper()
             try:
                 atomic_num = int(atom_name_num[atomic_symbol])
             except KeyError:
@@ -1411,4 +1404,3 @@ class GraphCreator:
         from .ensemble_creator import EnsembleCreator
 
         return EnsembleCreator(self.get_generative_graph(include_bond_connectors=False))
-

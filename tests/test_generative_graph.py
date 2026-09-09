@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import networkx as nx
+import pytest
+from rdkit import Chem
 
 import g2rins
 
@@ -52,3 +54,14 @@ def test_generative_graph_json_data_format_block():
     for node_dict in data["graph"]["nodes"]:
         assert node_dict["unit_id"] == labels.unit_id[node_dict["id"]]
         assert node_dict.get("bond_id") == labels.bond_id.get(node_dict["id"])
+
+
+@pytest.mark.parametrize(("text", "atomic_num"), [("c1cc[se]c1", 34), ("c1cc[as]cc1", 33)])
+def test_aromatic_two_letter_elements_keep_their_atomic_number(text, atomic_num):
+    creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    atoms = [data["atomic_num"] for _, data in creator.generative_graph.nodes(data=True)]
+    assert atoms.count(atomic_num) == 1
+    assert all(number > 0 for number in atoms)
+    molecule = creator.create_ensemble(1, output_format="mol", seed=0)[0]
+    Chem.SanitizeMol(molecule)
+    assert sum(atom.GetAtomicNum() == atomic_num for atom in molecule.GetAtoms()) == 1

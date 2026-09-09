@@ -197,6 +197,13 @@
     "pyproject",
     "svg",
     "RINS",
-    "docstrings"
+    "docstrings",
+    "counterion",
+    "counterions",
+    "dedup",
+    "pyrrole",
+    "PYTHONHASHSEED",
+    "rankdata",
+    "valent"
   ]
 }

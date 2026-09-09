@@ -26,7 +26,7 @@ class ParsingError(G2RINSError):
     """
 
     def __init__(self, token):
-        super().__init__()
+        super().__init__(token)
         self.token = token
 
     def __str__(self):
@@ -41,17 +41,32 @@ class ParsingWarning(G2RINSWarning):
     pass
 
 
+class MissingAtomSymbol(ParsingError):
+    """An atom node was constructed without an atom symbol child."""
+
+    def __init__(self, class_name):
+        self.class_name = str(class_name)
+        self.token = self.class_name
+        # One base initialization: args mirror __init__ so pickling round-trips.
+        Exception.__init__(self, self.class_name)
+
+    def __str__(self):
+        return f"Missing atom symbol in {self.class_name}. Please report and provide the input string."
+
+
 class TooManyTokens(ParsingError):
     def __init__(self, class_name, existing_token, new_token):
-        super().__init__()
         self.class_name = class_name
         self.existing_token = existing_token
         self.new_token = new_token
+        self.token = new_token
+        # One base initialization: args mirror __init__ so pickling round-trips.
+        Exception.__init__(self, class_name, existing_token, new_token)
 
     def __str__(self):
         string = f"Parsing Error {self.class_name} only expected one token, but got more. "
         string += f"The existing token is {self.existing_token} which conflicts with the new "
-        string += f"token {self.new_token}. Most likely in implementation error, please report."
+        string += f"token {self.new_token}. Most likely an implementation error, please report."
         return string
 
 
