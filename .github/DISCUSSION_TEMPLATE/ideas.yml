@@ -1,0 +1,33 @@
+title: "[Idea] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea for G²RINS? Use this category to discuss possible features, workflows, notation improvements, or research directions before turning them into implementation work.
+
+        If the request is already concrete and actionable, you can also open a feature request: https://github.com/depablolab/g2rins/issues
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem or opportunity does this address?
+      description: Describe the use case and why it would be useful to G²RINS users.
+      placeholder: It would be useful if G²RINS could...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What do you propose?
+      description: Explain the behavior, notation, API, workflow, or documentation change you have in mind.
+    validations:
+      required: true
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples or alternatives
+      description: Share example G²RINS strings, APIs, papers, related tools, or alternative approaches if helpful.
+  - type: textarea
+    id: impact
+    attributes:
+      label: Who would benefit?
+      description: Optional. Describe the users, polymer classes, simulations, or research workflows this would help.
