@@ -4,10 +4,18 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ## [Unreleased]
 
+### Breaking changes
+
+**Generative-graph JSON format v2 requires explicit identity on zero-number nodes.** Graph export and ensemble construction now raise `IncompatibleGenerativeGraphSchema` if any node with `atomic_num=0` lacks the boolean `is_connector_placeholder` attribute. `True` identifies an internal split-atom placeholder; `False` identifies a user wildcard, which can still be parsed and exported but cannot be used for ensemble generation. Graphs without zero-number nodes may omit this attribute. Changing the JSON `format.version` field alone does not migrate node identity.
+
+- **Preferred upgrade:** rebuild legacy graphs from their original G2RINS strings using `G2rins.make(text).get_graph_creator().get_generative_graph()` before export or generation.
+- **Migration without source strings requires known provenance:** use `mark_legacy_connector_placeholders(graph)` only when every unmarked zero-number node with exactly one static neighbor is known to be an internal placeholder. A pendant user wildcard such as `CC(*)O` has that same topology and will otherwise be marked `True`, incorrectly treating it as an internal placeholder. The helper cannot recover this distinction from graph structure. If the assumption cannot be established, recover the node identities from the graph producer before migrating.
+- **A migration warning is not verification:** `G2RINSWarning` reports counts, not affected node IDs, and does not establish that the assumption is correct. The helper returns a copy and preserves existing valid flags; compare the input and returned node flags to audit which identities it assigned.
+
 ### Added
 
 - Unit source text survives graphs written before the per-unit membership map existed. Such a graph keeps its `unit_g2rins` texts if every saved unit id is still derived, instead of silently reporting empty text for every unit. A present but empty or malformed map is treated as no evidence and never activates the legacy fallback.
-- `mark_legacy_connector_placeholders(graph)` migrates a copy of a legacy dataset when the caller knows its unmarked zero-number nodes are internal placeholders. It warns about that assumption, preserves existing flags, and leaves normal loading strict. Unmarked zero-number nodes whose static degree is not one (a terminal `[<]*`, a backbone `C*C`) are provably user wildcards and are marked as such, so only pendant wildcards remain indistinguishable from partnerless placeholders.
+- `mark_legacy_connector_placeholders(graph)` provides explicit migration for legacy datasets with known placeholder semantics; see [Breaking changes](#breaking-changes) for its assumptions and limitations. It marks unmarked zero-number nodes whose static degree is not one (a terminal `[<]*`, a backbone `C*C`) as user wildcards. Export and generation still require explicit identity on zero-number nodes.
 - `UnitLabels.unit_nodes` exposes the per-unit node partition behind `unit_id` and `bond_id`, so consumers no longer rebuild it by scanning every node.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
@@ -15,7 +23,6 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 ### Changed
 
 - User-written wildcard atoms (`*` and `[*]`) remain supported for parsing and generative-graph export, but now raise `UnsupportedWildcardGeneration` when an ensemble creator is built. They are no longer silently removed from generated chains or reported as internal rendering failures. Use explicit atoms and end groups, such as `[<][H]` for a hydrogen terminator.
-- Generative graphs and their JSON exports now identify internal split-atom placeholders with the boolean node attribute `is_connector_placeholder`. JSON format version 2 rejects ambiguous older graphs containing unmarked zero-number nodes: rebuild parsed graphs from their original G2RINS strings before export or generation, or explicitly migrate datasets whose placeholder semantics are known. Older graphs without zero-number nodes may omit this new attribute.
 - The extra graph information returned by `get_generative_graph(return_extra_graph_info=True)` no longer includes the unused `0: "None"` entry. Zero denotes a wildcard or a flagged connector placeholder; negative entries still label non-atom graph objects.
 - Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
