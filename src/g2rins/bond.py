@@ -26,6 +26,11 @@ class BondSymbol(G2rinsBase):
     def generate_string(self, extension):
         return self._symbol
 
+    @property
+    def direction(self) -> str:
+        """The cis/trans direction mark ("/" or "\\") of this bond, or "" when it carries none."""
+        return self._symbol if self._symbol in ("/", "\\") else ""
+
 
 class RingBond(G2rinsBase):
     def __init__(self, children: list):
