@@ -6,6 +6,15 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Added
 
+- `poisson(Mw, Mn)` and `flory_schulz(Mw, Mn)` now define moment-scaled
+  molar-mass target distributions while preserving the historical one-argument
+  forms. Their serialized layout supports both legacy ten-value vectors and the
+  new twelve-value vectors.
+- The mass-form `poisson(Mw, Mn)` now uses a zero-truncated Poisson law on
+  strictly positive chain counts. This makes the model physically meaningful for
+  polymers: the zero-count event is treated as a boundary/termination event,
+  not as a realizable zero-mass chain. The truncation is explicit in the code
+  and documentation because an idealized polymer chain must have positive mass.
 - Generative-graph exports now preserve optional stereochemistry provenance:
   `atom_chiral_token` on chiral bracket atoms and `bond_symbol_raw` for
   slash/backslash directional single bonds.

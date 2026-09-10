@@ -1169,7 +1169,8 @@ class GraphCreator:
         generative_graph.graph["g2rins_string"] = self.text
 
         graph_with_bond_connectors = self.g.copy()
-        MW_distribution_array = [StochasticDistribution.get_empty_serial_vector()] * 10
+        empty_vector = StochasticDistribution.get_empty_serial_vector()
+        MW_distribution_array = [empty_vector.copy() for _ in range(_STOCHASTIC_TREE_DEPTH)]
 
         for node, data in graph_with_bond_connectors.nodes(data=True):
             try:

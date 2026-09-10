@@ -48,6 +48,46 @@ ensemble_creator = graph_creator.get_ensemble_creator()
 ensemble = ensemble_creator.create_ensemble(100, output_format="smiles", ensemble_info=True)
 ```
 
+### Molar-mass distributions
+
+Poisson and Flory–Schulz support explicit number- and weight-average molar
+masses, ordered consistently as `(Mw, Mn)`:
+
+```text
+|poisson(1100, 1000)|
+|flory_schulz(1400, 1000)|
+```
+
+These forms sample molar-mass targets whose equally weighted chain population
+has the requested `Mn` and `Mw`. The one-argument forms `poisson(N)` and
+`flory_schulz(a)` remain available with their historical behavior for existing
+models and serialized graphs.
+
+For the two-argument molar-mass form, G²RINS uses a zero-truncated Poisson
+law on strictly positive repeat-unit counts. In other words, the count variable
+is modeled as
+
+```
+N | N > 0 ~ Poisson(lambda),
+M = q N,
+```
+
+with `q` chosen so that the target distribution has the requested `Mn` and
+`Mw`. The zero-count event is excluded from the realized chain population
+because a chemically meaningful polymer chain must have positive mass; in the
+ensemble engine that boundary case is interpreted as an immediate termination or
+molecular boundary event rather than as a real chain mass.
+
+This makes the mass-form Poisson model physically consistent with a polymer
+population while preserving the target-moment definitions. The zero-truncated
+Poisson law naturally spans only a narrow dispersity range,
+`1 <= Mw/Mn <= 1.298...`; for broader dispersity, prefer the Flory–Schulz,
+Schulz–Zimm, or log-normal forms.
+
+Sampled targets and realized molecular masses need not be identical. Repeat-unit
+granularity, end groups, topology, and stochastic boundary selection still
+affect the constructed polymer ensemble.
+
 Fixed-size sampling remains the default. To sample batches until cumulative
 Mn, Mw, and bond-contact frequencies stabilize, opt in explicitly:
 

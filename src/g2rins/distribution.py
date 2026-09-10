@@ -6,10 +6,12 @@ This module defines base classes for handling stochastic generation based on
 various statistical distributions.
 """
 import math
+import re
 from abc import abstractmethod
 from typing import Any, ClassVar, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
+from lark.exceptions import UnexpectedInput, VisitError
 from scipy import special, stats
 
 try:
@@ -23,6 +25,71 @@ from .util import RememberAdd, get_global_rng
 
 _T = TypeVar("_T", bound="StochasticDistribution")
 _S = TypeVar("_S", bound="StochasticGeneration")
+
+_SERIAL_SENTINEL = -1.0
+_LEGACY_SERIAL_LAYOUT = (
+    ("flory_schulz", 1),
+    ("schulz_zimm", 2),
+    ("gauss", 2),
+    ("uniform", 2),
+    ("log_normal", 2),
+    ("poisson", 1),
+)
+_CURRENT_SERIAL_LAYOUT = (
+    ("flory_schulz", 2),
+    ("schulz_zimm", 2),
+    ("gauss", 2),
+    ("uniform", 2),
+    ("log_normal", 2),
+    ("poisson", 2),
+)
+
+
+_GROUPED_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _strip_grouping_separators_in_numeric_literals(text: str) -> str:
+    """Remove thousands separators from grouped numeric literals.
+
+    This supports external generators that may emit locale-formatted values
+    such as ``11,963.3`` inside distribution argument lists.
+    """
+
+    def _degroup(match: re.Match[str]) -> str:
+        return match.group(0).replace(",", "")
+
+    return _GROUPED_NUMBER_RE.sub(_degroup, text)
+
+
+def _mass_tolerance(mass: float, quantum: float) -> float:
+    """Return a small absolute tolerance suitable for mass-lattice comparisons."""
+    scale = max(1.0, abs(mass), abs(quantum))
+    return 8.0 * math.ulp(scale)
+
+
+def _mass_floor_count(mass: float, quantum: float) -> int:
+    ratio = mass / quantum
+    nearest = int(np.rint(ratio))
+    if abs(mass - nearest * quantum) <= _mass_tolerance(mass, quantum):
+        return nearest
+    return math.floor(ratio)
+
+
+def _mass_ceil_count(mass: float, quantum: float) -> int:
+    ratio = mass / quantum
+    nearest = int(np.rint(ratio))
+    if abs(mass - nearest * quantum) <= _mass_tolerance(mass, quantum):
+        return nearest
+    return math.ceil(ratio)
+
+
+def _mass_lattice_count(mass: float, quantum: float) -> Optional[int]:
+    if not math.isfinite(mass):
+        return None
+    nearest = int(np.rint(mass / quantum))
+    if abs(mass - nearest * quantum) <= _mass_tolerance(mass, quantum):
+        return nearest
+    return None
 
 
 def _log_difference(log_larger: float, log_smaller: float) -> float:
@@ -118,9 +185,9 @@ class StochasticDistribution(StochasticGeneration):
 
     def __bool__(self) -> bool:
         """
-        Returns True if a statistical distribution is associated with this object.
+        Returns True if this object can generate targets, including point masses.
         """
-        return self._distribution is not None
+        return self.generable
 
     @classmethod
     def make(cls: Type[_T], text: str) -> _T:
@@ -142,7 +209,13 @@ class StochasticDistribution(StochasticGeneration):
         """
         for known_distr in cls._known_distributions:
             if known_distr.token_name_snake_case in text:
-                return known_distr.make(text)
+                try:
+                    return known_distr.make(text)
+                except UnexpectedInput:
+                    normalized_text = _strip_grouping_separators_in_numeric_literals(text)
+                    if normalized_text == text:
+                        raise
+                    return known_distr.make(normalized_text)
         raise UnknownDistribution(text)
 
     def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None, **kwargs: Any) -> Any:
@@ -453,6 +526,93 @@ class StochasticDistribution(StochasticGeneration):
             return self._distribution.pmf(k=int(mw), **kwargs)
         raise NotImplementedError
 
+    def reference_mw(self) -> float:
+        """Return the exact number-average target mass when the form defines one."""
+        raise NotImplementedError(f"{type(self).__name__} does not define a reference molecular weight")
+
+    def support_mw(self) -> Tuple[float, float]:
+        """Return the lower and upper support bounds in molar-mass units."""
+        if self._distribution is None:
+            raise NotImplementedError
+        parameters = getattr(self._distribution, "kwds", {})
+        if parameters.get("scale") == 0:
+            point = float(parameters.get("loc", 0.0))
+            return point, point
+        lower, upper = self._distribution.support()
+        return float(lower), float(upper)
+
+    def _draw_scaled_discrete(
+        self,
+        distribution,
+        quantum: float,
+        rng: np.random.Generator,
+        lower,
+        upper,
+        kwargs: Any,
+        *,
+        minimum_count: int,
+        deterministic_mass: Optional[float] = None,
+    ) -> float:
+        """Draw an integer count law through inclusive molar-mass bounds."""
+        try:
+            requested_lower = -math.inf if lower is None else float(lower)
+            requested_upper = math.inf if upper is None else float(upper)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise EmptyTruncatedDistributionSupport(type(self).__name__, math.nan, math.nan) from error
+
+        def empty_support() -> EmptyTruncatedDistributionSupport:
+            return EmptyTruncatedDistributionSupport(
+                type(self).__name__, requested_lower, requested_upper
+            )
+
+        if (
+            math.isnan(requested_lower)
+            or math.isnan(requested_upper)
+            or requested_lower > requested_upper
+            or requested_lower == math.inf
+            or requested_upper == -math.inf
+        ):
+            raise empty_support()
+
+        if deterministic_mass is not None:
+            tolerance = _mass_tolerance(deterministic_mass, quantum)
+            if requested_lower - tolerance <= deterministic_mass <= requested_upper + tolerance:
+                return float(deterministic_mass)
+            raise empty_support()
+
+        if lower is None and upper is None:
+            return float(quantum * distribution.rvs(random_state=rng, **kwargs))
+
+        lower_count = (
+            minimum_count
+            if requested_lower == -math.inf
+            else max(minimum_count, _mass_ceil_count(requested_lower, quantum))
+        )
+        upper_count = (
+            math.inf
+            if requested_upper == math.inf
+            else _mass_floor_count(requested_upper, quantum)
+        )
+        if lower_count > upper_count:
+            raise empty_support()
+
+        count = self._draw_bounded_discrete(
+            distribution,
+            rng,
+            lower_count,
+            upper_count,
+            empty_support,
+            kwargs,
+        )
+        mass = float(quantum * count)
+        tolerance = _mass_tolerance(mass, quantum)
+        if not requested_lower - tolerance <= mass <= requested_upper + tolerance:
+            raise RuntimeError(
+                f"{type(self).__name__} returned scaled discrete mass {mass:g} "
+                f"outside [{requested_lower:g}, {requested_upper:g}]"
+            )
+        return mass
+
     @classmethod
     def _default_serialize(cls: Type["StochasticDistribution"], n: int) -> Tuple[float, ...]:
         """
@@ -479,10 +639,11 @@ class StochasticDistribution(StochasticGeneration):
         Returns an empty serialization vector with the correct length to hold
         the default serialization of all known stochastic distributions.
         """
-        vector: List[float] = []
-        for distr_type in cls._known_distributions:
-            vector += list(distr_type.default_serialize())
-        return vector
+        return [
+            _SERIAL_SENTINEL
+            for _token_name, width in _CURRENT_SERIAL_LAYOUT
+            for _ in range(width)
+        ]
 
     def get_serial_vector(self) -> List[float]:
         """
@@ -492,52 +653,75 @@ class StochasticDistribution(StochasticGeneration):
         serialization values for other known distribution types.
         """
         vector: List[float] = []
-        for distr_type in self._known_distributions:
-            if type(self) is distr_type:
-                vector += list(self.serialize())
+        own_token = type(self).token_name_snake_case
+        for token_name, width in _CURRENT_SERIAL_LAYOUT:
+            if own_token == token_name:
+                serialized = tuple(self.serialize())
+                if len(serialized) != width:
+                    raise ValueError(
+                        f"{type(self).__name__} serialized {len(serialized)} values; expected {width}."
+                    )
+                vector.extend(serialized)
             else:
-                vector += list(distr_type.default_serialize())
+                vector.extend((_SERIAL_SENTINEL,) * width)
         return vector
 
     @classmethod
-    def from_serial_vector(cls: Type[_T], vector: List[float]) -> Optional[_T]:
-        """
-        Creates a StochasticDistribution instance from a serialization vector.
-
-        It iterates through known distributions, extracts the corresponding
-        segment from the vector, and if it's not the default serialization,
-        creates an instance of that distribution with the deserialized parameters.
-
-        Args:
-            vector (List[float]): The serialization vector.
-
-        Returns:
-            Optional[_T]: An instance of a StochasticDistribution subclass if
-                           the vector contains non-default serialization for one,
-                           otherwise None.
-
-        Raises:
-            ValueError: If the vector contains non-default serialization for more
-                        than one known distribution.
-        """
-        candidates: List[Tuple[float, ...]] = []
-        type_candidates: List[Type[_T]] = []
-        serial_values = iter(vector)
-        for distr_type in cls._known_distributions:
-            default_serial = distr_type.default_serialize()
-            given_serial = tuple(next(serial_values) for _ in default_serial)
-            if default_serial != given_serial:
-                candidates.append(given_serial)
-                type_candidates.append(distr_type)
-
-        if not candidates:
+    def from_serialized(cls: Type[_T], params: Tuple[float, ...]) -> Optional[_T]:
+        """Reconstruct a distribution from a class-local serialized parameter tuple."""
+        if params is None:
+            return None
+        params = tuple(params)
+        if not params:
+            return None
+        if all(float(value) == -1.0 for value in params):
             return None
 
-        if len(candidates) != 1:
-            raise ValueError("The passed vector did not contain only one candidate for the distribution.")
-        distr_type = type_candidates[0]
-        params = candidates[0]
-        return distr_type.make(distr_type.token_name_snake_case + str(params))
+        if len(params) == 1:
+            return cls.make(f"{cls.token_name_snake_case}({params[0]})")
+
+        if len(params) == 2:
+            return cls.make(f"{cls.token_name_snake_case}({params[0]}, {params[1]})")
+
+        raise ValueError(f"Unsupported serialized parameter tuple for {cls.__name__}: {params!r}")
+
+    @classmethod
+    def from_serial_vector(cls: Type[_T], vector: List[float]) -> Optional[_T]:
+        """Decode either the legacy 10-slot layout or the newer 12-slot layout."""
+        values = list(vector)
+        distribution_types = {
+            distribution_type.token_name_snake_case: distribution_type
+            for distribution_type in cls._known_distributions
+        }
+
+        def decode(layout):
+            candidates: List[Tuple[float, ...]] = []
+            type_candidates: List[Type[_T]] = []
+            index = 0
+            for token_name, width in layout:
+                distr_type = distribution_types[token_name]
+                segment = tuple(values[index:index + width])
+                index += width
+                default_serial = (_SERIAL_SENTINEL,) * width
+                if segment != default_serial:
+                    candidates.append(segment)
+                    type_candidates.append(distr_type)
+            if not candidates:
+                return None
+            if len(candidates) != 1:
+                raise ValueError("The passed vector did not contain only one candidate for the distribution.")
+            return type_candidates[0].from_serialized(candidates[0])
+
+        if len(values) == 10:
+            return decode(_LEGACY_SERIAL_LAYOUT)
+
+        if len(values) == 12:
+            return decode(_CURRENT_SERIAL_LAYOUT)
+
+        raise ValueError(
+            f"Unrecognized stochastic-distribution serialization length {len(values)}. "
+            "Expected the legacy length 10 or the current length 12."
+        )
 
     @abstractmethod
     def serialize(self) -> Tuple[float, ...]:
@@ -556,34 +740,25 @@ class StochasticDistribution(StochasticGeneration):
         raise NotImplementedError
 
 
-# TODO: Flory Schulz samples chain length rather than molecular weight. We need to implement it differently in ensemble_creator.py
 class FlorySchulz(StochasticDistribution):
-    """
-    Flory-Schulz distribution of molecular weights for geometrically distributed chain lengths.
+    """Flory–Schulz target distribution.
 
-    :math:`W_a(N) = a^2 N (1-a)^{N-1}`
-
-    where :math:`0<a<1` is the experimentally determined constant of remaining monomers and :math:`N` is the chain length.
-
-    The textual representation of this distribution is: `flory_schulz(a)`
+    ``flory_schulz(a)`` preserves the legacy weight-fraction count law.
+    ``flory_schulz(Mw, Mn)`` samples equally weighted chain targets in molar-mass
+    units using ``M = q*N``, where ``N`` is geometric, ``a = 2 - Mw/Mn``, and
+    ``q = Mn*a``. The mass form represents ``1 <= Mw/Mn < 2``.
     """
 
     class flory_schulz_gen(stats.rv_discrete):
-        """Flory Schulz distribution."""
+        """Legacy weight-fraction Flory–Schulz chain-length law."""
 
         def _rvs(self, fls_a, size=None, random_state=None):
-            # If X ~ NegativeBinomial(2, a), then N = X + 1 has
-            # P(N=n) = a**2 * n * (1-a)**(n-1).  Sampling this equivalent
-            # form avoids SciPy's generic discrete PPF, which can stall while
-            # inverting the infinite support.
             return random_state.negative_binomial(2, fls_a, size=size) + 1
 
         def _pmf(self, k, fls_a):
             return fls_a**2 * k * (1 - fls_a) ** (k - 1)
 
         def _sf(self, k, fls_a):
-            # Sum_{n=k+1..inf} a^2*n*(1-a)^(n-1)
-            #   = (1-a)^k * (1 + a*k).
             k = np.asarray(k)
             finite_k = np.where(np.isfinite(k), k, 0.0)
             tail_k = np.maximum(np.floor(finite_k), 0)
@@ -600,79 +775,150 @@ class FlorySchulz(StochasticDistribution):
             )
 
     _fls_a: Optional[float] = None
+    _Mw: Optional[float] = None
+    _Mn: Optional[float] = None
+    _q: Optional[float] = None
+    _mode: Optional[str] = None
 
     @classmethod
     def make(cls: Type[Self], text: str) -> Self:
-        """
-        Creates a FlorySchulz instance from its textual representation.
-
-        Args:
-            text (str): The textual representation, e.g., 'flory_schulz(0.9)'.
-
-        Returns:
-            Self: A FlorySchulz instance.
-        """
-        # We use G2rinsBase.make.__func__ to get the underlying function of the class method,
-        # then call it with cls as the first argument to ensure child typing.
-        # We do not want to call StochasticDistribution's make function, because it directs here.
-        return G2rinsBase.make.__func__(cls, text)
+        try:
+            return G2rinsBase.make.__func__(cls, text)
+        except VisitError as error:
+            raise error.orig_exc from error
 
     def __init__(self, children: List[Any]):
-        """
-        Initialization of Flory-Schulz distribution object.
-
-        Args:
-            children (List[Any]): List of parsed children, expected to contain the 'a' parameter as a float.
-        """
         super().__init__(children)
 
-        fls_a: Optional[float] = None
+        numbers: List[float] = []
         for child in self._children:
             if isinstance(child, float):
-                fls_a = child
+                numbers.append(float(child))
 
-        if not 0 < fls_a < 1:
-            raise RuntimeError(f"The Flory-Schulz distribution needs an a parameter between 0, and 1. But got {fls_a}.")
+        if len(numbers) == 1:
+            fls_a = numbers[0]
+            if not 0 < fls_a < 1:
+                raise RuntimeError(f"The legacy Flory-Schulz distribution needs a parameter between 0 and 1. Got {fls_a}.")
+            self._mode = "legacy"
+            self._fls_a = fls_a
+            self._distribution = self.flory_schulz_gen(name="Flory-Schulz", a=1)(fls_a=self._fls_a)
+            return
 
-        self._fls_a = fls_a
-        self._distribution = self.flory_schulz_gen(name="Flory-Schulz", a=1)(fls_a=self._fls_a)
+        if len(numbers) == 2:
+            self._Mw, self._Mn = numbers
+            if not np.isfinite(self._Mw) or not np.isfinite(self._Mn):
+                raise ValueError("Flory–Schulz molar-mass parameters must be finite.")
+            if not (self._Mn > 0 and self._Mw >= self._Mn):
+                raise ValueError("For flory_schulz(Mw, Mn), require finite Mw >= Mn > 0.")
+            dispersity = self._Mw / self._Mn
+            if not (1.0 <= dispersity < 2.0):
+                raise ValueError(
+                    "For flory_schulz(Mw, Mn), the representable dispersity range is "
+                    "1 <= Mw/Mn < 2; use Schulz-Zimm or log-normal for larger dispersity."
+                )
+            self._mode = "molar_mass"
+            self._fls_a = 2.0 - dispersity
+            self._q = self._Mn * self._fls_a
+            self._distribution = stats.geom(p=self._fls_a)
+            return
+
+        raise ValueError("flory_schulz accepts either one legacy parameter or two molar-mass parameters: (Mw, Mn).")
+
+    def _mass_to_count(self, mass: float) -> Optional[int]:
+        if self._q is None or self._q <= 0:
+            return None
+        count = _mass_lattice_count(mass, self._q)
+        return count if count is not None and count >= 1 else None
+
+    def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None, **kwargs):
+        if self._mode == "legacy":
+            return super().draw_mw(rng=rng, lower=lower, upper=upper, **kwargs)
+        if rng is None:
+            rng = get_global_rng()
+        return super()._draw_scaled_discrete(
+            self._distribution,
+            self._q,
+            rng,
+            lower,
+            upper,
+            kwargs,
+            minimum_count=1,
+            deterministic_mass=float(self._Mn) if self._Mn == self._Mw else None,
+        )
 
     def generate_string(self, extension: bool) -> str:
-        """
-        Generates the textual representation of the Flory-Schulz distribution.
-
-        Args:
-            extension (bool): Whether to include the '|' delimiters.
-
-        Returns:
-            str: The textual representation, e.g., '|flory_schulz(0.9)|'.
-        """
         if extension:
-            return f"|flory_schulz({self._fls_a})|"
+            if self._mode == "legacy":
+                return f"|flory_schulz({self._fls_a})|"
+            return f"|flory_schulz({self._Mw}, {self._Mn})|"
         return ""
 
     @property
     def generable(self) -> bool:
-        """
-        Returns True if the distribution is initialized (i.e., the 'a' parameter is set).
-        """
         return self._distribution is not None
 
     @classmethod
     def default_serialize(cls) -> Tuple[float, ...]:
-        """
-        Returns the default serialization for FlorySchulz (a tuple with one -1.0).
-        """
-        return cls._default_serialize(1)
+        return cls._default_serialize(2)
 
     def serialize(self) -> Tuple[float, ...]:
-        """
-        Serializes the 'a' parameter of the FlorySchulz distribution.
-        """
-        return (self._fls_a,)
+        if self._mode == "legacy":
+            return (self._fls_a, -1.0)
+        return (self._Mw, self._Mn)
+
+    @classmethod
+    def from_serialized(cls: Type[Self], params: Tuple[float, ...]) -> Optional[Self]:
+        if tuple(params) == (_SERIAL_SENTINEL, _SERIAL_SENTINEL):
+            return None
+        if len(params) == 1 or (len(params) == 2 and params[1] == _SERIAL_SENTINEL):
+            return cls.make(f"flory_schulz({params[0]})")
+        if len(params) == 2:
+            return cls.make(f"flory_schulz({params[0]}, {params[1]})")
+        raise ValueError(f"Unsupported serialized parameter tuple for {cls.__name__}: {params!r}")
+
+    def reference_mw(self) -> float:
+        if self._mode == "legacy":
+            return float(2.0 / self._fls_a - 1.0)
+        return float(self._Mn)
+
+    def support_mw(self) -> Tuple[float, float]:
+        if self._mode == "legacy":
+            return super().support_mw()
+        if self._Mn == self._Mw:
+            return float(self._Mn), float(self._Mn)
+        lower, upper = self._distribution.support()
+        return float(self._q * lower), float(self._q * upper)
 
     def prob_mw(self, mw):
-        return super().prob_mw(mw)
+        if self._mode == "legacy":
+            return super().prob_mw(mw)
+
+        if isinstance(mw, RememberAdd):
+            if self._Mn == self._Mw:
+                previous = mw.previous
+                value = mw.value
+                if previous < self._Mn <= value:
+                    return 1.0
+                return 0.0
+            lower = mw.previous
+            upper = mw.value
+            if lower > upper:
+                lower, upper = upper, lower
+            lower_count = _mass_floor_count(lower, self._q) if np.isfinite(lower) else -math.inf
+            upper_count = _mass_floor_count(upper, self._q) if np.isfinite(upper) else math.inf
+            lower_cdf = self._distribution.cdf(lower_count) if np.isfinite(lower_count) else 0.0
+            upper_cdf = self._distribution.cdf(upper_count) if np.isfinite(upper_count) else 1.0
+            return float(upper_cdf - lower_cdf)
+
+        if self._Mn == self._Mw:
+            point = float(self._Mn)
+            tol = _mass_tolerance(point, self._q)
+            return 1.0 if abs(float(mw) - point) <= tol else 0.0
+
+        count = self._mass_to_count(float(mw))
+        if count is None:
+            return 0.0
+        return float(self._distribution.pmf(count))
 
 
 StochasticDistribution._known_distributions.append(FlorySchulz)
@@ -1155,81 +1401,220 @@ StochasticDistribution._known_distributions.append(LogNormal)
 
 
 class Poisson(StochasticDistribution):
-    # TODO: implement prob_mw()
-    """
-    Poisson distribution of molecular weights for chain lengths.
-    Flory, P. J. Molecular size distribution in ethylene oxide polymers. Journal of the American chemical society 1940, 62, 1561–1565.
+    """Poisson target distribution.
 
-    The textual representation of this distribution is: `poisson(N)`
+    ``poisson(N)`` preserves the legacy unscaled behavior. The molar-mass form
+    ``poisson(Mw, Mn)`` is treated as a zero-truncated Poisson law on strictly
+    positive repeat-unit counts, so each generated chain has a physically valid
+    positive mass. The underlying count law is therefore
+    ``N | N > 0 ~ Poisson(lambda)`` conditioned on ``N >= 1`` and
+    ``M = q N`` with ``q > 0`` chosen so that the target distribution matches
+    ``Mn`` and ``Mw``. This excludes the mathematically allowed but
+    non-polymeric zero-mass event from the realized chain population.
+
+    The zero-truncated form is mathematically consistent with the idealized
+    polymer interpretation: a zero draw represents a boundary/termination event,
+    not a real chain mass. It also constrains the attainable dispersity to the
+    narrow Poisson window ``1 <= Mw/Mn <= 1.298...``.
     """
 
-    _N: Optional[float] = None  # Mean number of repeating units
+    _N: Optional[float] = None
+    _Mw: Optional[float] = None
+    _Mn: Optional[float] = None
+    _q: Optional[float] = None
+    _lambda: Optional[float] = None
+    _mode: Optional[str] = None
 
     def __init__(self, children: List[Any]):
-        """
-        Initialization of Poisson distribution object.
-
-        Args:
-            children (List[Any]): List of parsed children, expected to contain the mean (N) as a float.
-        """
         super().__init__(children)
-        N: Optional[float] = None
+        numbers: List[float] = []
         for child in self._children:
             if isinstance(child, float):
-                N = child
+                numbers.append(float(child))
 
-        self._N = N
-        self._distribution = stats.poisson(mu=self._N)
+        if len(numbers) == 1:
+            self._N = numbers[0]
+            self._mode = "legacy"
+            self._distribution = stats.poisson(mu=self._N)
+            return
+
+        if len(numbers) == 2:
+            self._Mw, self._Mn = numbers
+            if not np.isfinite(self._Mw) or not np.isfinite(self._Mn):
+                raise ValueError("Poisson molar-mass parameters must be finite.")
+            if not (self._Mn > 0 and self._Mw >= self._Mn):
+                raise ValueError("For poisson(Mw, Mn), require finite Mw >= Mn > 0.")
+            if self._Mw == self._Mn:
+                self._mode = "point_mass"
+                self._q = 1.0
+                self._distribution = None
+                return
+
+            target_ratio = float(self._Mw / self._Mn)
+            if target_ratio <= 1.0:
+                raise ValueError("For zero-truncated poisson(Mw, Mn), require Mw > Mn > 0.")
+
+            def zero_truncated_ratio(lam: float) -> float:
+                if lam <= 0.0:
+                    return 1.0
+                return ((1.0 + lam) * (1.0 - math.exp(-lam))) / lam
+
+            lam_low = 1e-12
+            lam_high = 2.0
+            max_ratio = zero_truncated_ratio(lam_high)
+            if target_ratio > max_ratio + 1e-12:
+                raise ValueError(
+                    "For zero-truncated poisson(Mw, Mn), the target dispersity exceeds the "
+                    f"supported Poisson range: Mw/Mn must be <= {max_ratio:.6f}."
+                )
+
+            for _ in range(200):
+                lam_mid = 0.5 * (lam_low + lam_high)
+                if zero_truncated_ratio(lam_mid) < target_ratio:
+                    lam_low = lam_mid
+                else:
+                    lam_high = lam_mid
+
+            self._mode = "molar_mass"
+            self._lambda = 0.5 * (lam_low + lam_high)
+            normalizer = 1.0 - math.exp(-self._lambda)
+            self._q = self._Mn * normalizer / self._lambda
+            self._distribution = stats.poisson(mu=self._lambda)
+            return
+
+        raise ValueError("poisson accepts either one legacy parameter or two molar-mass parameters: (Mw, Mn).")
 
     @classmethod
     def default_serialize(cls) -> Tuple[float, ...]:
-        """
-        Returns the default serialization for Poisson (a tuple with one -1.0).
-        """
-        return cls._default_serialize(1)
+        return cls._default_serialize(2)
 
     def serialize(self) -> Tuple[float, ...]:
-        """
-        Serializes the mean (N) of the Poisson distribution.
-        """
-        return (self._N,)
+        if self._mode == "legacy":
+            return (self._N, -1.0)
+        if self._mode == "point_mass":
+            return (self._Mn, self._Mn)
+        return (self._Mw, self._Mn)
+
+    @classmethod
+    def from_serialized(cls: Type[Self], params: Tuple[float, ...]) -> Optional[Self]:
+        if tuple(params) == (_SERIAL_SENTINEL, _SERIAL_SENTINEL):
+            return None
+        if len(params) == 1 or (len(params) == 2 and params[1] == _SERIAL_SENTINEL):
+            return cls.make(f"poisson({params[0]})")
+        if len(params) == 2:
+            return cls.make(f"poisson({params[0]}, {params[1]})")
+        raise ValueError(f"Unsupported serialized parameter tuple for {cls.__name__}: {params!r}")
+
+    def reference_mw(self) -> float:
+        if self._mode == "legacy":
+            return float(self._N)
+        return float(self._Mn)
+
+    def support_mw(self) -> Tuple[float, float]:
+        if self._mode == "point_mass":
+            return float(self._Mn), float(self._Mn)
+        if self._mode == "legacy":
+            return super().support_mw()
+        return float(self._q), math.inf
 
     @classmethod
     def make(cls: Type[Self], text: str) -> Self:
-        """
-        Creates a Poisson instance from its textual representation.
-
-        Args:
-            text (str): The textual representation, e.g., 'poisson(10)'.
-
-        Returns:
-            Self: A Poisson instance.
-        """
-        # We use G2rinsBase.make.__func__ to get the underlying function of the class method,
-        # then call it with cls as the first argument to ensure child typing.
-        # We do not want to call StochasticDistribution's make function, because it directs here.
-        return G2rinsBase.make.__func__(cls, text)
+        try:
+            return G2rinsBase.make.__func__(cls, text)
+        except VisitError as error:
+            raise error.orig_exc from error
 
     def generate_string(self, extension: bool) -> str:
-        """
-        Generates the textual representation of the Poisson distribution.
-
-        Args:
-            extension (bool): Whether to include the '|' delimiters.
-
-        Returns:
-            str: The textual representation, e.g., '|poisson(10)|'.
-        """
         if extension:
-            return f"|poisson({self._N})|"
+            if self._mode == "legacy":
+                return f"|poisson({self._N})|"
+            if self._mode == "point_mass":
+                return f"|poisson({self._Mn}, {self._Mn})|"
+            return f"|poisson({self._Mw}, {self._Mn})|"
         return ""
 
     @property
     def generable(self) -> bool:
-        """
-        Returns True if the distribution is initialized (i.e., N is set).
-        """
-        return self._distribution is not None
+        return self._distribution is not None or self._mode == "point_mass"
+
+    def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None, **kwargs):
+        if self._mode == "legacy":
+            return super().draw_mw(rng=rng, lower=lower, upper=upper, **kwargs)
+        if self._mode == "point_mass":
+            if rng is None:
+                rng = get_global_rng()
+            mass = float(self._Mn)
+            lower_bound = -math.inf if lower is None else float(lower)
+            upper_bound = math.inf if upper is None else float(upper)
+            if math.isnan(lower_bound) or math.isnan(upper_bound) or lower_bound > upper_bound:
+                raise EmptyTruncatedDistributionSupport(type(self).__name__, lower_bound, upper_bound)
+            tolerance = _mass_tolerance(mass, 1.0)
+            if lower_bound - tolerance <= mass <= upper_bound + tolerance:
+                return mass
+            raise EmptyTruncatedDistributionSupport(type(self).__name__, lower_bound, upper_bound)
+        if rng is None:
+            rng = get_global_rng()
+
+        if lower is None and upper is None:
+            while True:
+                count = int(self._distribution.rvs(random_state=rng, **kwargs))
+                if count > 0:
+                    return float(self._q * count)
+
+        requested_lower = -math.inf if lower is None else float(lower)
+        requested_upper = math.inf if upper is None else float(upper)
+        if math.isnan(requested_lower) or math.isnan(requested_upper) or requested_lower > requested_upper:
+            raise EmptyTruncatedDistributionSupport(type(self).__name__, requested_lower, requested_upper)
+
+        lower_count = 1 if requested_lower <= 0.0 else max(1, _mass_ceil_count(requested_lower, self._q))
+        upper_count = math.inf if requested_upper == math.inf else _mass_floor_count(requested_upper, self._q)
+        if upper_count < lower_count:
+            raise EmptyTruncatedDistributionSupport(type(self).__name__, requested_lower, requested_upper)
+
+        for _ in range(100_000):
+            count = int(self._distribution.rvs(random_state=rng, **kwargs))
+            if count < lower_count or count > upper_count:
+                continue
+            if count > 0:
+                mass = float(self._q * count)
+                tolerance = _mass_tolerance(mass, self._q)
+                if requested_lower - tolerance <= mass <= requested_upper + tolerance:
+                    return mass
+        raise EmptyTruncatedDistributionSupport(type(self).__name__, requested_lower, requested_upper)
+
+    def prob_mw(self, mw):
+        if self._mode == "legacy":
+            return super().prob_mw(mw)
+
+        if isinstance(mw, RememberAdd):
+            if self._mode == "point_mass":
+                previous = float(mw.previous)
+                value = float(mw.value)
+                if previous < self._Mn <= value:
+                    return 1.0
+                return 0.0
+            lower = float(mw.previous)
+            upper = float(mw.value)
+            if lower > upper:
+                lower, upper = upper, lower
+            lower_count = _mass_floor_count(lower, self._q) if np.isfinite(lower) else 0
+            upper_count = _mass_floor_count(upper, self._q) if np.isfinite(upper) else math.inf
+            if upper_count <= 0:
+                return 0.0
+            lower_cdf = 0.0 if lower_count <= 0 else self._distribution.cdf(lower_count)
+            upper_cdf = self._distribution.cdf(upper_count) if np.isfinite(upper_count) else 1.0
+            normalizer = 1.0 - self._distribution.pmf(0)
+            return float((upper_cdf - lower_cdf) / normalizer)
+
+        if self._mode == "point_mass":
+            tol = _mass_tolerance(self._Mn, self._q)
+            return 1.0 if abs(float(mw) - self._Mn) <= tol else 0.0
+
+        count = _mass_lattice_count(float(mw), self._q)
+        if count is None or count < 1:
+            return 0.0
+        normalizer = 1.0 - self._distribution.pmf(0)
+        return float(self._distribution.pmf(count) / normalizer)
 
 
 StochasticDistribution._known_distributions.append(Poisson)

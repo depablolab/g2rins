@@ -4153,19 +4153,7 @@ class EnsembleCreator:
         bounds = {}
         for sto_gen_id, distribution in self._prepared_distributions.items():
             try:
-                frozen = distribution._distribution
-                parameters = getattr(frozen, "kwds", {})
-                scale = parameters.get("scale")
-                if scale is not None and float(scale) == 0.0:
-                    point = float(parameters.get("loc", 0.0))
-                    if np.isfinite(point):
-                        bounds[sto_gen_id] = (point, point)
-                    continue
-                support_lower, support_upper = frozen.support()
-                bounds[sto_gen_id] = (
-                    float(support_lower),
-                    float(support_upper),
-                )
+                bounds[sto_gen_id] = distribution.support_mw()
             except (
                 AttributeError,
                 IndexError,

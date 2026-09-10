@@ -15,6 +15,15 @@ def node_match(node1_attrs, node2_attrs):
     ignored = {"atom_chiral_token"}
     node1 = {k: v for k, v in node1_attrs.items() if k not in ignored}
     node2 = {k: v for k, v in node2_attrs.items() if k not in ignored}
+    # Older regenerated fixtures compacted trailing empty stochastic-object
+    # slots. Normalize only those empty tails; dedicated tests below enforce
+    # the public ten-slot graph contract and the current 12-slot inner layout.
+    for node in (node1, node2):
+        vectors = node.get("molecular_weight_distribution")
+        if vectors is not None and len(vectors) < 10:
+            node["molecular_weight_distribution"] = vectors + [
+                [-1.0] * 12 for _ in range(10 - len(vectors))
+            ]
     return node1 == node2
 
 
@@ -31,6 +40,14 @@ def test_generative_graph_generation(graph_validation_dict):
         print(g2rins_string)
         graph_creator = g2rins.G2rins.make(g2rins_string).get_graph_creator()
         generative_graph = graph_creator.get_generative_graph(include_bond_connectors=False)
+        assert all(
+            len(attributes["molecular_weight_distribution"]) == 10
+            and all(
+                len(vector) == 12
+                for vector in attributes["molecular_weight_distribution"]
+            )
+            for _node, attributes in generative_graph.nodes(data=True)
+        )
         assert nx.is_isomorphic(generative_graph, graph_validation_dict[g2rins_string], node_match=node_match, edge_match=edge_match)
 
         dot_string_A = graph_creator.get_dot_string(include_bond_connectors=True)
@@ -59,6 +76,16 @@ def test_generative_graph_json_data_format_block():
     for node_dict in data["graph"]["nodes"]:
         assert node_dict["unit_id"] == labels.unit_id[node_dict["id"]]
         assert node_dict.get("bond_id") == labels.bond_id.get(node_dict["id"])
+
+
+def test_molecular_weight_distribution_graph_layout_keeps_ten_object_slots():
+    smi = "{[] [<]CC[>]; C[>]; [<][H] []}|poisson(1100, 1000)|"
+    graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+
+    for _node, attributes in graph.nodes(data=True):
+        vectors = attributes["molecular_weight_distribution"]
+        assert len(vectors) == 10
+        assert all(len(vector) == 12 for vector in vectors)
 
 
 def test_generative_graph_keeps_atom_chiral_token_when_written():
