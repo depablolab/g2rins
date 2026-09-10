@@ -6,6 +6,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Added
 
+- Alkene E/Z isomerism (`/`, `\`) and tetrahedral chirality (`@`, `@@`) written in a G²RINS string now survive into sampled molecules, RDKit conversion, and per-unit P-SMILES. The generative graph gained the node attribute `chiral` and the edge attributes `bond_dir` and `nbr_rank`.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
 

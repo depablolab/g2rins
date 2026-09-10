@@ -73,12 +73,17 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         if bond_attr["bond_type"] == 4:
             return Chem.BondType.QUADRUPLE
 
+    chiral_tags = {"@": Chem.ChiralType.CHI_TETRAHEDRAL_CCW, "@@": Chem.ChiralType.CHI_TETRAHEDRAL_CW}
+    bond_dirs = {"/": Chem.BondDir.ENDUPRIGHT, "\\": Chem.BondDir.ENDDOWNRIGHT}
+
     mol = Chem.RWMol()
     graph_idx_to_mol_idx = {}
+    neighbor_ranks = {}  # mol atom index -> SMILES-order rank of each of its bonds, in the order the bonds were added
     for graph_idx, data in mol_graph.nodes(data=True):
         atom = Chem.Atom(data["atomic_num"])
         atom.SetIsAromatic(data["aromatic"])
         atom.SetFormalCharge(data["charge"])
+        atom.SetChiralTag(chiral_tags.get(data.get("chiral"), Chem.ChiralType.CHI_UNSPECIFIED))
         # Preserve the written H count of aromatic bracket atoms that specify one
         # (e.g. [nH]); a negative value (or a caller-supplied None) leaves RDKit to
         # infer implicit H by valence. This is a public API taking a caller-built
@@ -100,7 +105,22 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         # counterion renders as a separate "." fragment.
         if attr["bond_type"] == 0:
             continue
-        mol.AddBond(graph_idx_to_mol_idx[u], graph_idx_to_mol_idx[v], convert_bond_type(attr))
+        # bond_dir and nbr_rank are read in the orientation edges() yields the edge (lower to higher atom id for sampled graphs).
+        num_bonds = mol.AddBond(graph_idx_to_mol_idx[u], graph_idx_to_mol_idx[v], convert_bond_type(attr))
+        mol.GetBondWithIdx(num_bonds - 1).SetBondDir(bond_dirs.get(attr.get("bond_dir"), Chem.BondDir.NONE))
+        for node, rank in zip((u, v), attr.get("nbr_rank", (0, 0))):
+            neighbor_ranks.setdefault(graph_idx_to_mol_idx[node], []).append(rank)
+
+    # RDKit reads a chiral tag against the order the bonds were added; the mark was written against SMILES order.
+    # Correct the parity of the permutation between the two, counting an implicit H or lone pair written before
+    # any neighbor (no rank-0 bond on a three-coordinate atom) as one more swap.
+    for mol_idx, ranks in neighbor_ranks.items():
+        atom = mol.GetAtomWithIdx(mol_idx)
+        if atom.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED:
+            continue
+        swaps = sum(a > b for i, a in enumerate(ranks) for b in ranks[i + 1 :]) + (len(ranks) == 3 and 0 not in ranks)
+        if swaps % 2:
+            atom.InvertChirality()
     if kekulize:
         Chem.SanitizeMol(mol)
         mol.UpdatePropertyCache()
@@ -112,6 +132,7 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         # dangling (under-valent) bond does not trip the valence check.
         Chem.SanitizeMol(mol, sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE)
         mol.UpdatePropertyCache(strict=False)
+    Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
     return mol
 
 
