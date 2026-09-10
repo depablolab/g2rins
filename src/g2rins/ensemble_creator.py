@@ -45,12 +45,17 @@ from .exception import (
 )
 from .generative_graph import (
     _AROMATIC_NAME,
+    _BOND_DIR_NAME,
     _BOND_TYPE_NAME,
+    _CHIRAL_NAME,
     _EDGE_STOCHASTIC_ID_NAME,
+    _NBR_RANK_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
+    _STATIC_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
+    _reverse_edge_data,
     derive_unit_labels,
     generative_graph_json_data,
 )
@@ -721,11 +726,11 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h"}
-    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME}
-    # Defaults for optional node attributes so a generative_graph built before an attribute
+    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", _CHIRAL_NAME}
+    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME, _BOND_DIR_NAME, _NBR_RANK_NAME}
+    # Defaults for optional node/edge attributes so a generative_graph built before an attribute
     # existed still yields an EnsembleCreator (required attributes stay strict).
-    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1}
+    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CHIRAL_NAME: "", _BOND_DIR_NAME: "", _NBR_RANK_NAME: [0, 0]}
 
     def __init__(self, generative_graph, static_graph, source_node, stochastic_tracker, sto_atom_id, rng, collect_info=True):
         self._atom_id = 0
@@ -951,12 +956,12 @@ class _PartialAtomGraph:
 
             u_atom_idx = gen_key_to_atom_key[u]
             v_atom_idx = gen_key_to_atom_key[v]
+            bond_attr = self.gen_edge_attr_to_bond_attr(self.static_graph.get_edge_data(u, v, k))
+            # The undirected atom graph yields edges from the lower to the higher atom id; directional bond attributes are read that way.
+            if u_atom_idx > v_atom_idx:
+                u_atom_idx, v_atom_idx, bond_attr = v_atom_idx, u_atom_idx, _reverse_edge_data(bond_attr)
 
-            if (u_atom_idx, v_atom_idx) not in edges_data_map and (
-                v_atom_idx,
-                u_atom_idx,
-            ) not in edges_data_map:
-                edges_data_map[(u_atom_idx, v_atom_idx)] = self.gen_edge_attr_to_bond_attr(self.static_graph.get_edge_data(u, v, k))
+            edges_data_map.setdefault((u_atom_idx, v_atom_idx), bond_attr)
 
         for u_atom_idx, v_atom_idx in edges_data_map:
             self.atom_graph.add_edge(u_atom_idx, v_atom_idx, **edges_data_map[(u_atom_idx, v_atom_idx)])
@@ -3581,11 +3586,13 @@ class EnsembleCreator:
 
 
     @staticmethod
-    def _unit_graph_with_stars(unit_graph, origin_bond_id):
+    def _unit_graph_with_stars(unit_graph, origin_bond_id, origin_rank):
         """
         Copy of `unit_graph` with a star atom bonded to every atom whose origin
         is a connection atom (has a derived bond id); the star's map number is
-        that bond id, so the P-SMILES prints numbered stars ``[*:n]``.
+        that bond id, so the P-SMILES prints numbered stars ``[*:n]``. The star
+        bond takes the neighbor rank of the inter-unit bond it stands in for, so
+        a chiral connection atom keeps its configuration.
         """
         star_graph = unit_graph.copy()
         for node, data in unit_graph.nodes(data=True):
@@ -3594,7 +3601,7 @@ class EnsembleCreator:
                 star_node = ("star", node)
                 # The converter renders map numbers as connection + 1.
                 star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
-                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
+                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False, _NBR_RANK_NAME: [origin_rank.get(data["origin_idx"], 0), 0]})
         return star_graph
 
     def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None):
@@ -3801,6 +3808,10 @@ class EnsembleCreator:
         origin_unit_id = {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
+        origin_rank = {}  # neighbor rank, at the connection atom, of its inter-unit bond
+        for u, _v, d in self._generative_graph.edges(data=True):
+            if not d[_STATIC_NAME]:
+                origin_rank.setdefault(str(u), d.get(_NBR_RANK_NAME, [0, 0])[0])
 
         # unit_g2rins was composed against the same derivation at parse time;
         # if the graph was mutated since, omit the texts rather than mislabel.
@@ -3813,7 +3824,7 @@ class EnsembleCreator:
             # Unit fragments have dangling inter-unit valences: kekulize=False
             # (an aromatic ring at a connection point can't be kekulized in
             # isolation).
-            star_mol = mol_graph_to_rdkit_mol(self._unit_graph_with_stars(unit_graph, origin_bond_id), kekulize=False)
+            star_mol = mol_graph_to_rdkit_mol(self._unit_graph_with_stars(unit_graph, origin_bond_id, origin_rank), kekulize=False)
             unit_id = origin_unit_id[next(iter(unit_graph.nodes(data=True)))[1]["origin_idx"]]
             canonical_units[unit_id] = {"psmiles": rdkit_mol_to_smiles(star_mol), "g2rins": unit_g2rins.get(unit_id, ""), "frequency": frequency}
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))

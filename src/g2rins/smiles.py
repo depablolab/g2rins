@@ -13,7 +13,7 @@ from .exception import (
     SmilesHasNonZeroBondConnectors,
     UnmatchedCounterion,
 )
-from .generative_graph import _BOND_TYPE_NAME, _PartialGraph
+from .generative_graph import _BOND_DIR_NAME, _BOND_TYPE_NAME, _PartialGraph
 
 
 class Branch(G2rinsBase, GenerationBase):
@@ -64,6 +64,8 @@ class Branch(G2rinsBase, GenerationBase):
                 if _BOND_TYPE_NAME in lhb.bond_attributes:
                     raise DoubleBondSymbolDefinition(partial_graph, self._bond_symbol, lhb.bond_attributes)
                 lhb.bond_attributes[_BOND_TYPE_NAME] = self._bond_symbol
+                if self._bond_symbol.direction:
+                    lhb.bond_attributes[_BOND_DIR_NAME] = self._bond_symbol.direction
 
         for element in self._elements[1:]:
             element_partial_graph = element._generate_partial_graph()
@@ -130,20 +132,26 @@ class BranchedAtom(G2rinsBase, GenerationBase):
 
     def _generate_partial_graph(self) -> _PartialGraph:
         partial_graph = self._atom_stand_in._generate_partial_graph()
+        # Bonds at this atom are ranked in writing order: preceding atom (0), ring closures, branches, following atom.
+        rank = 0
         # Adding ring bonds
-        for ring_idx, half_bond in product(self._ring_bonds, partial_graph.right_half_bonds):
-            partial_graph.add_ring_bond(ring_idx, half_bond)
+        for ring_idx in self._ring_bonds:
+            rank += 1
+            for half_bond in partial_graph.right_half_bonds:
+                partial_graph.add_ring_bond(ring_idx, half_bond.with_rank(rank))
 
         # Adding branches
         for branch in self._branches:
+            rank += 1
             branch_partial_graph = branch._generate_partial_graph()
-            bonds_to_add = product(partial_graph.right_half_bonds, branch_partial_graph.left_half_bonds)
+            bonds_to_add = product([half_bond.with_rank(rank) for half_bond in partial_graph.right_half_bonds], branch_partial_graph.left_half_bonds)
             # Branches have empty right hand half bonds, so only resetting left ones.
             branch_partial_graph.left_half_bonds = []
 
             partial_graph.merge(branch_partial_graph, bonds_to_add)
 
         # Not resetting right bonds, because this can bond to more on the right (not a branch)
+        partial_graph.right_half_bonds = [half_bond.with_rank(rank + 1) for half_bond in partial_graph.right_half_bonds]
         return partial_graph
 
     @property
@@ -198,6 +206,8 @@ class AtomAssembly(G2rinsBase, GenerationBase):
                 if _BOND_TYPE_NAME in half_bond.bond_attributes:
                     raise DoubleBondSymbolDefinition(partial_graph, self.bond_symbol, half_bond.bond_attributes)
                 half_bond.bond_attributes[_BOND_TYPE_NAME] = self.bond_symbol
+                if self.bond_symbol.direction:
+                    half_bond.bond_attributes[_BOND_DIR_NAME] = self.bond_symbol.direction
 
         return partial_graph
 
