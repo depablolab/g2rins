@@ -15,6 +15,7 @@ from rdkit import Chem
 import g2rins
 from g2rins.ensemble_creator import EnsembleCreator
 from g2rins.exception import InvalidUnitPSmiles, NoValidGenerationSource
+from g2rins.nx_rdkit_mol import mol_graph_to_rdkit_mol
 
 PEI = "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(200)|"
 HYPERBRANCHED_CH = "{[] [<][CH]([>])[>]; [<][H]; [>][H] []}|poisson(100)|"
@@ -155,7 +156,7 @@ def test_sequence_phantom_contraction_preserves_junction_edge_attributes():
     unit.add_edge("real", "phantom", bond_type=1, aromatic=False, source="static")
     unit.add_edge("phantom", "C0", bond_type=2, aromatic=False, source="junction")
 
-    EnsembleCreator._contract_sequence_phantoms([[unit]])
+    EnsembleCreator._contract_sequence_phantoms([[unit]], {"split-site": 1})
 
     assert "phantom" not in unit
     assert unit.has_edge("real", "C0")
@@ -164,7 +165,7 @@ def test_sequence_phantom_contraction_preserves_junction_edge_attributes():
     assert unit.nodes["C0"]["is_connector_placeholder"] is False
 
     edges_after_first_pass = list(unit.edges(data=True))
-    EnsembleCreator._contract_sequence_phantoms([[unit]])
+    EnsembleCreator._contract_sequence_phantoms([[unit]], {"split-site": 1})
     assert list(unit.edges(data=True)) == edges_after_first_pass
 
 
@@ -284,21 +285,46 @@ def test_partnerless_connector_unit_psmiles(text, unit_id, reference):
     assert dummy_count > 0
 
 
-@pytest.mark.parametrize("output_format", ["mol", "smiles"])
-def test_partnerless_repeat_converted_outputs(output_format):
-    creator = _make_creator(PARTNERLESS_REPEAT)
+@pytest.mark.parametrize(
+    ("text", "unit_id", "expected_fragment"),
+    [
+        pytest.param(PARTNERLESS_INITIATOR, "I0", "*N*", id="partnerless-initiator"),
+        pytest.param(PARTNERLESS_REPEAT, "R0", "*NCC", id="partnerless-repeat"),
+    ],
+)
+@pytest.mark.parametrize("output_format", ["mol_graph", "mol", "smiles"])
+def test_partnerless_sequence_fragments_omit_inactive_sites(text, unit_id, expected_fragment, output_format):
+    creator = _make_creator(text)
+    labels = g2rins.derive_unit_labels(creator.generative_graph)
+    inactive_origins = {str(node) for node, data in creator.generative_graph.nodes(data=True) if data.get("is_connector_placeholder") and node not in labels.bond_id}
+    active_origins = {str(node) for node in labels.bond_id}
+    assert len(inactive_origins) == 1
     result = creator.create_ensemble(1, output_format=output_format, ensemble_info=True, seed=0)
     _assert_public_unit_contract(creator, result)
-    dummy_count = 0
+    unit_mol = _parse_with_explicit_hydrogens(result.units[unit_id]["psmiles"])
+    assert [atom.GetTotalNumHs() for atom in unit_mol.GetAtoms() if atom.GetAtomicNum() == 7] == [1]
+    nitrogen_fragments = 0
     for sequence in result.sequences[0]:
         for unit in sequence:
-            mol = unit if output_format == "mol" else _parse_with_explicit_hydrogens(unit)
+            if output_format == "mol_graph":
+                assert not inactive_origins.intersection(data["origin_idx"] for _, data in unit.nodes(data=True))
+                for _, data in unit.nodes(data=True):
+                    if data.get("is_connector_placeholder"):
+                        assert data["origin_idx"] in active_origins
+                mol = mol_graph_to_rdkit_mol(unit, kekulize=False)
+            else:
+                mol = Chem.Mol(unit) if output_format == "mol" else _parse_with_explicit_hydrogens(unit)
             assert mol is not None
             for atom in mol.GetAtoms():
                 if atom.GetAtomicNum() == 0:
-                    dummy_count += 1
                     assert atom.GetDegree() == 1
-    assert dummy_count > 0
+                    atom.SetAtomMapNum(0)
+            nitrogens = [atom for atom in mol.GetAtoms() if atom.GetAtomicNum() == 7]
+            if nitrogens:
+                nitrogen_fragments += 1
+                assert [atom.GetTotalNumHs() for atom in nitrogens] == [1]
+                assert Chem.MolToSmiles(mol) == _canonical(expected_fragment)
+    assert nitrogen_fragments > 0
 
 
 @pytest.mark.parametrize(("text", "unit_id", "reference"), PARTNERLESS_CASES)
@@ -336,6 +362,23 @@ def test_unit_renderer_drops_only_identified_inactive_placeholders():
     assert set(rendered) == {"real", "wildcard"}
     assert rendered.has_edge("real", "wildcard")
     assert set(unit) == {"real", "inactive", "wildcard"}
+
+
+def test_sequence_finalizer_drops_only_identified_inactive_placeholders():
+    unit = nx.Graph()
+    unit.add_node("real", atomic_num=7, origin_idx="real", is_connector_placeholder=False)
+    unit.add_node("inactive", atomic_num=0, origin_idx="inactive", is_connector_placeholder=True)
+    unit.add_node("active", atomic_num=0, origin_idx="active", is_connector_placeholder=True)
+    unit.add_node("wildcard", atomic_num=0, origin_idx="wildcard", is_connector_placeholder=False)
+    unit.add_node("stub", atomic_num=0, origin_idx="far-side", is_connector_placeholder=False, connection=0)
+    unit.add_edges_from(("real", node) for node in ("inactive", "active", "wildcard", "stub"))
+
+    EnsembleCreator._contract_sequence_phantoms([[unit]], {"active": 1})
+
+    assert set(unit) == {"real", "active", "wildcard", "stub"}
+    assert set(unit.neighbors("real")) == {"active", "wildcard", "stub"}
+    assert "connection" not in unit.nodes["active"]
+    assert unit.nodes["stub"]["connection"] == 0
 
 
 @pytest.mark.parametrize(

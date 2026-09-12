@@ -3498,7 +3498,10 @@ class EnsembleCreator:
         # molecule's phantom collapse. Normalize them once here, before any of
         # create_ensemble's mol-graph/RDKit/SMILES conversion paths. Sequence
         # stubs retain the far-side atom's origin_idx and are not placeholders.
-        self._contract_sequence_phantoms(partial_atom_graph.sequence)
+        if partial_atom_graph.sequence:
+            labels = derive_unit_labels(self._generative_graph)
+            origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
+            self._contract_sequence_phantoms(partial_atom_graph.sequence, origin_bond_id)
 
         # Only report an unavailable explicit undershoot when it survives all
         # descendant rounding and final hydrogen reconciliation. Nested
@@ -3533,20 +3536,25 @@ class EnsembleCreator:
         return (partial_atom_graph.atom_graph, partial_atom_graph.units, partial_atom_graph.bonds_idx, partial_atom_graph.sequence, actual_mol_weights, distributions)
 
     @staticmethod
-    def _contract_sequence_phantoms(sequences):
-        """Collapse split-atom placeholders that a mapped stub already represents.
+    def _contract_sequence_phantoms(sequences, origin_bond_id):
+        """Omit inactive split sites and collapse sites represented by mapped stubs.
 
+        Identified internal placeholders without a template bond id cannot bond
+        and are omitted, just as in unit pSMILES, leaving room for implicit H.
         A mapped sequence connection stub hanging from a placeholder is
         reattached directly to that placeholder's real anchor, with the realized
         junction edge attributes preserved, and the placeholder is dropped so the
-        site is not counted twice. A placeholder with no such stub is the only
-        remaining marker of its split site, so it stays as an unmapped dummy:
+        site is not counted twice. An active placeholder with no such stub is the
+        only remaining marker of its split site, so it stays as an unmapped dummy:
         removing it would render an interior fragment as a complete small
         molecule with phantom hydrogens (a divalent carbanion as methanide).
         """
         for sequence in sequences:
             for unit_graph in sequence:
                 phantom_nodes = {node for node, data in unit_graph.nodes(data=True) if _is_connector_placeholder(data) and "connection" not in data}
+                inactive_nodes = {node for node in phantom_nodes if origin_bond_id.get(unit_graph.nodes[node]["origin_idx"]) is None}
+                unit_graph.remove_nodes_from(inactive_nodes)
+                phantom_nodes.difference_update(inactive_nodes)
                 for component in list(nx.connected_components(unit_graph.subgraph(phantom_nodes))):
                     real_anchors = set()
                     connection_edges = []
