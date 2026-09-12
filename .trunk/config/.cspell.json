@@ -236,6 +236,7 @@
     "clongdouble",
     "subdtype",
     "subarray",
-    "subarrays"
+    "subarrays",
+    "finalizer"
   ]
 }
