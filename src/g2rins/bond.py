@@ -327,7 +327,7 @@ class BondConnector(G2rinsBase, GenerationBase):
         return any(symbol.is_compatible(other_symbol) for symbol in self.symbol for other_symbol in other.symbol)
 
     def group_edge_attrs(self, other):
-        """Group-rule edge attributes of every distinct compatible symbol pair (self = source), in parse order; empty when incompatible."""
+        """Group-rule edge attributes, one per distinct group annotation among the compatible symbol pairs (self = source), in parse order; empty when incompatible."""
         attrs = []
         for symbol in self.symbol or []:
             for other_symbol in other.symbol or []:

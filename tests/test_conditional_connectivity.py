@@ -6,9 +6,9 @@
 Phase 0 -- the per-symbol group suffix: parsing and round-tripping of the three
 rules (ladder / exclusion / all), the compatibility matrix (ladder rigidity) and
 the stochastic-object validation set. Phase 1 -- the generative-graph encoding:
-every edge carries the four group-rule attributes, one edge per distinct pair of
-compatible symbols, terminal-descriptor edges annotated on the unit side, and
-the temporary generation gate in EnsembleCreator.
+every edge carries the four group-rule attributes, one edge per distinct group
+annotation of a compatible bond connector pair, terminal-descriptor edges
+annotated on the unit side, and the temporary generation gate in EnsembleCreator.
 """
 
 import warnings
@@ -193,6 +193,17 @@ VALIDATION_ERROR_CASES = [
         id="exclusion-initiator-vs-repeat-not-plain",
     ),
     pytest.param(
+        # No repeat unit takes index 1, so this initiator really bonds to the terminators.
+        "{[] [<]CC[>]; C([>1[]1])([>1[]1]); [<1[]1]CC[<1[]1], [<][H] []}|poisson(300)|",
+        GroupPartnerNotPlain,
+        id="partnerless-initiator-vs-typed-terminator",
+    ),
+    pytest.param(
+        "{[] [<]C([>1[]1])C([>1[]1])C[>]; ; [<1[]1][H], [<][H] []}|poisson(200)|",
+        GroupPartnerNotPlain,
+        id="exclusion-unit-vs-typed-terminator",
+    ),
+    pytest.param(
         "{[<[]1] [<]CC([>])[>]; ; [H][<] []}",
         GroupRuleOnTerminalBondConnector,
         id="group-rule-on-terminal-bond-connector",
@@ -225,12 +236,15 @@ def test_validation_errors(text, expected_error):
 
 
 END_GROUP_ONLY_PAIR_CASES = [
-    # Initiators never bond to initiators and terminators never to terminators, so
+    # Initiators never bond to initiators and terminators never to terminators, and an
+    # initiator that a repeat unit takes never reaches the terminators either, so
     # group-typed symbols that conjugate only across such pairs have no partner to check.
     pytest.param("{[] [$]CC[$]; C([$[all]1])([$[all]1])([$[all]1]); [$][H] []}|poisson(300)|", id="dollar-star-all-initiator"),
     pytest.param("{[] [$]CC[$]; C([$[]1])([$[]1]); [$][H] []}|poisson(300)|", id="dollar-exclusion-initiator"),
     pytest.param("{[] [$]CC[$]; C[$]; [$[]1][H], [$[]1]F []}|poisson(300)|", id="dollar-exclusion-terminators"),
     pytest.param("{[] [<]CC[>]; C([>[>]1])([>[>]1]), C([>[>]1])([>[>]1])([>[>]1]); [H][<] []}|poisson(300)|", id="ladder-groups-on-two-initiators"),
+    pytest.param("{[] [<]CC[>]; C([>[]1])([>[]1]); [<[]1]CC[<[]1] []}|poisson(300)|", id="connected-exclusion-initiator-vs-typed-terminators"),
+    pytest.param("{[] [<]CC[>]; C([>,>[>]1])([>,>[>]1]); [<[<]1]C([<[<]1])[<[<]1] []}|poisson(300)|", id="connected-ladder-initiator-vs-larger-ladder-terminator-group"),
 ]
 
 
@@ -248,6 +262,15 @@ def test_dollar_star_all_initiator_encoding():
     # Three initiator sites x the two sites of the repeat unit, all through the all-group.
     assert len(annotated) == 6
     assert all(edge == ("[$[all]1]", "[$]", "transition_weight", (1, 3, -1, 0)) for edge in annotated)
+
+
+def test_connected_initiator_never_reaches_typed_terminators():
+    text = "{[] [<]CC[>]; C([>[]1])([>[]1]); [<[]1]CC[<[]1] []}|poisson(300)|"
+    _assert_no_diagnostics(text)
+    annotated = [edge for edge in _bond_connector_edges(text) if edge[3] != SENTINEL]
+    # Two initiator transitions into the unit and two unit terminations; no initiator-terminator edge.
+    expected = [("[>[]1]", "[<]", "transition_weight", (1, 2, -1, 0))] * 2 + [("[>]", "[<[]1]", "termination_weight", (-1, 0, 1, 2))] * 2
+    assert sorted(annotated) == sorted(expected)
 
 
 def test_exclusion_beside_ladder_idx_reuse_is_legal():

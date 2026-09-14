@@ -579,7 +579,10 @@ class GroupPartnerNotPlain(ParsingError):
         self.stochastic_obj = stochastic_obj
 
     def __str__(self):
-        return f"The {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {str(self.partner_symbol)}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
+        partner = str(self.partner_symbol)
+        if partner == str(self.symbol):
+            partner = f"its own symbol {partner} on another site or instance of the unit"
+        return f"The {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {partner}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
 
 
 class GroupRuleOnTerminalBondConnector(ParsingError):
@@ -608,7 +611,10 @@ class SingleMemberGroup(ParsingWarning):
         self.rule_name = rule_name
 
     def __str__(self):
-        return f"Group {self.group_id} ({self.rule_name}) in the unit {str(self.token)} has a single member; a one-member group has no effect."
+        message = f"Group {self.group_id} ({self.rule_name}) in the unit {str(self.token)} has a single member; the rule has no other site to act on"
+        if self.rule_name == "LADDER":
+            message += ", though the channel stays ladder-typed and pairs only with other one-member ladder groups"
+        return message + "."
 
 
 class IndistinguishableSymbolsInSite(ParsingWarning):

@@ -258,9 +258,17 @@ class StochasticObject(G2rinsBase, GenerationBase):
         if not any(table for _owner, _kind, table, _symbols in scopes):
             return
 
-        def can_bond(kind_a, kind_b):
+        repeat_bond_connectors = [bc for residue in self._repeat_residues for bc in residue.bond_connectors]
+        # An initiator reaches the terminators only when no repeat unit takes it (connect_initiators_to_terminators).
+        partnerless_initiators = {id(bc) for residue in self._initiation_residues for bc in residue.bond_connectors if not any(bc.is_compatible(other) for other in repeat_bond_connectors)}
+
+        def can_bond(kind_a, bc_a, kind_b, bc_b):
             # Initiators never bond to initiators and terminators never to terminators.
-            return kind_a != kind_b or kind_a == "repeat"
+            if kind_a == kind_b:
+                return kind_a == "repeat"
+            if {kind_a, kind_b} == {"initiation", "termination"}:
+                return id(bc_a if kind_a == "initiation" else bc_b) in partnerless_initiators
+            return True
 
         ladder_groups = []
         for owner, kind, table, _symbols in scopes:
@@ -292,21 +300,21 @@ class StochasticObject(G2rinsBase, GenerationBase):
             for owner_b, kind_b, group_b, members_b in ladder_groups[i:]:
                 # Partners are groups that can engage: some member pair is compatible (outer AND inner);
                 # groups with disjoint inner channels never meet, however their outer symbols conjugate.
-                if not can_bond(kind_a, kind_b) or not any(symbol_a.is_compatible(symbol_b) for _bc_a, symbol_a in members_a for _bc_b, symbol_b in members_b):
+                if not any(can_bond(kind_a, bc_a, kind_b, bc_b) and symbol_a.is_compatible(symbol_b) for bc_a, symbol_a in members_a for bc_b, symbol_b in members_b):
                     continue
                 if len(members_a) != len(members_b):
                     raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the member counts differ")
                 if not _inner_classes_conjugate([symbol for _bc, symbol in members_a], [symbol for _bc, symbol in members_b]):
                     raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the inner class multisets are not conjugate")
 
-        every_symbol = [(kind, symbol) for _owner, kind, _table, symbols in scopes for _bc, symbol in symbols]
+        every_symbol = [(kind, bc, symbol) for _owner, kind, _table, symbols in scopes for bc, symbol in symbols]
         for _owner, kind, table, _symbols in scopes:
             for members in table.values():
-                for _bc, symbol in members:
+                for bc, symbol in members:
                     if symbol.group_rule not in (GroupRule.EXCLUSION, GroupRule.ALL):
                         continue
-                    for other_kind, other in every_symbol:
-                        if other.group_suffix is not None and can_bond(kind, other_kind) and symbol.is_compatible(other):
+                    for other_kind, other_bc, other in every_symbol:
+                        if other.group_suffix is not None and can_bond(kind, bc, other_kind, other_bc) and symbol.is_compatible(other):
                             raise GroupPartnerNotPlain(symbol, other, self)
 
     def _residue_string(self, residue, extension: bool) -> str:
