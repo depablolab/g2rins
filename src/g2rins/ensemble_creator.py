@@ -529,10 +529,35 @@ class _StochasticObjectTracker:
         return unterminated_sto_atom_ids
 
 
+def _edge_ids(graph):
+    """Edge identities of ``graph``, orientation-free for undirected graphs."""
+    edges = graph.edges(keys=True) if graph.is_multigraph() else graph.edges
+    if graph.is_directed():
+        return set(edges)
+    return {(frozenset(edge[:2]), *edge[2:]) for edge in edges}
+
+
+def _graphs_equal(left, right):
+    """Structural graph equality with array-aware attribute comparison."""
+    if left.is_directed() != right.is_directed() or left.is_multigraph() != right.is_multigraph():
+        return False
+    if set(left.nodes) != set(right.nodes) or not _graph_aware_equal(left.graph, right.graph):
+        return False
+    if not all(_graph_aware_equal(left.nodes[node], right.nodes[node]) for node in left.nodes):
+        return False
+    if _edge_ids(left) != _edge_ids(right):
+        return False
+    edges = left.edges(keys=True) if left.is_multigraph() else left.edges
+    return all(_graph_aware_equal(left.edges[edge], right.edges[edge]) for edge in edges)
+
+
 def _graph_aware_equal(left, right):
-    """Equality that compares graph-valued members by structure, not identity."""
+    """Equality that compares graph-valued members by structure, not identity,
+    and NumPy arrays by value (``==`` on an array is not a boolean)."""
     if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
-        return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and nx.utils.graphs_equal(left, right)
+        return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right)
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return isinstance(left, np.ndarray) and isinstance(right, np.ndarray) and np.array_equal(left, right)
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key]) for key in left)
     if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
@@ -602,13 +627,14 @@ def _bond_endpoint_sort_key(endpoint):
     return unit_id[0], int(unit_id[1:]), int(bond_id)
 
 
-def _bond_records(bond_counts, origin_endpoint):
+def _bond_records(bond_counts, origin_endpoint, origin_node):
     """
     Undirected linkage records from the growth-direction ``bond_counts``
     (origin_idx pairs): both orientations of a chemical linkage merge into one
     record with summed counts. Endpoint labels are sorted by (unit role, unit
-    number, bond id); ``nodes`` carries the generative-graph node id of each
-    endpoint in the same order.
+    number, bond id); ``nodes`` carries the generative-graph node key of each
+    endpoint in the same order (``origin_node`` maps the sampler's string
+    provenance back to the template key, which need not be a string).
     """
     merged = {}
     for (origin_u, origin_v), count in bond_counts.items():
@@ -620,7 +646,7 @@ def _bond_records(bond_counts, origin_endpoint):
         )
         merged[pair] = merged.get(pair, 0) + count
     return [
-        {"labels": [label for label, _node in pair], "nodes": [node for _label, node in pair], "count": count}
+        {"labels": [label for label, _node in pair], "nodes": [origin_node[origin] for _label, origin in pair], "count": count}
         for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
     ]
 
@@ -3894,6 +3920,7 @@ class EnsembleCreator:
         origin_unit_id = {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
+        origin_node = {str(node): node for node in self._generative_graph.nodes}
 
         # The public unit representation is validated against the immutable
         # template rather than the sampled unit snapshot it renders. Besides
@@ -3927,7 +3954,7 @@ class EnsembleCreator:
             }
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))
 
-        bond_records = _bond_records(bond_counts, origin_endpoint)
+        bond_records = _bond_records(bond_counts, origin_endpoint, origin_node)
 
         if json_file is not None:
             # The file's chains follow output_format (the caller's format

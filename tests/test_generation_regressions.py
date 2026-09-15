@@ -2027,3 +2027,53 @@ def test_ensemble_json_refuses_non_finite_values_before_writing(tmp_path):
     with pytest.raises(ValueError, match="Non-finite"):
         g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
     assert not path.exists()
+
+
+def test_bond_record_nodes_are_template_node_keys():
+    """``nodes`` holds the template's own node keys, whatever their type, and
+    each one corresponds to the label at the same position."""
+    import networkx as nx
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    labels = g2rins.derive_unit_labels(generative_graph)
+    initiator_site = next(node for node, unit_id in labels.unit_id.items() if unit_id == "I0" and node in labels.bond_id)
+    generative_graph = nx.relabel_nodes(generative_graph, {initiator_site: 42})
+    generative_graph.graph.pop("unit_node_ids", None)
+    generative_graph.graph.pop("unit_g2rins", None)
+    labels = g2rins.derive_unit_labels(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result.bonds
+    for record in result.bonds:
+        for label, node in zip(record["labels"], record["nodes"]):
+            assert node in generative_graph
+            assert label == f"{labels.unit_id[node]}.{labels.bond_id[node]}"
+    assert any(42 in record["nodes"] for record in result.bonds)
+    assert 42 in result.units["I0"]["subgraph"]
+
+
+def test_ensemble_equality_is_array_aware():
+    import copy
+
+    from g2rins.ensemble_creator import EnsembleData
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(generative_graph))
+    generative_graph.nodes[node]["metadata"] = {"vector": np.array([1, 2])}
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+        again = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result == copy.deepcopy(result)
+    assert result == again
+    changed = copy.deepcopy(result)
+    unit_id = next(unit_id for unit_id, info in changed.units.items() if node in info["subgraph"])
+    changed.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"] = np.array([1, 3])
+    assert result != changed
+    # Arrays inside ordinary containers, not only inside graphs.
+    assert EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {}) == EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {})
+    assert EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {}) != EnsembleData([], {"R0": {"vector": [1, 2]}}, [], [], {}, {})
