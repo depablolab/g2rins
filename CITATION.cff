@@ -1,8 +1,8 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite it using the metadata from this file."
+message: "If you use G2RINS, please cite the paper listed under preferred-citation."
 type: software
 title: "G2RINS"
-abstract: "Implementation of G2RINS, a line-and-graph representation of polymers. Grammar validation, generative graph construction, and molecular ensemble generation."
+abstract: "Implementation of G2RINS, a string-and-graph representation of polymers. Grammar validation, generative graph construction, and molecular ensemble generation."
 authors:
   - family-names: Zaldivar
     given-names: Gervasio
@@ -12,3 +12,31 @@ license: GPL-3.0-only
 repository-code: "https://github.com/depablolab/g2rins"
 version: 1.0.0
 date-released: "2026-08-08"
+preferred-citation:
+  type: article
+  title: "G2RINS: A Generative String-and-Graph Polymer Representation to Assist Computational Materials Discovery"
+  authors:
+    - family-names: Zaldivar
+      given-names: Gervasio
+      orcid: "https://orcid.org/0009-0006-2026-3301"
+    - family-names: Tian
+      given-names: Yuan
+      orcid: "https://orcid.org/0000-0002-7277-1408"
+    - family-names: Sun
+      given-names: Ge
+      orcid: "https://orcid.org/0009-0000-4508-0321"
+    - family-names: Kappatou
+      given-names: Chryssa
+    - family-names: Eiden
+      given-names: Philipp
+    - family-names: Wulkow
+      given-names: Niklas B.
+    - family-names: Settels
+      given-names: Volker
+    - family-names: de Pablo
+      given-names: Juan J.
+  journal: ChemRxiv
+  year: 2026
+  doi: "10.26434/chemrxiv.15007504/v1"
+  status: preprint
+  notes: "Gervasio Zaldivar and Yuan Tian contributed equally to this work."
