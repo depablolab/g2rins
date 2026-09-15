@@ -25,6 +25,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - The extra graph information returned by `get_generative_graph(return_extra_graph_info=True)` no longer includes the unused `0: "None"` entry. Zero denotes a wildcard or a flagged connector placeholder; negative entries still label non-atom graph objects.
 - Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
 - The CI, trunk and release-build workflows also run for pushes and pull requests to the `next` branch, the release-candidate line that collects reviewed changes ahead of the next release.
+- The full Linux/Windows/macOS compatibility matrix can be run on demand, through a manual workflow dispatch, on any branch that carries the trigger, so a release candidate is checked on all three platforms before it lands.
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
