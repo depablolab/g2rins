@@ -36,24 +36,33 @@ from .exception import (
     IncompatibleGenerativeGraphSchema,
     IncompleteStochasticGeneration,
     InvalidGenerationSource,
+    InvalidUnitPSmiles,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
     TooManyDiscardedChains,
     UndershootSnapshotMissed,
+    UnsupportedWildcardGeneration,
     UnvalidatedGenerationSource,
 )
 from .generative_graph import (
     _AROMATIC_NAME,
     _BOND_TYPE_NAME,
+    _CONNECTOR_PLACEHOLDER_NAME,
     _EDGE_STOCHASTIC_ID_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
+    _atomic_number,
+    _connector_placeholder_flag,
+    _is_connector_placeholder,
+    _static_neighbors,
+    _verified_unit_texts,
     derive_unit_labels,
     generative_graph_json_data,
 )
 from .nx_rdkit_mol import (
+    _ATOM_MAP_OFFSET,
     mol_graph_to_rdkit_mol,
     mol_graph_to_smiles,
     rdkit_mol_to_smiles,
@@ -532,6 +541,27 @@ class EnsembleData:
     whose endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
     ``endpoint.rsplit(".", 1)``), sorted so the same linkage always prints
     identically.
+
+    Each unit's pSMILES has one mapped star ``[*:n]`` per template bond_id.
+    Internal split-atom placeholders with no bond_id are omitted.
+
+    A sequence fragment marks its split sites, not every connection site. A
+    split site whose connection the sampler recorded carries a mapped stub
+    ``[*:n]``, whose map number identifies a sampled connection, not the
+    template bond_id used in unit pSMILES; in molecule graphs such a stub
+    carries ``is_connector_placeholder=False`` and an explicit ``connection``
+    attribute, retains the far-side ``origin_idx``, and is neutral and
+    non-aromatic with no explicit hydrogen count or sampling bookkeeping copied
+    from that atom, and its bond to the fragment is never aromatic. Any other
+    split site keeps its placeholder as an unmapped ``*`` with
+    ``is_connector_placeholder=True`` and no ``connection``, so an interior
+    split unit is not rendered as a complete small molecule.
+
+    A connection atom carrying a single descriptor has no split-atom placeholder,
+    but can still receive a mapped stub when the sampler records a connection
+    (for example, ``CO[>]`` can appear as ``CO[*:1]``). Fragment masses do not
+    sum to the chain mass, because each fragment is hydrogen-capped when read
+    in isolation. Use ``chains`` for composition and mass.
     """
 
     chains: list
@@ -716,11 +746,11 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h"}
+    _ATOM_ATTRS = {"atomic_num", _CONNECTOR_PLACEHOLDER_NAME, _AROMATIC_NAME, "charge", "num_explicit_h"}
     _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME}
     # Defaults for optional node attributes so a generative_graph built before an attribute
     # existed still yields an EnsembleCreator (required attributes stay strict).
-    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1}
+    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CONNECTOR_PLACEHOLDER_NAME: False}
 
     def __init__(self, generative_graph, static_graph, source_node, stochastic_tracker, sto_atom_id, rng, collect_info=True):
         self._atom_id = 0
@@ -845,7 +875,7 @@ class _PartialAtomGraph:
         itself if real, otherwise the real atoms reached through the phantom
         chain (never crossing back over the junction toward `exclude`)."""
         graph = self.atom_graph
-        if graph.nodes[atom_idx].get("atomic_num", 0) > 0:
+        if not _is_connector_placeholder(graph.nodes[atom_idx]):
             return [atom_idx]
         anchors = []
         seen = {atom_idx, exclude}
@@ -856,7 +886,7 @@ class _PartialAtomGraph:
                 if neighbor in seen:
                     continue
                 seen.add(neighbor)
-                if graph.nodes[neighbor].get("atomic_num", 0) > 0:
+                if not _is_connector_placeholder(graph.nodes[neighbor]):
                     anchors.append(neighbor)
                 else:
                     queue.append(neighbor)
@@ -879,7 +909,7 @@ class _PartialAtomGraph:
         template_nodes = self.generative_graph.nodes
 
         for _u, v, attr in self.generative_graph.out_edges(node_idx, data=True):
-            if attr.get("static") and template_nodes[v].get("atomic_num", 0) > 0:
+            if attr.get("static") and not _is_connector_placeholder(template_nodes[v]):
                 total_bond += attr.get("bond_type", 0)
                 if attr.get("aromatic"):
                     has_aromatic = True
@@ -1214,10 +1244,10 @@ class _PartialAtomGraph:
                         break
                 terminator_weight = 0
                 for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    atomic_number = data["atomic_num"]
-                    if atomic_number <= 0:
+                    if _is_connector_placeholder(data):
                         # Phantom placeholders carry no mass and no hydrogens.
                         continue
+                    atomic_number = data["atomic_num"]
                     occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
                     num_H = _infer_hydrogen_count(
                         atomic_number,
@@ -1469,7 +1499,7 @@ class _PartialAtomGraph:
         target_molar_amounts = [all_molar_amounts[i] for i in minus_one_indices]
 
         target_weights = []
-        for attr, idx, molar in zip(target_attr, target_idx, target_molar_amounts):
+        for attr, idx, molar in zip(target_attr, target_idx, target_molar_amounts, strict=False):
             w = float(attr[_TRANSITION_NAME])
             target_sto_gen_id = self.generative_graph.nodes[idx]["stochastic_id_tree"][0]
             if target_sto_gen_id >= 0:
@@ -1835,7 +1865,7 @@ class _PartialAtomGraph:
             # Find a transition bond
             stochastic_idx = []
             propagation_weight = []
-            for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds)):
+            for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False):
                 if half_bond.propagation_suitable:
                     # TODO carefully check if stochastic bonds have the right weight here!
                     propagation_weight += [half_bond.weight]
@@ -1993,6 +2023,30 @@ class _PartialAtomGraph:
         else:
             return None
 
+    def _add_sequence_connection_stub(self, unit, anchor, far_side):
+        """Create a neutral, non-aromatic dummy with far-side provenance.
+
+        The realized junction bond order is preserved, but its aromatic flag is
+        not: a stub is a non-ring dummy, and an aromatic bond to it cannot be
+        kekulized (AtomKekulizeException, 'non-ring atom marked aromatic').
+        """
+        source_data = self.atom_graph.nodes[far_side]
+        stub_data = {
+            "origin_idx": deepcopy(source_data["origin_idx"]),
+            "atomic_num": 0,
+            _AROMATIC_NAME: False,
+            "charge": 0,
+            "num_explicit_h": -1,
+            _CONNECTOR_PLACEHOLDER_NAME: False,
+            "connection": self.current_connection,
+        }
+        stub = "C" + str(self.current_connection)
+        stub_edge = deepcopy(self.atom_graph.edges[anchor, far_side])
+        stub_edge[_AROMATIC_NAME] = False
+        unit.add_node(stub, **stub_data)
+        unit.add_edge(anchor, stub, **stub_edge)
+        self.current_connection += 1
+
     def add_unit_to_sequence(self, last_unit):
         added_unit = deepcopy(last_unit)
         if added_unit is None:
@@ -2006,15 +2060,7 @@ class _PartialAtomGraph:
             initiator = self.sequence[0][0]
             for u, v in self.atom_graph.edges():
                 if ((u, v) not in added_unit.edges()) and (v in added_unit.nodes()):
-                    initiator.add_node("C" + str(self.current_connection))
-                    initiator.add_edge(u, "C" + str(self.current_connection))
-                    for attribute in self.atom_graph.edges[(u, v)]:
-                        initiator.edges[(u, "C" + str(self.current_connection))][attribute] = self.atom_graph.edges[(u, v)][attribute]
-                    for attribute in self.atom_graph.nodes[v]:
-                        initiator.nodes["C" + str(self.current_connection)][attribute] = self.atom_graph.nodes[v][attribute]
-                    initiator.nodes["C" + str(self.current_connection)]["atomic_num"] = 0
-                    initiator.nodes["C" + str(self.current_connection)]["connection"] = self.current_connection
-                    self.current_connection += 1
+                    self._add_sequence_connection_stub(initiator, u, v)
             return
 
         connection = None
@@ -2037,15 +2083,7 @@ class _PartialAtomGraph:
                                 self.terminal_units.append(added_unit)
                                 self.sequence[sequence_idx].append(added_unit)
                             else:
-                                unit.add_node("C" + str(self.current_connection))
-                                unit.add_edge(u, "C" + str(self.current_connection))
-                                for attribute in self.atom_graph.edges[(u, v)]:
-                                    unit.edges[(u, "C" + str(self.current_connection))][attribute] = self.atom_graph.edges[(u, v)][attribute]
-                                for attribute in self.atom_graph.nodes[v]:
-                                    unit.nodes["C" + str(self.current_connection)][attribute] = self.atom_graph.nodes[v][attribute]
-                                unit.nodes["C" + str(self.current_connection)]["atomic_num"] = 0
-                                unit.nodes["C" + str(self.current_connection)]["connection"] = self.current_connection
-                                self.current_connection += 1
+                                self._add_sequence_connection_stub(unit, u, v)
                                 self.terminal_units.append(added_unit)
                                 self.sequence.append([added_unit])
                             break
@@ -2058,10 +2096,61 @@ class _PartialAtomGraph:
 
 
 class EnsembleCreator:
+    """Generate molecules from a graph with explicit connector placeholders.
+
+    User wildcard atoms remain valid for parsing and graph export, but raise
+    UnsupportedWildcardGeneration here, before any sampling. Legacy graphs
+    containing unmarked zero-number nodes must be rebuilt from their input
+    strings or explicitly migrated with mark_legacy_connector_placeholders;
+    model-generated graphs must supply explicit flags in their
+    producer. Placeholder identity cannot be recovered from topology.
+    Python and NumPy boolean flags are accepted; NumPy flags are normalized
+    to Python booleans in the creator's copy without changing the input graph.
+    """
 
     def __init__(self, generative_graph):
 
         self._generative_graph = generative_graph.copy()
+        wildcard_nodes = []
+        placeholder_nodes = []
+        for node, data in self._generative_graph.nodes(data=True):
+            atomic_num = data["atomic_num"] = _atomic_number(node, data)
+            placeholder = _connector_placeholder_flag(node, data)
+            if _CONNECTOR_PLACEHOLDER_NAME in data:
+                data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+            if atomic_num < 0:
+                # Negative numbers label non-atom graph objects (descriptors); the
+                # sampler would otherwise fail deep inside RDKit atom construction.
+                raise IncompatibleGenerativeGraphSchema(
+                    "atomic_num",
+                    "nodes",
+                    node_id=node,
+                    reason="invalid",
+                    detail=(
+                        f"Expected a non-negative integer; received {atomic_num!r}. Negative values label non-atom "
+                        "graph objects such as bond descriptors: build the graph with include_bond_connectors=False."
+                    ),
+                )
+            if placeholder:
+                placeholder_nodes.append(node)
+            elif atomic_num == 0:
+                wildcard_nodes.append(node)
+
+        if wildcard_nodes:
+            node = wildcard_nodes[0]
+            # Unit labels can be derived for ML graphs too; source text is
+            # optional parser provenance. Preserve the node diagnostic even
+            # when malformed graph data prevents label derivation.
+            unit_id = None
+            unit_text = None
+            try:
+                labels = derive_unit_labels(self._generative_graph)
+            except (KeyError, TypeError, ValueError, AttributeError, nx.NetworkXException):
+                labels = None
+            if labels is not None:
+                unit_id = labels.unit_id.get(node)
+                unit_text = _verified_unit_texts(self._generative_graph, labels).get(unit_id)
+            raise UnsupportedWildcardGeneration(node, unit_id, unit_text)
 
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
@@ -2071,6 +2160,19 @@ class EnsembleCreator:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
 
         self._static_graph = self._create_static_graph(self.generative_graph)
+        # A placeholder is one half of a split atom. Its sole static neighbor
+        # must be real, so contraction always has an anchor in every output mode.
+        for node in placeholder_nodes:
+            neighbors = _static_neighbors(self._static_graph, node)
+            static_degree = len(neighbors)
+            if static_degree != 1:
+                detail = f"A connector placeholder must have exactly one static neighbor, its split atom; found {static_degree}."
+            else:
+                anchor = next(iter(neighbors))
+                if self._generative_graph.nodes[anchor]["atomic_num"] > 0:
+                    continue
+                detail = f"A connector placeholder's static neighbor must be a real atom; node {anchor!r} is another placeholder."
+            raise IncompatibleGenerativeGraphSchema(_CONNECTOR_PLACEHOLDER_NAME, "nodes", node_id=node, reason="invalid", detail=detail)
         self._static_proof_supported = all(u == v or self._static_graph.has_edge(v, u) for u, v in self._static_graph.edges())
 
         # The static partition: a unit is one static-connected component.
@@ -3391,6 +3493,12 @@ class EnsembleCreator:
                         pending_termination.clear()
                         break
 
+        # TODO: replace this legacy clique closure in a focused follow-up. It
+        # selects explicitly marked placeholders below but attempts to traverse
+        # them via the absent ``num`` attribute. Correct junction attributes
+        # currently depend on merge() inserting the junction edge last;
+        # reordering edges can select a static placeholder edge's attributes.
+        # Remove that ordering dependency in the bond-semantics follow-up.
         def find_non_phantom_endpoints(G, phantom_node):
 
             visited = set()
@@ -3416,7 +3524,7 @@ class EnsembleCreator:
 
             return non_phantom_endpoints, attr
 
-        phantom_nodes = [node for node, data in partial_atom_graph.atom_graph.nodes(data=True) if data.get("atomic_num") == 0]
+        phantom_nodes = [node for node, data in partial_atom_graph.atom_graph.nodes(data=True) if _is_connector_placeholder(data)]
         processed = set()
 
         for phantom_node in phantom_nodes:
@@ -3476,6 +3584,15 @@ class EnsembleCreator:
                 data["occupied_valence"] = occupied
                 partial_atom_graph.stochastic_tracker.credit_hydrogen_delta(data["owner_sto_atom_id"], delta)
 
+        # Sequence fragments are independent snapshots made before the whole
+        # molecule's phantom collapse. Normalize them once here, before any of
+        # create_ensemble's mol-graph/RDKit/SMILES conversion paths. Sequence
+        # stubs retain the far-side atom's origin_idx and are not placeholders.
+        if partial_atom_graph.sequence:
+            labels = derive_unit_labels(self._generative_graph)
+            origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
+            self._contract_sequence_phantoms(partial_atom_graph.sequence, origin_bond_id)
+
         # Only report an unavailable explicit undershoot when it survives all
         # descendant rounding and final hydrogen reconciliation. Nested
         # first-step overshoots are structural quantization that a live
@@ -3509,21 +3626,91 @@ class EnsembleCreator:
         return (partial_atom_graph.atom_graph, partial_atom_graph.units, partial_atom_graph.bonds_idx, partial_atom_graph.sequence, actual_mol_weights, distributions)
 
     @staticmethod
+    def _contract_sequence_phantoms(sequences, origin_bond_id):
+        """Omit inactive split sites and collapse sites represented by mapped stubs.
+
+        Identified internal placeholders without a template bond id cannot bond
+        and are omitted, just as in unit pSMILES, leaving room for implicit H.
+        A mapped sequence connection stub hanging from a placeholder is
+        reattached directly to that placeholder's real anchor, with the realized
+        junction edge attributes preserved, and the placeholder is dropped so the
+        site is not counted twice. An active placeholder with no such stub is the
+        only remaining marker of its split site, so it stays as an unmapped dummy:
+        removing it would render an interior fragment as a complete small
+        molecule with phantom hydrogens (a divalent carbanion as methanide).
+        """
+        for sequence in sequences:
+            for unit_graph in sequence:
+                phantom_nodes = {node for node, data in unit_graph.nodes(data=True) if _is_connector_placeholder(data) and "connection" not in data}
+                inactive_nodes = {node for node in phantom_nodes if origin_bond_id.get(unit_graph.nodes[node]["origin_idx"]) is None}
+                unit_graph.remove_nodes_from(inactive_nodes)
+                phantom_nodes.difference_update(inactive_nodes)
+                for component in list(nx.connected_components(unit_graph.subgraph(phantom_nodes))):
+                    real_anchors = set()
+                    connection_edges = []
+                    for phantom_node in component:
+                        for neighbor in list(unit_graph.neighbors(phantom_node)):
+                            if neighbor in component:
+                                continue
+                            neighbor_data = unit_graph.nodes[neighbor]
+                            if "connection" in neighbor_data:
+                                connection_edges.append((neighbor, deepcopy(unit_graph[phantom_node][neighbor])))
+                            elif _is_connector_placeholder(neighbor_data):
+                                raise RuntimeError("A sequence phantom has an unsupported boundary node. Please report this bug.")
+                            else:
+                                real_anchors.add(neighbor)
+
+                    if len(real_anchors) != 1:
+                        raise RuntimeError(f"A sequence phantom component must have exactly one real anchor, found {len(real_anchors)}. Please report this bug.")
+                    real_anchor = next(iter(real_anchors))
+                    for connection_node, edge_data in connection_edges:
+                        if unit_graph.has_edge(real_anchor, connection_node):
+                            raise RuntimeError("A sequence connection is already attached to its phantom's real anchor. Please report this bug.")
+                        unit_graph.add_edge(real_anchor, connection_node, **edge_data)
+                    if connection_edges:
+                        unit_graph.remove_nodes_from(component)
+
+    @staticmethod
     def _unit_graph_with_stars(unit_graph, origin_bond_id):
         """
-        Copy of `unit_graph` with a star atom bonded to every atom whose origin
-        is a connection atom (has a derived bond id); the star's map number is
-        that bond id, so the P-SMILES prints numbered stars ``[*:n]``.
+        Copy of `unit_graph` with one mapped star for every template bond id.
+        A split-atom phantom already is the connection star, while a real
+        connection atom receives a new star. Bond ids deliberately remain on
+        placeholder nodes in the generative graph and its JSON export. Internal
+        placeholders without a bond id cannot bond and are omitted.
         """
         star_graph = unit_graph.copy()
         for node, data in unit_graph.nodes(data=True):
             bond_id = origin_bond_id.get(data["origin_idx"])
             if bond_id is not None:
-                star_node = ("star", node)
-                # The converter renders map numbers as connection + 1.
-                star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
-                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
+                # Use the converter's offset from connection indices to maps.
+                if _is_connector_placeholder(data):
+                    star_graph.nodes[node]["connection"] = bond_id - _ATOM_MAP_OFFSET
+                else:
+                    star_node = ("star", node)
+                    star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - _ATOM_MAP_OFFSET})
+                    star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
+            elif _is_connector_placeholder(data):
+                star_graph.remove_node(node)
         return star_graph
+
+    @staticmethod
+    def _validate_unit_psmiles_mol(unit_id, star_mol, expected_maps, expected_real_atom_count):
+        """Check mapped-star IDs and degrees and the template's real-atom count."""
+        dummy_atoms = [atom for atom in star_mol.GetAtoms() if atom.GetAtomicNum() == 0]
+        actual_maps = sorted(atom.GetAtomMapNum() for atom in dummy_atoms)
+        invalid_dummy_degrees = tuple((atom.GetIdx(), atom.GetAtomMapNum(), atom.GetDegree()) for atom in dummy_atoms if atom.GetDegree() != 1)
+        actual_real_atom_count = sum(atom.GetAtomicNum() > 0 for atom in star_mol.GetAtoms())
+        expected_maps = sorted(expected_maps)
+        if actual_maps != expected_maps or invalid_dummy_degrees or actual_real_atom_count != expected_real_atom_count:
+            raise InvalidUnitPSmiles(
+                unit_id,
+                expected_maps,
+                actual_maps,
+                invalid_dummy_degrees,
+                expected_real_atom_count,
+                actual_real_atom_count,
+            )
 
     def create_ensemble(
         self,
@@ -3739,11 +3926,16 @@ class EnsembleCreator:
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
 
-        # unit_g2rins was composed against the same derivation at parse time;
-        # if the graph was mutated since, omit the texts rather than mislabel.
-        unit_g2rins = self._generative_graph.graph.get("unit_g2rins", {})
-        if not set(unit_g2rins).issubset(origin_unit_id.values()):
-            unit_g2rins = {}
+        # The public unit representation is validated against the immutable
+        # template rather than the sampled unit snapshot it renders. Besides
+        # renderer defects, this catches snapshots that lost a real atom or
+        # connection site at a merge watermark. This template-only contract
+        # could move to a pre-flight check in a future change.
+        template_nodes = self._generative_graph.nodes
+        template_unit_bond_ids = {unit_id: [labels.bond_id[node] for node in nodes if node in labels.bond_id] for unit_id, nodes in labels.unit_nodes.items()}
+        template_unit_real_atom_counts = {unit_id: sum(not _is_connector_placeholder(template_nodes[node]) for node in nodes) for unit_id, nodes in labels.unit_nodes.items()}
+
+        unit_g2rins = _verified_unit_texts(self._generative_graph, labels)
 
         canonical_units = {}
         for unit_graph, frequency in units.items():
@@ -3752,6 +3944,12 @@ class EnsembleCreator:
             # isolation).
             star_mol = mol_graph_to_rdkit_mol(self._unit_graph_with_stars(unit_graph, origin_bond_id), kekulize=False)
             unit_id = origin_unit_id[next(iter(unit_graph.nodes(data=True)))[1]["origin_idx"]]
+            self._validate_unit_psmiles_mol(
+                unit_id,
+                star_mol,
+                template_unit_bond_ids[unit_id],
+                template_unit_real_atom_counts[unit_id],
+            )
             canonical_units[unit_id] = {"psmiles": rdkit_mol_to_smiles(star_mol), "g2rins": unit_g2rins.get(unit_id, ""), "frequency": frequency}
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))
 

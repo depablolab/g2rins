@@ -3,9 +3,36 @@
 
 import pytest
 
-from g2rins.atom import Atom, BracketAtom
+from g2rins.atom import Atom, AtomSymbol, BracketAtom
+from g2rins.exception import MissingAtomSymbol, ParsingError, TooManyTokens
 from g2rins.parser import get_global_parser
 from g2rins.transformer import get_global_transformer
+
+
+@pytest.mark.parametrize("atom_class", [Atom, BracketAtom])
+def test_symbol_less_atom_is_rejected_at_construction(atom_class):
+    with pytest.raises(ParsingError, match="Missing atom symbol") as caught:
+        atom_class([])
+    assert type(caught.value) is MissingAtomSymbol
+    assert caught.value.class_name == atom_class.__name__
+    assert "Token:" not in str(caught.value)
+
+
+def test_duplicate_atom_symbols_report_the_conflicting_tokens():
+    first, second = AtomSymbol.make("C"), AtomSymbol.make("N")
+    with pytest.raises(TooManyTokens) as caught:
+        Atom([first, second])
+    assert caught.value.existing_token is first
+    assert caught.value.new_token is second
+
+
+@pytest.mark.parametrize("string", ["*", "[*]"])
+def test_wildcard_atom_preserves_symbol(string):
+    atom = Atom.make(string)
+    assert str(atom) == string
+    assert str(atom.symbol) == "*"
+    assert atom.aromatic is False
+    assert atom.charge == 0
 
 
 @pytest.mark.parametrize("string", ["B", "C", "N", "O", "S", "P", "F", "Cl", "Br", "I"])

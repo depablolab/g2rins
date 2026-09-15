@@ -27,7 +27,6 @@ from .atom import (
     HCount,
     Isotope,
 )
-from .g2rins_molecule import G2rins, G2rinsMolecule, DotGeneration, DotSystemSize
 from .bond import (
     BondConnector,
     BondConnectorGeneration,
@@ -52,8 +51,19 @@ from .distribution import (
     Uniform,
 )
 from .ensemble_creator import EnsembleCreator
-from .generative_graph import GraphCreator, UnitLabels, derive_unit_labels, generative_graph_json_data
-from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
+from .g2rins_molecule import DotGeneration, DotSystemSize, G2rins, G2rinsMolecule
+from .generative_graph import (
+    GraphCreator,
+    UnitLabels,
+    derive_unit_labels,
+    generative_graph_json_data,
+    mark_legacy_connector_placeholders,
+)
+from .nx_rdkit_mol import (
+    mol_graph_to_rdkit_mol,
+    mol_graph_to_smiles,
+    rdkit_mol_to_smiles,
+)
 from .parser import get_global_parser
 from .smiles import (
     AtomAssembly,
@@ -129,6 +139,7 @@ __all__ = [
     "UnitLabels",
     "derive_unit_labels",
     "generative_graph_json_data",
+    "mark_legacy_connector_placeholders",
     "GraphCreator",
     "EnsembleCreator",
 ]

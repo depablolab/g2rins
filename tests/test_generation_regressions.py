@@ -2192,7 +2192,7 @@ def test_create_ensemble_json_file(tmp_path):
     assert list(data) == ["string", "format", "graph", "ensemble"]
     # The string is the regenerated canonical text, not the verbatim input.
     assert data["string"].startswith("{[] [<]CC([>])c1ccccc1;")
-    assert data["format"]["version"] == 1
+    assert data["format"]["version"] == 2
     assert data["format"]["derived_node_fields"] == ["unit_id", "bond_id"]
 
     labels = g2rins.derive_unit_labels(ensemble_creator._generative_graph)
