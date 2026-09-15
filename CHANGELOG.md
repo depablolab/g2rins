@@ -32,7 +32,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
-- Exported graph and ensemble JSON is format version 2: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
+- The ensemble output format — the `ensemble` section of JSON files and `EnsembleData` — is version 2, sharing the `format.version` field with the generative-graph JSON format v2 above: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
 
 ### Removed
 
@@ -40,6 +40,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ### Fixed
 
+- Ensemble JSON files normalize NumPy values throughout the `ensemble` section (unit subgraphs, node-link chains, weights) the same way as the graph section, and refuse non-finite values before the file is written; previously a NumPy-typed node attribute made `create_ensemble(json_file=...)` fail at write time.
 - Split atoms with several connection sites now render one dummy per active site in ensemble unit pSMILES and sequence fragments, eliminating duplicate dummy atoms. Split placeholders become mapped pSMILES stars; recorded sequence stubs attach directly to the real atom and preserve the realized junction bond order. Active split sites without a recorded stub retain their unmapped `*`, including in carbanion fragments. Partnerless split sites, identified as internal placeholders without a template bond ID, are omitted from both representations so they do not consume implicit-hydrogen valence. The generative graph, JSON graph export, and DOT view retain these inactive sites without bond IDs. Completed chains and template bond records are unchanged. Sequence fragments are still hydrogen-capped in isolation, so their masses need not sum to the chain mass.
 - Unit pSMILES is validated against template map numbers, connection-star degrees, and real-atom counts before export. Inconsistent output raises `InvalidUnitPSmiles` with normalized diagnostics that survive pickling and deep copying.
 - Sequence connection stubs and their attachment bonds are non-aromatic, and stubs are neutral even when their far-side atom is charged. This prevents aromatic inter-unit bonds from producing non-ring aromatic dummy atoms that fail fragment sanitization with `AtomKekulizeException`. Stubs carry `is_connector_placeholder=False` and retain origin and connection provenance without copying sampling bookkeeping.

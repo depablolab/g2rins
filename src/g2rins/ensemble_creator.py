@@ -56,6 +56,7 @@ from .generative_graph import (
     _atomic_number,
     _connector_placeholder_flag,
     _is_connector_placeholder,
+    _json_safe,
     _static_neighbors,
     _verified_unit_texts,
     derive_unit_labels,
@@ -3939,8 +3940,11 @@ class EnsembleCreator:
                 "distributions": ensemble_distributions,
                 "sequences": [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
             }
+            # The ensemble section (unit subgraphs, node-link chains, weights) is
+            # normalized like the graph section, before the file is opened.
+            payload = _json_safe(json_data)
             with open(json_file, "w") as file_handle:
-                json.dump(json_data, file_handle, indent=2)
+                json.dump(payload, file_handle, indent=2)
 
         if ensemble_info:
             return EnsembleData(

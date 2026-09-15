@@ -1993,3 +1993,37 @@ def test_generative_graph_and_ensemble_share_node_ids():
     direct_molecule = direct.sample_mol_graph(rng=np.random.default_rng(0))
     direct_origins = {str(data["origin_idx"]) for _node, data in direct_molecule.nodes(data=True) if "origin_idx" in data}
     assert direct_origins <= {str(node) for node in generative_graph.nodes}
+
+
+def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):
+    """The ensemble section of the JSON file (unit subgraphs, node-link chains,
+    weights) is normalized like the graph section: NumPy values become JSON
+    values, and the graph in memory keeps its NumPy values."""
+    import json
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    node = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
+    generative_graph.nodes[node]["metadata"] = {"score": np.float32(0.25), "counts": np.array([1, 2], dtype=np.int16), "flag": np.bool_(True)}
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(2, output_format="mol_graph", json_file=str(path), seed=0)
+
+    data = json.loads(path.read_text())
+    stored = [node_data for unit in data["ensemble"]["units"].values() for node_data in unit["subgraph"]["nodes"] if "metadata" in node_data]
+    assert len(stored) == 1
+    assert stored[0]["metadata"] == {"score": 0.25, "counts": [1, 2], "flag": True}
+    assert [type(value) for value in stored[0]["metadata"].values()] == [float, list, bool]
+    assert isinstance(generative_graph.nodes[node]["metadata"]["score"], np.float32)
+    assert isinstance(generative_graph.nodes[node]["metadata"]["counts"], np.ndarray)
+
+
+def test_ensemble_json_refuses_non_finite_values_before_writing(tmp_path):
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    generative_graph.nodes[next(iter(generative_graph))]["metadata"] = {"score": float("nan")}
+    path = tmp_path / "ensemble.json"
+    with pytest.raises(ValueError, match="Non-finite"):
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    assert not path.exists()
