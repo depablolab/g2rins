@@ -144,7 +144,7 @@ def test_placeholder_bond_ids_and_bond_records_remain_unchanged():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
-    r0_endpoints = {endpoint for record in result.bonds for endpoint in record["between"] if endpoint.startswith("R0.")}
+    r0_endpoints = {endpoint for record in result.bonds for endpoint in record["labels"] if endpoint.startswith("R0.")}
     assert {"R0.2", "R0.3"} <= r0_endpoints
 
 
@@ -197,14 +197,14 @@ def test_generated_sequence_graphs_mark_every_connection_site():
     assert unmapped_count > 0
 
 
-@pytest.mark.parametrize("output_format", ["mol", "smiles"])
+@pytest.mark.parametrize("output_format", ["mol_graph", "smiles"])
 def test_converted_sequence_units_have_degree_one_dummies(output_format):
     result = _create_one(PEI, output_format=output_format)
     mapped_count = 0
     for chain_sequences in result.sequences:
         for sequence in chain_sequences:
             for unit in sequence:
-                mol = unit if output_format == "mol" else Chem.MolFromSmiles(unit)
+                mol = mol_graph_to_rdkit_mol(unit, kekulize=False) if output_format == "mol_graph" else Chem.MolFromSmiles(unit)
                 assert mol is not None
                 for atom in mol.GetAtoms():
                     if atom.GetAtomicNum() == 0:
@@ -292,7 +292,7 @@ def test_partnerless_connector_unit_psmiles(text, unit_id, reference):
         pytest.param(PARTNERLESS_REPEAT, "R0", "*NCC", id="partnerless-repeat"),
     ],
 )
-@pytest.mark.parametrize("output_format", ["mol_graph", "mol", "smiles"])
+@pytest.mark.parametrize("output_format", ["mol_graph", "smiles"])
 def test_partnerless_sequence_fragments_omit_inactive_sites(text, unit_id, expected_fragment, output_format):
     creator = _make_creator(text)
     labels = g2rins.derive_unit_labels(creator.generative_graph)
@@ -313,7 +313,7 @@ def test_partnerless_sequence_fragments_omit_inactive_sites(text, unit_id, expec
                         assert data["origin_idx"] in active_origins
                 mol = mol_graph_to_rdkit_mol(unit, kekulize=False)
             else:
-                mol = Chem.Mol(unit) if output_format == "mol" else _parse_with_explicit_hydrogens(unit)
+                mol = _parse_with_explicit_hydrogens(unit)
             assert mol is not None
             for atom in mol.GetAtoms():
                 if atom.GetAtomicNum() == 0:
@@ -415,7 +415,7 @@ def test_corpus_unit_psmiles_follow_template_contract(text):
         pytest.param("{[] [<]c1ccc([>])cc1[>]; [<][H]; [>][H] []}|poisson(600)|", id="aromatic-neighbor"),
     ],
 )
-@pytest.mark.parametrize("output_format", ["mol_graph", "mol", "smiles"])
+@pytest.mark.parametrize("output_format", ["mol_graph", "smiles"])
 def test_sequence_stubs_are_neutral_and_non_aromatic(text, output_format):
     creator = _make_creator(text)
     result = creator.create_ensemble(1, output_format=output_format, ensemble_info=True, seed=0)
@@ -435,7 +435,7 @@ def test_sequence_stubs_are_neutral_and_non_aromatic(text, output_format):
                         for neighbor in unit.neighbors(node):
                             assert unit[node][neighbor]["aromatic"] is False
             else:
-                mol = unit if output_format == "mol" else _parse_with_explicit_hydrogens(unit)
+                mol = _parse_with_explicit_hydrogens(unit)
                 assert mol is not None
                 # A stub bond left aromatic survives fragment-mode conversion and
                 # only fails here, on the kekulizing sanitization a caller runs.

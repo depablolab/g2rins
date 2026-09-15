@@ -529,6 +529,17 @@ class _StochasticObjectTracker:
         return unterminated_sto_atom_ids
 
 
+def _graph_aware_equal(left, right):
+    """Equality that compares graph-valued members by structure, not identity."""
+    if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
+        return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and nx.utils.graphs_equal(left, right)
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key]) for key in left)
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(_graph_aware_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 @dataclass
 class EnsembleData:
     """
@@ -577,6 +588,13 @@ class EnsembleData:
     sequences: list
     mol_weights: dict
     distributions: dict
+
+    def __eq__(self, other):
+        # Unit subgraphs (and molecule-graph chains or sequences) are graph
+        # objects; two ensembles with the same content compare equal.
+        if not isinstance(other, EnsembleData):
+            return NotImplemented
+        return all(_graph_aware_equal(getattr(self, name), getattr(other, name)) for name in ("chains", "units", "bonds", "sequences", "mol_weights", "distributions"))
 
 
 def _bond_endpoint_sort_key(endpoint):
@@ -1973,7 +1991,8 @@ class EnsembleCreator:
     model-generated graphs must supply explicit flags in their
     producer. Placeholder identity cannot be recovered from topology.
     Python and NumPy boolean flags are accepted; NumPy flags are normalized
-    to Python booleans in the creator's copy without changing the input graph.
+    to Python booleans in the creator's copy without changing the input graph,
+    and a flag omitted on a real atom is filled in as False there.
     """
 
     def __init__(self, generative_graph):
@@ -1983,9 +2002,10 @@ class EnsembleCreator:
         placeholder_nodes = []
         for node, data in self._generative_graph.nodes(data=True):
             atomic_num = data["atomic_num"] = _atomic_number(node, data)
+            # The copy carries the flag on every node: a legacy graph that omits
+            # it on a real atom means False, so unit subgraphs stay uniform.
             placeholder = _connector_placeholder_flag(node, data)
-            if _CONNECTOR_PLACEHOLDER_NAME in data:
-                data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+            data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
             if atomic_num < 0:
                 # Negative numbers label non-atom graph objects (descriptors); the
                 # sampler would otherwise fail deep inside RDKit atom construction.

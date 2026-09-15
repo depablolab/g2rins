@@ -263,6 +263,9 @@ def test_legacy_placeholder_migration_is_explicit_and_preserves_generation():
     payload = g2rins.generative_graph_json_data(migrated)
     assert payload["format"]["version"] == 2
     restored = nx.node_link_graph(json.loads(json.dumps(payload))["graph"], edges="edges")
+    # The export injects derived labels onto the nodes; unit subgraphs copy the
+    # template nodes verbatim, so strip them as a consumer would before use.
+    restored = _without_derived_labels(restored, payload["format"]["derived_node_fields"])
     actual = g2rins.EnsembleCreator(restored).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
     for info in expected.units.values():
         info["g2rins"] = ""  # The legacy dataset has no parser provenance.
