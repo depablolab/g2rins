@@ -561,7 +561,7 @@ def _graph_aware_equal(left, right):
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key]) for key in left)
     if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
-        return len(left) == len(right) and all(_graph_aware_equal(a, b) for a, b in zip(left, right))
+        return len(left) == len(right) and all(_graph_aware_equal(a, b) for a, b in zip(left, right, strict=True))
     return left == right
 
 

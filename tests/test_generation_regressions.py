@@ -1932,7 +1932,7 @@ def test_create_ensemble_json_file(tmp_path):
 
     for record in ensemble["bonds"]:
         assert list(record) == ["labels", "nodes", "count"] and record["count"] > 0
-        for endpoint, node_id in zip(record["labels"], record["nodes"]):
+        for endpoint, node_id in zip(record["labels"], record["nodes"], strict=True):
             unit_id, bond_id = endpoint.rsplit(".", 1)
             assert unit_id in ensemble["units"] and int(bond_id) >= 1
             # nodes are aligned with labels: both name the same connection atom.
@@ -1962,7 +1962,7 @@ def test_create_ensemble_json_file_mol_graph_chains(tmp_path):
     assert data["format"]["chain_format"] == "mol_graph"
     stored_chains = data["ensemble"]["chains"]
     assert len(stored_chains) == 2
-    for chain_data, chain_graph in zip(stored_chains, chains):
+    for chain_data, chain_graph in zip(stored_chains, chains, strict=True):
         restored = nx.node_link_graph(chain_data, edges="edges")
         assert restored.number_of_nodes() == chain_graph.number_of_nodes()
         assert restored.number_of_edges() == chain_graph.number_of_edges()
@@ -2047,7 +2047,7 @@ def test_bond_record_nodes_are_template_node_keys():
         result = g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
     assert result.bonds
     for record in result.bonds:
-        for label, node in zip(record["labels"], record["nodes"]):
+        for label, node in zip(record["labels"], record["nodes"], strict=True):
             assert node in generative_graph
             assert label == f"{labels.unit_id[node]}.{labels.bond_id[node]}"
     assert any(42 in record["nodes"] for record in result.bonds)
