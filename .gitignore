@@ -149,3 +149,17 @@ local/
 .claudeignore
 .mcp.json
 CLAUDE.md
+# Added by code-review-graph
+.code-review-graph/
+.codebuddy/
+.gemini/
+.kiro/
+.qoder/
+.cursorrules
+.windsurfrules
+opencode.jsonc
+AGENTS.md
+CODEBUDDY.md
+GEMINI.md
+QODER.md
+.github/code-review-graph.instruction.md
