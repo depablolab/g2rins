@@ -1183,24 +1183,7 @@ class _PartialAtomGraph:
         estimator_rng = copy.deepcopy(rng)
 
         def _get_terminator_atom_graph(source):
-            stochastic_object_tracker = _StochasticObjectTracker(
-                self.generative_graph,
-                estimator_rng,
-                path_is_conditional=self.stochastic_tracker.path_is_conditional,
-                zero_support_is_unavoidable=(self.stochastic_tracker.zero_support_is_unavoidable),
-            )
-            source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
-            term_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
-            terminator_atom_graph = _PartialAtomGraph(
-                self.generative_graph,
-                static_graph,
-                source,
-                stochastic_object_tracker,
-                term_sto_atom_id,
-                estimator_rng,
-            )
-            del stochastic_object_tracker
-            return terminator_atom_graph
+            return self._observational_fragment(source, static_graph, estimator_rng)
 
         # Price the same custody set the terminate/cap passes fire from: the
         # owner's bucket plus its terminated descendants'. A cap held in a
@@ -1249,42 +1232,124 @@ class _PartialAtomGraph:
                 # existing endpoint sheds and, for split-dummy connectors, by
                 # charging the attach order to the massless dummy instead of
                 # its real anchors (so their hydrogens stayed uncounted).
-                extra_occupied = {}
-                for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    if data["origin_idx"] == str(node_id):
-                        for anchor in terminator_atom_graph._real_anchors(frag_node, exclude=None):
-                            extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
-                        break
-                terminator_weight = 0
-                for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    if _is_connector_placeholder(data):
-                        # Phantom placeholders carry no mass and no hydrogens.
-                        continue
-                    atomic_number = data["atomic_num"]
-                    occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
-                    num_H = _infer_hydrogen_count(
-                        atomic_number,
-                        data.get("charge", 0),
-                        occupied,
-                        data.get("num_explicit_h", -1),
-                        data.get(_AROMATIC_NAME, False),
-                    )
-                    terminator_weight += atomic_masses[atomic_number] + num_H * atomic_masses.get(1)
+                terminator_weight = self._fragment_gross_mw(terminator_atom_graph, node_id, attach_order)
                 if attach_order not in source_delta_by_order:
-                    delta = 0.0
-                    for anchor in self._real_anchors(termination_bond.atom_idx, exclude=None):
-                        anchor_data = self.atom_graph.nodes[anchor]
-                        new_h = _infer_hydrogen_count(
-                            anchor_data["atomic_num"],
-                            anchor_data["charge"],
-                            anchor_data["occupied_valence"] + attach_order,
-                            anchor_data.get("num_explicit_h", -1),
-                            anchor_data.get(_AROMATIC_NAME, False),
-                        )
-                        delta += (new_h - anchor_data["credited_h"]) * atomic_masses.get(1)
-                    source_delta_by_order[attach_order] = delta
+                    source_delta_by_order[attach_order] = self._source_attach_delta(termination_bond.atom_idx, attach_order)
                 avg_termination_mw += target_prob[i] * (terminator_weight + source_delta_by_order[attach_order])
         return avg_termination_mw
+
+    def _observational_fragment(self, source, static_graph, estimator_rng):
+        """Build the static fragment that starts at ``source`` under a throwaway tracker, so an
+        estimate can read its atoms without touching the sample's tracker or RNG stream."""
+        stochastic_object_tracker = _StochasticObjectTracker(
+            self.generative_graph,
+            estimator_rng,
+            path_is_conditional=self.stochastic_tracker.path_is_conditional,
+            zero_support_is_unavoidable=(self.stochastic_tracker.zero_support_is_unavoidable),
+        )
+        source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
+        fragment_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
+        return _PartialAtomGraph(self.generative_graph, static_graph, source, stochastic_object_tracker, fragment_sto_atom_id, estimator_rng)
+
+    def _fragment_gross_mw(self, fragment, target_node, attach_order):
+        """Mass ``fragment`` adds when attached at ``target_node`` with a bond of ``attach_order``:
+        atoms plus inferred hydrogens, the attach order charged to the target's real anchors
+        (never to a massless split dummy). Placeholders carry no mass and no hydrogens."""
+        extra_occupied = {}
+        for frag_node, data in fragment.atom_graph.nodes(data=True):
+            if data["origin_idx"] == str(target_node):
+                for anchor in fragment._real_anchors(frag_node, exclude=None):
+                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
+                break
+        gross = 0.0
+        for frag_node, data in fragment.atom_graph.nodes(data=True):
+            if _is_connector_placeholder(data):
+                continue
+            atomic_number = data["atomic_num"]
+            occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
+            num_H = _infer_hydrogen_count(
+                atomic_number,
+                data.get("charge", 0),
+                occupied,
+                data.get("num_explicit_h", -1),
+                data.get(_AROMATIC_NAME, False),
+            )
+            gross += atomic_masses[atomic_number] + num_H * atomic_masses.get(1)
+        return gross
+
+    def _source_attach_delta(self, source_atom_idx, attach_order):
+        """Net hydrogen mass the existing endpoint ``source_atom_idx`` sheds when a bond of
+        ``attach_order`` is added to it (its real anchors, for a split dummy)."""
+        delta = 0.0
+        for anchor in self._real_anchors(source_atom_idx, exclude=None):
+            anchor_data = self.atom_graph.nodes[anchor]
+            new_h = _infer_hydrogen_count(
+                anchor_data["atomic_num"],
+                anchor_data["charge"],
+                anchor_data["occupied_valence"] + attach_order,
+                anchor_data.get("num_explicit_h", -1),
+                anchor_data.get(_AROMATIC_NAME, False),
+            )
+            delta += (new_h - anchor_data["credited_h"]) * atomic_masses.get(1)
+        return delta
+
+    def _forced_exit_pending_mw(self, sto_atom_id, static_graph, rng):
+        """Mass the live instance ``sto_atom_id`` still owes through its forced exits.
+
+        For a literal tail this is the net attach mass of the fragment (as the cap estimate
+        prices an end group); for a join into a sibling object it is that object's expected
+        mass plus what the object will owe through its own exits, since the object does not
+        exist yet. The receiving ancestor's projection counts it while the exit is unfired;
+        the fire credits the realized mass through the ordinary merge path and consumes the
+        bond, so nothing is counted twice. Observational: the sample's tracker and RNG stream
+        are untouched. Scans the same custody set the fire does.
+        """
+        estimator_rng = copy.deepcopy(rng)
+        pending = 0.0
+        for bucket_id in self._custody_bucket_ids(sto_atom_id):
+            for half_bond in self._open_half_bond_map.get(bucket_id, []):
+                all_attr, all_idx, _all_molar = half_bond.get_mode_bonds(_TRANSITION_NAME)
+                indices = [i for i, attr in enumerate(all_attr) if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT]
+                if not indices:
+                    continue
+                weights = np.asarray([all_attr[i][_TRANSITION_NAME] for i in indices], dtype=float)
+                probabilities = weights / weights.sum()
+                source_tree = self.generative_graph.nodes[half_bond.node_idx]["stochastic_id_tree"]
+                for probability, i in zip(probabilities, indices, strict=True):
+                    pending += probability * self._forced_exit_mw(all_idx[i], all_attr[i], source_tree, half_bond.atom_idx, static_graph, estimator_rng)
+        return pending
+
+    def _forced_exit_mw(self, target_idx, attr, source_tree, source_atom_idx, static_graph, estimator_rng):
+        target_gen_id = self.generative_graph.nodes[target_idx]["stochastic_id_tree"][0]
+        attach_order = attr.get(_BOND_TYPE_NAME, 1)
+        if target_gen_id in source_tree[1:]:
+            # A literal tail in an enclosing unit's text. Without a realized source atom (the
+            # static estimate for an object that does not exist yet) the endpoint sheds one
+            # hydrogen per bond order.
+            cache = self.__dict__.setdefault("_fragment_gross_mw_cache", {})
+            key = (target_idx, attach_order)
+            if key not in cache:
+                cache[key] = self._fragment_gross_mw(self._observational_fragment(target_idx, static_graph, estimator_rng), target_idx, attach_order)
+            source_delta = self._source_attach_delta(source_atom_idx, attach_order) if source_atom_idx is not None else -attach_order * atomic_masses.get(1)
+            return cache[key] + source_delta
+        # A join into a sibling object: its whole expected mass, and what it owes in turn.
+        return self.stochastic_tracker._sto_gen_id_distribution[target_gen_id].mean_mw() + self._static_pending_exit_mw(target_gen_id, static_graph, estimator_rng)
+
+    def _static_pending_exit_mw(self, gen_id, static_graph, estimator_rng):
+        """What an instance of stochastic object ``gen_id`` will owe through its own forced
+        exits, read from the graph alone: one exit per distinct target (every unit of the object
+        carries the same exit edge; the instance fires it once)."""
+        cache = self.__dict__.setdefault("_static_pending_exit_mw_cache", {})
+        if gen_id not in cache:
+            cache[gen_id] = 0.0  # a join cycle cannot exist; this only guards the recursion
+            seen, pending = set(), 0.0
+            for u, v, attr in self.generative_graph.edges(data=True):
+                if attr.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT or self.generative_graph.nodes[u]["stochastic_id_tree"][0] != gen_id or v in seen:
+                    continue
+                seen.add(v)
+                pending += self._forced_exit_mw(v, attr, self.generative_graph.nodes[u]["stochastic_id_tree"], None, static_graph, estimator_rng)
+            cache[gen_id] = pending
+        return cache[gen_id]
 
     def get_average_termination_mw(self, sto_atom_id, static_graph, rng):
         return self._get_average_level_termination_mw(
@@ -3114,7 +3179,7 @@ class EnsembleCreator:
             # rounding boundary, systematically biasing small nested objects.
             return expected - tracker._sto_atom_id_actual_molw[sto_atom_id]
 
-        def _projected_molw(tracker, live_ids, sto_atom_id):
+        def _projected_molw(graph, tracker, live_ids, sto_atom_id):
             """Projected final tracked mass of sto_atom_id EXCLUDING its own
             termination caps (callers add the fresh/cached cap estimate).
 
@@ -3129,7 +3194,9 @@ class EnsembleCreator:
             live_set = set(live_ids)
             projected = tracker._sto_atom_id_actual_molw[sto_atom_id]
             for child in _live_forest_children(tracker, live_ids, live_set, sto_atom_id):
-                projected += _remaining_credit(tracker, child)
+                # A child's own target excludes what it owes upward through forced exits (a
+                # literal tail lands in this instance, a joined sibling registers under it).
+                projected += _remaining_credit(tracker, child) + graph._forced_exit_pending_mw(child, self._static_graph, rng)
             return projected
 
         def _total_termination_mw(
@@ -3348,6 +3415,7 @@ class EnsembleCreator:
             proj_now = {}
             for sto_atom_id in growable:
                 projected = _projected_molw(
+                    partial_atom_graph,
                     tracker,
                     unterminated_sto_atom_ids,
                     sto_atom_id,
@@ -3421,6 +3489,7 @@ class EnsembleCreator:
                         )
                         projected_under = (
                             _projected_molw(
+                                snapshot_graph,
                                 snapshot_tracker,
                                 snapshot_live_ids,
                                 crossing_sto_atom_id,

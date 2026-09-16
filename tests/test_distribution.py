@@ -248,3 +248,22 @@ def test_poisson(M, rng):
     serial_vector = poisson.get_serial_vector()
     new_instance = g2rins.StochasticDistribution.from_serial_vector(serial_vector)
     assert str(new_instance) == str(poisson)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("poisson(80)", 80.0),
+        ("gauss(1000, 45)", 1000.0),
+        ("uniform(500, 600)", 550.0),
+        ("schulz_zimm(1200, 1000)", 1000.0),
+        ("log_normal(1000, 1.5)", 1000.0),
+    ],
+)
+def test_mean_mw_is_the_distribution_mean(text, expected):
+    assert g2rins.StochasticDistribution.make(text).mean_mw() == pytest.approx(expected)
+
+
+def test_mean_mw_of_flory_schulz_is_finite_and_positive():
+    mean = g2rins.StochasticDistribution.make("flory_schulz(0.01)").mean_mw()
+    assert mean > 0 and mean < float("inf")

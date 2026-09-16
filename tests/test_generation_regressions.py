@@ -2358,3 +2358,73 @@ def test_forced_exit_is_never_drawn_and_fires_at_finalization():
     owner = parents[-1]
     assert not tracker.is_terminated(owner)
     assert partial.fire_forced_exits(sto_atom_id, rng) == 0
+
+
+# --- forced exits are priced into the receiving instance's projection ------------------------------
+
+
+def _child_instance_of(text, atomic_num):
+    """A registered instance of the nested object holding the first atom with ``atomic_num``."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == atomic_num)
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    return ensemble_creator, partial, tracker, sto_atom_id, parents, rng
+
+
+def test_forced_exit_pending_mass_equals_the_realized_credit():
+    """The pending mass of a literal tail is exactly what the fire credits the
+    receiving instance: the fragment's atoms and hydrogens, minus the hydrogen
+    the source endpoint sheds."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    ensemble_creator, partial, tracker, sto_atom_id, parents, rng = _child_instance_of(text, 7)
+    owner = parents[-1]
+    pending = partial._forced_exit_pending_mw(sto_atom_id, ensemble_creator._static_graph, rng)
+    assert pending == pytest.approx(79.904 - 1.008, abs=0.01)
+    before = tracker._sto_atom_id_actual_molw[owner]
+    tracker.terminate(sto_atom_id)
+    assert partial.fire_forced_exits(sto_atom_id, rng) == 1
+    assert tracker._sto_atom_id_actual_molw[owner] - before == pytest.approx(pending, abs=1e-6)
+    assert partial._forced_exit_pending_mw(sto_atom_id, ensemble_creator._static_graph, rng) == 0.0
+
+
+def test_series_join_is_priced_as_the_joined_object_and_its_own_tail():
+    """A join owes the joined object's expected mass plus what that object owes
+    in turn (its tail), read from the graph since the object does not exist yet."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    ensemble_creator, partial, tracker, sto_atom_id, _parents, rng = _child_instance_of(text, 7)
+    pending = partial._forced_exit_pending_mw(sto_atom_id, ensemble_creator._static_graph, rng)
+    assert pending == pytest.approx(80.0 + (79.904 - 1.008), abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", id="two-blocks-per-unit"),
+        pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", id="series-blocks"),
+        pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CCS[>1])C[>]; C[>]; [<][H], [<1][H] []}|poisson(2000)|", id="tail-with-port"),
+    ],
+)
+def test_forced_exit_mass_keeps_the_owner_on_target(text):
+    """With every tail delivered, an unpriced tail would bias the owner above
+    its target (measured +4.4 % and +4.5 % on the first two strings); priced,
+    the mean realized mass stays within the usual few-percent band."""
+    from rdkit.Chem import Descriptors
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+        masses = []
+        for seed in range(40):
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+            masses.append(Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(mol_graph)))
+    mean = sum(masses) / len(masses)
+    assert abs(mean - 2000.0) / 2000.0 < 0.025, f"mean realized mass {mean:.1f} for a 2000 target"

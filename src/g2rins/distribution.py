@@ -116,6 +116,13 @@ class StochasticDistribution(StochasticGeneration):
         """
         super().__init__(children)
 
+    def mean_mw(self) -> float:
+        """Expected molecular weight of the distribution: prices mass that is owed but not yet
+        drawn, such as a nested stochastic object joined to one that is finishing."""
+        if self._distribution is None:
+            raise NotImplementedError
+        return float(self._distribution.mean())
+
     def __bool__(self) -> bool:
         """
         Returns True if a statistical distribution is associated with this object.
@@ -191,11 +198,7 @@ class StochasticDistribution(StochasticGeneration):
         def empty_support() -> EmptyTruncatedDistributionSupport:
             return EmptyTruncatedDistributionSupport(type(self).__name__, requested_lower, requested_upper)
 
-        if (
-            math.isnan(requested_lower)
-            or math.isnan(requested_upper)
-            or requested_lower > requested_upper
-        ):
+        if math.isnan(requested_lower) or math.isnan(requested_upper) or requested_lower > requested_upper:
             raise empty_support()
 
         # Molecular weights live on [0, +inf). Intersect before sampling so a
@@ -219,9 +222,7 @@ class StochasticDistribution(StochasticGeneration):
             raise empty_support()
 
         try:
-            support_lower, support_upper = (
-                float(value) for value in distribution.support(**kwargs)
-            )
+            support_lower, support_upper = (float(value) for value in distribution.support(**kwargs))
         except (TypeError, ValueError, OverflowError) as error:
             raise RuntimeError(f"Could not determine support for {type(self).__name__}") from error
         if math.isnan(support_lower) or math.isnan(support_upper):
@@ -233,16 +234,10 @@ class StochasticDistribution(StochasticGeneration):
             raise empty_support()
 
         if is_discrete:
-            return self._draw_bounded_discrete(
-                distribution, rng, interval_lower, interval_upper, empty_support, kwargs
-            )
-        return self._draw_bounded_continuous(
-            distribution, rng, interval_lower, interval_upper, empty_support, kwargs
-        )
+            return self._draw_bounded_discrete(distribution, rng, interval_lower, interval_upper, empty_support, kwargs)
+        return self._draw_bounded_continuous(distribution, rng, interval_lower, interval_upper, empty_support, kwargs)
 
-    def _draw_bounded_discrete(
-        self, distribution, rng, interval_lower, interval_upper, empty_support, kwargs
-    ) -> float:
+    def _draw_bounded_discrete(self, distribution, rng, interval_lower, interval_upper, empty_support, kwargs) -> float:
         """Sample an inclusive integer interval using log-CDF/log-SF search."""
         lower_integer = math.ceil(interval_lower)
         upper_integer = None if interval_upper == math.inf else math.floor(interval_upper)
@@ -284,14 +279,10 @@ class StochasticDistribution(StochasticGeneration):
 
         unit_draw = _open_unit_draw(rng)
         if use_survival:
-            log_probability = float(
-                np.logaddexp(log_sf_upper, math.log(unit_draw) + log_sf_mass)
-            )
+            log_probability = float(np.logaddexp(log_sf_upper, math.log(unit_draw) + log_sf_mass))
             boundary_log_probability = log_sf_before
         else:
-            log_probability = float(
-                np.logaddexp(log_cdf_before, math.log(unit_draw) + log_cdf_mass)
-            )
+            log_probability = float(np.logaddexp(log_cdf_before, math.log(unit_draw) + log_cdf_mass))
             boundary_log_probability = log_cdf_before
 
         sample_integer = _discrete_inverse(
@@ -307,18 +298,14 @@ class StochasticDistribution(StochasticGeneration):
             raise RuntimeError("Discrete truncated-distribution inverse escaped its interval")
         return float(sample_integer)
 
-    def _draw_bounded_discrete_logpmf(
-        self, distribution, rng, lower_integer, upper_integer, empty_support, kwargs
-    ) -> float:
+    def _draw_bounded_discrete_logpmf(self, distribution, rng, lower_integer, upper_integer, empty_support, kwargs) -> float:
         """Sample a finite discrete interval whose cumulative tails underflow."""
         if upper_integer is not None:
             count = upper_integer - lower_integer + 1
             if count <= 0:
                 raise empty_support()
             if count > 1_000_000:
-                raise RuntimeError(
-                    "A numerically underflowed discrete interval is too wide for per-value inversion"
-                )
+                raise RuntimeError("A numerically underflowed discrete interval is too wide for per-value inversion")
             values = np.arange(lower_integer, upper_integer + 1, dtype=np.int64)
             log_weights = np.asarray(distribution.logpmf(values, **kwargs), dtype=float)
         else:
@@ -343,9 +330,7 @@ class StochasticDistribution(StochasticGeneration):
                     if (decreasing and negligible) or ended:
                         break
                 if count >= 1_000_000:
-                    raise RuntimeError(
-                        "Could not bracket a numerically underflowed one-sided discrete tail"
-                    )
+                    raise RuntimeError("Could not bracket a numerically underflowed one-sided discrete tail")
                 count = min(2 * count, 1_000_000)
 
         if np.isnan(log_weights).any() or np.isposinf(log_weights).any():
@@ -363,9 +348,7 @@ class StochasticDistribution(StochasticGeneration):
         index = int(rng.choice(values.size, p=weights))
         return float(values[index])
 
-    def _draw_bounded_continuous(
-        self, distribution, rng, interval_lower, interval_upper, empty_support, kwargs
-    ) -> float:
+    def _draw_bounded_continuous(self, distribution, rng, interval_lower, interval_upper, empty_support, kwargs) -> float:
         """Sample a continuous interval, choosing its stable probability tail."""
         log_cdf_lower = float(distribution.logcdf(interval_lower, **kwargs))
         log_cdf_upper = float(distribution.logcdf(interval_upper, **kwargs))
@@ -389,9 +372,7 @@ class StochasticDistribution(StochasticGeneration):
 
         unit_draw = _open_unit_draw(rng)
         if use_survival:
-            log_probability = float(
-                np.logaddexp(log_sf_upper, math.log(unit_draw) + log_sf_mass)
-            )
+            log_probability = float(np.logaddexp(log_sf_upper, math.log(unit_draw) + log_sf_mass))
             probability = float(math.exp(log_probability))
             probability = min(
                 max(probability, np.nextafter(0.0, 1.0)),
@@ -399,9 +380,7 @@ class StochasticDistribution(StochasticGeneration):
             )
             sample_mw = float(distribution.isf(probability, **kwargs))
         else:
-            log_probability = float(
-                np.logaddexp(log_cdf_lower, math.log(unit_draw) + log_cdf_mass)
-            )
+            log_probability = float(np.logaddexp(log_cdf_lower, math.log(unit_draw) + log_cdf_mass))
             probability = float(math.exp(log_probability))
             probability = min(
                 max(probability, np.nextafter(0.0, 1.0)),
@@ -419,10 +398,7 @@ class StochasticDistribution(StochasticGeneration):
             if interval_lower - tolerance <= sample_mw <= interval_upper + tolerance:
                 sample_mw = min(max(sample_mw, interval_lower), interval_upper)
             else:
-                raise RuntimeError(
-                    f"{type(self).__name__} returned truncated quantile {sample_mw:g} "
-                    f"outside [{interval_lower:g}, {interval_upper:g}]"
-                )
+                raise RuntimeError(f"{type(self).__name__} returned truncated quantile {sample_mw:g} " f"outside [{interval_lower:g}, {interval_upper:g}]")
         return sample_mw
 
     def prob_mw(self, mw: Union[float, "RememberAdd"], **kwargs: Any) -> float:
@@ -594,9 +570,7 @@ class FlorySchulz(StochasticDistribution):
             finite_k = np.where(np.isfinite(k), k, 0.0)
             tail_k = np.maximum(np.floor(finite_k), 0)
             log_tail = tail_k * np.log1p(-fls_a) + np.log1p(fls_a * tail_k)
-            return np.where(
-                np.isposinf(k), -math.inf, np.where(np.isneginf(k), 0.0, log_tail)
-            )
+            return np.where(np.isposinf(k), -math.inf, np.where(np.isneginf(k), 0.0, log_tail))
 
     _fls_a: Optional[float] = None
 
@@ -809,6 +783,9 @@ class SchulzZimm(StochasticDistribution):
         """
         return super().prob_mw(mw)
 
+    def mean_mw(self) -> float:
+        return float(self._Mn)
+
 
 StochasticDistribution._known_distributions.append(SchulzZimm)
 
@@ -910,6 +887,9 @@ class Gauss(StochasticDistribution):
             return 1.0
         return super().prob_mw(mw)
 
+    def mean_mw(self) -> float:
+        return float(self._mu)
+
 
 StochasticDistribution._known_distributions.append(Gauss)
 
@@ -993,6 +973,9 @@ class Uniform(StochasticDistribution):
         """
         return self._distribution is not None
 
+    def mean_mw(self) -> float:
+        return float(self._low + self._high) / 2.0
+
 
 StochasticDistribution._known_distributions.append(Uniform)
 
@@ -1040,11 +1023,7 @@ class LogNormal(StochasticDistribution):
 
         def _ppf(self, q, Mn, D):
             standard_normal = special.ndtri(q)
-            log_m = (
-                standard_normal * np.sqrt(np.log(D))
-                - np.log(D) / 2
-                + np.log(Mn)
-            )
+            log_m = standard_normal * np.sqrt(np.log(D)) - np.log(D) / 2 + np.log(Mn)
             return np.exp(log_m)
 
         def _isf(self, q, Mn, D):
@@ -1149,6 +1128,9 @@ class LogNormal(StochasticDistribution):
         """
         return super().prob_mw(mw, Mn=self._M, D=self._D)
 
+    def mean_mw(self) -> float:
+        return float(self._M)
+
 
 StochasticDistribution._known_distributions.append(LogNormal)
 
@@ -1229,6 +1211,9 @@ class Poisson(StochasticDistribution):
         Returns True if the distribution is initialized (i.e., N is set).
         """
         return self._distribution is not None
+
+    def mean_mw(self) -> float:
+        return float(self._N)
 
 
 StochasticDistribution._known_distributions.append(Poisson)
