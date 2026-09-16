@@ -2211,3 +2211,39 @@ def test_ensemble_equality_is_reflexive_and_boolean():
         assert (left == right) is False
         assert (left != right) is True
     assert scalar == ensemble(np.float64(2.0))
+
+
+def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
+    """Metadata that generation and the JSON export accept must compare
+    without raising: object arrays compare element-wise (their elements may
+    hold arrays), and structured NumPy data compares only with structured
+    data of the same dtype, so a record never meets a plain float inside a
+    NumPy comparison."""
+    import copy
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    objects = np.empty(1, dtype=object)
+    objects[0] = {"vector": np.array([1, 2])}
+    other_objects = np.empty(1, dtype=object)
+    other_objects[0] = {"vector": np.array([1, 3])}
+    result = ensemble(objects)
+    assert result == copy.deepcopy(result)
+    assert result == ensemble(copy.deepcopy(objects))
+    assert result != ensemble(other_objects)
+
+    record = np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")])[0]
+    same_record = np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")])[0]
+    structured, plain = ensemble(record), ensemble(2.0)
+    assert (structured == plain) is False
+    assert (plain == structured) is False
+    assert structured == ensemble(same_record)
