@@ -1927,7 +1927,17 @@ def test_create_ensemble_json_file(tmp_path):
         subgraph_ids = {node_dict["id"] for node_dict in info["subgraph"]["nodes"]}
         assert subgraph_ids == {node for node, uid in labels.unit_id.items() if uid == unit_id}
         assert all(node_dict["unit_id"] == unit_id and "bond_id" not in node_dict for node_dict in info["subgraph"]["nodes"])
-        assert all(edge["static"] for edge in info["subgraph"]["edges"])
+        # Exactly the template's static edges among the unit's nodes, with
+        # their keys and data, and the template's node data plus unit_id.
+        template = ensemble_creator._generative_graph
+        expected_edges = {(u, v, key): data for u, v, key, data in template.edges(keys=True, data=True) if u in subgraph_ids and v in subgraph_ids and data["static"]}
+        stored_edges = {(edge["source"], edge["target"], edge["key"]): edge for edge in info["subgraph"]["edges"]}
+        assert set(stored_edges) == set(expected_edges)
+        assert expected_edges or len(subgraph_ids) == 1
+        for edge_key, expected in expected_edges.items():
+            assert {name: value for name, value in stored_edges[edge_key].items() if name not in ("source", "target", "key")} == expected
+        for node_dict in info["subgraph"]["nodes"]:
+            assert {name: value for name, value in node_dict.items() if name != "id"} == {**template.nodes[node_dict["id"]], "unit_id": unit_id}
     assert "[*:2]" in ensemble["units"]["R0"]["psmiles"], "repeat unit carries two numbered stars"
 
     for record in ensemble["bonds"]:
@@ -2019,14 +2029,114 @@ def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path)
     assert isinstance(generative_graph.nodes[node]["metadata"]["counts"], np.ndarray)
 
 
-def test_ensemble_json_refuses_non_finite_values_before_writing(tmp_path):
+def test_ensemble_json_refuses_non_finite_values_in_the_ensemble_section(tmp_path, monkeypatch):
+    """A non-finite value that reaches the file only through the ensemble
+    section (here a unit subgraph) is refused before the file is opened. The
+    graph section is replaced by a clean export so it cannot reject first."""
+    import copy
+
+    import g2rins.ensemble_creator as ensemble_creator_module
+
     smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
     generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    clean_export = g2rins.generative_graph_json_data(generative_graph)
     generative_graph.nodes[next(iter(generative_graph))]["metadata"] = {"score": float("nan")}
+    monkeypatch.setattr(ensemble_creator_module, "generative_graph_json_data", lambda graph: copy.deepcopy(clean_export))
     path = tmp_path / "ensemble.json"
-    with pytest.raises(ValueError, match="Non-finite"):
+    with pytest.raises(ValueError, match=r"Non-finite JSON value at \$\['ensemble'\]"):
         g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
     assert not path.exists()
+
+
+def test_ensemble_from_reloaded_graph_carries_no_stale_derived_fields():
+    """A template loaded back from an export carries the injected unit_id and
+    bond_id as node attributes. The creator drops them, so unit subgraphs
+    carry the current unit_id only and bond records follow the current
+    derivation, even when the reloaded node order renumbers the labels; a
+    reload in the exported order reproduces the original ensemble."""
+    import json
+
+    import networkx as nx
+
+    text = "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    payload = json.loads(json.dumps(g2rins.generative_graph_json_data(generative_graph)))
+    restored = nx.node_link_graph(payload["graph"], edges="edges")
+    payload["graph"]["nodes"].reverse()
+    reordered = nx.node_link_graph(payload["graph"], edges="edges")
+    assert all("unit_id" in data for _node, data in restored.nodes(data=True))
+    reordered_labels = g2rins.derive_unit_labels(reordered)
+    # The reversed order renumbers connection sites, so stale bond ids conflict.
+    assert any(data["bond_id"] != reordered_labels.bond_id.get(node) for node, data in reordered.nodes(data=True) if "bond_id" in data)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        expected = g2rins.EnsembleCreator(generative_graph).create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+        actual = g2rins.EnsembleCreator(restored).create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+        actual_reordered = g2rins.EnsembleCreator(reordered).create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+    for result, graph in ((actual, restored), (actual_reordered, reordered)):
+        labels = g2rins.derive_unit_labels(graph)
+        for unit_id, info in result.units.items():
+            for node, data in info["subgraph"].nodes(data=True):
+                assert "bond_id" not in data
+                assert data["unit_id"] == unit_id == labels.unit_id[node]
+        for record in result.bonds:
+            for label, node in zip(record["labels"], record["nodes"], strict=True):
+                assert label == f"{labels.unit_id[node]}.{labels.bond_id[node]}"
+        # The caller's graph keeps its attributes; only the creator's copy drops them.
+        assert all("unit_id" in data for _node, data in graph.nodes(data=True))
+    assert actual == expected
+
+
+def test_unit_subgraphs_do_not_copy_graph_level_metadata():
+    """Unit subgraphs copy node and edge data only: graph-level metadata of
+    the template is neither copied nor required to be copyable."""
+    import threading
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    generative_graph.graph["lock"] = threading.Lock()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result.units
+    assert all(info["subgraph"].graph == {} for info in result.units.values())
+
+
+def test_ensemble_export_is_independent_of_the_hash_seed(tmp_path):
+    """Unit subgraph node order, chain attribute order and the JSON bytes do
+    not depend on PYTHONHASHSEED: the same serialized template and sampling
+    seed give identical files in fresh interpreters with different hash
+    seeds. The nested template has units small enough for networkx to
+    iterate their membership set."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    text = "{[] [<]CC([>])C(=O)O{[>] [<]CCO[>]; ; [<]C []}|poisson(300)|; COC(=O)C(C)[>]; [<]Br []}|poisson(800)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    template_path = tmp_path / "template.json"
+    template_path.write_text(json.dumps(g2rins.generative_graph_json_data(generative_graph)))
+    script = tmp_path / "export.py"
+    script.write_text(
+        "import json, sys, warnings\n"
+        "import networkx as nx\n"
+        "import g2rins\n"
+        "warnings.simplefilter('ignore')\n"
+        "graph = nx.node_link_graph(json.load(open(sys.argv[1]))['graph'], edges='edges')\n"
+        "g2rins.EnsembleCreator(graph).create_ensemble(2, output_format='mol_graph', json_file=sys.argv[2], seed=0)\n"
+    )
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(g2rins.__file__)))
+    python_path = os.pathsep.join(entry for entry in (package_root, os.environ.get("PYTHONPATH")) if entry)
+    outputs = []
+    for hash_seed in ("0", "1", "2", "3"):
+        out = tmp_path / f"ensemble_{hash_seed}.json"
+        env = {**os.environ, "PYTHONHASHSEED": hash_seed, "PYTHONPATH": python_path}
+        subprocess.run([sys.executable, str(script), str(template_path), str(out)], env=env, check=True, capture_output=True, text=True)
+        outputs.append(out.read_bytes())
+    assert len(set(outputs)) == 1
+    units = json.loads(outputs[0])["ensemble"]["units"]
+    assert {"I0", "R0", "R1"} <= set(units) and all(unit["subgraph"]["nodes"] for unit in units.values())
 
 
 def test_bond_record_nodes_are_template_node_keys():
@@ -2077,3 +2187,27 @@ def test_ensemble_equality_is_array_aware():
     # Arrays inside ordinary containers, not only inside graphs.
     assert EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {}) == EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {})
     assert EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {}) != EnsembleData([], {"R0": {"vector": [1, 2]}}, [], [], {}, {})
+
+
+def test_ensemble_equality_is_reflexive_and_boolean():
+    """``result == result`` holds whatever the metadata (NaN included, as for
+    Python containers), and a NumPy scalar never broadcasts against a
+    container: mismatched metadata compares unequal in both operand orders."""
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    with_nan = ensemble({"score": float("nan")})
+    assert with_nan == with_nan
+    scalar, one, two = ensemble(np.float64(2.0)), ensemble([2.0]), ensemble([2.0, 2.0])
+    for left, right in ((scalar, one), (one, scalar), (scalar, two), (two, scalar)):
+        assert (left == right) is False
+        assert (left != right) is True
+    assert scalar == ensemble(np.float64(2.0))
