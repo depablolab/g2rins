@@ -11,6 +11,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - **Preferred upgrade:** rebuild legacy graphs from their original G2RINS strings using `G2rins.make(text).get_graph_creator().get_generative_graph()` before export or generation.
 - **Migration without source strings requires known provenance:** use `mark_legacy_connector_placeholders(graph)` only when every unmarked zero-number node with exactly one static neighbor is known to be an internal placeholder. A pendant user wildcard such as `CC(*)O` has that same topology and will otherwise be marked `True`, incorrectly treating it as an internal placeholder. The helper cannot recover this distinction from graph structure. If the assumption cannot be established, recover the node identities from the graph producer before migrating.
 - **A migration warning is not verification:** `G2RINSWarning` reports counts, not affected node IDs, and does not establish that the assumption is correct. The helper returns a copy and preserves existing valid flags; compare the input and returned node flags to audit which identities it assigned.
+- **Every generative-graph edge carries `transition_role`** (the `TransitionRole` encoding: 0 not a transition, 1 stochastic, 2 forced entry, 3 forced exit, 4 global), part of the generative-graph JSON format v2. Ensemble construction and export refuse a graph in which any edge lacks the field or contradicts its transition weight or stochastic id; rebuild such graphs from their G2RINS strings.
 
 ### Added
 

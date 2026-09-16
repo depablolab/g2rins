@@ -3,6 +3,7 @@
 
 import copy
 import json
+import warnings
 
 import networkx as nx
 import numpy as np
@@ -277,3 +278,173 @@ def test_export_rejects_non_finite_keys(key):
     graph.graph["metadata"] = {key: "value"}
     with pytest.raises(ValueError, match=r"Non-finite JSON value.*\['metadata'\]"):
         g2rins.generative_graph_json_data(graph)
+
+
+# --- transition_role: the role of every transition edge, classified at construction ---------------
+
+_TRANSITION_ROLE_PROBES = [
+    pytest.param(
+        # entry into the block, literal tail out of it, unit-to-unit through the outer connectors
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|",
+        {((6, 0), (7, 1), 2), ((7, 1), (35, 0), 3), ((6, 0), (6, 0), 1)},
+        id="literal-tail",
+    ),
+    pytest.param(
+        # the exit crosses the enclosing level's own bond connectors: a stochastic choice
+        "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; C[>]; [<]Br []}|poisson(2000)|",
+        {((7, 0), (6, 1), 2), ((8, 1), (7, 0), 1), ((6, 0), (7, 0), 1)},
+        id="connector-mediated-exit",
+    ),
+    pytest.param(
+        # the literal fragment before a port is forced; the port itself is a terminator here
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CCS[>1])C[>]; C[>]; [<][H], [<1][H] []}|poisson(2000)|",
+        {((6, 0), (7, 1), 2), ((7, 1), (6, 0), 3), ((6, 0), (6, 0), 1)},
+        id="tail-with-port",
+    ),
+    pytest.param(
+        # two blocks in series: the join and the tail are both forced
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|",
+        {((6, 0), (7, 1), 2), ((7, 1), (8, 2), 3), ((6, 2), (35, 0), 3), ((6, 0), (6, 0), 1)},
+        id="series-blocks",
+    ),
+    pytest.param(
+        # top level: no enclosing object, both connections are global
+        "CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C",
+        {((6, -1), (7, 0), 4), ((7, 0), (35, -1), 4)},
+        id="top-level-tail",
+    ),
+    pytest.param(
+        # multifunctional initiator: every exit goes through the enclosing level's connectors
+        "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], [<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|",
+        {((7, 0), (6, 1), 2), ((8, 1), (7, 0), 1), ((8, 2), (7, 0), 1), ((8, 0), (6, 2), 1)},
+        id="multifunctional-initiator",
+    ),
+]
+
+
+def _transition_role_signature(graph):
+    """{(source atomic num, source SO), (target atomic num, target SO), role} of every transition edge."""
+    return {
+        ((graph.nodes[u]["atomic_num"], graph.nodes[u]["stochastic_id_tree"][0]), (graph.nodes[v]["atomic_num"], graph.nodes[v]["stochastic_id_tree"][0]), data["transition_role"])
+        for u, v, data in graph.edges(data=True)
+        if data["transition_weight"] > 0
+    }
+
+
+@pytest.mark.parametrize(("text", "expected"), _TRANSITION_ROLE_PROBES)
+def test_transition_roles_are_classified_from_the_bond_connector_path(text, expected):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    assert _transition_role_signature(graph) == expected
+
+
+def test_forced_exit_is_stamped_with_the_nearest_common_ancestor():
+    """A literal tail is stamped with the parent; a join between two nested blocks with their
+    shared parent, not with the first block's own level."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    stamps = {
+        (graph.nodes[u]["stochastic_id_tree"][0], graph.nodes[v]["stochastic_id_tree"][0]): data["stochastic_id"]
+        for u, v, data in graph.edges(data=True)
+        if data["transition_role"] == int(g2rins.TransitionRole.FORCED_EXIT)
+    }
+    assert stamps == {(1, 2): 0, (2, 0): 0}
+
+
+def test_transition_role_is_consistent_on_every_edge_of_the_corpus(graph_validation_dict):
+    """Every edge of every corpus graph carries a valid role that agrees with its transition
+    weight, its stochastic id and the tree positions of its endpoints; the counts per role
+    pin the corpus classification (update them when the golden corpus changes)."""
+    counts = {int(role): 0 for role in g2rins.TransitionRole}
+    for text in graph_validation_dict:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            creator = g2rins.G2rins.make(text).get_graph_creator()
+            graph = creator.get_generative_graph(include_bond_connectors=False)
+            with_connectors = creator.get_generative_graph(include_bond_connectors=True)
+        assert all(data["transition_role"] == 0 for _u, _v, data in with_connectors.edges(data=True))
+        for u, v, data in graph.edges(data=True):
+            role = data["transition_role"]
+            assert isinstance(role, int) and not isinstance(role, bool)
+            counts[role] += 1
+            is_transition = data["transition_weight"] > 0
+            assert (role == 0) == (not is_transition)
+            if not is_transition:
+                continue
+            source_tree = [i for i in graph.nodes[u]["stochastic_id_tree"] if i >= 0]
+            target_tree = [i for i in graph.nodes[v]["stochastic_id_tree"] if i >= 0]
+            assert (role == 4) == (data["stochastic_id"] == -1)
+            if role == 2:
+                # into a descendant, controlled by it
+                assert source_tree and source_tree[0] in target_tree[1:]
+                assert data["stochastic_id"] == target_tree[0]
+            if role == 3:
+                # out of the source's object, stamped with a common ancestor of both endpoints
+                assert source_tree and source_tree[0] not in target_tree
+                assert data["stochastic_id"] in source_tree[1:] and data["stochastic_id"] in target_tree
+            if role == 1:
+                assert data["stochastic_id"] >= 0
+    assert counts == {0: 1251, 1: 20, 2: 2, 3: 2, 4: 98}
+
+
+def test_transition_role_values_are_stable():
+    assert [(role.name, int(role)) for role in g2rins.TransitionRole] == [("NONE", 0), ("STOCHASTIC", 1), ("FORCED_ENTRY", 2), ("FORCED_EXIT", 3), ("GLOBAL", 4)]
+
+
+def _transition_edge(graph):
+    return next((u, v, key) for u, v, key, data in graph.edges(keys=True, data=True) if data["transition_weight"] > 0)
+
+
+def test_transition_role_is_required_at_export_and_at_construction():
+    from g2rins.exception import IncompatibleGenerativeGraphSchema
+
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    edge = _transition_edge(graph)
+
+    missing = graph.copy()
+    del missing.edges[edge]["transition_role"]
+    with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+        g2rins.generative_graph_json_data(missing)
+    with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+        g2rins.EnsembleCreator(missing)
+
+    for bad in (7, -1, True, "3", 3.0):
+        invalid = graph.copy()
+        invalid.edges[edge]["transition_role"] = bad
+        with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+            g2rins.generative_graph_json_data(invalid)
+        with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+            g2rins.EnsembleCreator(invalid)
+
+    # A value in range that contradicts the edge's own weight or stamp is refused at construction.
+    silent_default = graph.copy()
+    silent_default.edges[edge]["transition_role"] = 0
+    with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+        g2rins.EnsembleCreator(silent_default)
+    wrong_stamp = graph.copy()
+    wrong_stamp.edges[edge]["transition_role"] = int(g2rins.TransitionRole.GLOBAL)
+    with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+        g2rins.EnsembleCreator(wrong_stamp)
+    static_edge = next((u, v, key) for u, v, key, data in graph.edges(keys=True, data=True) if data["static"])
+    role_on_static = graph.copy()
+    role_on_static.edges[static_edge]["transition_role"] = 1
+    with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
+        g2rins.EnsembleCreator(role_on_static)
+
+
+def test_transition_role_survives_the_json_round_trip():
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+        payload = json.loads(json.dumps(g2rins.generative_graph_json_data(graph)))
+        restored = nx.node_link_graph(payload["graph"], edges="edges")
+        g2rins.EnsembleCreator(restored)
+    assert _transition_role_signature(restored) == _transition_role_signature(graph)
+    assert {type(data["transition_role"]) for _u, _v, data in restored.edges(data=True)} == {int}

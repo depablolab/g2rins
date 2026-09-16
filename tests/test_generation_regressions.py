@@ -1813,9 +1813,18 @@ def test_transition_from_a_finished_level_without_a_live_instance_raises():
     rng = np.random.default_rng(0)
     tracker = _StochasticObjectTracker(generative_graph, rng)
     # A unit of the first nested object; its exit site carries the join to
-    # the second object, stamped at the first object's own level.
+    # the second object. The parser stamps that join with the shared parent
+    # (a forced exit), so recreate the hand-off this guard protects against
+    # by stamping it at the first object's own level, where no live instance
+    # can take custody once that object has finished.
     source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
     tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    join = next(
+        (u, v, key)
+        for u, v, key, data in generative_graph.edges(keys=True, data=True)
+        if data["transition_role"] == int(g2rins.TransitionRole.FORCED_EXIT) and generative_graph.nodes[v]["stochastic_id_tree"][0] == 2
+    )
+    generative_graph.edges[join]["stochastic_id"] = tree[0]
     sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
     partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
     tracker.terminate(sto_atom_id)

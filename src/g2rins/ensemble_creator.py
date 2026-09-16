@@ -54,6 +54,7 @@ from .generative_graph import (
     _TERMINATION_NAME,
     _TRANSITION_NAME,
     _atomic_number,
+    _check_transition_role,
     _connector_placeholder_flag,
     _is_connector_placeholder,
     _static_neighbors,
@@ -2155,9 +2156,12 @@ class EnsembleCreator:
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
         # error but silently generate truncated, end-group-less molecules.
-        for _u, _v, edge_data in self._generative_graph.edges(data=True):
+        for u, v, edge_data in self._generative_graph.edges(data=True):
             if _EDGE_STOCHASTIC_ID_NAME not in edge_data:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
+            # Sampling decides forced fires by the transition role; a graph written before the
+            # field existed, or one that contradicts its own weights and stamps, is refused.
+            _check_transition_role((u, v), edge_data)
 
         self._static_graph = self._create_static_graph(self.generative_graph)
         # A placeholder is one half of a split atom. Its sole static neighbor
