@@ -53,6 +53,8 @@ from .generative_graph import (
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
+    _TRANSITION_ROLE_NAME,
+    TransitionRole,
     _atomic_number,
     _check_transition_role,
     _connector_placeholder_flag,
@@ -131,6 +133,11 @@ def _rdkit_implicit_hydrogens(atomic_num: int, charge: int, occupied_valence: in
         probe_atom.UpdatePropertyCache(strict=False)  # strict=False: over-valent input yields 0, not a throw
     # NOT GetTotalNumHs(): that would count the stand-in explicit Hs.
     return int(probe_atom.GetNumImplicitHs())
+
+
+def _transition_competes_at(attr, sto_gen_id):
+    """A transition edge at ``sto_gen_id`` that competes as a draw: forced exits never do."""
+    return attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attr.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
 
 
 def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit_h=-1, aromatic=False) -> int:
@@ -1042,7 +1049,8 @@ class _PartialAtomGraph:
         """
         if not half_bonds:
             raise ValueError("Cannot pop from empty list")
-        eligible_half_bonds = [half_bond for half_bond in half_bonds if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
+        # A forced exit is never drawn: it fires at its source instance's finalization.
+        eligible_half_bonds = [half_bond for half_bond in half_bonds if any(_transition_competes_at(attr, sto_gen_id) for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
         if not eligible_half_bonds:
             return None, []
         max_hierarchy = max(half_bond.gen_hierarchy for half_bond in eligible_half_bonds)
@@ -1149,6 +1157,10 @@ class _PartialAtomGraph:
         than ``sto_gen_id`` that still has a live instance."""
         tracker = self.stochastic_tracker
         for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []):
+            if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT:
+                # Owed unconditionally: fired by fire_forced_exits at the source
+                # instance's finalization, whatever the owner level's liveness.
+                return True
             level = attr.get(_EDGE_STOCHASTIC_ID_NAME)
             if level == -1:
                 return True
@@ -1429,6 +1441,8 @@ class _PartialAtomGraph:
         for bucket_id in bucket_ids:
             bucket = self._open_half_bond_map.get(bucket_id, [])
             for half_bond in list(bucket):
+                if any(attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])):
+                    raise RuntimeError("A forced exit survived its instance's finalization unfired and reached the junction cap. This is a bug, please report on github.")
                 all_attributes, all_ids, all_molar = half_bond.get_mode_bonds(_TERMINATION_NAME)
                 level_indices = [i for i, attr in enumerate(all_attributes) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == gen_sto_id]
                 if not level_indices:
@@ -1619,11 +1633,10 @@ class _PartialAtomGraph:
         — that continuation is still owed and the bond travels onward at its
         own level's turn — and a channel with neither terminators nor
         retained transitions is retired unfired by the terminate-time wipe,
-        the weighted competition's legal zero-growth outcome. A literal exit
+        the weighted competition's legal zero-growth outcome. A forced exit
         (the finished object's terminal bond connector bonded straight to the
-        enclosing unit's plain SMILES) is promoted like any other owner-level
-        transition and can be retired the same way; firing such exits
-        unconditionally is a planned change (see CHANGELOG).
+        enclosing unit's plain SMILES, or to a sibling object) never reaches
+        promotion: fire_forced_exits delivers it first.
         The finished level's own propagation modes are dropped: that level is
         decided. Scans the child's bucket plus its terminated descendants'
         buckets (a frontier can end inside a deeper instance), the same
@@ -1640,6 +1653,8 @@ class _PartialAtomGraph:
             kept_bonds = []
             for half_bond in self._open_half_bond_map.get(bucket_id, []):
                 attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
+                if any(attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT for attr in attr_list):
+                    raise RuntimeError("A forced exit survived its instance's finalization unfired and reached promotion. This is a bug, please report on github.")
                 level_indices = [i for i, attr in enumerate(attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
                 if not level_indices:
                     kept_bonds.append(half_bond)
@@ -1692,7 +1707,7 @@ class _PartialAtomGraph:
         # only keep target_attr and target_idx of the requested stochastic level (sto_gen_id)
         all_target_attr, all_target_idx, all_molar_amounts = transition_bond.get_mode_bonds(_TRANSITION_NAME)
 
-        filtered_indices = [i for i, attr in enumerate(all_target_attr) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
+        filtered_indices = [i for i, attr in enumerate(all_target_attr) if _transition_competes_at(attr, sto_gen_id)]
 
         if not filtered_indices:
             raise RuntimeError("A popped transition bond carries no edge at the level it was selected for. This is a bug, please report on github.")
@@ -1779,7 +1794,9 @@ class _PartialAtomGraph:
 
         for j, half_bond in enumerate(half_bonds):
             prop_attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
-            fired_level_indices = [i for i, attr in enumerate(prop_attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
+            # A forced exit at the fired level is neither converted nor dropped: it stays a
+            # transition mode on the transferred copy and fires at its own instance's finalization.
+            fired_level_indices = [i for i, attr in enumerate(prop_attr_list) if _transition_competes_at(attr, sto_gen_id)]
             if not fired_level_indices:
                 # No transition edge at the fired level: leave the bond
                 # untouched in its bucket. Other levels' continuations (-1
@@ -1980,6 +1997,67 @@ class _PartialAtomGraph:
             last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
             self.add_unit_to_sequence(last_unit)
             self.nested_transition(new_sto_atom_id, rng)
+
+    def fire_forced_exits(self, sto_atom_id, rng):
+        """Fire every forced exit the finalized instance ``sto_atom_id`` owes; return how many.
+
+        A forced exit (``transition_role`` FORCED_EXIT) is the literal text that follows a
+        nested stochastic object inside a unit, or a sibling object joined to it directly:
+        chemistry of the enclosing unit that must not depend on a later draw. It fires here,
+        after the instance's own end groups and before its remaining sites are capped or
+        promoted, whether or not the owner has parked. The custody set is the instance's
+        bucket plus its terminated descendants' buckets, as terminate_graph scans it; bonds
+        fire in bucket order so a seeded run stays reproducible.
+        """
+        fired = 0
+        for bucket_id in self._custody_bucket_ids(sto_atom_id):
+            for half_bond in list(self._open_half_bond_map.get(bucket_id, [])):
+                if any(attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])):
+                    self._fire_forced_exit(bucket_id, half_bond, sto_atom_id, rng)
+                    fired += 1
+        return fired
+
+    def _fire_forced_exit(self, bucket_id, half_bond, sto_atom_id, rng):
+        all_attr, all_idx, _all_molar = half_bond.get_mode_bonds(_TRANSITION_NAME)
+        indices = [i for i, attr in enumerate(all_attr) if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT]
+        if len(indices) == 1:
+            chosen = indices[0]
+        else:
+            weights = np.asarray([all_attr[i][_TRANSITION_NAME] for i in indices], dtype=float)
+            chosen = indices[self.stochastic_tracker.choose(rng, len(indices), weights, "forced exit target selection")]
+        target_idx = all_idx[chosen]
+        selected_attr = self.gen_edge_attr_to_bond_attr(all_attr[chosen])
+        tracker = self.stochastic_tracker
+        target_tree = self.generative_graph.nodes[target_idx]["stochastic_id_tree"]
+        target_gen_id = target_tree[0]
+
+        # The instance that receives the fragment and its mass. A literal tail belongs to
+        # the finalized instance's own ancestor at the target's level, parked or not, taken
+        # from its recorded parent chain. A join into a sibling object registers that
+        # object's instance now, at the first object's finalization, under the same parent
+        # chain: an instance is created by the fire that attaches its first unit.
+        target_sto_atom_id = None
+        parent_list = tracker.parent_map.get(sto_atom_id, [])
+        for ancestor in reversed(parent_list):
+            if tracker._stochastic_atom_id_to_gen_id[ancestor] == target_gen_id and not tracker.is_terminated(ancestor):
+                target_sto_atom_id = ancestor
+                break
+        if target_sto_atom_id is None:
+            parent_expected_molw = tracker._sto_atom_id_expected_molw.get(parent_list[-1]) if parent_list else None
+            target_sto_atom_id = tracker.register_new_atom_instance(target_gen_id, sto_atom_id, parent_expected_molw, False)
+            if parent_list:
+                tracker.parent_map[target_sto_atom_id] = list(parent_list)
+        if _DECISION_TRACE is not None:
+            _DECISION_TRACE.append({"kind": "forced_exit", "id": sto_atom_id, "bucket": bucket_id, "target": target_sto_atom_id, "target_gen": target_gen_id})
+
+        self._open_half_bond_map[bucket_id].remove(half_bond)
+        other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, target_idx, tracker, target_sto_atom_id, rng)
+        other_target_idx = other_graph.pop_target_open_half_bond(target_sto_atom_id, target_idx)
+        pre_merge_watermark = self._atom_id
+        self.merge(other_graph, half_bond.atom_idx, other_target_idx, selected_attr)
+        last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
+        self.add_unit_to_sequence(last_unit)
+        self.nested_transition(target_sto_atom_id, rng)
 
     def add_new_unit_and_bond(self, pre_merge_watermark):
         # `pre_merge_watermark` is self._atom_id captured BEFORE the most recent
@@ -3122,8 +3200,9 @@ class EnsembleCreator:
                 checkpoints.pop(sto_atom_id, None)
 
         def _finalize_pending(sto_atom_id):
-            """Fire the parked instance's declared end groups, then hand its
-            remaining continuation sites to the nearest live ancestor as
+            """Fire the parked instance's declared end groups and its forced
+            exits (the enclosing unit's literal text after the object), then
+            hand its remaining continuation sites to the nearest live ancestor as
             ordinary growth options (the multifunctional initiation principle
             generalized to every level of the nested tree): the ancestor's
             next step is one weighted draw over chain continuation and
@@ -3137,6 +3216,9 @@ class EnsembleCreator:
             tracker = partial_atom_graph.stochastic_tracker
             partial_atom_graph.terminate_graph(sto_atom_id, rng)
             pending_termination.discard(sto_atom_id)
+            # Literal chemistry of the enclosing unit is delivered now, before the
+            # instance's remaining sites are capped or promoted (see fire_forced_exits).
+            partial_atom_graph.fire_forced_exits(sto_atom_id, rng)
             nearest_live_ancestor = None
             for ancestor in reversed(tracker.parent_map.get(sto_atom_id, [])):
                 if not tracker.is_terminated(ancestor):
