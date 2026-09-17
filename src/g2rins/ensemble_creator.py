@@ -4079,7 +4079,10 @@ class EnsembleCreator:
                     return mol_graph_to_smiles(unit, kekulize=False)
 
             saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
-            json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
+            # Every part of the file is normalized before it is opened: the
+            # source string here, the graph section by its exporter, and the
+            # ensemble section piece by piece below.
+            json_data = {"string": _json_safe(self._generative_graph.graph.get("g2rins_string", ""), "$['string']")}
             json_data.update(generative_graph_json_data(self._generative_graph))
             json_data["format"]["chain_format"] = molecule_format
             # The ensemble section (unit subgraphs, node-link chains, weights) is

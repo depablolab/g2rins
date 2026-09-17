@@ -2058,6 +2058,31 @@ def test_ensemble_json_refuses_non_finite_values_in_the_ensemble_section(tmp_pat
     assert not path.exists()
 
 
+def test_ensemble_json_normalizes_the_source_string_before_writing(tmp_path):
+    """The top-level source string is normalized like every other part of the
+    file: NumPy-backed provenance is written as a plain string, and provenance
+    that cannot be serialized is refused before the file is opened, so an
+    existing output file is left untouched."""
+    import json
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    text = generative_graph.graph["g2rins_string"]
+    generative_graph.graph["g2rins_string"] = np.array(text)
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    stored = json.loads(path.read_text())["string"]
+    assert stored == text and type(stored) is str
+
+    previous = path.read_bytes()
+    generative_graph.graph["g2rins_string"] = 1 + 2j
+    with pytest.raises(TypeError, match=r"Unsupported JSON value at \$\['string'\]"):
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    assert path.read_bytes() == previous
+
+
 def test_ensemble_from_reloaded_graph_carries_no_stale_derived_fields():
     """A template loaded back from an export carries the injected unit_id and
     bond_id as node attributes. The creator drops them, so unit subgraphs
