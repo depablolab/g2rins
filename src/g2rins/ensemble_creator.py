@@ -553,16 +553,24 @@ def _graphs_equal(left, right):
 
 
 def _array_equal(left, right):
-    """Value equality of NumPy arrays or scalars (0-d arrays). Object arrays
+    """Value equality of two NumPy arrays (0-d for scalars). Object arrays
     compare element-wise through :func:`_graph_aware_equal`; structured data
-    compares only with structured data of the same dtype, and types NumPy
-    cannot compare are unequal instead of raising."""
+    compares only with structured data of the same dtype, field by field when
+    a field holds Python objects; types NumPy cannot compare are unequal
+    instead of raising."""
     if left.shape != right.shape:
         return False
     if left.dtype.kind == "O" or right.dtype.kind == "O":
+        # tolist() yields Python objects, except for scalar types without a
+        # Python equivalent (longdouble), which _graph_aware_equal settles
+        # directly against a plain value instead of coming back here.
         return _graph_aware_equal(left.tolist(), right.tolist())
     if left.dtype.names is not None or right.dtype.names is not None:
-        return left.dtype == right.dtype and bool(np.array_equal(left, right))
+        if left.dtype != right.dtype:
+            return False
+        if left.dtype.hasobject:
+            return all(_array_equal(left[name], right[name]) for name in left.dtype.names)
+        return bool(np.array_equal(left, right))
     try:
         return bool(np.array_equal(left, right))
     except TypeError:
@@ -583,8 +591,15 @@ def _graph_aware_equal(left, right):
     if isinstance(left, (dict, list, tuple)) or isinstance(right, (dict, list, tuple)):
         # A container never equals a scalar or an array; NumPy would broadcast.
         return False
-    if isinstance(left, (np.ndarray, np.generic)) or isinstance(right, (np.ndarray, np.generic)):
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
         return _array_equal(np.asarray(left), np.asarray(right))
+    if isinstance(left, np.generic) or isinstance(right, np.generic):
+        # One NumPy scalar against a plain Python value: NumPy's own scalar
+        # comparison is a boolean, or raises for structured data (unequal).
+        try:
+            return bool(left == right)
+        except (TypeError, ValueError, OverflowError):
+            return False
     return bool(left == right)
 
 

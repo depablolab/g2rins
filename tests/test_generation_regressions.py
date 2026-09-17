@@ -2247,3 +2247,108 @@ def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
     assert (structured == plain) is False
     assert (plain == structured) is False
     assert structured == ensemble(same_record)
+
+    # Structured data whose field holds Python objects (kind "V", not "O")
+    # compares field by field, for arrays and for their record scalars.
+    def object_records(vector):
+        records = np.empty(1, dtype=[("metadata", object)])
+        records["metadata"][0] = {"vector": np.array(vector)}
+        return records
+
+    with_objects = ensemble(object_records([1, 2]))
+    assert with_objects == copy.deepcopy(with_objects)
+    assert with_objects == ensemble(object_records([1, 2]))
+    assert with_objects != ensemble(object_records([1, 3]))
+    record_with_objects = ensemble(object_records([1, 2])[0])
+    assert record_with_objects == copy.deepcopy(record_with_objects)
+    assert record_with_objects != ensemble(object_records([1, 3])[0])
+
+    # A NumPy scalar without a Python equivalent (longdouble) against a plain
+    # value settles directly instead of converting back and forth.
+    long_double, none, big_int = ensemble(np.longdouble(2)), ensemble(None), ensemble(2**100)
+    for left, right in ((long_double, none), (none, long_double), (long_double, big_int), (big_int, long_double)):
+        assert (left == right) is False
+    assert long_double == ensemble(np.longdouble(2))
+    assert long_double == ensemble(2.0)
+
+
+def test_ensemble_equality_never_raises_across_metadata_types():
+    """Every ordered pair of supported metadata values compares to a Python
+    bool, symmetrically; a value equals its deep copy (NaN aside), and a
+    plainly different value of the same kind is unequal. The space of user
+    metadata is open-ended; this pins the kinds generation and export accept."""
+    import copy
+    import itertools
+
+    import networkx as nx
+
+    from g2rins.ensemble_creator import EnsembleData
+
+    def object_array(*elements):
+        array = np.empty(len(elements), dtype=object)
+        for index, element in enumerate(elements):
+            array[index] = element
+        return array
+
+    def object_records(vector):
+        records = np.empty(1, dtype=[("metadata", object)])
+        records["metadata"][0] = {"vector": np.array(vector)}
+        return records
+
+    def nested_records(vector):
+        records = np.empty(1, dtype=[("inner", [("tag", "U2"), ("payload", object)]), ("weight", "f4")])
+        records["inner"]["tag"][0] = "ab"
+        records["inner"]["payload"][0] = [np.array(vector), {"k": np.array(vector)}]
+        records["weight"][0] = 0.5
+        return records
+
+    def values(vector):
+        return {
+            "none": None,
+            "bool": True,
+            "int": 2,
+            "float": 2.0,
+            "big_int": 2**100,
+            "str": "a",
+            "np_int": np.int64(vector[1]),
+            "np_float32": np.float32(vector[1]),
+            "np_float64": np.float64(vector[1]),
+            "np_longdouble": np.longdouble(vector[1]),
+            "np_bool": np.bool_(True),
+            "np_str": np.str_("a"),
+            "array_int": np.array(vector),
+            "array_float": np.array(vector, dtype=float),
+            "array_longdouble": np.array(vector, dtype=np.longdouble),
+            "array_0d": np.array(float(vector[1])),
+            "object_dicts": object_array({"vector": np.array(vector)}),
+            "object_mixed": object_array(None, np.longdouble(vector[1]), np.array(vector), "a"),
+            "record_numeric": np.array([(4, vector[1] / 2)], dtype=[("count", "i4"), ("weight", "f4")]),
+            "record_numeric_scalar": np.array([(4, vector[1] / 2)], dtype=[("count", "i4"), ("weight", "f4")])[0],
+            "record_objects": object_records(vector),
+            "record_objects_scalar": object_records(vector)[0],
+            "record_nested": nested_records(vector),
+            "record_nested_scalar": nested_records(vector)[0],
+            "list": [1, np.array(vector)],
+            "tuple": (1, np.array(vector)),
+            "dict": {"a": np.longdouble(vector[1]), "b": None},
+            "set": {1, vector[1]},
+            "nan": float("nan"),
+            "array_nan": np.array([np.nan]),
+            "graph": nx.MultiDiGraph([(1, vector[1])]),
+        }
+
+    def data(value):
+        return EnsembleData([], {"R0": {"metadata": value}}, [], [], {}, {})
+
+    same, other = values([1, 2]), values([1, 3])
+    results = {}
+    for (left_name, left), (right_name, right) in itertools.product(same.items(), repeat=2):
+        result = data(left) == data(right)
+        assert isinstance(result, bool), (left_name, right_name)
+        results[(left_name, right_name)] = result
+    for (left_name, right_name), result in results.items():
+        assert result == results[(right_name, left_name)], (left_name, right_name)
+    for name, value in same.items():
+        assert data(value) == data(value)
+        assert (data(value) == data(copy.deepcopy(value))) is (name != "array_nan")
+        assert (data(value) == data(other[name])) is (name in ("none", "bool", "int", "float", "big_int", "str", "np_bool", "np_str"))
