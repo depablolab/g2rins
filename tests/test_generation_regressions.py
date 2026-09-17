@@ -2248,6 +2248,18 @@ def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
     assert (plain == structured) is False
     assert structured == ensemble(same_record)
 
+    # Structured data equals structured data of the same dtype only: neither
+    # an object array holding the same tuple nor a record with other field
+    # names is the same value, in either operand order.
+    tuple_array = np.empty(1, dtype=object)
+    tuple_array[0] = (4, 0.5)
+    records = ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
+    renamed = ensemble(np.array([(4, 0.5)], dtype=[("n", "i4"), ("w", "f4")]))
+    tuples = ensemble(tuple_array)
+    for left, right in ((records, tuples), (tuples, records), (renamed, tuples), (tuples, renamed), (records, renamed), (renamed, records)):
+        assert (left == right) is False
+    assert records == ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
+
     # Structured data whose field holds Python objects (kind "V", not "O")
     # compares field by field, for arrays and for their record scalars.
     def object_records(vector):

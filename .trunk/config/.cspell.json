@@ -237,6 +237,7 @@
     "subdtype",
     "subarray",
     "subarrays",
-    "finalizer"
+    "finalizer",
+    "hasobject"
   ]
 }

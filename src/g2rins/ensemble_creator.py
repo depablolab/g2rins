@@ -560,17 +560,19 @@ def _array_equal(left, right):
     instead of raising."""
     if left.shape != right.shape:
         return False
-    if left.dtype.kind == "O" or right.dtype.kind == "O":
-        # tolist() yields Python objects, except for scalar types without a
-        # Python equivalent (longdouble), which _graph_aware_equal settles
-        # directly against a plain value instead of coming back here.
-        return _graph_aware_equal(left.tolist(), right.tolist())
     if left.dtype.names is not None or right.dtype.names is not None:
+        # Structured data equals structured data of the same dtype only; an
+        # object array holding the same tuples is a different representation.
         if left.dtype != right.dtype:
             return False
         if left.dtype.hasobject:
             return all(_array_equal(left[name], right[name]) for name in left.dtype.names)
         return bool(np.array_equal(left, right))
+    if left.dtype.kind == "O" or right.dtype.kind == "O":
+        # tolist() yields Python objects, except for scalar types without a
+        # Python equivalent (longdouble), which _graph_aware_equal settles
+        # directly against a plain value instead of coming back here.
+        return _graph_aware_equal(left.tolist(), right.tolist())
     try:
         return bool(np.array_equal(left, right))
     except TypeError:
