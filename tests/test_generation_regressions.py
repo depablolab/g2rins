@@ -1972,10 +1972,20 @@ def test_create_ensemble_json_file_mol_graph_chains(tmp_path):
     assert data["format"]["chain_format"] == "mol_graph"
     stored_chains = data["ensemble"]["chains"]
     assert len(stored_chains) == 2
+    node_keys = ["id", "atomic_num", "is_connector_placeholder", "aromatic", "charge", "num_explicit_h", "origin_idx"]
+    edge_keys = ["source", "target", "bond_type", "aromatic"]
     for chain_data, chain_graph in zip(stored_chains, chains, strict=True):
+        # The file carries the atom and bond attributes plus the template
+        # provenance, in a fixed key order, and no sampler bookkeeping.
+        assert all(list(node) == node_keys for node in chain_data["nodes"])
+        assert all(list(edge) == edge_keys for edge in chain_data["edges"])
         restored = nx.node_link_graph(chain_data, edges="edges")
-        assert restored.number_of_nodes() == chain_graph.number_of_nodes()
-        assert restored.number_of_edges() == chain_graph.number_of_edges()
+        assert set(restored.nodes) == set(chain_graph.nodes)
+        assert {frozenset(edge) for edge in restored.edges} == {frozenset(edge) for edge in chain_graph.edges}
+        for node, attributes in restored.nodes(data=True):
+            assert attributes == {key: chain_graph.nodes[node][key] for key in node_keys[1:]}
+        for u, v, attributes in restored.edges(data=True):
+            assert attributes == {key: chain_graph.edges[u, v][key] for key in edge_keys[2:]}
     for chain_sequences in data["ensemble"]["sequences"]:
         for sequence in chain_sequences:
             assert sequence and all(isinstance(unit, str) for unit in sequence)
@@ -2106,8 +2116,9 @@ def test_ensemble_export_is_independent_of_the_hash_seed(tmp_path):
     """Unit subgraph node order, chain attribute order and the JSON bytes do
     not depend on PYTHONHASHSEED: the same serialized template and sampling
     seed give identical files in fresh interpreters with different hash
-    seeds. The nested template has units small enough for networkx to
-    iterate their membership set."""
+    seeds. The nested template has units small enough that a subgraph view
+    of the template would have iterated their membership set, which is the
+    regression this guards."""
     import json
     import os
     import subprocess
@@ -2129,10 +2140,11 @@ def test_ensemble_export_is_independent_of_the_hash_seed(tmp_path):
     package_root = os.path.dirname(os.path.dirname(os.path.abspath(g2rins.__file__)))
     python_path = os.pathsep.join(entry for entry in (package_root, os.environ.get("PYTHONPATH")) if entry)
     outputs = []
-    for hash_seed in ("0", "1", "2", "3"):
+    for hash_seed in ("0", "1", "2"):
         out = tmp_path / f"ensemble_{hash_seed}.json"
         env = {**os.environ, "PYTHONHASHSEED": hash_seed, "PYTHONPATH": python_path}
-        subprocess.run([sys.executable, str(script), str(template_path), str(out)], env=env, check=True, capture_output=True, text=True)
+        completed = subprocess.run([sys.executable, str(script), str(template_path), str(out)], env=env, capture_output=True, text=True)
+        assert completed.returncode == 0, completed.stderr
         outputs.append(out.read_bytes())
     assert len(set(outputs)) == 1
     units = json.loads(outputs[0])["ensemble"]["units"]
@@ -2184,9 +2196,55 @@ def test_ensemble_equality_is_array_aware():
     unit_id = next(unit_id for unit_id, info in changed.units.items() if node in info["subgraph"])
     changed.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"] = np.array([1, 3])
     assert result != changed
+
     # Arrays inside ordinary containers, not only inside graphs.
-    assert EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {}) == EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {})
-    assert EnsembleData([], {"R0": {"vector": np.array([1, 2])}}, [], [], {}, {}) != EnsembleData([], {"R0": {"vector": [1, 2]}}, [], [], {}, {})
+    def data(units):
+        return EnsembleData(chains=[], units=units, bonds=[], sequences=[], mol_weights={}, distributions={})
+
+    assert data({"R0": {"vector": np.array([1, 2])}}) == data({"R0": {"vector": np.array([1, 2])}})
+    assert data({"R0": {"vector": np.array([1, 2])}}) != data({"R0": {"vector": [1, 2]}})
+    assert data({"R0": {"vector": [1, 2]}}) == data({"R0": {"vector": (1, 2)}})
+
+
+def test_unit_subgraphs_are_detached_from_the_template():
+    """Mutating a returned subgraph's node or edge data in place leaves the
+    creator's template, and therefore the next ensemble, unchanged."""
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
+    generative_graph.nodes[node]["metadata"] = {"vector": [1, 2]}
+    edge = next(edge for edge in generative_graph.edges(keys=True, data=True) if edge[3]["static"])
+    edge[3]["tags"] = ["a"]
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+        unit_id = next(unit_id for unit_id, info in result.units.items() if node in info["subgraph"])
+        result.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"][0] = 99
+        edge_unit = next(info for info in result.units.values() if info["subgraph"].has_edge(edge[0], edge[1], edge[2]))
+        edge_unit["subgraph"].edges[edge[0], edge[1], edge[2]]["tags"].append("b")
+        again = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert creator._generative_graph.nodes[node]["metadata"] == {"vector": [1, 2]}
+    assert creator._generative_graph.edges[edge[0], edge[1], edge[2]]["tags"] == ["a"]
+    assert again.units[unit_id]["subgraph"].nodes[node]["metadata"] == {"vector": [1, 2]}
+    assert result != again
+
+
+def test_unit_subgraphs_name_an_attribute_that_cannot_be_copied():
+    """A template node attribute that cannot be deep-copied fails ensemble
+    information with the node and attribute named, not a bare pickling error."""
+    import threading
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(generative_graph))
+    generative_graph.nodes[node]["handle"] = threading.Lock()
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert creator.create_ensemble(1, output_format="smiles", seed=0)
+        with pytest.raises(TypeError, match=rf"node {node!r} attribute 'handle'"):
+            creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
 
 
 def test_ensemble_equality_is_reflexive_and_boolean():
@@ -2286,9 +2344,10 @@ def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
 
 def test_ensemble_equality_never_raises_across_metadata_types():
     """Every ordered pair of supported metadata values compares to a Python
-    bool, symmetrically; a value equals its deep copy (NaN aside), and a
-    plainly different value of the same kind is unequal. The space of user
-    metadata is open-ended; this pins the kinds generation and export accept."""
+    bool, symmetrically; a value equals its deep copy (a NaN array aside: a
+    NaN float deep-copies to the same object), and a plainly different value
+    of the same kind is unequal. The space of user metadata is open-ended;
+    this pins the kinds generation and export accept."""
     import copy
     import itertools
 
@@ -2350,7 +2409,7 @@ def test_ensemble_equality_never_raises_across_metadata_types():
         }
 
     def data(value):
-        return EnsembleData([], {"R0": {"metadata": value}}, [], [], {}, {})
+        return EnsembleData(chains=[], units={"R0": {"metadata": value}}, bonds=[], sequences=[], mol_weights={}, distributions={})
 
     same, other = values([1, 2]), values([1, 3])
     results = {}

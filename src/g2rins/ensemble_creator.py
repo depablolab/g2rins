@@ -10,7 +10,7 @@ import os
 import pickle
 import warnings
 from collections import Counter, OrderedDict, deque
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -629,6 +629,18 @@ class EnsembleData:
     fresh parse of the same string; node ids are only valid for this parsed
     graph.
 
+    ``subgraph`` values are networkx graphs, so a unit record is not JSON
+    serializable as is: use ``json_file``, or ``nx.node_link_data(subgraph,
+    edges="edges")``. Their node and edge data are deep copies, so every
+    template node and edge attribute must be deep-copyable when ensemble
+    information is requested (it must already be JSON-safe for ``json_file``).
+
+    ``==`` is structural: graph-valued members compare by structure, NumPy
+    data by value (object arrays element-wise, structured data only with
+    structured data of the same dtype), a list equals a tuple with equal
+    elements, and NaN compares unequal unless it is the same object; there is
+    no ``equal_nan``.
+
     Each unit's pSMILES has one mapped star ``[*:n]`` per template bond_id.
     Internal split-atom placeholders with no bond_id are omitted.
 
@@ -709,10 +721,23 @@ def _unit_subgraphs(generative_graph, unit_nodes):
     for unit_id, nodes in unit_nodes.items():
         members = set(nodes)
         subgraph = generative_graph.__class__()
-        subgraph.add_nodes_from((node, {**deepcopy(generative_graph.nodes[node]), "unit_id": unit_id}) for node in nodes)
-        subgraph.add_edges_from((u, v, key, deepcopy(data)) for u, v, key, data in generative_graph.edges(nodes, keys=True, data=True) if v in members and data["static"])
+        subgraph.add_nodes_from((node, {**_copied_attributes(generative_graph.nodes[node], f"node {node!r}"), "unit_id": unit_id}) for node in nodes)
+        subgraph.add_edges_from(
+            (u, v, key, _copied_attributes(data, f"edge {(u, v, key)!r}")) for u, v, key, data in generative_graph.edges(nodes, keys=True, data=True) if v in members and data["static"]
+        )
         subgraphs[unit_id] = subgraph
     return subgraphs
+
+
+def _copied_attributes(data, where):
+    """Deep copy of an attribute dict, naming the attribute that cannot be copied."""
+    copied = {}
+    for key, value in data.items():
+        try:
+            copied[key] = deepcopy(value)
+        except Exception as error:
+            raise TypeError(f"Template {where} attribute {key!r} cannot be deep-copied for the unit subgraph: {error}") from error
+    return copied
 
 
 @contextmanager
@@ -1107,18 +1132,18 @@ class _PartialAtomGraph:
         for u_atom_idx, v_atom_idx in edges_data_map:
             self.atom_graph.add_edge(u_atom_idx, v_atom_idx, **edges_data_map[(u_atom_idx, v_atom_idx)])
 
-    def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | Sequence[str] = None) -> dict[str, bool | float | int]:
+    def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | Iterable[str] = None) -> dict[str, bool | float | int]:
         if keys_to_copy is None:
             keys_to_copy = self._ATOM_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
-    def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | Sequence[str] = None) -> dict[str, bool | int]:
+    def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | Iterable[str] = None) -> dict[str, bool | int]:
         if keys_to_copy is None:
             keys_to_copy = self._BOND_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
     @staticmethod
-    def _copy_some_dict_attr(dictionary: dict[str, Any], keys_to_copy: set[str]) -> dict[str, Any]:
+    def _copy_some_dict_attr(dictionary: dict[str, Any], keys_to_copy: Iterable[str]) -> dict[str, Any]:
         new_dict = {}
         for k in keys_to_copy:
             if k in dictionary:
@@ -3777,9 +3802,10 @@ class EnsembleCreator:
         ``json_file`` writes the originating G2RINS string, the generative graph (with
         derived unit/bond annotations) and the ensemble data to that path as
         JSON. The file's chains follow ``output_format`` -- SMILES strings, or
-        node-link graph dicts for ``"mol_graph"`` (roughly two orders of
-        magnitude larger; picking the format is picking the file size) -- as
-        recorded in ``format.chain_format``; sequences are written as SMILES
+        node-link graph dicts for ``"mol_graph"`` (a few hundred times larger
+        per chain, so for any sizeable ensemble picking the format is picking
+        the file size) -- as recorded in ``format.chain_format``; sequences
+        are written as SMILES
         regardless. With the default ``output_format="mol_graph"`` the file
         therefore holds node-link chains; pass ``"smiles"`` for the compact
         chains of earlier versions. ``json_max_chains`` caps only the number
@@ -3789,8 +3815,13 @@ class EnsembleCreator:
         The file's ``ensemble`` section mirrors :class:`EnsembleData`:
         ``units`` in the same order, each ``subgraph`` as networkx node-link
         data (``nx.node_link_graph(data, edges="edges")`` restores it,
-        multigraph keys included); ``bonds`` with ``nodes`` holding the graph
-        section's ``id`` values, whatever type the template used;
+        multigraph keys included); node-link chains whose nodes carry the
+        atom attributes ``atomic_num``, ``is_connector_placeholder``,
+        ``aromatic``, ``charge``, ``num_explicit_h`` and ``origin_idx`` (the
+        template node the atom came from) and whose bonds carry ``bond_type``
+        and ``aromatic``, without the sampler's in-memory bookkeeping;
+        ``bonds`` with ``nodes`` holding the graph section's ``id`` values,
+        whatever type the template used;
         ``mol_weights`` and ``distributions`` keyed by the stochastic id as a
         JSON string. The graph section and the unit subgraphs are exports of
         the creator's private copy of the template (``atomic_num`` as ``int``,
@@ -3841,6 +3872,11 @@ class EnsembleCreator:
         # The JSON dump needs unit/sequence info even when the caller did not
         # ask for the returned ensemble information.
         collect_info = ensemble_info or json_file is not None
+        if collect_info:
+            # Unit labels and subgraphs read only the immutable template, so a
+            # template attribute that cannot be copied fails before sampling.
+            labels = derive_unit_labels(self._generative_graph)
+            unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_nodes)
 
         total_discards = 0
         discard_reasons = Counter()
@@ -3979,8 +4015,6 @@ class EnsembleCreator:
         # chemically identical units -- e.g. two Br terminators -- apart) and
         # carry the generative-graph node ids alongside; only chains/sequences
         # follow output_format.
-        labels = derive_unit_labels(self._generative_graph)
-        unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_nodes)
         origin_unit_id = {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
@@ -4034,7 +4068,12 @@ class EnsembleCreator:
             else:
 
                 def _chain_json(molecule):
-                    return nx.node_link_data(molecule, edges="edges")
+                    # The file carries the atom and bond attributes plus the
+                    # template provenance; sampler bookkeeping stays in memory.
+                    data = nx.node_link_data(molecule, edges="edges")
+                    data["nodes"] = [{key: node[key] for key in ("id", *_PartialAtomGraph._ATOM_ATTRS, "origin_idx") if key in node} for node in data["nodes"]]
+                    data["edges"] = [{key: edge[key] for key in ("source", "target", *_PartialAtomGraph._BOND_ATTRS) if key in edge} for edge in data["edges"]]
+                    return data
 
                 def _sequence_unit_smiles(unit):
                     return mol_graph_to_smiles(unit, kekulize=False)
@@ -4043,19 +4082,23 @@ class EnsembleCreator:
             json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
             json_data.update(generative_graph_json_data(self._generative_graph))
             json_data["format"]["chain_format"] = molecule_format
-            json_data["ensemble"] = {
-                "units": {unit_id: {**info, "subgraph": nx.node_link_data(info["subgraph"], edges="edges")} for unit_id, info in canonical_units.items()},
-                "chains": [_chain_json(molecule) for molecule in saved_chains],
-                "bonds": bond_records,
-                "mol_weights": mol_weight_lists,
-                "distributions": ensemble_distributions,
-                "sequences": [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
-            }
             # The ensemble section (unit subgraphs, node-link chains, weights) is
-            # normalized like the graph section, before the file is opened.
-            payload = _json_safe(json_data)
+            # normalized like the graph section before the file is opened, one
+            # piece at a time so that only one normalized copy of each
+            # node-link chain is ever held.
+            ensemble_path = "$['ensemble']"
+            json_data["ensemble"] = {
+                "units": _json_safe({unit_id: {**info, "subgraph": nx.node_link_data(info["subgraph"], edges="edges")} for unit_id, info in canonical_units.items()}, f"{ensemble_path}['units']"),
+                "chains": [_json_safe(_chain_json(molecule), f"{ensemble_path}['chains'][{index}]") for index, molecule in enumerate(saved_chains)],
+                "bonds": _json_safe(bond_records, f"{ensemble_path}['bonds']"),
+                "mol_weights": _json_safe(mol_weight_lists, f"{ensemble_path}['mol_weights']"),
+                "distributions": _json_safe(ensemble_distributions, f"{ensemble_path}['distributions']"),
+                "sequences": _json_safe(
+                    [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences], f"{ensemble_path}['sequences']"
+                ),
+            }
             with open(json_file, "w") as file_handle:
-                json.dump(payload, file_handle, indent=2)
+                json.dump(json_data, file_handle, indent=2)
 
         if ensemble_info:
             return EnsembleData(
