@@ -2441,6 +2441,54 @@ def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
     assert long_double == ensemble(2.0)
 
 
+def test_ensemble_equality_boundary_for_cyclic_shared_and_unconvertible_metadata():
+    """The structural-equality domain is closed: metadata that refers back to
+    itself compares unequal instead of recursing, a structure that merely
+    shares references compares normally, and an object whose array conversion
+    fails compares unequal instead of raising, in both operand orders."""
+    import copy
+
+    class Unconvertible:
+        def __array__(self, dtype=None, copy=None):
+            raise ValueError("cannot be converted")
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    def cyclic():
+        value = {"x": 1}
+        value["self"] = value
+        return value
+
+    cycle = ensemble(cyclic())
+    assert cycle == cycle
+    assert (cycle == copy.deepcopy(cycle)) is False
+    assert (cycle == ensemble(cyclic())) is False
+    assert (ensemble(cyclic()) == cycle) is False
+
+    shared = np.array([1, 2])
+    references = {"a": shared, "b": shared, "c": [shared, {"d": shared}]}
+    with_shared = ensemble(references)
+    assert with_shared == copy.deepcopy(with_shared)
+    assert with_shared == ensemble(copy.deepcopy(references))
+    assert with_shared == ensemble({"a": np.array([1, 2]), "b": np.array([1, 2]), "c": [np.array([1, 2]), {"d": np.array([1, 2])}]})
+    assert (with_shared == ensemble({"a": shared, "b": shared, "c": [shared, {"d": np.array([1, 3])}]})) is False
+
+    unconvertible = ensemble(Unconvertible())
+    assert unconvertible == unconvertible
+    for other in (np.array([1.0]), np.float64(1.0), np.ma.array([1.0], mask=[False]), Unconvertible()):
+        assert (unconvertible == ensemble(other)) is False
+        assert (ensemble(other) == unconvertible) is False
+
+
 def test_ensemble_equality_never_raises_across_metadata_types():
     """Every ordered pair of supported metadata values compares to a Python
     bool, symmetrically; a value equals its deep copy (a NaN array aside: a
@@ -2468,6 +2516,19 @@ def test_ensemble_equality_never_raises_across_metadata_types():
             if not isinstance(other, Ambiguous):
                 return NotImplemented
             return bool(self.vector == other.vector)
+
+    class Unconvertible:
+        def __array__(self, dtype=None, copy=None):
+            raise ValueError("cannot be converted")
+
+    def cyclic(vector):
+        value = {"vector": np.array(vector)}
+        value["self"] = value
+        return value
+
+    def shared(vector):
+        array = np.array(vector)
+        return {"a": array, "b": [array, array]}
 
     def object_array(*elements):
         array = np.empty(len(elements), dtype=object)
@@ -2527,6 +2588,9 @@ def test_ensemble_equality_never_raises_across_metadata_types():
             "masked": np.ma.array(vector, mask=[False, True]),
             "masked_all_visible": np.ma.array(vector, mask=[False, False]),
             "masked_record": np.ma.array([(4, vector[1] / 2)], mask=[(False, True)], dtype=[("count", "i4"), ("weight", "f4")]),
+            "cyclic": cyclic(vector),
+            "shared_references": shared(vector),
+            "unconvertible": Unconvertible(),
         }
 
     def data(value):
@@ -2542,7 +2606,7 @@ def test_ensemble_equality_never_raises_across_metadata_types():
         assert result == results[(right_name, left_name)], (left_name, right_name)
     # Objects whose own comparison is ambiguous equal themselves only; a
     # masked value that hides the differing element makes the variants equal.
-    unequal_to_copy = ("array_nan", "dataclass_array", "ambiguous_object")
+    unequal_to_copy = ("array_nan", "dataclass_array", "ambiguous_object", "cyclic", "unconvertible")
     equal_to_other = ("none", "bool", "int", "float", "big_int", "str", "np_bool", "np_str", "masked", "masked_record")
     for name, value in same.items():
         assert data(value) == data(value)

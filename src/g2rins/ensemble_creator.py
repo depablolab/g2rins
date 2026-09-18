@@ -538,21 +538,21 @@ def _edge_ids(graph):
     return {(frozenset(edge[:2]), *edge[2:]) for edge in edges}
 
 
-def _graphs_equal(left, right):
+def _graphs_equal(left, right, active):
     """Structural graph equality with array-aware attribute comparison."""
     if left.is_directed() != right.is_directed() or left.is_multigraph() != right.is_multigraph():
         return False
-    if set(left.nodes) != set(right.nodes) or not _graph_aware_equal(left.graph, right.graph):
+    if set(left.nodes) != set(right.nodes) or not _graph_aware_equal(left.graph, right.graph, active):
         return False
-    if not all(_graph_aware_equal(left.nodes[node], right.nodes[node]) for node in left.nodes):
+    if not all(_graph_aware_equal(left.nodes[node], right.nodes[node], active) for node in left.nodes):
         return False
     if _edge_ids(left) != _edge_ids(right):
         return False
     edges = left.edges(keys=True) if left.is_multigraph() else left.edges
-    return all(_graph_aware_equal(left.edges[edge], right.edges[edge]) for edge in edges)
+    return all(_graph_aware_equal(left.edges[edge], right.edges[edge], active) for edge in edges)
 
 
-def _array_equal(left, right):
+def _array_equal(left, right, active):
     """Value equality of two NumPy arrays (0-d for scalars). Object arrays
     compare element-wise through :func:`_graph_aware_equal`; structured data
     compares only with structured data of the same dtype, field by field when
@@ -566,42 +566,45 @@ def _array_equal(left, right):
         if left.dtype != right.dtype:
             return False
         if left.dtype.hasobject:
-            return all(_array_equal(left[name], right[name]) for name in left.dtype.names)
+            return all(_array_equal(left[name], right[name], active) for name in left.dtype.names)
         return bool(np.array_equal(left, right))
     if left.dtype.kind == "O" or right.dtype.kind == "O":
         # tolist() yields Python objects, except for scalar types without a
         # Python equivalent (longdouble), which _graph_aware_equal settles
         # directly against a plain value instead of coming back here.
-        return _graph_aware_equal(left.tolist(), right.tolist())
+        return _graph_aware_equal(left.tolist(), right.tolist(), active)
     try:
         return bool(np.array_equal(left, right))
-    except TypeError:
+    except Exception:
         return False
 
 
-def _masked_equal(left, right):
+def _masked_equal(left, right, active):
     """Masked arrays compare by mask and by the values that are not masked,
     field by field for structured data; an array without a mask counts as
     unmasked everywhere, and values hidden under matching masks are ignored."""
-    left, right = np.ma.asarray(left), np.ma.asarray(right)
+    try:
+        left, right = np.ma.asarray(left), np.ma.asarray(right)
+        left_mask, right_mask = np.ma.getmaskarray(left), np.ma.getmaskarray(right)
+    except Exception:
+        return False
     if left.shape != right.shape:
         return False
     if left.dtype.names is not None or right.dtype.names is not None:
-        return left.dtype == right.dtype and all(_masked_equal(left[name], right[name]) for name in left.dtype.names)
-    left_mask, right_mask = np.ma.getmaskarray(left), np.ma.getmaskarray(right)
+        return left.dtype == right.dtype and all(_masked_equal(left[name], right[name], active) for name in left.dtype.names)
     if not np.array_equal(left_mask, right_mask):
         return False
     kept = ~left_mask
-    return _array_equal(np.ma.getdata(left)[kept], np.ma.getdata(right)[kept])
+    return _array_equal(np.ma.getdata(left)[kept], np.ma.getdata(right)[kept], active)
 
 
 def _comparison_result(left, right):
-    """``left == right`` as a bool: a comparison that raises, or that yields
-    anything but a boolean (an array, when NumPy broadcasts a scalar against a
-    sequence), means unequal."""
+    """``left == right`` as a bool, best effort: a comparison that raises, or
+    that yields anything but a boolean (an array, when NumPy broadcasts a
+    scalar against a sequence), means unequal."""
     try:
         result = left == right
-    except (TypeError, ValueError, OverflowError):
+    except Exception:
         return False
     return bool(result) if isinstance(result, (bool, np.bool_)) else False
 
@@ -610,24 +613,50 @@ def _is_collection(value):
     return isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray, np.ndarray))
 
 
-def _graph_aware_equal(left, right):
-    """Equality that compares graph-valued members by structure, not identity,
-    and NumPy data by value (``==`` on an array is not a boolean)."""
+_RECURSIVE_TYPES = (dict, list, tuple, deque, np.ndarray, nx.Graph)
+
+
+def _graph_aware_equal(left, right, active=None):
+    """Structural equality for the metadata types :class:`EnsembleData`
+    supports (see its docstring); other objects compare best effort.
+    ``active`` holds the pairs of containers being compared up the call
+    chain, so metadata that refers back to itself compares unequal instead
+    of recursing, while a structure that merely shares references compares
+    normally."""
     if left is right:
         return True
+    if active is None:
+        active = set()
+    if not (isinstance(left, _RECURSIVE_TYPES) and isinstance(right, _RECURSIVE_TYPES)):
+        return _compare(left, right, active)
+    pair = (id(left), id(right))
+    if pair in active:
+        return False
+    active.add(pair)
+    try:
+        return _compare(left, right, active)
+    finally:
+        active.discard(pair)
+
+
+def _compare(left, right, active):
     if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
-        return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right)
+        return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right, active)
     if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key]) for key in left)
+        return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key], active) for key in left)
     if isinstance(left, (list, tuple, deque)) and isinstance(right, (list, tuple, deque)):
-        return len(left) == len(right) and all(_graph_aware_equal(a, b) for a, b in zip(left, right, strict=True))
+        return len(left) == len(right) and all(_graph_aware_equal(a, b, active) for a, b in zip(left, right, strict=True))
     if _is_collection(left) != _is_collection(right):
         # A collection never equals a scalar or an array; NumPy would broadcast.
         return False
     if isinstance(left, np.ma.MaskedArray) or isinstance(right, np.ma.MaskedArray):
-        return _masked_equal(left, right)
+        return _masked_equal(left, right, active)
     if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
-        return _array_equal(np.asarray(left), np.asarray(right))
+        try:
+            arrays = np.asarray(left), np.asarray(right)
+        except Exception:
+            return False
+        return _array_equal(*arrays, active)
     # A NumPy scalar against a plain value, or any other pair of objects: their
     # own comparison, guarded, so an ambiguous comparison means unequal.
     return _comparison_result(left, right)
@@ -663,15 +692,18 @@ class EnsembleData:
     template node and edge attribute must be deep-copyable when ensemble
     information is requested (it must already be JSON-safe for ``json_file``).
 
-    ``==`` is structural: graph-valued members compare by structure, NumPy
-    data by value (object arrays element-wise, structured data only with
-    structured data of the same dtype, masked arrays by mask and unmasked
-    values, field by field for structured data), a list, tuple or deque with
-    equal elements compare equal, a collection never equals a scalar, and
-    NaN compares unequal unless it is the same object; there is no
-    ``equal_nan``. Any other value, a dataclass instance included, compares
-    with its own ``==``, and a comparison that raises or is ambiguous means
-    unequal, so such an object equals itself only.
+    ``==`` is structural, and tested, for these metadata types: ``None``,
+    ``bool``, ``int``, ``float`` (NaN unequal unless the same object),
+    ``str`` and ``bytes``; NumPy scalars and arrays of numeric, boolean,
+    string, object and structured dtypes, structured data only against
+    structured data of the same dtype, and masked arrays by mask and
+    unmasked values; ``dict`` with structurally compared values; ``list``,
+    ``tuple`` and ``deque`` element-wise; networkx graphs by structure. A
+    collection never equals a scalar, there is no ``equal_nan``, and
+    metadata that refers back to itself compares unequal. Any other object
+    compares best effort: equal when it is the same object, otherwise by its
+    own ``==``, where a comparison that raises or is ambiguous means unequal;
+    no structural semantics are promised for such objects.
 
     Each unit's pSMILES has one mapped star ``[*:n]`` per template bond_id.
     Internal split-atom placeholders with no bond_id are omitted.
