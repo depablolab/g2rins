@@ -3850,8 +3850,10 @@ class EnsembleCreator:
         multigraph keys included); node-link chains whose nodes carry the
         atom attributes ``atomic_num``, ``is_connector_placeholder``,
         ``aromatic``, ``charge``, ``num_explicit_h`` and ``origin_idx`` (the
-        template node the atom came from) and whose bonds carry ``bond_type``
-        and ``aromatic``, without the sampler's in-memory bookkeeping;
+        template's own key of the node the atom came from, whereas the
+        in-memory chain graphs carry it as the sampler's string form) and
+        whose bonds carry ``bond_type`` and ``aromatic``, without the
+        sampler's in-memory bookkeeping;
         ``bonds`` with ``nodes`` holding the graph section's ``id`` values,
         whatever type the template used;
         ``mol_weights`` and ``distributions`` keyed by the stochastic id as a
@@ -4101,9 +4103,12 @@ class EnsembleCreator:
 
                 def _chain_json(molecule):
                     # The file carries the atom and bond attributes plus the
-                    # template provenance; sampler bookkeeping stays in memory.
+                    # template provenance as the template's own node key (the
+                    # sampler tracks it as a string); bookkeeping stays in memory.
                     data = nx.node_link_data(molecule, edges="edges")
-                    data["nodes"] = [{key: node[key] for key in ("id", *_PartialAtomGraph._ATOM_ATTRS, "origin_idx") if key in node} for node in data["nodes"]]
+                    data["nodes"] = [
+                        {key: origin_node[node[key]] if key == "origin_idx" else node[key] for key in ("id", *_PartialAtomGraph._ATOM_ATTRS, "origin_idx") if key in node} for node in data["nodes"]
+                    ]
                     data["edges"] = [{key: edge[key] for key in ("source", "target", *_PartialAtomGraph._BOND_ATTRS) if key in edge} for edge in data["edges"]]
                     return data
 

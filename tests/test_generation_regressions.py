@@ -2083,6 +2083,34 @@ def test_ensemble_json_normalizes_the_source_string_before_writing(tmp_path):
     assert path.read_bytes() == previous
 
 
+def test_exported_chain_provenance_uses_template_node_keys(tmp_path):
+    """Chain atoms in the file name their template node by the template's own
+    key, whatever its type, so a consumer can look the node up in the graph
+    section, the unit subgraphs and the bond records, which all use that key.
+    The in-memory chain graphs keep the sampler's string form."""
+    import json
+
+    import networkx as nx
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    labels = g2rins.derive_unit_labels(generative_graph)
+    initiator_site = next(node for node, unit_id in labels.unit_id.items() if unit_id == "I0" and node in labels.bond_id)
+    generative_graph = nx.relabel_nodes(generative_graph, {initiator_site: 42})
+    generative_graph.graph.pop("unit_node_ids", None)
+    generative_graph.graph.pop("unit_g2rins", None)
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = g2rins.EnsembleCreator(generative_graph).create_ensemble(2, output_format="mol_graph", ensemble_info=True, json_file=str(path), seed=0).chains
+    data = json.loads(path.read_text())
+    origins = [node["origin_idx"] for chain in data["ensemble"]["chains"] for node in chain["nodes"]]
+    assert all(origin in generative_graph for origin in origins)
+    assert 42 in origins
+    assert {node["id"] for node in data["graph"]["nodes"]} >= set(origins)
+    assert all(isinstance(data["origin_idx"], str) for chain in chains for _node, data in chain.nodes(data=True))
+
+
 def test_ensemble_from_reloaded_graph_carries_no_stale_derived_fields():
     """A template loaded back from an export carries the injected unit_id and
     bond_id as node attributes. The creator drops them, so unit subgraphs
