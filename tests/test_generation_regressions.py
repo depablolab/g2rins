@@ -159,7 +159,7 @@ def test_truncated_chain_contract():
     _reset_rngs(1)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble = ensemble_creator.create_ensemble(n_samples=1, output_format="mol", max_number_of_discarded_chains=3)
+        ensemble = ensemble_creator.create_ensemble(n_samples=1, output_format="mol_graph", max_number_of_discarded_chains=3)
     assert ensemble is None
 
 
@@ -290,9 +290,9 @@ def test_example_ensemble(smi, target_mn, mn_rtol, n_samples, min_dispersity):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-        molecules = ensemble_creator.create_ensemble(n_samples=n_samples, output_format="mol")
+        molecules = ensemble_creator.create_ensemble(n_samples=n_samples, output_format="mol_graph")
     assert molecules is not None and len(molecules) == n_samples
-    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    weights = np.array([Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(m)) for m in molecules])
     mn = weights.mean()
     assert abs(mn - target_mn) / target_mn < mn_rtol, f"Mn {mn:.0f} vs target {target_mn:.0f}"
     if min_dispersity is not None:
@@ -433,7 +433,7 @@ def test_create_ensemble_aromatic_core_unit():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(star).get_graph_creator().get_ensemble_creator()
-        for output_format in ("mol_graph", "mol", "smiles"):
+        for output_format in ("mol_graph", "smiles"):
             for with_info in (False, True):
                 _reset_rngs(0)
                 result = ensemble_creator.create_ensemble(n_samples=2, output_format=output_format, ensemble_info=with_info)
@@ -443,6 +443,10 @@ def test_create_ensemble_aromatic_core_unit():
                     # units are returned and the aromatic triazole survives the
                     # kekulize-free fragment conversion.
                     assert len(result.units) > 0
+        # The rdkit "mol" output format is gone; convert chains yourself via
+        # g2rins.mol_graph_to_rdkit_mol or Chem.MolFromSmiles.
+        with pytest.raises(ValueError, match="Unsupported format"):
+            ensemble_creator.create_ensemble(n_samples=1, output_format="mol")
 
 
 def test_star_initiator_has_three_arms():
@@ -500,7 +504,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
         warnings.simplefilter("always")
         molecules = ensemble_creator.create_ensemble(
             n_samples=1,
-            output_format="mol",
+            output_format="mol_graph",
             max_number_of_discarded_chains=10,
         )
 
@@ -1760,16 +1764,17 @@ def test_triple_nested_repeat_unit_does_not_starve():
         warnings.simplefilter("always")
         molecules = ensemble_creator.create_ensemble(
             n_samples=n_samples,
-            output_format="mol",
+            output_format="mol_graph",
             max_number_of_discarded_chains=40,
         )
     assert molecules is not None and len(molecules) == n_samples
     discards = [w for w in caught_warnings if issubclass(w.category, DiscardedSamplingPaths)]
     assert not discards, f"starvation discards returned: {[str(w.message) for w in discards]}"
-    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    rdkit_molecules = [g2rins.mol_graph_to_rdkit_mol(graph) for graph in molecules]
+    weights = np.array([Descriptors.MolWt(m) for m in rdkit_molecules])
     mn = weights.mean()
     assert 850 <= mn <= 1150, f"Mn {mn:.0f} off the 1000 outer target"
-    for i, mol in enumerate(molecules):
+    for i, mol in enumerate(rdkit_molecules):
         chlorine_count = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
         assert chlorine_count == 1, f"chain {i}: expected exactly 1 outer Cl cap, found {chlorine_count}"
 
@@ -1870,8 +1875,9 @@ def test_create_ensemble_json_file(tmp_path):
     """The json_file export must be strict JSON (no NaN/numpy leakage) with the
     documented layout: {string, format, graph, ensemble}, derived unit/bond
     labels injected into the graph nodes, canonical unit entries with numbered
-    P-SMILES stars, undirected bond records, chains capped by json_max_chains
-    while statistics keep every sampled chain."""
+    P-SMILES stars and static unit subgraphs, undirected bond records pairing
+    endpoint labels with generative-graph node ids, chains capped by
+    json_max_chains while statistics keep every sampled chain."""
     import json
 
     smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
@@ -1895,6 +1901,7 @@ def test_create_ensemble_json_file(tmp_path):
     assert data["string"].startswith("{[] [<]CC([>])c1ccccc1;")
     assert data["format"]["version"] == 2
     assert data["format"]["derived_node_fields"] == ["unit_id", "bond_id"]
+    assert data["format"]["chain_format"] == "smiles"
 
     labels = g2rins.derive_unit_labels(ensemble_creator._generative_graph)
     for node_dict in data["graph"]["nodes"]:
@@ -1912,18 +1919,76 @@ def test_create_ensemble_json_file(tmp_path):
 
     assert set(ensemble["units"]) == {"I0", "R0", "T0"}
     for unit_id, info in ensemble["units"].items():
-        assert list(info) == ["psmiles", "g2rins", "frequency"]
+        assert list(info) == ["psmiles", "g2rins", "subgraph", "count"]
         assert "[*:1]" in info["psmiles"]
-        assert info["g2rins"] and info["frequency"] > 0
+        assert info["g2rins"] and info["count"] > 0
+        # The subgraph is the unit's static piece of the generative graph:
+        # the same node ids, static edges only, unit_id (only) on its nodes.
+        subgraph_ids = {node_dict["id"] for node_dict in info["subgraph"]["nodes"]}
+        assert subgraph_ids == {node for node, uid in labels.unit_id.items() if uid == unit_id}
+        assert all(node_dict["unit_id"] == unit_id and "bond_id" not in node_dict for node_dict in info["subgraph"]["nodes"])
+        # Exactly the template's static edges among the unit's nodes, with
+        # their keys and data, and the template's node data plus unit_id.
+        template = ensemble_creator._generative_graph
+        expected_edges = {(u, v, key): data for u, v, key, data in template.edges(keys=True, data=True) if u in subgraph_ids and v in subgraph_ids and data["static"]}
+        stored_edges = {(edge["source"], edge["target"], edge["key"]): edge for edge in info["subgraph"]["edges"]}
+        assert set(stored_edges) == set(expected_edges)
+        assert expected_edges or len(subgraph_ids) == 1
+        for edge_key, expected in expected_edges.items():
+            assert {name: value for name, value in stored_edges[edge_key].items() if name not in ("source", "target", "key")} == expected
+        for node_dict in info["subgraph"]["nodes"]:
+            assert {name: value for name, value in node_dict.items() if name != "id"} == {**template.nodes[node_dict["id"]], "unit_id": unit_id}
     assert "[*:2]" in ensemble["units"]["R0"]["psmiles"], "repeat unit carries two numbered stars"
 
     for record in ensemble["bonds"]:
-        assert list(record) == ["between", "count"] and record["count"] > 0
-        for endpoint in record["between"]:
+        assert list(record) == ["labels", "nodes", "count"] and record["count"] > 0
+        for endpoint, node_id in zip(record["labels"], record["nodes"], strict=True):
             unit_id, bond_id = endpoint.rsplit(".", 1)
             assert unit_id in ensemble["units"] and int(bond_id) >= 1
-    linkages = {tuple(record["between"]) for record in ensemble["bonds"]}
+            # nodes are aligned with labels: both name the same connection atom.
+            assert labels.unit_id[node_id] == unit_id
+            assert labels.bond_id[node_id] == int(bond_id)
+    linkages = {tuple(record["labels"]) for record in ensemble["bonds"]}
     assert ("I0.1", "R0.1") in linkages and ("R0.2", "T0.1") in linkages
+
+
+def test_create_ensemble_json_file_mol_graph_chains(tmp_path):
+    """With output_format="mol_graph" the file's chains follow the caller's
+    format as node-link graph dicts (picking the format is picking the file
+    size); sequences are written as SMILES regardless."""
+    import json
+
+    import networkx as nx
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    path = tmp_path / "ensemble_graphs.json"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        chains = ensemble_creator.create_ensemble(2, output_format="mol_graph", json_file=str(path))
+
+    data = json.loads(path.read_text())
+    assert data["format"]["chain_format"] == "mol_graph"
+    stored_chains = data["ensemble"]["chains"]
+    assert len(stored_chains) == 2
+    node_keys = ["id", "atomic_num", "is_connector_placeholder", "aromatic", "charge", "num_explicit_h", "origin_idx"]
+    edge_keys = ["source", "target", "bond_type", "aromatic"]
+    for chain_data, chain_graph in zip(stored_chains, chains, strict=True):
+        # The file carries the atom and bond attributes plus the template
+        # provenance, in a fixed key order, and no sampler bookkeeping.
+        assert all(list(node) == node_keys for node in chain_data["nodes"])
+        assert all(list(edge) == edge_keys for edge in chain_data["edges"])
+        restored = nx.node_link_graph(chain_data, edges="edges")
+        assert set(restored.nodes) == set(chain_graph.nodes)
+        assert {frozenset(edge) for edge in restored.edges} == {frozenset(edge) for edge in chain_graph.edges}
+        for node, attributes in restored.nodes(data=True):
+            assert attributes == {key: chain_graph.nodes[node][key] for key in node_keys[1:]}
+        for u, v, attributes in restored.edges(data=True):
+            assert attributes == {key: chain_graph.edges[u, v][key] for key in edge_keys[2:]}
+    for chain_sequences in data["ensemble"]["sequences"]:
+        for sequence in chain_sequences:
+            assert sequence and all(isinstance(unit, str) for unit in sequence)
 
 
 def test_generative_graph_and_ensemble_share_node_ids():
@@ -1948,3 +2013,602 @@ def test_generative_graph_and_ensemble_share_node_ids():
     direct_molecule = direct.sample_mol_graph(rng=np.random.default_rng(0))
     direct_origins = {str(data["origin_idx"]) for _node, data in direct_molecule.nodes(data=True) if "origin_idx" in data}
     assert direct_origins <= {str(node) for node in generative_graph.nodes}
+
+
+def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):
+    """The ensemble section of the JSON file (unit subgraphs, node-link chains,
+    weights) is normalized like the graph section: NumPy values become JSON
+    values, and the graph in memory keeps its NumPy values."""
+    import json
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    node = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
+    generative_graph.nodes[node]["metadata"] = {"score": np.float32(0.25), "counts": np.array([1, 2], dtype=np.int16), "flag": np.bool_(True)}
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(2, output_format="mol_graph", json_file=str(path), seed=0)
+
+    data = json.loads(path.read_text())
+    stored = [node_data for unit in data["ensemble"]["units"].values() for node_data in unit["subgraph"]["nodes"] if "metadata" in node_data]
+    assert len(stored) == 1
+    assert stored[0]["metadata"] == {"score": 0.25, "counts": [1, 2], "flag": True}
+    assert [type(value) for value in stored[0]["metadata"].values()] == [float, list, bool]
+    assert isinstance(generative_graph.nodes[node]["metadata"]["score"], np.float32)
+    assert isinstance(generative_graph.nodes[node]["metadata"]["counts"], np.ndarray)
+
+
+def test_ensemble_json_refuses_non_finite_values_in_the_ensemble_section(tmp_path, monkeypatch):
+    """A non-finite value that reaches the file only through the ensemble
+    section (here a unit subgraph) is refused before the file is opened. The
+    graph section is replaced by a clean export so it cannot reject first."""
+    import copy
+
+    import g2rins.ensemble_creator as ensemble_creator_module
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    clean_export = g2rins.generative_graph_json_data(generative_graph)
+    generative_graph.nodes[next(iter(generative_graph))]["metadata"] = {"score": float("nan")}
+    monkeypatch.setattr(ensemble_creator_module, "generative_graph_json_data", lambda graph: copy.deepcopy(clean_export))
+    path = tmp_path / "ensemble.json"
+    with pytest.raises(ValueError, match=r"Non-finite JSON value at \$\['ensemble'\]"):
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    assert not path.exists()
+
+
+def test_ensemble_json_normalizes_the_source_string_before_writing(tmp_path):
+    """The top-level source string is normalized like every other part of the
+    file: NumPy-backed provenance is written as a plain string, and provenance
+    that cannot be serialized is refused before the file is opened, so an
+    existing output file is left untouched."""
+    import json
+
+    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    text = generative_graph.graph["g2rins_string"]
+    generative_graph.graph["g2rins_string"] = np.array(text)
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    stored = json.loads(path.read_text())["string"]
+    assert stored == text and type(stored) is str
+
+    previous = path.read_bytes()
+    generative_graph.graph["g2rins_string"] = 1 + 2j
+    with pytest.raises(TypeError, match=r"Unsupported JSON value at \$\['string'\]"):
+        g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", json_file=str(path), seed=0)
+    assert path.read_bytes() == previous
+
+
+def test_exported_chain_provenance_uses_template_node_keys(tmp_path):
+    """Chain atoms in the file name their template node by the template's own
+    key, whatever its type, so a consumer can look the node up in the graph
+    section, the unit subgraphs and the bond records, which all use that key.
+    The in-memory chain graphs keep the sampler's string form."""
+    import json
+
+    import networkx as nx
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    labels = g2rins.derive_unit_labels(generative_graph)
+    initiator_site = next(node for node, unit_id in labels.unit_id.items() if unit_id == "I0" and node in labels.bond_id)
+    generative_graph = nx.relabel_nodes(generative_graph, {initiator_site: 42})
+    generative_graph.graph.pop("unit_node_ids", None)
+    generative_graph.graph.pop("unit_g2rins", None)
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = g2rins.EnsembleCreator(generative_graph).create_ensemble(2, output_format="mol_graph", ensemble_info=True, json_file=str(path), seed=0).chains
+    data = json.loads(path.read_text())
+    origins = [node["origin_idx"] for chain in data["ensemble"]["chains"] for node in chain["nodes"]]
+    assert all(origin in generative_graph for origin in origins)
+    assert 42 in origins
+    assert {node["id"] for node in data["graph"]["nodes"]} >= set(origins)
+    assert all(isinstance(data["origin_idx"], str) for chain in chains for _node, data in chain.nodes(data=True))
+
+
+def test_ensemble_from_reloaded_graph_carries_no_stale_derived_fields():
+    """A template loaded back from an export carries the injected unit_id and
+    bond_id as node attributes. The creator drops them, so unit subgraphs
+    carry the current unit_id only and bond records follow the current
+    derivation, even when the reloaded node order renumbers the labels; a
+    reload in the exported order reproduces the original ensemble."""
+    import json
+
+    import networkx as nx
+
+    text = "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    payload = json.loads(json.dumps(g2rins.generative_graph_json_data(generative_graph)))
+    restored = nx.node_link_graph(payload["graph"], edges="edges")
+    payload["graph"]["nodes"].reverse()
+    reordered = nx.node_link_graph(payload["graph"], edges="edges")
+    assert all("unit_id" in data for _node, data in restored.nodes(data=True))
+    reordered_labels = g2rins.derive_unit_labels(reordered)
+    # The reversed order renumbers connection sites, so stale bond ids conflict.
+    assert any(data["bond_id"] != reordered_labels.bond_id.get(node) for node, data in reordered.nodes(data=True) if "bond_id" in data)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        expected = g2rins.EnsembleCreator(generative_graph).create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+        actual = g2rins.EnsembleCreator(restored).create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+        actual_reordered = g2rins.EnsembleCreator(reordered).create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+    for result, graph in ((actual, restored), (actual_reordered, reordered)):
+        labels = g2rins.derive_unit_labels(graph)
+        for unit_id, info in result.units.items():
+            for node, data in info["subgraph"].nodes(data=True):
+                assert "bond_id" not in data
+                assert data["unit_id"] == unit_id == labels.unit_id[node]
+        for record in result.bonds:
+            for label, node in zip(record["labels"], record["nodes"], strict=True):
+                assert label == f"{labels.unit_id[node]}.{labels.bond_id[node]}"
+        # The caller's graph keeps its attributes; only the creator's copy drops them.
+        assert all("unit_id" in data for _node, data in graph.nodes(data=True))
+    assert actual == expected
+
+
+def test_unit_subgraphs_do_not_copy_graph_level_metadata():
+    """Unit subgraphs copy node and edge data only: graph-level metadata of
+    the template is neither copied nor required to be copyable."""
+    import threading
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    generative_graph.graph["lock"] = threading.Lock()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result.units
+    assert all(info["subgraph"].graph == {} for info in result.units.values())
+
+
+def test_ensemble_export_is_independent_of_the_hash_seed(tmp_path):
+    """Unit subgraph node order, chain attribute order and the JSON bytes do
+    not depend on PYTHONHASHSEED: the same serialized template and sampling
+    seed give identical files in fresh interpreters with different hash
+    seeds. The nested template has units small enough that a subgraph view
+    of the template would have iterated their membership set, which is the
+    regression this guards."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    text = "{[] [<]CC([>])C(=O)O{[>] [<]CCO[>]; ; [<]C []}|poisson(300)|; COC(=O)C(C)[>]; [<]Br []}|poisson(800)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    template_path = tmp_path / "template.json"
+    template_path.write_text(json.dumps(g2rins.generative_graph_json_data(generative_graph)))
+    script = tmp_path / "export.py"
+    script.write_text(
+        "import json, sys, warnings\n"
+        "import networkx as nx\n"
+        "import g2rins\n"
+        "warnings.simplefilter('ignore')\n"
+        "graph = nx.node_link_graph(json.load(open(sys.argv[1]))['graph'], edges='edges')\n"
+        "g2rins.EnsembleCreator(graph).create_ensemble(2, output_format='mol_graph', json_file=sys.argv[2], seed=0)\n"
+    )
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(g2rins.__file__)))
+    python_path = os.pathsep.join(entry for entry in (package_root, os.environ.get("PYTHONPATH")) if entry)
+    outputs = []
+    for hash_seed in ("0", "1", "2"):
+        out = tmp_path / f"ensemble_{hash_seed}.json"
+        env = {**os.environ, "PYTHONHASHSEED": hash_seed, "PYTHONPATH": python_path}
+        completed = subprocess.run([sys.executable, str(script), str(template_path), str(out)], env=env, capture_output=True, text=True)
+        assert completed.returncode == 0, completed.stderr
+        outputs.append(out.read_bytes())
+    assert len(set(outputs)) == 1
+    units = json.loads(outputs[0])["ensemble"]["units"]
+    assert {"I0", "R0", "R1"} <= set(units) and all(unit["subgraph"]["nodes"] for unit in units.values())
+
+
+def test_bond_record_nodes_are_template_node_keys():
+    """``nodes`` holds the template's own node keys, whatever their type, and
+    each one corresponds to the label at the same position."""
+    import networkx as nx
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    labels = g2rins.derive_unit_labels(generative_graph)
+    initiator_site = next(node for node, unit_id in labels.unit_id.items() if unit_id == "I0" and node in labels.bond_id)
+    generative_graph = nx.relabel_nodes(generative_graph, {initiator_site: 42})
+    generative_graph.graph.pop("unit_node_ids", None)
+    generative_graph.graph.pop("unit_g2rins", None)
+    labels = g2rins.derive_unit_labels(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = g2rins.EnsembleCreator(generative_graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result.bonds
+    for record in result.bonds:
+        for label, node in zip(record["labels"], record["nodes"], strict=True):
+            assert node in generative_graph
+            assert label == f"{labels.unit_id[node]}.{labels.bond_id[node]}"
+    assert any(42 in record["nodes"] for record in result.bonds)
+    assert 42 in result.units["I0"]["subgraph"]
+
+
+def test_ensemble_equality_is_array_aware():
+    import copy
+
+    from g2rins.ensemble_creator import EnsembleData
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(generative_graph))
+    generative_graph.nodes[node]["metadata"] = {"vector": np.array([1, 2])}
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+        again = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result == copy.deepcopy(result)
+    assert result == again
+    changed = copy.deepcopy(result)
+    unit_id = next(unit_id for unit_id, info in changed.units.items() if node in info["subgraph"])
+    changed.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"] = np.array([1, 3])
+    assert result != changed
+
+    # Arrays inside ordinary containers, not only inside graphs.
+    def data(units):
+        return EnsembleData(chains=[], units=units, bonds=[], sequences=[], mol_weights={}, distributions={})
+
+    assert data({"R0": {"vector": np.array([1, 2])}}) == data({"R0": {"vector": np.array([1, 2])}})
+    assert data({"R0": {"vector": np.array([1, 2])}}) != data({"R0": {"vector": [1, 2]}})
+    assert data({"R0": {"vector": [1, 2]}}) == data({"R0": {"vector": (1, 2)}})
+
+
+def test_unit_subgraphs_are_detached_from_the_template():
+    """Mutating a returned subgraph's node or edge data in place leaves the
+    creator's template, and therefore the next ensemble, unchanged."""
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
+    generative_graph.nodes[node]["metadata"] = {"vector": [1, 2]}
+    edge = next(edge for edge in generative_graph.edges(keys=True, data=True) if edge[3]["static"])
+    edge[3]["tags"] = ["a"]
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+        unit_id = next(unit_id for unit_id, info in result.units.items() if node in info["subgraph"])
+        result.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"][0] = 99
+        edge_unit = next(info for info in result.units.values() if info["subgraph"].has_edge(edge[0], edge[1], edge[2]))
+        edge_unit["subgraph"].edges[edge[0], edge[1], edge[2]]["tags"].append("b")
+        again = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert creator._generative_graph.nodes[node]["metadata"] == {"vector": [1, 2]}
+    assert creator._generative_graph.edges[edge[0], edge[1], edge[2]]["tags"] == ["a"]
+    assert again.units[unit_id]["subgraph"].nodes[node]["metadata"] == {"vector": [1, 2]}
+    assert result != again
+
+
+def test_unit_subgraphs_name_an_attribute_that_cannot_be_copied():
+    """A template node attribute that cannot be deep-copied fails ensemble
+    information with the node and attribute named, not a bare pickling error."""
+    import threading
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(generative_graph))
+    generative_graph.nodes[node]["handle"] = threading.Lock()
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert creator.create_ensemble(1, output_format="smiles", seed=0)
+        with pytest.raises(TypeError, match=rf"node {node!r} attribute 'handle'"):
+            creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+
+def test_ensemble_equality_is_reflexive_and_boolean():
+    """``result == result`` holds whatever the metadata (NaN included, as for
+    Python containers), and a NumPy scalar never broadcasts against a
+    container: mismatched metadata compares unequal in both operand orders."""
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    with_nan = ensemble({"score": float("nan")})
+    assert with_nan == with_nan
+    scalar, one, two = ensemble(np.float64(2.0)), ensemble([2.0]), ensemble([2.0, 2.0])
+    for left, right in ((scalar, one), (one, scalar), (scalar, two), (two, scalar)):
+        assert (left == right) is False
+        assert (left != right) is True
+    assert scalar == ensemble(np.float64(2.0))
+
+
+def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
+    """Metadata that generation and the JSON export accept must compare
+    without raising: object arrays compare element-wise (their elements may
+    hold arrays), and structured NumPy data compares only with structured
+    data of the same dtype, so a record never meets a plain float inside a
+    NumPy comparison."""
+    import copy
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    objects = np.empty(1, dtype=object)
+    objects[0] = {"vector": np.array([1, 2])}
+    other_objects = np.empty(1, dtype=object)
+    other_objects[0] = {"vector": np.array([1, 3])}
+    result = ensemble(objects)
+    assert result == copy.deepcopy(result)
+    assert result == ensemble(copy.deepcopy(objects))
+    assert result != ensemble(other_objects)
+
+    record = np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")])[0]
+    same_record = np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")])[0]
+    structured, plain = ensemble(record), ensemble(2.0)
+    assert (structured == plain) is False
+    assert (plain == structured) is False
+    assert structured == ensemble(same_record)
+
+    # Structured data equals structured data of the same dtype only: neither
+    # an object array holding the same tuple nor a record with other field
+    # names is the same value, in either operand order.
+    tuple_array = np.empty(1, dtype=object)
+    tuple_array[0] = (4, 0.5)
+    records = ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
+    renamed = ensemble(np.array([(4, 0.5)], dtype=[("n", "i4"), ("w", "f4")]))
+    tuples = ensemble(tuple_array)
+    for left, right in ((records, tuples), (tuples, records), (renamed, tuples), (tuples, renamed), (records, renamed), (renamed, records)):
+        assert (left == right) is False
+    assert records == ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
+
+    # An object whose own == is ambiguous (a dataclass holding an array)
+    # compares unequal, in both orders, instead of raising: it equals itself
+    # only. A NumPy scalar next to any collection is unequal instead of
+    # broadcasting into a wrong True.
+    import dataclasses
+    from collections import deque
+
+    @dataclasses.dataclass
+    class Payload:
+        vector: np.ndarray
+
+    payload = ensemble(Payload(np.array([1.0, 2.0])))
+    assert payload == payload
+    assert (payload == copy.deepcopy(payload)) is False
+    assert (copy.deepcopy(payload) == payload) is False
+    assert (payload == ensemble(Payload(np.array([1.0, 2.0])))) is False
+    scalar_one, queue = ensemble(np.float64(1.0)), ensemble(deque([1.0]))
+    assert (scalar_one == queue) is False
+    assert (queue == scalar_one) is False
+    assert queue == ensemble(deque([1.0]))
+
+    # Masked arrays compare by mask and unmasked values, as the JSON file
+    # shows them (masked entries are written as null): values hidden under
+    # matching masks do not matter, an unmasked array counts as unmasked
+    # everywhere, and structured masks apply field by field.
+    masked = ensemble(np.ma.array([1.0, 2.0], mask=[False, True]))
+    assert masked == copy.deepcopy(masked)
+    assert masked == ensemble(np.ma.array([1.0, 2.0], mask=[False, True]))
+    assert masked == ensemble(np.ma.array([1.0, 9.0], mask=[False, True]))
+    for other in (np.ma.array([1.0, 2.0], mask=[True, False]), np.ma.array([5.0, 2.0], mask=[False, True]), np.array([1.0, 2.0])):
+        assert (masked == ensemble(other)) is False
+        assert (ensemble(other) == masked) is False
+    assert ensemble(np.ma.array([1.0, 2.0], mask=[False, False])) == ensemble(np.array([1.0, 2.0]))
+    assert ensemble(np.ma.array([1.0, 2.0], mask=[True, True])) == ensemble(np.ma.array([3.0, 4.0], mask=[True, True]))
+    assert (ensemble(np.ma.array([1.0, 2.0], mask=[True, True])) == ensemble(np.array([1.0, 2.0]))) is False
+    assert ensemble(np.ma.array(2.0, mask=True)) == ensemble(np.ma.array(3.0, mask=True))
+    assert (ensemble(np.ma.array(2.0, mask=True)) == ensemble(np.float64(2.0))) is False
+    objects = np.ma.array([{"vector": np.array([1, 2])}, None], mask=[False, True], dtype=object)
+    assert ensemble(objects) == ensemble(copy.deepcopy(objects))
+    assert (ensemble(objects) == ensemble(np.ma.array([{"vector": np.array([1, 3])}, None], mask=[False, True], dtype=object))) is False
+    record_dtype = [("count", "i4"), ("weight", "f4")]
+    masked_record = ensemble(np.ma.array([(4, 0.5)], mask=[(False, True)], dtype=record_dtype))
+    assert masked_record == ensemble(np.ma.array([(4, 9.0)], mask=[(False, True)], dtype=record_dtype))
+    assert (masked_record == ensemble(np.ma.array([(5, 0.5)], mask=[(False, True)], dtype=record_dtype))) is False
+    assert (masked_record == ensemble(np.ma.array([(4, 0.5)], mask=[(True, False)], dtype=record_dtype))) is False
+
+    # Structured data whose field holds Python objects (kind "V", not "O")
+    # compares field by field, for arrays and for their record scalars.
+    def object_records(vector):
+        records = np.empty(1, dtype=[("metadata", object)])
+        records["metadata"][0] = {"vector": np.array(vector)}
+        return records
+
+    with_objects = ensemble(object_records([1, 2]))
+    assert with_objects == copy.deepcopy(with_objects)
+    assert with_objects == ensemble(object_records([1, 2]))
+    assert with_objects != ensemble(object_records([1, 3]))
+    record_with_objects = ensemble(object_records([1, 2])[0])
+    assert record_with_objects == copy.deepcopy(record_with_objects)
+    assert record_with_objects != ensemble(object_records([1, 3])[0])
+
+    # A NumPy scalar without a Python equivalent (longdouble) against a plain
+    # value settles directly instead of converting back and forth.
+    long_double, none, big_int = ensemble(np.longdouble(2)), ensemble(None), ensemble(2**100)
+    for left, right in ((long_double, none), (none, long_double), (long_double, big_int), (big_int, long_double)):
+        assert (left == right) is False
+    assert long_double == ensemble(np.longdouble(2))
+    assert long_double == ensemble(2.0)
+
+
+def test_ensemble_equality_boundary_for_cyclic_shared_and_unconvertible_metadata():
+    """The structural-equality domain is closed: metadata that refers back to
+    itself compares unequal instead of recursing, a structure that merely
+    shares references compares normally, and an object whose array conversion
+    fails compares unequal instead of raising, in both operand orders."""
+    import copy
+
+    class Unconvertible:
+        def __array__(self, dtype=None, copy=None):
+            raise ValueError("cannot be converted")
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    def cyclic():
+        value = {"x": 1}
+        value["self"] = value
+        return value
+
+    cycle = ensemble(cyclic())
+    assert cycle == cycle
+    assert (cycle == copy.deepcopy(cycle)) is False
+    assert (cycle == ensemble(cyclic())) is False
+    assert (ensemble(cyclic()) == cycle) is False
+
+    shared = np.array([1, 2])
+    references = {"a": shared, "b": shared, "c": [shared, {"d": shared}]}
+    with_shared = ensemble(references)
+    assert with_shared == copy.deepcopy(with_shared)
+    assert with_shared == ensemble(copy.deepcopy(references))
+    assert with_shared == ensemble({"a": np.array([1, 2]), "b": np.array([1, 2]), "c": [np.array([1, 2]), {"d": np.array([1, 2])}]})
+    assert (with_shared == ensemble({"a": shared, "b": shared, "c": [shared, {"d": np.array([1, 3])}]})) is False
+
+    unconvertible = ensemble(Unconvertible())
+    assert unconvertible == unconvertible
+    for other in (np.array([1.0]), np.float64(1.0), np.ma.array([1.0], mask=[False]), Unconvertible()):
+        assert (unconvertible == ensemble(other)) is False
+        assert (ensemble(other) == unconvertible) is False
+
+
+def test_ensemble_equality_never_raises_across_metadata_types():
+    """Every ordered pair of supported metadata values compares to a Python
+    bool, symmetrically; a value equals its deep copy (a NaN array aside: a
+    NaN float deep-copies to the same object), and a plainly different value
+    of the same kind is unequal. The space of user metadata is open-ended;
+    this pins the kinds generation and export accept."""
+    import copy
+    import dataclasses
+    import itertools
+    from collections import deque
+
+    import networkx as nx
+
+    from g2rins.ensemble_creator import EnsembleData
+
+    @dataclasses.dataclass
+    class Payload:
+        vector: np.ndarray
+
+    class Ambiguous:
+        def __init__(self, vector):
+            self.vector = vector
+
+        def __eq__(self, other):
+            if not isinstance(other, Ambiguous):
+                return NotImplemented
+            return bool(self.vector == other.vector)
+
+    class Unconvertible:
+        def __array__(self, dtype=None, copy=None):
+            raise ValueError("cannot be converted")
+
+    def cyclic(vector):
+        value = {"vector": np.array(vector)}
+        value["self"] = value
+        return value
+
+    def shared(vector):
+        array = np.array(vector)
+        return {"a": array, "b": [array, array]}
+
+    def object_array(*elements):
+        array = np.empty(len(elements), dtype=object)
+        for index, element in enumerate(elements):
+            array[index] = element
+        return array
+
+    def object_records(vector):
+        records = np.empty(1, dtype=[("metadata", object)])
+        records["metadata"][0] = {"vector": np.array(vector)}
+        return records
+
+    def nested_records(vector):
+        records = np.empty(1, dtype=[("inner", [("tag", "U2"), ("payload", object)]), ("weight", "f4")])
+        records["inner"]["tag"][0] = "ab"
+        records["inner"]["payload"][0] = [np.array(vector), {"k": np.array(vector)}]
+        records["weight"][0] = 0.5
+        return records
+
+    def values(vector):
+        return {
+            "none": None,
+            "bool": True,
+            "int": 2,
+            "float": 2.0,
+            "big_int": 2**100,
+            "str": "a",
+            "np_int": np.int64(vector[1]),
+            "np_float32": np.float32(vector[1]),
+            "np_float64": np.float64(vector[1]),
+            "np_longdouble": np.longdouble(vector[1]),
+            "np_bool": np.bool_(True),
+            "np_str": np.str_("a"),
+            "array_int": np.array(vector),
+            "array_float": np.array(vector, dtype=float),
+            "array_longdouble": np.array(vector, dtype=np.longdouble),
+            "array_0d": np.array(float(vector[1])),
+            "object_dicts": object_array({"vector": np.array(vector)}),
+            "object_mixed": object_array(None, np.longdouble(vector[1]), np.array(vector), "a"),
+            "record_numeric": np.array([(4, vector[1] / 2)], dtype=[("count", "i4"), ("weight", "f4")]),
+            "record_numeric_scalar": np.array([(4, vector[1] / 2)], dtype=[("count", "i4"), ("weight", "f4")])[0],
+            "record_objects": object_records(vector),
+            "record_objects_scalar": object_records(vector)[0],
+            "record_nested": nested_records(vector),
+            "record_nested_scalar": nested_records(vector)[0],
+            "list": [1, np.array(vector)],
+            "tuple": (1, np.array(vector)),
+            "dict": {"a": np.longdouble(vector[1]), "b": None},
+            "set": {1, vector[1]},
+            "nan": float("nan"),
+            "array_nan": np.array([np.nan]),
+            "graph": nx.MultiDiGraph([(1, vector[1])]),
+            "deque": deque([1, np.array(vector)]),
+            "frozenset": frozenset({1, vector[1]}),
+            "dataclass_array": Payload(np.array(vector)),
+            "ambiguous_object": Ambiguous(np.array(vector)),
+            "masked": np.ma.array(vector, mask=[False, True]),
+            "masked_all_visible": np.ma.array(vector, mask=[False, False]),
+            "masked_record": np.ma.array([(4, vector[1] / 2)], mask=[(False, True)], dtype=[("count", "i4"), ("weight", "f4")]),
+            "cyclic": cyclic(vector),
+            "shared_references": shared(vector),
+            "unconvertible": Unconvertible(),
+        }
+
+    def data(value):
+        return EnsembleData(chains=[], units={"R0": {"metadata": value}}, bonds=[], sequences=[], mol_weights={}, distributions={})
+
+    same, other = values([1, 2]), values([1, 3])
+    results = {}
+    for (left_name, left), (right_name, right) in itertools.product(same.items(), repeat=2):
+        result = data(left) == data(right)
+        assert isinstance(result, bool), (left_name, right_name)
+        results[(left_name, right_name)] = result
+    for (left_name, right_name), result in results.items():
+        assert result == results[(right_name, left_name)], (left_name, right_name)
+    # Objects whose own comparison is ambiguous equal themselves only; a
+    # masked value that hides the differing element makes the variants equal.
+    unequal_to_copy = ("array_nan", "dataclass_array", "ambiguous_object", "cyclic", "unconvertible")
+    equal_to_other = ("none", "bool", "int", "float", "big_int", "str", "np_bool", "np_str", "masked", "masked_record")
+    for name, value in same.items():
+        assert data(value) == data(value)
+        assert (data(value) == data(copy.deepcopy(value))) is (name not in unequal_to_copy)
+        assert (data(value) == data(other[name])) is (name in equal_to_other)

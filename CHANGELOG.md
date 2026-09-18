@@ -12,12 +12,17 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - **Migration without source strings requires known provenance:** use `mark_legacy_connector_placeholders(graph)` only when every unmarked zero-number node with exactly one static neighbor is known to be an internal placeholder. A pendant user wildcard such as `CC(*)O` has that same topology and will otherwise be marked `True`, incorrectly treating it as an internal placeholder. The helper cannot recover this distinction from graph structure. If the assumption cannot be established, recover the node identities from the graph producer before migrating.
 - **A migration warning is not verification:** `G2RINSWarning` reports counts, not affected node IDs, and does not establish that the assumption is correct. The helper returns a copy and preserves existing valid flags; compare the input and returned node flags to audit which identities it assigned.
 
+**Ensemble output format v2.** `EnsembleData.units` records are `{"psmiles", "g2rins", "subgraph", "count"}` (`frequency` renamed to `count`) and `EnsembleData.bonds` records are `{"labels", "nodes", "count"}` (`between` renamed to `labels`); the `ensemble` section of JSON files uses the same keys and shares `format.version` 2 with the generative-graph JSON format above. `subgraph` holds a networkx graph, so a unit record is no longer JSON-serializable as is (use `json_file`, or `nx.node_link_data(record["subgraph"], edges="edges")` before `json.dump`), and every template node and edge attribute must be deep-copyable when ensemble information is requested (checked before sampling starts). The `mol` output format of `create_ensemble` is removed. JSON files written with the default `output_format="mol_graph"` now store node-link chain graphs instead of SMILES strings; pass `output_format="smiles"` to keep the compact chains of version 1. `EnsembleData` equality is structural.
+
 ### Added
 
 - `mark_legacy_connector_placeholders(graph)` provides explicit migration for legacy datasets with known placeholder semantics; see [Breaking changes](#breaking-changes) for its assumptions and limitations. It marks unmarked zero-number nodes whose static degree is not one (a terminal `[<]*`, a backbone `C*C`) as user wildcards. Migration and ensemble validation count incoming and outgoing static neighbors, including when a reverse non-static edge exists. Export and generation require explicit identity on zero-number nodes.
 - `UnitLabels.unit_nodes` exposes the per-unit node partition behind `unit_id` and `bond_id`, so consumers no longer rebuild it by scanning every node.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
+- Unit records in the ensemble output carry the unit's static subgraph of the generative graph (`subgraph`: original node ids, static edges only, nodes in derivation order and edges in template order, `unit_id` stamped on the copy's nodes, no graph-level attributes; node-link encoded in JSON files).
+- Bond records carry the generative-graph node ids of the two connection atoms (`nodes`, positionally aligned with `labels`; labels survive a fresh parse, node ids are only valid for the graph they came from).
+- Ensemble JSON files follow the requested `output_format` for their stored chains — SMILES strings or node-link graph dicts — and record the choice in `format.chain_format`; chain nodes carry the atom attributes and their template provenance (`origin_idx`, as the template's own node key), chain bonds the bond type and aromaticity, and no sampler bookkeeping. Sequences are written as SMILES regardless. The whole `ensemble` section is normalized like the graph section (NumPy values become JSON values, non-finite values raise `ValueError` before the file is opened), and the file bytes do not depend on the interpreter's hash seed.
 
 ### Changed
 
@@ -29,6 +34,13 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
+- The ensemble output format — the `ensemble` section of JSON files and `EnsembleData` — is version 2, sharing the `format.version` field with the generative-graph JSON format v2 above: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
+- The ensemble creator's private copy of the generative graph carries `is_connector_placeholder` on every node, filling `False` where a legacy graph omits it on a real atom, and drops the derived `unit_id`/`bond_id` node attributes that a graph loaded back from a JSON export carries, so unit subgraphs always expose the flag and carry the current `unit_id` only.
+- `EnsembleData` equality compares graph-valued members (unit subgraphs, and molecule-graph chains or sequences) by structure instead of object identity, so two ensembles with the same content compare equal. Structural equality is defined for `None`, booleans, integers, floats (NaN unequal unless the same object), strings and bytes; NumPy scalars and arrays of numeric, boolean, string, object and structured dtypes (structured data only against structured data of the same dtype) and masked arrays (by mask and unmasked values); dicts; lists, tuples and deques (element-wise); and networkx graphs. A collection never equals a scalar, and metadata that refers back to itself compares unequal. Any other object compares best effort, by identity or its own `==`, and a comparison that raises or is ambiguous means unequal.
+
+### Removed
+
+- The `mol` output format of `create_ensemble`. Request `mol_graph` and convert chains with `g2rins.mol_graph_to_rdkit_mol`, or parse the SMILES output. Sequence fragments have dangling inter-unit valences, so convert them with `g2rins.mol_graph_to_rdkit_mol(unit, kekulize=False)`.
 
 ### Fixed
 
