@@ -238,6 +238,9 @@
     "subarray",
     "subarrays",
     "finalizer",
-    "hasobject"
+    "hasobject",
+    "deque",
+    "getdata",
+    "getmaskarray"
   ]
 }
