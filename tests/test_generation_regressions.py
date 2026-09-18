@@ -2343,6 +2343,52 @@ def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
         assert (left == right) is False
     assert records == ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
 
+    # An object whose own == is ambiguous (a dataclass holding an array)
+    # compares unequal, in both orders, instead of raising: it equals itself
+    # only. A NumPy scalar next to any collection is unequal instead of
+    # broadcasting into a wrong True.
+    import dataclasses
+    from collections import deque
+
+    @dataclasses.dataclass
+    class Payload:
+        vector: np.ndarray
+
+    payload = ensemble(Payload(np.array([1.0, 2.0])))
+    assert payload == payload
+    assert (payload == copy.deepcopy(payload)) is False
+    assert (copy.deepcopy(payload) == payload) is False
+    assert (payload == ensemble(Payload(np.array([1.0, 2.0])))) is False
+    scalar_one, queue = ensemble(np.float64(1.0)), ensemble(deque([1.0]))
+    assert (scalar_one == queue) is False
+    assert (queue == scalar_one) is False
+    assert queue == ensemble(deque([1.0]))
+
+    # Masked arrays compare by mask and unmasked values, as the JSON file
+    # shows them (masked entries are written as null): values hidden under
+    # matching masks do not matter, an unmasked array counts as unmasked
+    # everywhere, and structured masks apply field by field.
+    masked = ensemble(np.ma.array([1.0, 2.0], mask=[False, True]))
+    assert masked == copy.deepcopy(masked)
+    assert masked == ensemble(np.ma.array([1.0, 2.0], mask=[False, True]))
+    assert masked == ensemble(np.ma.array([1.0, 9.0], mask=[False, True]))
+    for other in (np.ma.array([1.0, 2.0], mask=[True, False]), np.ma.array([5.0, 2.0], mask=[False, True]), np.array([1.0, 2.0])):
+        assert (masked == ensemble(other)) is False
+        assert (ensemble(other) == masked) is False
+    assert ensemble(np.ma.array([1.0, 2.0], mask=[False, False])) == ensemble(np.array([1.0, 2.0]))
+    assert ensemble(np.ma.array([1.0, 2.0], mask=[True, True])) == ensemble(np.ma.array([3.0, 4.0], mask=[True, True]))
+    assert (ensemble(np.ma.array([1.0, 2.0], mask=[True, True])) == ensemble(np.array([1.0, 2.0]))) is False
+    assert ensemble(np.ma.array(2.0, mask=True)) == ensemble(np.ma.array(3.0, mask=True))
+    assert (ensemble(np.ma.array(2.0, mask=True)) == ensemble(np.float64(2.0))) is False
+    objects = np.ma.array([{"vector": np.array([1, 2])}, None], mask=[False, True], dtype=object)
+    assert ensemble(objects) == ensemble(copy.deepcopy(objects))
+    assert (ensemble(objects) == ensemble(np.ma.array([{"vector": np.array([1, 3])}, None], mask=[False, True], dtype=object))) is False
+    record_dtype = [("count", "i4"), ("weight", "f4")]
+    masked_record = ensemble(np.ma.array([(4, 0.5)], mask=[(False, True)], dtype=record_dtype))
+    assert masked_record == ensemble(np.ma.array([(4, 9.0)], mask=[(False, True)], dtype=record_dtype))
+    assert (masked_record == ensemble(np.ma.array([(5, 0.5)], mask=[(False, True)], dtype=record_dtype))) is False
+    assert (masked_record == ensemble(np.ma.array([(4, 0.5)], mask=[(True, False)], dtype=record_dtype))) is False
+
     # Structured data whose field holds Python objects (kind "V", not "O")
     # compares field by field, for arrays and for their record scalars.
     def object_records(vector):
@@ -2374,11 +2420,26 @@ def test_ensemble_equality_never_raises_across_metadata_types():
     of the same kind is unequal. The space of user metadata is open-ended;
     this pins the kinds generation and export accept."""
     import copy
+    import dataclasses
     import itertools
+    from collections import deque
 
     import networkx as nx
 
     from g2rins.ensemble_creator import EnsembleData
+
+    @dataclasses.dataclass
+    class Payload:
+        vector: np.ndarray
+
+    class Ambiguous:
+        def __init__(self, vector):
+            self.vector = vector
+
+        def __eq__(self, other):
+            if not isinstance(other, Ambiguous):
+                return NotImplemented
+            return bool(self.vector == other.vector)
 
     def object_array(*elements):
         array = np.empty(len(elements), dtype=object)
@@ -2431,6 +2492,13 @@ def test_ensemble_equality_never_raises_across_metadata_types():
             "nan": float("nan"),
             "array_nan": np.array([np.nan]),
             "graph": nx.MultiDiGraph([(1, vector[1])]),
+            "deque": deque([1, np.array(vector)]),
+            "frozenset": frozenset({1, vector[1]}),
+            "dataclass_array": Payload(np.array(vector)),
+            "ambiguous_object": Ambiguous(np.array(vector)),
+            "masked": np.ma.array(vector, mask=[False, True]),
+            "masked_all_visible": np.ma.array(vector, mask=[False, False]),
+            "masked_record": np.ma.array([(4, vector[1] / 2)], mask=[(False, True)], dtype=[("count", "i4"), ("weight", "f4")]),
         }
 
     def data(value):
@@ -2444,7 +2512,11 @@ def test_ensemble_equality_never_raises_across_metadata_types():
         results[(left_name, right_name)] = result
     for (left_name, right_name), result in results.items():
         assert result == results[(right_name, left_name)], (left_name, right_name)
+    # Objects whose own comparison is ambiguous equal themselves only; a
+    # masked value that hides the differing element makes the variants equal.
+    unequal_to_copy = ("array_nan", "dataclass_array", "ambiguous_object")
+    equal_to_other = ("none", "bool", "int", "float", "big_int", "str", "np_bool", "np_str", "masked", "masked_record")
     for name, value in same.items():
         assert data(value) == data(value)
-        assert (data(value) == data(copy.deepcopy(value))) is (name != "array_nan")
-        assert (data(value) == data(other[name])) is (name in ("none", "bool", "int", "float", "big_int", "str", "np_bool", "np_str"))
+        assert (data(value) == data(copy.deepcopy(value))) is (name not in unequal_to_copy)
+        assert (data(value) == data(other[name])) is (name in equal_to_other)

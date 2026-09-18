@@ -10,7 +10,7 @@ import os
 import pickle
 import warnings
 from collections import Counter, OrderedDict, deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -579,6 +579,37 @@ def _array_equal(left, right):
         return False
 
 
+def _masked_equal(left, right):
+    """Masked arrays compare by mask and by the values that are not masked,
+    field by field for structured data; an array without a mask counts as
+    unmasked everywhere, and values hidden under matching masks are ignored."""
+    left, right = np.ma.asarray(left), np.ma.asarray(right)
+    if left.shape != right.shape:
+        return False
+    if left.dtype.names is not None or right.dtype.names is not None:
+        return left.dtype == right.dtype and all(_masked_equal(left[name], right[name]) for name in left.dtype.names)
+    left_mask, right_mask = np.ma.getmaskarray(left), np.ma.getmaskarray(right)
+    if not np.array_equal(left_mask, right_mask):
+        return False
+    kept = ~left_mask
+    return _array_equal(np.ma.getdata(left)[kept], np.ma.getdata(right)[kept])
+
+
+def _comparison_result(left, right):
+    """``left == right`` as a bool: a comparison that raises, or that yields
+    anything but a boolean (an array, when NumPy broadcasts a scalar against a
+    sequence), means unequal."""
+    try:
+        result = left == right
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
+def _is_collection(value):
+    return isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray, np.ndarray))
+
+
 def _graph_aware_equal(left, right):
     """Equality that compares graph-valued members by structure, not identity,
     and NumPy data by value (``==`` on an array is not a boolean)."""
@@ -588,21 +619,18 @@ def _graph_aware_equal(left, right):
         return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right)
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key]) for key in left)
-    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+    if isinstance(left, (list, tuple, deque)) and isinstance(right, (list, tuple, deque)):
         return len(left) == len(right) and all(_graph_aware_equal(a, b) for a, b in zip(left, right, strict=True))
-    if isinstance(left, (dict, list, tuple)) or isinstance(right, (dict, list, tuple)):
-        # A container never equals a scalar or an array; NumPy would broadcast.
+    if _is_collection(left) != _is_collection(right):
+        # A collection never equals a scalar or an array; NumPy would broadcast.
         return False
+    if isinstance(left, np.ma.MaskedArray) or isinstance(right, np.ma.MaskedArray):
+        return _masked_equal(left, right)
     if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
         return _array_equal(np.asarray(left), np.asarray(right))
-    if isinstance(left, np.generic) or isinstance(right, np.generic):
-        # One NumPy scalar against a plain Python value: NumPy's own scalar
-        # comparison is a boolean, or raises for structured data (unequal).
-        try:
-            return bool(left == right)
-        except (TypeError, ValueError, OverflowError):
-            return False
-    return bool(left == right)
+    # A NumPy scalar against a plain value, or any other pair of objects: their
+    # own comparison, guarded, so an ambiguous comparison means unequal.
+    return _comparison_result(left, right)
 
 
 @dataclass
@@ -637,9 +665,13 @@ class EnsembleData:
 
     ``==`` is structural: graph-valued members compare by structure, NumPy
     data by value (object arrays element-wise, structured data only with
-    structured data of the same dtype), a list equals a tuple with equal
-    elements, and NaN compares unequal unless it is the same object; there is
-    no ``equal_nan``.
+    structured data of the same dtype, masked arrays by mask and unmasked
+    values, field by field for structured data), a list, tuple or deque with
+    equal elements compare equal, a collection never equals a scalar, and
+    NaN compares unequal unless it is the same object; there is no
+    ``equal_nan``. Any other value, a dataclass instance included, compares
+    with its own ``==``, and a comparison that raises or is ambiguous means
+    unequal, so such an object equals itself only.
 
     Each unit's pSMILES has one mapped star ``[*:n]`` per template bond_id.
     Internal split-atom placeholders with no bond_id are omitted.
