@@ -241,6 +241,8 @@
     "hasobject",
     "deque",
     "getdata",
-    "getmaskarray"
+    "getmaskarray",
+    "dtypes",
+    "deques"
   ]
 }
