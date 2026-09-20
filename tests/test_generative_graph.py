@@ -108,7 +108,7 @@ def test_aromatic_two_letter_elements_keep_their_atomic_number(text, atomic_num)
     atoms = [data["atomic_num"] for _, data in creator.generative_graph.nodes(data=True)]
     assert atoms.count(atomic_num) == 1
     assert all(number > 0 for number in atoms)
-    molecule = creator.create_ensemble(1, output_format="mol", seed=0)[0]
+    molecule = g2rins.mol_graph_to_rdkit_mol(creator.create_ensemble(1, output_format="mol_graph", seed=0)[0])
     Chem.SanitizeMol(molecule)
     assert sum(atom.GetAtomicNum() == atomic_num for atom in molecule.GetAtoms()) == 1
 
