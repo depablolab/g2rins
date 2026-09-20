@@ -21,6 +21,7 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import IntEnum
+from itertools import combinations
 from typing import Any, Optional
 
 import networkx as nx
@@ -1301,6 +1302,7 @@ class ConvergedEnsembleData(EnsembleData):
     number_average_molecular_weight: float
     weight_average_molecular_weight: float
     dispersity: float
+    unit_path_statistics: dict | None = None
     representative_counts: list | None = None
 
 
@@ -1325,6 +1327,8 @@ class ConvergenceCheckpoint:
     policy: str = "full"
     representative_features: tuple = ()
     representative_counts: tuple = ()
+    unit_path_counts: dict | None = None
+    unit_path_diagnostics: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -1342,6 +1346,203 @@ def _normalized_sparse_counts(counts):
     if not total:
         return ()
     return tuple(sorted((key, count / total) for key, count in counts.items()))
+
+
+_UNIT_PATH_STATISTICS_SCHEMA = "unit-graph-simple-paths/v2"
+_UNIT_PATH_UNIT_KEY = "canonical-psmiles/v1"
+_UNIT_PATH_NODE_TOKEN = "canonical-unit-key+occurrence-degree/v1"
+_UNIT_PATH_EDGE_TOKEN = "bond-type+aromatic+canonical-attachment-sites/v2"
+_UNIT_PATH_K_VALUES = (2, 3, 4)
+
+
+def _reverse_unit_path_edge_token(edge_token):
+    """Reverse an oriented edge token, swapping its attachment-site ends."""
+    if len(edge_token) < 4:
+        return tuple(edge_token)
+    return (*edge_token[:2], edge_token[3], edge_token[2])
+
+
+def _reverse_unit_path_motif(motif):
+    """Reverse a node/edge-alternating motif without losing edge orientation."""
+    reversed_motif = []
+    for token in reversed(motif):
+        if token[0] == "E":
+            reversed_motif.append(("E",) + _reverse_unit_path_edge_token(token[1:]))
+        else:
+            reversed_motif.append(token)
+    return tuple(reversed_motif)
+
+
+def _unit_path_counts(metadata, graph, max_motifs=None):
+    """Count undirected simple occurrence paths while compact metadata exists."""
+    occurrences = metadata.occurrences
+    adjacency = [[] for _ in occurrences]
+    edges = []
+    atom_owner = {}
+    for occurrence_id, occurrence in enumerate(occurrences):
+        for atom in occurrence.nodes:
+            if atom in atom_owner:
+                raise ValueError("Molecular atom belongs to multiple unit occurrences")
+            atom_owner[atom] = occurrence_id
+    unowned_atoms = set(graph) - set(atom_owner)
+    if unowned_atoms:
+        raise ValueError("Molecular graph contains atoms with no unit occurrence")
+    def add_edge(left_owner, right_owner, edge_token):
+        if left_owner == right_owner:
+            return
+        if not (0 <= left_owner < len(occurrences) and 0 <= right_owner < len(occurrences)):
+            raise ValueError("Inter-occurrence edge references an unknown occurrence")
+        # Do not collapse parallel molecular bonds: they are distinct physical
+        # k=2 paths and can participate independently in longer simple paths.
+        edge_token = tuple(edge_token)
+        adjacency[left_owner].append((right_owner, edge_token))
+        adjacency[right_owner].append(
+            (left_owner, _reverse_unit_path_edge_token(edge_token))
+        )
+        edges.append((left_owner, right_owner, edge_token))
+
+    for occurrence in occurrences:
+        connection = occurrence.incoming_connection
+        if connection is None:
+            continue
+        left_atom, right_atom = connection
+        left_owner = atom_owner.get(left_atom)
+        right_owner = atom_owner.get(right_atom)
+        if left_owner is None or right_owner is None:
+            raise ValueError("Inter-occurrence molecular bond references an unknown atom")
+        edge_token = occurrence.incoming_edge_token
+        if edge_token is None:
+            raise ValueError("Unit occurrence connection has no edge token")
+        add_edge(left_owner, right_owner, edge_token)
+
+    # Future G2RINS closure operations can publish compact occurrence-ID edges
+    # here without forcing the normal tree-growth path to scan every atom bond.
+    for left_owner, right_owner, edge_token in getattr(
+        metadata, "inter_occurrence_edges", ()
+    ):
+        add_edge(left_owner, right_owner, tuple(edge_token))
+
+    node_tokens = [
+        (occurrence.unit_id, len(adjacency[occurrence_id]))
+        for occurrence_id, occurrence in enumerate(occurrences)
+    ]
+    counts = {k: Counter() for k in _UNIT_PATH_K_VALUES}
+    emitted_motifs = 0
+
+    def record(path, edge_tokens):
+        nonlocal emitted_motifs
+        forward = []
+        for index, occurrence_id in enumerate(path):
+            forward.append(("N",) + node_tokens[occurrence_id])
+            if index < len(edge_tokens):
+                forward.append(("E",) + edge_tokens[index])
+        motif = tuple(forward)
+        counts[len(path)][min(motif, _reverse_unit_path_motif(motif))] += 1
+        emitted_motifs += 1
+        if max_motifs is not None and emitted_motifs > max_motifs:
+            raise ValueError(
+                "Unit-path motif limit exceeded; increase unit_path_max_motifs "
+                "or use a separately versioned sampled descriptor"
+            )
+
+    for left, right, edge_token in edges:
+        record((left, right), (edge_token,))
+    for center, neighbors in enumerate(adjacency):
+        for (left, left_edge), (right, right_edge) in combinations(neighbors, 2):
+            if left == right:
+                continue
+            record(
+                (left, center, right),
+                (_reverse_unit_path_edge_token(left_edge), right_edge),
+            )
+    for left_center, right_center, center_edge in edges:
+        for left, left_edge in adjacency[left_center]:
+            if left == right_center:
+                continue
+            for right, right_edge in adjacency[right_center]:
+                if right in (left_center, left):
+                    continue
+                record(
+                    (left, left_center, right_center, right),
+                    (_reverse_unit_path_edge_token(left_edge), center_edge, right_edge),
+                )
+    return counts
+
+
+def _public_unit_path_statistics(counts, units, accepted_chains, diagnostics=None):
+    """Replace local unit IDs with canonical chemistry and create JSON records."""
+    used_unit_ids = {
+        token[1]
+        for counter in counts.values()
+        for motif in counter
+        for token in motif
+        if token[0] == "N"
+    }
+    unit_keys = {}
+    for unit_id in used_unit_ids:
+        unit = units.get(unit_id, {})
+        unit_key = unit.get("psmiles")
+        if not isinstance(unit_key, str) or not unit_key:
+            raise ValueError(f"No canonical chemistry key is available for unit {unit_id!r}")
+        unit_keys[unit_id] = unit_key
+    public_counts = {str(k): {} for k in _UNIT_PATH_K_VALUES}
+    for k, counter in counts.items():
+        for motif, count in counter.items():
+            converted = tuple(
+                (token[0], unit_keys[token[1]], token[2])
+                if token[0] == "N"
+                else token
+                for token in motif
+            )
+            reversed_converted = _reverse_unit_path_motif(converted)
+            if reversed_converted < converted:
+                converted = reversed_converted
+                motif = _reverse_unit_path_motif(motif)
+            displays = public_counts[str(k)].setdefault(converted, Counter())
+            displays[motif] += count
+    diagnostics = diagnostics or {}
+    motif_total = int(diagnostics.get("motif_total", sum(
+        sum(counter.values()) for counter in counts.values()
+    )))
+    chains_with_diagnostics = int(diagnostics.get("chains", accepted_chains))
+    return {
+        "schema": _UNIT_PATH_STATISTICS_SCHEMA,
+        "k_values": list(_UNIT_PATH_K_VALUES),
+        "unit_key": _UNIT_PATH_UNIT_KEY,
+        "node_token": _UNIT_PATH_NODE_TOKEN,
+        "edge_token": _UNIT_PATH_EDGE_TOKEN,
+        "aggregation": "raw-counts-over-all-accepted-chains",
+        "diagnostics": {
+            "accepted_chains": accepted_chains,
+            "motifs": {str(k): int(sum(counter.values())) for k, counter in counts.items()},
+            "motifs_per_chain": {
+                "min": int(diagnostics.get("motif_min", 0)),
+                "max": int(diagnostics.get("motif_max", 0)),
+                "mean": (
+                    motif_total / chains_with_diagnostics
+                    if chains_with_diagnostics
+                    else 0.0
+                ),
+            },
+        },
+        "counts": {
+            k: [
+                {
+                    "token": [list(part) for part in motif],
+                    "display_tokens": [
+                        {
+                            "token": [list(part) for part in display],
+                            "count": int(display_count),
+                        }
+                        for display, display_count in sorted(displays.items())
+                    ],
+                    "count": int(sum(displays.values())),
+                }
+                for motif, displays in sorted(counter.items())
+            ]
+            for k, counter in public_counts.items()
+        },
+    }
 
 
 def _representative_feature(deferred):
@@ -1406,6 +1607,10 @@ class _CompactMetadata:
     occurrences: tuple
     sequences: tuple
     unit_prototypes: dict
+    # Tree growth records parent links in each occurrence. Future generators
+    # that can close an inter-occurrence cycle must publish the additional
+    # (left_occurrence, right_occurrence, edge_token) records here.
+    inter_occurrence_edges: tuple = ()
 
     def materialize_sequences(self):
         def materialize_unit(occurrence_id):
@@ -2152,6 +2357,7 @@ class _UnitOccurrence:
     prototype_key: tuple
     nodes: tuple[int, ...]
     incoming_connection: tuple[int, int] | None
+    incoming_edge_token: tuple[str, bool] | None
     connections: list[tuple[str, int, dict, dict]]
 
 
@@ -2184,6 +2390,7 @@ class _PartialAtomGraph:
         rng,
         collect_info=True,
         unit_id_by_origin=None,
+        attachment_site_by_origin=None,
         termination_fragment_masses=None,
         static_source_templates=None,
     ):
@@ -2195,6 +2402,7 @@ class _PartialAtomGraph:
         # recursively copy graph-valued unit keys and sequence fragments.
         self.collect_info = collect_info
         self._unit_id_by_origin = unit_id_by_origin or {}
+        self._attachment_site_by_origin = attachment_site_by_origin or {}
         self._termination_fragment_masses = (
             termination_fragment_masses
             if termination_fragment_masses is not None
@@ -2211,6 +2419,9 @@ class _PartialAtomGraph:
         self._bond_counts = Counter()
         self._unit_counts = Counter()
         self._unit_occurrences: list[_UnitOccurrence] = []
+        # Tree growth leaves this empty. A future closure operation must append
+        # (left_occurrence_id, right_occurrence_id, edge_token) here.
+        self._inter_occurrence_edges: list[tuple[int, int, tuple[str, bool]]] = []
         self._unit_prototypes: dict[tuple, nx.Graph] = {}
         self._atom_to_unit_occurrence: dict[int, int] = {}
         self.sto_instance_molw_list = {}
@@ -2226,6 +2437,7 @@ class _PartialAtomGraph:
         memo[id(self.generative_graph)] = self.generative_graph
         memo[id(self.static_graph)] = self.static_graph
         memo[id(self._unit_id_by_origin)] = self._unit_id_by_origin
+        memo[id(self._attachment_site_by_origin)] = self._attachment_site_by_origin
         memo[id(self._termination_fragment_masses)] = self._termination_fragment_masses
         memo[id(self._static_source_templates)] = self._static_source_templates
         # Prototypes are an append-only derived cache keyed entirely by unit
@@ -3555,10 +3767,32 @@ class _PartialAtomGraph:
             )
             self._journal_metadata_counter("_bond_counts", bond_key)
             self._bond_counts[bond_key] += 1
+            edge_data = current_atom_graph.get_edge_data(u, v)
+            edge_token = (
+                str(edge_data.get(_BOND_TYPE_NAME, 1)),
+                bool(edge_data.get(_AROMATIC_NAME, False)),
+                str(
+                    self._attachment_site_by_origin[
+                        str(current_atom_graph.nodes[u]["origin_idx"])
+                    ]
+                ),
+                str(
+                    self._attachment_site_by_origin[
+                        str(current_atom_graph.nodes[v]["origin_idx"])
+                    ]
+                ),
+            )
+        else:
+            edge_token = None
 
-        return self._record_unit_occurrence(new_nodes, connection)
+        return self._record_unit_occurrence(new_nodes, connection, edge_token)
 
-    def _record_unit_occurrence(self, nodes, incoming_connection=None):
+    def _record_unit_occurrence(
+        self,
+        nodes,
+        incoming_connection=None,
+        incoming_edge_token=None,
+    ):
         if not self.collect_info or not nodes:
             return None
         origin = self.atom_graph.nodes[nodes[0]]["origin_idx"]
@@ -3578,6 +3812,7 @@ class _PartialAtomGraph:
                 prototype_key,
                 tuple(nodes),
                 incoming_connection,
+                incoming_edge_token,
                 [],
             )
         )
@@ -3672,19 +3907,28 @@ class _PartialAtomGraph:
         ]
         return units, dict(self._bond_counts), sequences
 
-    def compact_metadata(self, include_sequences=False):
+    def compact_metadata(self, include_sequences=False, include_occurrences=False):
         """Return stable IDs and optionally the compact sequence recipe."""
         return _CompactMetadata(
             unit_counts=dict(self._unit_counts),
             bond_counts=dict(self._bond_counts),
                 labeled_bond_counts={},
-            occurrences=(tuple(self._unit_occurrences) if include_sequences else ()),
+            occurrences=(
+                tuple(self._unit_occurrences)
+                if include_sequences or include_occurrences
+                else ()
+            ),
             sequences=(
                 tuple(tuple(sequence) for sequence in self._sequences)
                 if include_sequences
                 else ()
             ),
             unit_prototypes=(dict(self._unit_prototypes) if include_sequences else {}),
+            inter_occurrence_edges=(
+                tuple(self._inter_occurrence_edges)
+                if include_sequences or include_occurrences
+                else ()
+            ),
         )
 
 
@@ -4920,6 +5164,7 @@ class EnsembleCreator:
             rng,
             collect_info=collect_info,
             unit_id_by_origin=self._unit_id_by_origin,
+            attachment_site_by_origin=self._origin_bond_id,
             termination_fragment_masses=self._termination_fragment_masses,
             static_source_templates=self._static_source_templates,
         )
@@ -5633,7 +5878,10 @@ class EnsembleCreator:
             except AttributeError:
                 break
         include_sequences = metadata_mode >= _MetadataLevel.COMPACT_SEQUENCES
-        compact = partial_atom_graph.compact_metadata(include_sequences)
+        compact = partial_atom_graph.compact_metadata(
+            include_sequences,
+            True,
+        )
         compact.labeled_bond_counts = _labeled_bond_counts(
             compact.bond_counts,
             self._origin_endpoint,
@@ -6151,6 +6399,7 @@ class EnsembleCreator:
         native_diagnostics_path=None,
         max_worker_restarts=2,
         checkpoint_policy="full",
+        unit_path_max_motifs=1_000_000,
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=True,
         fallback_on_worker_crash=True,
@@ -6171,6 +6420,9 @@ class EnsembleCreator:
         Statistics always include every accepted chain. ``retain_chains`` and
         ``retain_sequences`` control which sample-level outputs are kept;
         ``metadata`` controls returned aggregate unit/contact metadata.
+        ``unit_path_max_motifs`` bounds the exact k=2,3,4 path motifs emitted
+        for one accepted chain; exceeding it fails rather than truncating or
+        sampling the descriptor.
         ``representative_distance`` enables an online feature-space cover:
         retained representatives differ by more than the threshold in at least
         one of log molecular weight, log building-block count, building-block
@@ -6219,6 +6471,8 @@ class EnsembleCreator:
             raise ValueError(
                 "checkpoint_policy must be 'full' or 'statistics'."
             )
+        if unit_path_max_motifs is not None and unit_path_max_motifs < 1:
+            raise ValueError("unit_path_max_motifs must be positive or None.")
         if (checkpoint is not None or checkpoint_callback is not None) and seed is None:
             raise ValueError("seed is required for resumable convergence checkpoints.")
         if checkpoint is not None and not isinstance(
@@ -6278,6 +6532,7 @@ class EnsembleCreator:
             "reservoir_size": reservoir_size,
             "representative_distance": representative_distance,
             "checkpoint_policy": checkpoint_policy,
+            "unit_path_max_motifs": unit_path_max_motifs,
             "use_repeat_units_as_source": bool(use_repeat_units_as_source),
             "strip_unresolved_directional_markers": bool(
                 strip_unresolved_directional_markers
@@ -6292,6 +6547,15 @@ class EnsembleCreator:
         if checkpoint is None:
             aggregate_unit_counts = Counter()
             aggregate_bond_counts = Counter()
+            aggregate_unit_path_counts = {
+                k: Counter() for k in _UNIT_PATH_K_VALUES
+            }
+            aggregate_unit_path_diagnostics = {
+                "chains": 0,
+                "motif_total": 0,
+                "motif_min": None,
+                "motif_max": 0,
+            }
             aggregate_distributions = {}
             batch_index = 0
             accepted_count = 0
@@ -6319,6 +6583,7 @@ class EnsembleCreator:
             # caller's current choice. Explicitly recorded policies remain
             # strict resume settings.
             saved_settings.setdefault("smiles_policy", smiles_policy)
+            saved_settings.setdefault("unit_path_max_motifs", unit_path_max_motifs)
             if saved_settings != checkpoint_settings:
                 raise ValueError("checkpoint settings do not match this convergence run.")
             aggregate_unit_counts = Counter(
@@ -6331,6 +6596,22 @@ class EnsembleCreator:
                 {
                     tuple(zip(record["labels"], record["nodes"])): record["count"]
                     for record in checkpoint.aggregate.bonds
+                }
+            )
+            aggregate_unit_path_counts = {
+                k: Counter((getattr(checkpoint, "unit_path_counts", {}) or {}).get(k, {}))
+                for k in _UNIT_PATH_K_VALUES
+            }
+            aggregate_unit_path_diagnostics = dict(
+                getattr(checkpoint, "unit_path_diagnostics", None)
+                or {
+                    "chains": checkpoint.accepted_count,
+                    "motif_total": sum(
+                        sum(counter.values())
+                        for counter in aggregate_unit_path_counts.values()
+                    ),
+                    "motif_min": 0,
+                    "motif_max": 0,
                 }
             )
             aggregate_distributions = dict(checkpoint.aggregate.distributions)
@@ -6436,6 +6717,32 @@ class EnsembleCreator:
                     sample = deferred.sample
                     metadata_record = sample.metadata
                     molecular_weight = deferred.molecular_weight
+                    if metadata:
+                        path_counts = _unit_path_counts(
+                            metadata_record,
+                            sample.graph,
+                            unit_path_max_motifs,
+                        )
+                        chain_motif_count = sum(
+                            sum(counts.values())
+                            for counts in path_counts.values()
+                        )
+                        aggregate_unit_path_diagnostics["chains"] += 1
+                        aggregate_unit_path_diagnostics["motif_total"] += chain_motif_count
+                        current_minimum = aggregate_unit_path_diagnostics["motif_min"]
+                        if current_minimum is None:
+                            aggregate_unit_path_diagnostics["motif_min"] = chain_motif_count
+                        else:
+                            aggregate_unit_path_diagnostics["motif_min"] = min(
+                                current_minimum,
+                                chain_motif_count,
+                            )
+                        aggregate_unit_path_diagnostics["motif_max"] = max(
+                            aggregate_unit_path_diagnostics["motif_max"],
+                            chain_motif_count,
+                        )
+                        for k, counts in path_counts.items():
+                            aggregate_unit_path_counts[k].update(counts)
                     accepted_count += 1
                     batch_accepted += 1
                     mass_sum += molecular_weight
@@ -6643,6 +6950,11 @@ class EnsembleCreator:
                             deepcopy(representative_features)
                         ),
                         representative_counts=tuple(representative_counts),
+                        unit_path_counts={
+                            k: dict(counts)
+                            for k, counts in aggregate_unit_path_counts.items()
+                        },
+                        unit_path_diagnostics=dict(aggregate_unit_path_diagnostics),
                     )
                 )
 
@@ -6711,15 +7023,14 @@ class EnsembleCreator:
             directional_warning_examples,
             strip_unresolved_directional_markers,
         )
+        materialized_units = (
+            self._materialize_unit_counts(aggregate_unit_counts)
+            if metadata
+            else {}
+        )
         return ConvergedEnsembleData(
             chains=chains,
-            units=(
-                self._materialize_unit_counts(
-                    aggregate_unit_counts
-                )
-                if metadata
-                else {}
-            ),
+            units=materialized_units,
             bonds=(
                 _bond_records_from_labeled(aggregate_bond_counts)
                 if metadata
@@ -6743,6 +7054,7 @@ class EnsembleCreator:
                 "reservoir_size": reservoir_size,
                 "representative_distance": representative_distance,
                 "checkpoint_policy": checkpoint_policy,
+                "unit_path_max_motifs": unit_path_max_motifs,
                 "use_repeat_units_as_source": bool(
                     use_repeat_units_as_source
                 ),
@@ -6752,5 +7064,15 @@ class EnsembleCreator:
             number_average_molecular_weight=mn,
             weight_average_molecular_weight=mw,
             dispersity=mw / mn,
+            unit_path_statistics=(
+                _public_unit_path_statistics(
+                    aggregate_unit_path_counts,
+                    materialized_units,
+                    accepted_count,
+                    aggregate_unit_path_diagnostics,
+                )
+                if metadata
+                else None
+            ),
             representative_counts=returned_representative_counts,
         )

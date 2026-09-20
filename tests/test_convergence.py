@@ -742,6 +742,7 @@ def test_seeded_convergence_checkpoint_resumes_exactly():
     assert resumed.weight_average_molecular_weight == pytest.approx(
         uninterrupted.weight_average_molecular_weight
     )
+    assert resumed.unit_path_statistics == uninterrupted.unit_path_statistics
 
 
 def test_statistics_checkpoint_is_compact_and_omits_retained_payloads():
@@ -843,6 +844,39 @@ def test_statistics_checkpoint_resume_preserves_statistics_without_payloads():
     assert (
         resumed_checkpoints[-1].reservoir_rng_state
         == uninterrupted_checkpoints[-1].reservoir_rng_state
+    )
+    assert resumed.unit_path_statistics == uninterrupted.unit_path_statistics
+    assert resumed_checkpoints[-1].unit_path_counts == uninterrupted_checkpoints[-1].unit_path_counts
+
+
+def test_serial_and_parallel_unit_path_statistics_match():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        serial = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=4,
+            window=10,
+            output_format="mol_graph",
+            seed=43,
+            parallel=False,
+        )
+        parallel = creator.create_ensemble_until_converged(
+            batch_size=2,
+            max_samples=4,
+            window=10,
+            output_format="mol_graph",
+            seed=43,
+            parallel=True,
+            n_workers=2,
+        )
+
+    assert serial.unit_path_statistics == parallel.unit_path_statistics
+    assert serial.number_average_molecular_weight == pytest.approx(
+        parallel.number_average_molecular_weight
+    )
+    assert serial.weight_average_molecular_weight == pytest.approx(
+        parallel.weight_average_molecular_weight
     )
 
 
