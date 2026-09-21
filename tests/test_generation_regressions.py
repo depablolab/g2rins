@@ -2489,6 +2489,66 @@ def test_ensemble_equality_boundary_for_cyclic_shared_and_unconvertible_metadata
         assert (ensemble(other) == unconvertible) is False
 
 
+@pytest.mark.parametrize("kind, depth", [("list", 400), ("dict", 400), ("tuple", 250), ("deque", 400)])
+def test_ensemble_equality_survives_deeply_nested_metadata(kind, depth):
+    """Metadata that generation can deep-copy still compares at the default
+    recursion limit, including on Python 3.10 where recursive all() calls
+    also consume recursion depth. Tuples use a lower depth because their
+    deep copy adds a list-comprehension frame on Python 3.10."""
+    import copy
+    import sys
+    from collections import deque
+
+    wrap = {
+        "list": lambda value: [value],
+        "dict": lambda value: {"child": value},
+        "tuple": lambda value: (value,),
+        "deque": lambda value: deque([value]),
+    }[kind]
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    def nested(innermost):
+        value = innermost
+        for _ in range(depth):
+            value = wrap(value)
+        return value
+
+    def cyclic():
+        # Start with a mutable container so deepcopy can memoize the cycle
+        # before traversing even a chain of immutable tuples.
+        value = []
+        value.append(nested(value))
+        return value
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)  # a larger ambient limit would hide the regression
+    try:
+        deep = ensemble(nested([1.0]))
+        twin = copy.deepcopy(deep)
+        assert (deep == twin) is True
+        assert (twin == deep) is True
+        assert (deep == ensemble(nested([1.0]))) is True
+        assert (deep == ensemble(nested([2.0]))) is False
+        assert (ensemble(nested([2.0])) == deep) is False
+
+        cycle = ensemble(cyclic())
+        assert cycle == cycle
+        assert (cycle == copy.deepcopy(cycle)) is False
+        assert (copy.deepcopy(cycle) == cycle) is False
+        assert (cycle == ensemble(cyclic())) is False
+    finally:
+        sys.setrecursionlimit(limit)
+
+
 def test_ensemble_equality_never_raises_across_metadata_types():
     """Every ordered pair of supported metadata values compares to a Python
     bool, symmetrically; a value equals its deep copy (a NaN array aside: a
