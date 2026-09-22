@@ -243,6 +243,7 @@
     "getdata",
     "getmaskarray",
     "dtypes",
-    "deques"
+    "deques",
+    "setrecursionlimit"
   ]
 }

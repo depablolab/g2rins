@@ -622,44 +622,57 @@ def _graph_aware_equal(left, right, active=None):
     ``active`` holds the pairs of containers being compared up the call
     chain, so metadata that refers back to itself compares unequal instead
     of recursing, while a structure that merely shares references compares
-    normally."""
+    normally. Keep dict and sequence traversal in this frame with explicit
+    loops: recursive generators add a frame per level, and on Python 3.10
+    their ``all()`` calls also count toward the recursion limit. For dicts
+    and sequences, this direct recursion leaves more headroom than the deep
+    copy into a unit subgraph. Object arrays and structured arrays with
+    object fields still use additional recursive helper calls and may reach
+    the recursion limit before the deep copy does."""
     if left is right:
         return True
     if active is None:
         active = set()
-    if not (isinstance(left, _RECURSIVE_TYPES) and isinstance(right, _RECURSIVE_TYPES)):
-        return _compare(left, right, active)
-    pair = (id(left), id(right))
-    if pair in active:
-        return False
-    active.add(pair)
-    try:
-        return _compare(left, right, active)
-    finally:
-        active.discard(pair)
-
-
-def _compare(left, right, active):
-    if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
-        return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right, active)
-    if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(_graph_aware_equal(left[key], right[key], active) for key in left)
-    if isinstance(left, (list, tuple, deque)) and isinstance(right, (list, tuple, deque)):
-        return len(left) == len(right) and all(_graph_aware_equal(a, b, active) for a, b in zip(left, right, strict=True))
-    if _is_collection(left) != _is_collection(right):
-        # A collection never equals a scalar or an array; NumPy would broadcast.
-        return False
-    if isinstance(left, np.ma.MaskedArray) or isinstance(right, np.ma.MaskedArray):
-        return _masked_equal(left, right, active)
-    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
-        try:
-            arrays = np.asarray(left), np.asarray(right)
-        except Exception:
+    pair = None
+    if isinstance(left, _RECURSIVE_TYPES) and isinstance(right, _RECURSIVE_TYPES):
+        pair = (id(left), id(right))
+        if pair in active:
             return False
-        return _array_equal(*arrays, active)
-    # A NumPy scalar against a plain value, or any other pair of objects: their
-    # own comparison, guarded, so an ambiguous comparison means unequal.
-    return _comparison_result(left, right)
+        active.add(pair)
+    try:
+        if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
+            return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right, active)
+        if isinstance(left, dict) and isinstance(right, dict):
+            if left.keys() != right.keys():
+                return False
+            for key in left:
+                if not _graph_aware_equal(left[key], right[key], active):
+                    return False
+            return True
+        if isinstance(left, (list, tuple, deque)) and isinstance(right, (list, tuple, deque)):
+            if len(left) != len(right):
+                return False
+            for a, b in zip(left, right, strict=True):
+                if not _graph_aware_equal(a, b, active):
+                    return False
+            return True
+        if _is_collection(left) != _is_collection(right):
+            # A collection never equals a scalar or an array; NumPy would broadcast.
+            return False
+        if isinstance(left, np.ma.MaskedArray) or isinstance(right, np.ma.MaskedArray):
+            return _masked_equal(left, right, active)
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
+            try:
+                arrays = np.asarray(left), np.asarray(right)
+            except Exception:
+                return False
+            return _array_equal(*arrays, active)
+        # A NumPy scalar against a plain value, or any other pair of objects: their
+        # own comparison, guarded, so an ambiguous comparison means unequal.
+        return _comparison_result(left, right)
+    finally:
+        if pair is not None:
+            active.discard(pair)
 
 
 @dataclass
