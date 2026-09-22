@@ -239,6 +239,13 @@
     "subdtype",
     "subarray",
     "subarrays",
-    "finalizer"
+    "finalizer",
+    "hasobject",
+    "deque",
+    "getdata",
+    "getmaskarray",
+    "dtypes",
+    "deques",
+    "setrecursionlimit"
   ]
 }

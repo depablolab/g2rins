@@ -10,7 +10,7 @@ import os
 import pickle
 import warnings
 from collections import Counter, OrderedDict, deque
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -48,6 +48,7 @@ from .generative_graph import (
     _AROMATIC_NAME,
     _BOND_TYPE_NAME,
     _CONNECTOR_PLACEHOLDER_NAME,
+    _DERIVED_NODE_FIELDS,
     _EDGE_STOCHASTIC_ID_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
@@ -59,6 +60,7 @@ from .generative_graph import (
     _check_transition_role,
     _connector_placeholder_flag,
     _is_connector_placeholder,
+    _json_safe,
     _static_neighbors,
     _verified_unit_texts,
     derive_unit_labels,
@@ -536,19 +538,193 @@ class _StochasticObjectTracker:
         return unterminated_sto_atom_ids
 
 
+def _edge_ids(graph):
+    """Edge identities of ``graph``, orientation-free for undirected graphs."""
+    edges = graph.edges(keys=True) if graph.is_multigraph() else graph.edges
+    if graph.is_directed():
+        return set(edges)
+    return {(frozenset(edge[:2]), *edge[2:]) for edge in edges}
+
+
+def _graphs_equal(left, right, active):
+    """Structural graph equality with array-aware attribute comparison."""
+    if left.is_directed() != right.is_directed() or left.is_multigraph() != right.is_multigraph():
+        return False
+    if set(left.nodes) != set(right.nodes) or not _graph_aware_equal(left.graph, right.graph, active):
+        return False
+    if not all(_graph_aware_equal(left.nodes[node], right.nodes[node], active) for node in left.nodes):
+        return False
+    if _edge_ids(left) != _edge_ids(right):
+        return False
+    edges = left.edges(keys=True) if left.is_multigraph() else left.edges
+    return all(_graph_aware_equal(left.edges[edge], right.edges[edge], active) for edge in edges)
+
+
+def _array_equal(left, right, active):
+    """Value equality of two NumPy arrays (0-d for scalars). Object arrays
+    compare element-wise through :func:`_graph_aware_equal`; structured data
+    compares only with structured data of the same dtype, field by field when
+    a field holds Python objects; types NumPy cannot compare are unequal
+    instead of raising."""
+    if left.shape != right.shape:
+        return False
+    if left.dtype.names is not None or right.dtype.names is not None:
+        # Structured data equals structured data of the same dtype only; an
+        # object array holding the same tuples is a different representation.
+        if left.dtype != right.dtype:
+            return False
+        if left.dtype.hasobject:
+            return all(_array_equal(left[name], right[name], active) for name in left.dtype.names)
+        return bool(np.array_equal(left, right))
+    if left.dtype.kind == "O" or right.dtype.kind == "O":
+        # tolist() yields Python objects, except for scalar types without a
+        # Python equivalent (longdouble), which _graph_aware_equal settles
+        # directly against a plain value instead of coming back here.
+        return _graph_aware_equal(left.tolist(), right.tolist(), active)
+    try:
+        return bool(np.array_equal(left, right))
+    except Exception:
+        return False
+
+
+def _masked_equal(left, right, active):
+    """Masked arrays compare by mask and by the values that are not masked,
+    field by field for structured data; an array without a mask counts as
+    unmasked everywhere, and values hidden under matching masks are ignored."""
+    try:
+        left, right = np.ma.asarray(left), np.ma.asarray(right)
+        left_mask, right_mask = np.ma.getmaskarray(left), np.ma.getmaskarray(right)
+    except Exception:
+        return False
+    if left.shape != right.shape:
+        return False
+    if left.dtype.names is not None or right.dtype.names is not None:
+        return left.dtype == right.dtype and all(_masked_equal(left[name], right[name], active) for name in left.dtype.names)
+    if not np.array_equal(left_mask, right_mask):
+        return False
+    kept = ~left_mask
+    return _array_equal(np.ma.getdata(left)[kept], np.ma.getdata(right)[kept], active)
+
+
+def _comparison_result(left, right):
+    """``left == right`` as a bool, best effort: a comparison that raises, or
+    that yields anything but a boolean (an array, when NumPy broadcasts a
+    scalar against a sequence), means unequal."""
+    try:
+        result = left == right
+    except Exception:
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
+def _is_collection(value):
+    return isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray, np.ndarray))
+
+
+_RECURSIVE_TYPES = (dict, list, tuple, deque, np.ndarray, nx.Graph)
+
+
+def _graph_aware_equal(left, right, active=None):
+    """Structural equality for the metadata types :class:`EnsembleData`
+    supports (see its docstring); other objects compare best effort.
+    ``active`` holds the pairs of containers being compared up the call
+    chain, so metadata that refers back to itself compares unequal instead
+    of recursing, while a structure that merely shares references compares
+    normally. Keep dict and sequence traversal in this frame with explicit
+    loops: recursive generators add a frame per level, and on Python 3.10
+    their ``all()`` calls also count toward the recursion limit. For dicts
+    and sequences, this direct recursion leaves more headroom than the deep
+    copy into a unit subgraph. Object arrays and structured arrays with
+    object fields still use additional recursive helper calls and may reach
+    the recursion limit before the deep copy does."""
+    if left is right:
+        return True
+    if active is None:
+        active = set()
+    pair = None
+    if isinstance(left, _RECURSIVE_TYPES) and isinstance(right, _RECURSIVE_TYPES):
+        pair = (id(left), id(right))
+        if pair in active:
+            return False
+        active.add(pair)
+    try:
+        if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
+            return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right, active)
+        if isinstance(left, dict) and isinstance(right, dict):
+            if left.keys() != right.keys():
+                return False
+            for key in left:
+                if not _graph_aware_equal(left[key], right[key], active):
+                    return False
+            return True
+        if isinstance(left, (list, tuple, deque)) and isinstance(right, (list, tuple, deque)):
+            if len(left) != len(right):
+                return False
+            for a, b in zip(left, right, strict=True):
+                if not _graph_aware_equal(a, b, active):
+                    return False
+            return True
+        if _is_collection(left) != _is_collection(right):
+            # A collection never equals a scalar or an array; NumPy would broadcast.
+            return False
+        if isinstance(left, np.ma.MaskedArray) or isinstance(right, np.ma.MaskedArray):
+            return _masked_equal(left, right, active)
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
+            try:
+                arrays = np.asarray(left), np.asarray(right)
+            except Exception:
+                return False
+            return _array_equal(*arrays, active)
+        # A NumPy scalar against a plain value, or any other pair of objects: their
+        # own comparison, guarded, so an ambiguous comparison means unequal.
+        return _comparison_result(left, right)
+    finally:
+        if pair is not None:
+            active.discard(pair)
+
+
 @dataclass
 class EnsembleData:
     """
     Full result of :meth:`EnsembleCreator.create_ensemble` with ``ensemble_info=True``.
 
-    ``chains`` and ``sequences`` follow the requested ``output_format``;
-    the ensemble aggregates are format-independent: ``units`` maps each
-    derived unit_id (see :func:`g2rins.derive_unit_labels`) to
-    ``{"psmiles", "g2rins", "frequency"}`` and ``bonds`` is a list of
-    undirected linkage records ``{"between": ["I0.1", "R0.1"], "count": n}``
-    whose endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
-    ``endpoint.rsplit(".", 1)``), sorted so the same linkage always prints
-    identically.
+    ``chains`` and ``sequences`` follow the requested ``output_format``; the
+    ensemble aggregates are template-level and format-independent. ``units``
+    maps each derived unit_id (see :func:`g2rins.derive_unit_labels`) to
+    ``{"psmiles", "g2rins", "subgraph", "count"}``, ordered by unit role and
+    number, where ``subgraph`` is a detached copy of the unit's static
+    subgraph of the creator's private copy of the generative graph: original
+    node ids, static edges only (multigraph keys kept), nodes in derivation
+    order and edges in template order, node data as the creator holds it
+    (``atomic_num`` as ``int``, the placeholder flag on every node, no derived
+    export fields) plus ``unit_id`` stamped on the copy's nodes, and no
+    graph-level attributes. ``bonds`` is a list of undirected linkage records
+    ``{"labels": ["I0.1", "R0.1"], "nodes": [id, id], "count": n}``:
+    ``labels`` endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
+    ``endpoint.rsplit(".", 1)``) sorted so the same linkage always prints
+    identically, and ``nodes`` holds the generative-graph node ids of the
+    same two connection atoms, aligned with ``labels``. Labels survive a
+    fresh parse of the same string; node ids are only valid for this parsed
+    graph.
+
+    ``subgraph`` values are networkx graphs, so a unit record is not JSON
+    serializable as is: use ``json_file``, or ``nx.node_link_data(subgraph,
+    edges="edges")``. Their node and edge data are deep copies, so every
+    template node and edge attribute must be deep-copyable when ensemble
+    information is requested (it must already be JSON-safe for ``json_file``).
+
+    ``==`` is structural, and tested, for these metadata types: ``None``,
+    ``bool``, ``int``, ``float`` (NaN unequal unless the same object),
+    ``str`` and ``bytes``; NumPy scalars and arrays of numeric, boolean,
+    string, object and structured dtypes, structured data only against
+    structured data of the same dtype, and masked arrays by mask and
+    unmasked values; ``dict`` with structurally compared values; ``list``,
+    ``tuple`` and ``deque`` element-wise; networkx graphs by structure. A
+    collection never equals a scalar, there is no ``equal_nan``, and
+    metadata that refers back to itself compares unequal. Any other object
+    compares best effort: equal when it is the same object, otherwise by its
+    own ``==``, where a comparison that raises or is ambiguous means unequal;
+    no structural semantics are promised for such objects.
 
     Each unit's pSMILES has one mapped star ``[*:n]`` per template bond_id.
     Internal split-atom placeholders with no bond_id are omitted.
@@ -579,24 +755,74 @@ class EnsembleData:
     mol_weights: dict
     distributions: dict
 
+    def __eq__(self, other):
+        # Unit subgraphs (and molecule-graph chains or sequences) are graph
+        # objects; two ensembles with the same content compare equal.
+        if not isinstance(other, EnsembleData):
+            return NotImplemented
+        return all(_graph_aware_equal(getattr(self, name), getattr(other, name)) for name in ("chains", "units", "bonds", "sequences", "mol_weights", "distributions"))
+
 
 def _bond_endpoint_sort_key(endpoint):
     unit_id, bond_id = endpoint.rsplit(".", 1)
     return unit_id[0], int(unit_id[1:]), int(bond_id)
 
 
-def _bond_records(bond_counts, origin_endpoint):
+def _bond_records(bond_counts, origin_endpoint, origin_node):
     """
     Undirected linkage records from the growth-direction ``bond_counts``
     (origin_idx pairs): both orientations of a chemical linkage merge into one
-    record with summed counts, endpoints sorted by (unit role, unit number,
-    bond id).
+    record with summed counts. Endpoint labels are sorted by (unit role, unit
+    number, bond id); ``nodes`` carries the generative-graph node key of each
+    endpoint in the same order (``origin_node`` maps the sampler's string
+    provenance back to the template key, which need not be a string).
     """
     merged = {}
     for (origin_u, origin_v), count in bond_counts.items():
-        pair = tuple(sorted((origin_endpoint[origin_u], origin_endpoint[origin_v]), key=_bond_endpoint_sort_key))
+        pair = tuple(
+            sorted(
+                ((origin_endpoint[origin_u], origin_u), (origin_endpoint[origin_v], origin_v)),
+                key=lambda endpoint: _bond_endpoint_sort_key(endpoint[0]),
+            )
+        )
         merged[pair] = merged.get(pair, 0) + count
-    return [{"between": list(pair), "count": count} for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(endpoint) for endpoint in item[0]))]
+    return [
+        {"labels": [label for label, _node in pair], "nodes": [origin_node[origin] for _label, origin in pair], "count": count}
+        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
+    ]
+
+
+def _unit_subgraphs(generative_graph, unit_nodes):
+    """
+    Detached static subgraph per unit: the unit's nodes with their static
+    edges only (non-static edges are generative rules, not template
+    structure -- an induced subgraph would drag intra-unit self-transitions
+    along). Node ids are kept; ``unit_id`` is stamped on the copy's nodes,
+    never on the generative graph itself. Nodes follow the derivation order
+    of ``unit_nodes`` and edges the template's order, so the copies do not
+    depend on hash seeds; graph-level attributes are not copied.
+    """
+    subgraphs = {}
+    for unit_id, nodes in unit_nodes.items():
+        members = set(nodes)
+        subgraph = generative_graph.__class__()
+        subgraph.add_nodes_from((node, {**_copied_attributes(generative_graph.nodes[node], f"node {node!r}"), "unit_id": unit_id}) for node in nodes)
+        subgraph.add_edges_from(
+            (u, v, key, _copied_attributes(data, f"edge {(u, v, key)!r}")) for u, v, key, data in generative_graph.edges(nodes, keys=True, data=True) if v in members and data["static"]
+        )
+        subgraphs[unit_id] = subgraph
+    return subgraphs
+
+
+def _copied_attributes(data, where):
+    """Deep copy of an attribute dict, naming the attribute that cannot be copied."""
+    copied = {}
+    for key, value in data.items():
+        try:
+            copied[key] = deepcopy(value)
+        except Exception as error:
+            raise TypeError(f"Template {where} attribute {key!r} cannot be deep-copied for the unit subgraph: {error}") from error
+    return copied
 
 
 @contextmanager
@@ -667,9 +893,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         mol_graph = sample
         molecule_units = bonds = sequences = mol_weights = distributions = None
 
-    if molecule_format == "mol":
-        molecule = mol_graph_to_rdkit_mol(mol_graph)
-    elif molecule_format == "smiles":
+    if molecule_format == "smiles":
         molecule = mol_graph_to_smiles(mol_graph)
     else:
         molecule = mol_graph
@@ -679,9 +903,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         # Units are static-connected fragments with dangling inter-unit
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
-        if molecule_format == "mol":
-            converted_sequences = [[mol_graph_to_rdkit_mol(unit, kekulize=False) for unit in sequence] for sequence in sequences]
-        elif molecule_format == "smiles":
+        if molecule_format == "smiles":
             converted_sequences = [[mol_graph_to_smiles(unit, kekulize=False) for unit in sequence] for sequence in sequences]
         else:
             converted_sequences = sequences
@@ -754,8 +976,9 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _CONNECTOR_PLACEHOLDER_NAME, _AROMATIC_NAME, "charge", "num_explicit_h"}
-    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME}
+    # Ordered, so copied chain attributes keep one key order across processes.
+    _ATOM_ATTRS = ("atomic_num", _CONNECTOR_PLACEHOLDER_NAME, _AROMATIC_NAME, "charge", "num_explicit_h")
+    _BOND_ATTRS = (_BOND_TYPE_NAME, _AROMATIC_NAME)
     # Defaults for optional node attributes so a generative_graph built before an attribute
     # existed still yields an EnsembleCreator (required attributes stay strict).
     _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CONNECTOR_PLACEHOLDER_NAME: False}
@@ -994,18 +1217,18 @@ class _PartialAtomGraph:
         for u_atom_idx, v_atom_idx in edges_data_map:
             self.atom_graph.add_edge(u_atom_idx, v_atom_idx, **edges_data_map[(u_atom_idx, v_atom_idx)])
 
-    def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | set[str] = None) -> dict[str, bool | float | int]:
+    def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | Iterable[str] = None) -> dict[str, bool | float | int]:
         if keys_to_copy is None:
             keys_to_copy = self._ATOM_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
-    def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | set[str] = None) -> dict[str, bool | int]:
+    def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | Iterable[str] = None) -> dict[str, bool | int]:
         if keys_to_copy is None:
             keys_to_copy = self._BOND_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
     @staticmethod
-    def _copy_some_dict_attr(dictionary: dict[str, Any], keys_to_copy: set[str]) -> dict[str, Any]:
+    def _copy_some_dict_attr(dictionary: dict[str, Any], keys_to_copy: Iterable[str]) -> dict[str, Any]:
         new_dict = {}
         for k in keys_to_copy:
             if k in dictionary:
@@ -2249,7 +2472,8 @@ class EnsembleCreator:
     model-generated graphs must supply explicit flags in their
     producer. Placeholder identity cannot be recovered from topology.
     Python and NumPy boolean flags are accepted; NumPy flags are normalized
-    to Python booleans in the creator's copy without changing the input graph.
+    to Python booleans in the creator's copy without changing the input graph,
+    and a flag omitted on a real atom is filled in as False there.
     """
 
     def __init__(self, generative_graph):
@@ -2259,9 +2483,14 @@ class EnsembleCreator:
         placeholder_nodes = []
         for node, data in self._generative_graph.nodes(data=True):
             atomic_num = data["atomic_num"] = _atomic_number(node, data)
+            # The copy carries the flag on every node: a legacy graph that omits
+            # it on a real atom means False, so unit subgraphs stay uniform.
             placeholder = _connector_placeholder_flag(node, data)
-            if _CONNECTOR_PLACEHOLDER_NAME in data:
-                data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+            data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+            # Derived export annotations are re-derived at export; a template
+            # restored from a JSON file must not carry them into the copy.
+            for field in _DERIVED_NODE_FIELDS:
+                data.pop(field, None)
             if atomic_num < 0:
                 # Negative numbers label non-atom graph objects (descriptors); the
                 # sampler would otherwise fail deep inside RDKit atom construction.
@@ -3894,10 +4123,38 @@ class EnsembleCreator:
 
         ``json_file`` writes the originating G2RINS string, the generative graph (with
         derived unit/bond annotations) and the ensemble data to that path as
-        JSON; chains and sequences are written as SMILES regardless of
-        ``output_format``. ``json_max_chains``
-        caps only the number of chains stored in the file (default ``None`` =
-        all); statistics always cover every sampled chain.
+        JSON. The file's chains follow ``output_format`` -- SMILES strings, or
+        node-link graph dicts for ``"mol_graph"`` (a few hundred times larger
+        per chain, so for any sizeable ensemble picking the format is picking
+        the file size) -- as recorded in ``format.chain_format``; sequences
+        are written as SMILES
+        regardless. With the default ``output_format="mol_graph"`` the file
+        therefore holds node-link chains; pass ``"smiles"`` for the compact
+        chains of earlier versions. ``json_max_chains`` caps only the number
+        of chains stored in the file (default ``None`` = all); statistics
+        always cover every sampled chain.
+
+        The file's ``ensemble`` section mirrors :class:`EnsembleData`:
+        ``units`` in the same order, each ``subgraph`` as networkx node-link
+        data (``nx.node_link_graph(data, edges="edges")`` restores it,
+        multigraph keys included); node-link chains whose nodes carry the
+        atom attributes ``atomic_num``, ``is_connector_placeholder``,
+        ``aromatic``, ``charge``, ``num_explicit_h`` and ``origin_idx`` (the
+        template's own key of the node the atom came from, whereas the
+        in-memory chain graphs carry it as the sampler's string form) and
+        whose bonds carry ``bond_type`` and ``aromatic``, without the
+        sampler's in-memory bookkeeping;
+        ``bonds`` with ``nodes`` holding the graph section's ``id`` values,
+        whatever type the template used;
+        ``mol_weights`` and ``distributions`` keyed by the stochastic id as a
+        JSON string. The graph section and the unit subgraphs are exports of
+        the creator's private copy of the template (``atomic_num`` as ``int``,
+        the placeholder flag on every node, derived export fields dropped), so
+        they can differ from :func:`generative_graph_json_data` on the input
+        graph for legacy or NumPy-typed graphs. The whole payload is
+        normalized like the graph section; non-finite values raise
+        ``ValueError`` before the file is opened, and the bytes do not depend
+        on the interpreter's hash seed.
 
         ``parallel=False`` (the default) samples everything in this process.
         ``parallel=True`` samples chains in ``n_workers`` subprocesses:
@@ -3924,7 +4181,7 @@ class EnsembleCreator:
         chain), so the cross-mode equality applies to failure-free runs.
         """
 
-        supported_formats = {"mol", "smiles", "mol_graph"}
+        supported_formats = {"smiles", "mol_graph"}
         molecule_format = output_format.lower()
         if molecule_format not in supported_formats:
             raise ValueError(f"Unsupported format: '{output_format}'. " f"Please choose from {list(supported_formats)}.")
@@ -3939,6 +4196,11 @@ class EnsembleCreator:
         # The JSON dump needs unit/sequence info even when the caller did not
         # ask for the returned ensemble information.
         collect_info = ensemble_info or json_file is not None
+        if collect_info:
+            # Unit labels and subgraphs read only the immutable template, so a
+            # template attribute that cannot be copied fails before sampling.
+            labels = derive_unit_labels(self._generative_graph)
+            unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_nodes)
 
         total_discards = 0
         discard_reasons = Counter()
@@ -4072,14 +4334,15 @@ class EnsembleCreator:
 
             list_of_sequences.append(record["sequences"])
 
-        # Ensemble aggregates are format-independent: units and bonds are keyed
-        # by the derived labels (which also keeps chemically identical units --
-        # e.g. two Br terminators -- apart), only chains/sequences follow
-        # output_format.
-        labels = derive_unit_labels(self._generative_graph)
+        # Ensemble aggregates are template-level and format-independent: units
+        # and bonds are keyed by the derived labels (which also keeps
+        # chemically identical units -- e.g. two Br terminators -- apart) and
+        # carry the generative-graph node ids alongside; only chains/sequences
+        # follow output_format.
         origin_unit_id = {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
+        origin_node = {str(node): node for node in self._generative_graph.nodes}
 
         # The public unit representation is validated against the immutable
         # template rather than the sampled unit snapshot it renders. Besides
@@ -4093,7 +4356,7 @@ class EnsembleCreator:
         unit_g2rins = _verified_unit_texts(self._generative_graph, labels)
 
         canonical_units = {}
-        for unit_graph, frequency in units.items():
+        for unit_graph, count in units.items():
             # Unit fragments have dangling inter-unit valences: kekulize=False
             # (an aromatic ring at a connection point can't be kekulized in
             # isolation).
@@ -4105,46 +4368,64 @@ class EnsembleCreator:
                 template_unit_bond_ids[unit_id],
                 template_unit_real_atom_counts[unit_id],
             )
-            canonical_units[unit_id] = {"psmiles": rdkit_mol_to_smiles(star_mol), "g2rins": unit_g2rins.get(unit_id, ""), "frequency": frequency}
+            canonical_units[unit_id] = {
+                "psmiles": rdkit_mol_to_smiles(star_mol),
+                "g2rins": unit_g2rins.get(unit_id, ""),
+                "subgraph": unit_subgraphs[unit_id],
+                "count": count,
+            }
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))
 
-        bond_records = _bond_records(bond_counts, origin_endpoint)
+        bond_records = _bond_records(bond_counts, origin_endpoint, origin_node)
 
         if json_file is not None:
+            # The file's chains follow output_format (the caller's format
+            # choice decides the file size); sequences are always SMILES.
             if molecule_format == "smiles":
 
-                def _chain_smiles(molecule):
+                def _chain_json(molecule):
                     return molecule
 
-                def _unit_smiles(unit):
+                def _sequence_unit_smiles(unit):
                     return unit
-
-            elif molecule_format == "mol":
-
-                def _chain_smiles(molecule):
-                    return rdkit_mol_to_smiles(molecule)
-
-                def _unit_smiles(unit):
-                    return rdkit_mol_to_smiles(unit)
 
             else:
 
-                def _chain_smiles(molecule):
-                    return mol_graph_to_smiles(molecule)
+                def _chain_json(molecule):
+                    # The file carries the atom and bond attributes plus the
+                    # template provenance as the template's own node key (the
+                    # sampler tracks it as a string); bookkeeping stays in memory.
+                    data = nx.node_link_data(molecule, edges="edges")
+                    data["nodes"] = [
+                        {key: origin_node[node[key]] if key == "origin_idx" else node[key] for key in ("id", *_PartialAtomGraph._ATOM_ATTRS, "origin_idx") if key in node} for node in data["nodes"]
+                    ]
+                    data["edges"] = [{key: edge[key] for key in ("source", "target", *_PartialAtomGraph._BOND_ATTRS) if key in edge} for edge in data["edges"]]
+                    return data
 
-                def _unit_smiles(unit):
+                def _sequence_unit_smiles(unit):
                     return mol_graph_to_smiles(unit, kekulize=False)
 
             saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
-            json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
+            # Every part of the file is normalized before it is opened: the
+            # source string here, the graph section by its exporter, and the
+            # ensemble section piece by piece below.
+            json_data = {"string": _json_safe(self._generative_graph.graph.get("g2rins_string", ""), "$['string']")}
             json_data.update(generative_graph_json_data(self._generative_graph))
+            json_data["format"]["chain_format"] = molecule_format
+            # The ensemble section (unit subgraphs, node-link chains, weights) is
+            # normalized like the graph section before the file is opened, one
+            # piece at a time so that only one normalized copy of each
+            # node-link chain is ever held.
+            ensemble_path = "$['ensemble']"
             json_data["ensemble"] = {
-                "units": canonical_units,
-                "chains": [_chain_smiles(molecule) for molecule in saved_chains],
-                "bonds": bond_records,
-                "mol_weights": mol_weight_lists,
-                "distributions": ensemble_distributions,
-                "sequences": [[[_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
+                "units": _json_safe({unit_id: {**info, "subgraph": nx.node_link_data(info["subgraph"], edges="edges")} for unit_id, info in canonical_units.items()}, f"{ensemble_path}['units']"),
+                "chains": [_json_safe(_chain_json(molecule), f"{ensemble_path}['chains'][{index}]") for index, molecule in enumerate(saved_chains)],
+                "bonds": _json_safe(bond_records, f"{ensemble_path}['bonds']"),
+                "mol_weights": _json_safe(mol_weight_lists, f"{ensemble_path}['mol_weights']"),
+                "distributions": _json_safe(ensemble_distributions, f"{ensemble_path}['distributions']"),
+                "sequences": _json_safe(
+                    [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences], f"{ensemble_path}['sequences']"
+                ),
             }
             with open(json_file, "w") as file_handle:
                 json.dump(json_data, file_handle, indent=2)
