@@ -32302,7 +32302,7 @@
         "gen_weight": 1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [0, -2, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "5c4a0783-fbde-4f0a-9fe1-5220efc19e30"
+        "id": "dd25ce82-c663-4e8e-9fb3-7f0961c74b02"
       },
       {
         "atomic_num": 6,
@@ -32331,7 +32331,7 @@
         "gen_weight": 1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [0, -2, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "82bc5f21-3127-4f47-8831-982810dfc72b"
+        "id": "30dd4a49-4807-44d7-a23c-9e4c72995f22"
       },
       {
         "atomic_num": 6,
@@ -32360,7 +32360,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [0, -2, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "0a9b50a1-ae7d-4e49-80d3-34f7d94d90fc"
+        "id": "b75f4b1d-2e40-465b-9d4d-be25e77e3b08"
       },
       {
         "atomic_num": 8,
@@ -32389,7 +32389,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [0, -2, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "d6922135-3d00-4188-9b9b-809371635257"
+        "id": "ec02badf-56f0-40af-b546-4dce134ec65a"
       },
       {
         "atomic_num": 8,
@@ -32418,7 +32418,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [0, -2, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "0c1380bb-8fc3-4b0f-80b9-5380d0df09a0"
+        "id": "17ee440d-37d8-42bf-bcd2-41f5ec345c4c"
       },
       {
         "atomic_num": 6,
@@ -32447,7 +32447,7 @@
         "gen_weight": 1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "e890a1a0-df9f-4f45-a810-c7eb1034d3da"
+        "id": "bc1700aa-1b1e-421a-a234-985afb599691"
       },
       {
         "atomic_num": 6,
@@ -32476,7 +32476,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "5344ba09-a598-4e31-8ab5-08b956e65bcf"
+        "id": "b6dec653-886a-4224-b6e5-50dcf2239624"
       },
       {
         "atomic_num": 6,
@@ -32505,7 +32505,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "f515c9e1-6ecc-48b1-8829-dcc8be5873b6"
+        "id": "caa9fe0a-c2a5-46aa-bb5f-d0c5e60dda0f"
       },
       {
         "atomic_num": 8,
@@ -32534,7 +32534,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "e4fdf3c9-b7ba-4884-9872-e1e74cb5f510"
+        "id": "ab788bdd-2a5e-4f4b-9e03-b549b8bfb8b8"
       },
       {
         "atomic_num": 8,
@@ -32563,7 +32563,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "7f68ae7e-7cdf-4cb4-b348-3af0ee41cc08"
+        "id": "32301bde-9e23-478c-8462-67072643a2be"
       },
       {
         "atomic_num": 6,
@@ -32592,7 +32592,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "69c4a82d-c692-48b8-aac0-0533a2444edf"
+        "id": "df6f2720-10ab-4bba-846d-761ed3917800"
       },
       {
         "atomic_num": 6,
@@ -32621,7 +32621,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "485fe5e5-aca1-4e96-9f83-a3efc7d1b895"
+        "id": "6ff26fad-5b1b-4b95-bb8d-50cd986ce03b"
       },
       {
         "atomic_num": 8,
@@ -32650,7 +32650,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "6e5386c8-10fb-41f8-9abe-253130ccb78b"
+        "id": "49b65c12-9d92-4d38-92de-dd079559150b"
       },
       {
         "atomic_num": 6,
@@ -32679,7 +32679,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "296b7b1e-db74-4f70-bc7d-1803af95bae4"
+        "id": "c9325a8e-1c70-4c19-b292-f4bac58f23f3"
       },
       {
         "atomic_num": 8,
@@ -32708,7 +32708,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "e818b98d-fb1c-47a5-8d7f-f51a6aa87e8f"
+        "id": "923a5ba1-bc92-4882-8623-de2114a54be7"
       },
       {
         "atomic_num": 6,
@@ -32737,7 +32737,7 @@
         "gen_weight": 1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "36e58b3a-9cec-4ae0-916f-f9c390c16d2f"
+        "id": "2dc116db-d829-4a3e-a349-0feeaeb7352b"
       },
       {
         "atomic_num": 6,
@@ -32766,7 +32766,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "976f2a6c-4085-4a60-8005-d7398731ff16"
+        "id": "c8824bf3-6e41-4063-8474-cb0d5216231f"
       },
       {
         "atomic_num": 6,
@@ -32795,7 +32795,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "d75ecb95-8d26-4f5f-9c40-1fcc596f0fe4"
+        "id": "b66ba977-b571-40e8-8d2f-ddd38369b106"
       },
       {
         "atomic_num": 6,
@@ -32824,7 +32824,7 @@
         "gen_weight": 1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "9305c9da-0c25-4976-b86d-5a0907d466b5"
+        "id": "6f2084c3-c5ea-4205-bfa3-f8ced7161f07"
       },
       {
         "atomic_num": 1,
@@ -32853,7 +32853,7 @@
         "gen_weight": 1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "4dd10419-68f6-46d7-827a-0e368351aed1"
+        "id": "2fa01a20-5713-4b29-93e8-79cdcd976e4b"
       },
       {
         "atomic_num": 35,
@@ -32882,7 +32882,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [1, 0, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "02977b2c-1f5d-4fb8-9192-c8efb449ce3a"
+        "id": "9df13139-2953-4e29-b334-f4d856aa8890"
       },
       {
         "atomic_num": 35,
@@ -32911,7 +32911,7 @@
         "gen_weight": -1.0,
         "gen_hierarchy": 0,
         "stochastic_id_tree": [0, -2, -2, -2, -2, -2, -2, -2, -2, -2],
-        "id": "3e169da3-8e88-4f2b-8a73-c7e9c520d796"
+        "id": "127b1b52-2464-41b0-aad3-60692e01d670"
       }
     ],
     "adjacency": [
@@ -32924,7 +32924,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "82bc5f21-3127-4f47-8831-982810dfc72b",
+          "id": "30dd4a49-4807-44d7-a23c-9e4c72995f22",
           "key": 0
         },
         {
@@ -32935,7 +32935,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "82bc5f21-3127-4f47-8831-982810dfc72b",
+          "id": "30dd4a49-4807-44d7-a23c-9e4c72995f22",
           "key": 1
         }
       ],
@@ -32948,7 +32948,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "0a9b50a1-ae7d-4e49-80d3-34f7d94d90fc",
+          "id": "b75f4b1d-2e40-465b-9d4d-be25e77e3b08",
           "key": 0
         },
         {
@@ -32959,7 +32959,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "5c4a0783-fbde-4f0a-9fe1-5220efc19e30",
+          "id": "dd25ce82-c663-4e8e-9fb3-7f0961c74b02",
           "key": 0
         },
         {
@@ -32970,7 +32970,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "5c4a0783-fbde-4f0a-9fe1-5220efc19e30",
+          "id": "dd25ce82-c663-4e8e-9fb3-7f0961c74b02",
           "key": 1
         },
         {
@@ -32981,7 +32981,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "3e169da3-8e88-4f2b-8a73-c7e9c520d796",
+          "id": "127b1b52-2464-41b0-aad3-60692e01d670",
           "key": 0
         }
       ],
@@ -32994,7 +32994,7 @@
           "transition_weight": 0,
           "stochastic_id": 0,
           "aromatic": false,
-          "id": "d6922135-3d00-4188-9b9b-809371635257",
+          "id": "ec02badf-56f0-40af-b546-4dce134ec65a",
           "key": 0
         },
         {
@@ -33005,7 +33005,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "0c1380bb-8fc3-4b0f-80b9-5380d0df09a0",
+          "id": "17ee440d-37d8-42bf-bcd2-41f5ec345c4c",
           "key": 0
         },
         {
@@ -33016,7 +33016,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "82bc5f21-3127-4f47-8831-982810dfc72b",
+          "id": "30dd4a49-4807-44d7-a23c-9e4c72995f22",
           "key": 0
         }
       ],
@@ -33029,7 +33029,7 @@
           "transition_weight": 0,
           "stochastic_id": 0,
           "aromatic": false,
-          "id": "0a9b50a1-ae7d-4e49-80d3-34f7d94d90fc",
+          "id": "b75f4b1d-2e40-465b-9d4d-be25e77e3b08",
           "key": 0
         }
       ],
@@ -33042,7 +33042,7 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "0a9b50a1-ae7d-4e49-80d3-34f7d94d90fc",
+          "id": "b75f4b1d-2e40-465b-9d4d-be25e77e3b08",
           "key": 0
         }
       ],
@@ -33055,7 +33055,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "5344ba09-a598-4e31-8ab5-08b956e65bcf",
+          "id": "b6dec653-886a-4224-b6e5-50dcf2239624",
           "key": 0
         },
         {
@@ -33066,7 +33066,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "f515c9e1-6ecc-48b1-8829-dcc8be5873b6",
+          "id": "caa9fe0a-c2a5-46aa-bb5f-d0c5e60dda0f",
           "key": 0
         },
         {
@@ -33077,7 +33077,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "9305c9da-0c25-4976-b86d-5a0907d466b5",
+          "id": "6f2084c3-c5ea-4205-bfa3-f8ced7161f07",
           "key": 0
         },
         {
@@ -33088,7 +33088,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "9305c9da-0c25-4976-b86d-5a0907d466b5",
+          "id": "6f2084c3-c5ea-4205-bfa3-f8ced7161f07",
           "key": 1
         }
       ],
@@ -33101,7 +33101,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "e890a1a0-df9f-4f45-a810-c7eb1034d3da",
+          "id": "bc1700aa-1b1e-421a-a234-985afb599691",
           "key": 0
         }
       ],
@@ -33114,7 +33114,7 @@
           "transition_weight": 0,
           "stochastic_id": 1,
           "aromatic": false,
-          "id": "e4fdf3c9-b7ba-4884-9872-e1e74cb5f510",
+          "id": "ab788bdd-2a5e-4f4b-9e03-b549b8bfb8b8",
           "key": 0
         },
         {
@@ -33125,7 +33125,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "7f68ae7e-7cdf-4cb4-b348-3af0ee41cc08",
+          "id": "32301bde-9e23-478c-8462-67072643a2be",
           "key": 0
         },
         {
@@ -33136,7 +33136,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "e890a1a0-df9f-4f45-a810-c7eb1034d3da",
+          "id": "bc1700aa-1b1e-421a-a234-985afb599691",
           "key": 0
         }
       ],
@@ -33149,7 +33149,7 @@
           "transition_weight": 0,
           "stochastic_id": 1,
           "aromatic": false,
-          "id": "f515c9e1-6ecc-48b1-8829-dcc8be5873b6",
+          "id": "caa9fe0a-c2a5-46aa-bb5f-d0c5e60dda0f",
           "key": 0
         }
       ],
@@ -33162,7 +33162,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "69c4a82d-c692-48b8-aac0-0533a2444edf",
+          "id": "df6f2720-10ab-4bba-846d-761ed3917800",
           "key": 0
         },
         {
@@ -33173,7 +33173,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "f515c9e1-6ecc-48b1-8829-dcc8be5873b6",
+          "id": "caa9fe0a-c2a5-46aa-bb5f-d0c5e60dda0f",
           "key": 0
         }
       ],
@@ -33186,7 +33186,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "485fe5e5-aca1-4e96-9f83-a3efc7d1b895",
+          "id": "6ff26fad-5b1b-4b95-bb8d-50cd986ce03b",
           "key": 0
         },
         {
@@ -33197,7 +33197,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "7f68ae7e-7cdf-4cb4-b348-3af0ee41cc08",
+          "id": "32301bde-9e23-478c-8462-67072643a2be",
           "key": 0
         }
       ],
@@ -33210,7 +33210,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "6e5386c8-10fb-41f8-9abe-253130ccb78b",
+          "id": "49b65c12-9d92-4d38-92de-dd079559150b",
           "key": 0
         },
         {
@@ -33221,7 +33221,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "69c4a82d-c692-48b8-aac0-0533a2444edf",
+          "id": "df6f2720-10ab-4bba-846d-761ed3917800",
           "key": 0
         }
       ],
@@ -33234,7 +33234,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "296b7b1e-db74-4f70-bc7d-1803af95bae4",
+          "id": "c9325a8e-1c70-4c19-b292-f4bac58f23f3",
           "key": 0
         },
         {
@@ -33245,42 +33245,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "485fe5e5-aca1-4e96-9f83-a3efc7d1b895",
-          "key": 0
-        }
-      ],
-      [
-        {
-          "bond_type": 2,
-          "static": true,
-          "propagation_weight": 0,
-          "termination_weight": 0,
-          "transition_weight": 0,
-          "stochastic_id": 1,
-          "aromatic": false,
-          "id": "e818b98d-fb1c-47a5-8d7f-f51a6aa87e8f",
-          "key": 0
-        },
-        {
-          "static": true,
-          "propagation_weight": 0,
-          "termination_weight": 0,
-          "transition_weight": 0,
-          "stochastic_id": 1,
-          "bond_type": 1,
-          "aromatic": false,
-          "id": "36e58b3a-9cec-4ae0-916f-f9c390c16d2f",
-          "key": 0
-        },
-        {
-          "static": true,
-          "propagation_weight": 0,
-          "termination_weight": 0,
-          "transition_weight": 0,
-          "stochastic_id": 1,
-          "bond_type": 1,
-          "aromatic": false,
-          "id": "6e5386c8-10fb-41f8-9abe-253130ccb78b",
+          "id": "6ff26fad-5b1b-4b95-bb8d-50cd986ce03b",
           "key": 0
         }
       ],
@@ -33293,7 +33258,42 @@
           "transition_weight": 0,
           "stochastic_id": 1,
           "aromatic": false,
-          "id": "296b7b1e-db74-4f70-bc7d-1803af95bae4",
+          "id": "923a5ba1-bc92-4882-8623-de2114a54be7",
+          "key": 0
+        },
+        {
+          "static": true,
+          "propagation_weight": 0,
+          "termination_weight": 0,
+          "transition_weight": 0,
+          "stochastic_id": 1,
+          "bond_type": 1,
+          "aromatic": false,
+          "id": "2dc116db-d829-4a3e-a349-0feeaeb7352b",
+          "key": 0
+        },
+        {
+          "static": true,
+          "propagation_weight": 0,
+          "termination_weight": 0,
+          "transition_weight": 0,
+          "stochastic_id": 1,
+          "bond_type": 1,
+          "aromatic": false,
+          "id": "49b65c12-9d92-4d38-92de-dd079559150b",
+          "key": 0
+        }
+      ],
+      [
+        {
+          "bond_type": 2,
+          "static": true,
+          "propagation_weight": 0,
+          "termination_weight": 0,
+          "transition_weight": 0,
+          "stochastic_id": 1,
+          "aromatic": false,
+          "id": "c9325a8e-1c70-4c19-b292-f4bac58f23f3",
           "key": 0
         }
       ],
@@ -33306,7 +33306,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "976f2a6c-4085-4a60-8005-d7398731ff16",
+          "id": "c8824bf3-6e41-4063-8474-cb0d5216231f",
           "key": 0
         },
         {
@@ -33317,7 +33317,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "d75ecb95-8d26-4f5f-9c40-1fcc596f0fe4",
+          "id": "b66ba977-b571-40e8-8d2f-ddd38369b106",
           "key": 0
         },
         {
@@ -33328,7 +33328,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "296b7b1e-db74-4f70-bc7d-1803af95bae4",
+          "id": "c9325a8e-1c70-4c19-b292-f4bac58f23f3",
           "key": 0
         },
         {
@@ -33339,7 +33339,18 @@
           "stochastic_id": 0,
           "bond_type": 1,
           "aromatic": false,
-          "id": "5c4a0783-fbde-4f0a-9fe1-5220efc19e30",
+          "id": "dd25ce82-c663-4e8e-9fb3-7f0961c74b02",
+          "key": 0
+        },
+        {
+          "termination_weight": 1.0,
+          "static": false,
+          "propagation_weight": 0,
+          "transition_weight": 0,
+          "stochastic_id": 0,
+          "bond_type": 1,
+          "aromatic": false,
+          "id": "127b1b52-2464-41b0-aad3-60692e01d670",
           "key": 0
         }
       ],
@@ -33352,7 +33363,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "36e58b3a-9cec-4ae0-916f-f9c390c16d2f",
+          "id": "2dc116db-d829-4a3e-a349-0feeaeb7352b",
           "key": 0
         }
       ],
@@ -33365,7 +33376,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "36e58b3a-9cec-4ae0-916f-f9c390c16d2f",
+          "id": "2dc116db-d829-4a3e-a349-0feeaeb7352b",
           "key": 0
         }
       ],
@@ -33378,7 +33389,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "e890a1a0-df9f-4f45-a810-c7eb1034d3da",
+          "id": "bc1700aa-1b1e-421a-a234-985afb599691",
           "key": 0
         },
         {
@@ -33389,7 +33400,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "e890a1a0-df9f-4f45-a810-c7eb1034d3da",
+          "id": "bc1700aa-1b1e-421a-a234-985afb599691",
           "key": 1
         },
         {
@@ -33400,7 +33411,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "02977b2c-1f5d-4fb8-9192-c8efb449ce3a",
+          "id": "9df13139-2953-4e29-b334-f4d856aa8890",
           "key": 0
         }
       ],
@@ -33413,7 +33424,7 @@
           "stochastic_id": 1,
           "bond_type": 1,
           "aromatic": false,
-          "id": "e890a1a0-df9f-4f45-a810-c7eb1034d3da",
+          "id": "bc1700aa-1b1e-421a-a234-985afb599691",
           "key": 0
         }
       ],

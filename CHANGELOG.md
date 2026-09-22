@@ -23,6 +23,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Unit records in the ensemble output carry the unit's static subgraph of the generative graph (`subgraph`: original node ids, static edges only, nodes in derivation order and edges in template order, `unit_id` stamped on the copy's nodes, no graph-level attributes; node-link encoded in JSON files).
 - Bond records carry the generative-graph node ids of the two connection atoms (`nodes`, positionally aligned with `labels`; labels survive a fresh parse, node ids are only valid for the graph they came from).
 - Ensemble JSON files follow the requested `output_format` for their stored chains — SMILES strings or node-link graph dicts — and record the choice in `format.chain_format`; chain nodes carry the atom attributes and their template provenance (`origin_idx`, as the template's own node key), chain bonds the bond type and aromaticity, and no sampler bookkeeping. Sequences are written as SMILES regardless. The whole `ensemble` section is normalized like the graph section (NumPy values become JSON values, non-finite values raise `ValueError` before the file is opened), and the file bytes do not depend on the interpreter's hash seed.
+- Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, and `MissingTermination`. The canonical configuration — a site capped in the step that grows it — stays silent.
 
 ### Changed
 
@@ -37,6 +38,9 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - The ensemble output format — the `ensemble` section of JSON files and `EnsembleData` — is version 2, sharing the `format.version` field with the generative-graph JSON format v2 above: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
 - The ensemble creator's private copy of the generative graph carries `is_connector_placeholder` on every node, filling `False` where a legacy graph omits it on a real atom, and drops the derived `unit_id`/`bond_id` node attributes that a graph loaded back from a JSON export carries, so unit subgraphs always expose the flag and carry the current `unit_id` only.
 - `EnsembleData` equality compares graph-valued members (unit subgraphs, and molecule-graph chains or sequences) by structure instead of object identity, so two ensembles with the same content compare equal. Structural equality is defined for `None`, booleans, integers, floats (NaN unequal unless the same object), strings and bytes; NumPy scalars and arrays of numeric, boolean, string, object and structured dtypes (structured data only against structured data of the same dtype) and masked arrays (by mask and unmasked values); dicts; lists, tuples and deques (element-wise); and networkx graphs. A collection never equals a scalar, and metadata that refers back to itself compares unequal. Any other object compares best effort, by identity or its own `==`, and a comparison that raises or is ambiguous means unequal.
+- When a nested stochastic object finishes, its continuation and the level's remaining entry sites compete in one weighted draw at the owning level, instead of the continuation firing unconditionally.
+- Which terminator caps an open site is resolved at graph construction: the declaration nearest the site wins, and termination edges that can never fire are removed from the generative graph. The stochastic object that owns the site's bond descriptor fires the cap, and the cap's mass counts toward that object's molecular weight target.
+- A nested stochastic object used as an initiator now inherits the enclosing object's terminators for its exposed chain ends, as one used as a repeat unit already did.
 
 ### Removed
 
@@ -56,6 +60,8 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Bare wildcard atoms (`*`) retain their symbol when a parsed G2RINS string is serialized or exported, instead of incorrectly becoming `None`.
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
+- Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.
+- Open sites handed to another level's custody lost their termination modes, silently dropping declared end groups from finished molecules.
 
 ## [1.0.0] - 2026-08-08
 
