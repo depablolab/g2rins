@@ -2491,10 +2491,11 @@ def test_ensemble_equality_boundary_for_cyclic_shared_and_unconvertible_metadata
 
 @pytest.mark.parametrize("kind, depth", [("list", 400), ("dict", 400), ("tuple", 250), ("deque", 400)])
 def test_ensemble_equality_survives_deeply_nested_metadata(kind, depth):
-    """Metadata that generation can deep-copy still compares at the default
-    recursion limit, including on Python 3.10 where recursive all() calls
-    also consume recursion depth. Tuples use a lower depth because their
-    deep copy adds a list-comprehension frame on Python 3.10."""
+    """Deeply nested dicts and sequences that generation can deep-copy still
+    compare at the default recursion limit, including on Python 3.10 where
+    recursive all() calls also consume recursion depth. Tuples use a lower
+    depth because their deep copy adds a list-comprehension frame on Python
+    3.10."""
     import copy
     import sys
     from collections import deque
@@ -2529,22 +2530,30 @@ def test_ensemble_equality_survives_deeply_nested_metadata(kind, depth):
         value.append(nested(value))
         return value
 
+    def compared(left, right):
+        # A sentinel makes overflow fail both the is True and is False checks
+        # without pytest's expensive recursion scan over deep frame locals.
+        try:
+            return left == right
+        except RecursionError:
+            return RecursionError
+
     limit = sys.getrecursionlimit()
     sys.setrecursionlimit(1000)  # a larger ambient limit would hide the regression
     try:
         deep = ensemble(nested([1.0]))
         twin = copy.deepcopy(deep)
-        assert (deep == twin) is True
-        assert (twin == deep) is True
-        assert (deep == ensemble(nested([1.0]))) is True
-        assert (deep == ensemble(nested([2.0]))) is False
-        assert (ensemble(nested([2.0])) == deep) is False
+        assert compared(deep, twin) is True
+        assert compared(twin, deep) is True
+        assert compared(deep, ensemble(nested([1.0]))) is True
+        assert compared(deep, ensemble(nested([2.0]))) is False
+        assert compared(ensemble(nested([2.0])), deep) is False
 
         cycle = ensemble(cyclic())
-        assert cycle == cycle
-        assert (cycle == copy.deepcopy(cycle)) is False
-        assert (copy.deepcopy(cycle) == cycle) is False
-        assert (cycle == ensemble(cyclic())) is False
+        assert compared(cycle, cycle) is True
+        assert compared(cycle, copy.deepcopy(cycle)) is False
+        assert compared(copy.deepcopy(cycle), cycle) is False
+        assert compared(cycle, ensemble(cyclic())) is False
     finally:
         sys.setrecursionlimit(limit)
 

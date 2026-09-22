@@ -624,8 +624,11 @@ def _graph_aware_equal(left, right, active=None):
     of recursing, while a structure that merely shares references compares
     normally. Keep dict and sequence traversal in this frame with explicit
     loops: recursive generators add a frame per level, and on Python 3.10
-    their ``all()`` calls also count toward the recursion limit. Direct
-    recursion leaves more headroom than the deep copy into a unit subgraph."""
+    their ``all()`` calls also count toward the recursion limit. For dicts
+    and sequences, this direct recursion leaves more headroom than the deep
+    copy into a unit subgraph. Object arrays and structured arrays with
+    object fields still use additional recursive helper calls and may reach
+    the recursion limit before the deep copy does."""
     if left is right:
         return True
     if active is None:
