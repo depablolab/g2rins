@@ -37,6 +37,7 @@ lint:
         - .gitignore
         - src/g2rins/data/*
         - tests/smi.json
+        - tests/unit_psmiles_corpus.json
     - linters: [yamllint]
       paths:
         - .github/workflows/release.yml

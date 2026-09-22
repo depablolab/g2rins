@@ -4,11 +4,14 @@ on:
   push:
     branches:
       - main
+      - next
   pull_request:
     branches:
       - main
+      - next
   schedule:
     - cron: "0 0 1 * *"
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -54,10 +57,10 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -vvv
 
-  # Full compatibility matrix after merges to main and on the monthly schedule.
+  # Full compatibility matrix after merges to main or next, on the monthly schedule, and on manual dispatch.
   full-tests:
     name: Full Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    if: github.event_name == 'push' || github.event_name == 'schedule'
+    if: github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
 
     strategy:

@@ -4,6 +4,9 @@
 import threading
 import warnings
 
+# Map zero means "unmapped" in RDKit; sequence connection indices start at zero.
+_ATOM_MAP_OFFSET = 1
+
 # RDKit's SMILES writer recurses per atom in C++; the default stack overflows
 # (hard 0xC00000FD on Windows) near 3k atoms. Empirically a 2000-atom linear
 # chain is safe on the default stack and 4000 crashes, so gate with margin.
@@ -38,8 +41,7 @@ def _run_with_big_stack(fn, *args):
                 threading.stack_size(old_size)
     except (ValueError, RuntimeError):
         warnings.warn(
-            "Could not start a big-stack thread; running RDKit conversion inline. "
-            "Molecules over ~3000 atoms may crash the process (stack overflow).",
+            "Could not start a big-stack thread; running RDKit conversion inline. " "Molecules over ~3000 atoms may crash the process (stack overflow).",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -83,15 +85,14 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         # (e.g. [nH]); a negative value (or a caller-supplied None) leaves RDKit to
         # infer implicit H by valence. This is a public API taking a caller-built
         # graph, so tolerate a missing/None attribute rather than raising.
-        # Never on dummy atoms (atomic_num 0): connection placeholders copy every
-        # attribute of the neighboring real atom, whose H count must not render
-        # as a phantom hydrogen on the [*:n] stub.
+        # Never on dummy atoms (atomic_num 0): a caller-supplied H count must not
+        # render as a phantom hydrogen on a [*:n] connection stub.
         num_explicit_h = data.get("num_explicit_h", -1)
         if num_explicit_h is not None and num_explicit_h >= 0 and data["atomic_num"] > 0:
             atom.SetNumExplicitHs(int(num_explicit_h))
             atom.SetNoImplicit(True)
         if "connection" in data:
-            atom.SetAtomMapNum(data["connection"] + 1)
+            atom.SetAtomMapNum(data["connection"] + _ATOM_MAP_OFFSET)
 
         graph_idx_to_mol_idx[graph_idx] = mol.AddAtom(atom)
 
