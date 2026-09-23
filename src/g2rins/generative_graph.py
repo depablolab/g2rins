@@ -8,6 +8,7 @@ import warnings
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
+from enum import IntEnum
 
 import networkx as nx
 import numpy as np
@@ -41,8 +42,29 @@ _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
 _CONNECTOR_PLACEHOLDER_NAME = "is_connector_placeholder"
+_TRANSITION_ROLE_NAME = "transition_role"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 10
+
+
+class TransitionRole(IntEnum):
+    """Role of a transition edge, carried by ``transition_role`` on every generative-graph edge.
+
+    NONE marks an edge that is not a transition. A STOCHASTIC transition is mediated by a bond
+    connector of the managing stochastic object and competes as a weighted option at that
+    level. A FORCED_ENTRY enters a nested stochastic object from its parent with no parent
+    bond connector on the path. A FORCED_EXIT leaves a nested stochastic object through its
+    terminal bond connector without crossing a bond connector of any enclosing object, so the
+    enclosing level has no decision to make; it fires when the instance that owns the source
+    site finalizes. A GLOBAL transition crosses stochastic families (stochastic id -1) and
+    fires after every instance has terminated. The integer encoding is stable across versions.
+    """
+
+    NONE = 0
+    STOCHASTIC = 1
+    FORCED_ENTRY = 2
+    FORCED_EXIT = 3
+    GLOBAL = 4
 
 
 def is_static_edge(edge_data):
@@ -56,6 +78,59 @@ def is_static_edge(edge_data):
 
 
 _DERIVED_NODE_FIELDS = ("unit_id", "bond_id")
+
+
+def _stochastic_ancestors(stochastic_obj):
+    """Yield the enclosing stochastic objects of ``stochastic_obj``, nearest first."""
+    ancestor = stochastic_obj.stochastic_parent
+    while ancestor is not None:
+        yield ancestor
+        ancestor = ancestor.stochastic_parent
+
+
+def _transition_role_value(edge, data):
+    """Validated integer ``transition_role`` of one edge; raises IncompatibleGenerativeGraphSchema."""
+    if _TRANSITION_ROLE_NAME not in data:
+        raise IncompatibleGenerativeGraphSchema(_TRANSITION_ROLE_NAME, "edges", node_id=edge)
+    value = data[_TRANSITION_ROLE_NAME]
+    valid = isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and int(value) in {int(role) for role in TransitionRole}
+    if not valid:
+        raise IncompatibleGenerativeGraphSchema(
+            _TRANSITION_ROLE_NAME,
+            "edges",
+            node_id=edge,
+            reason="invalid",
+            detail=f"Expected an integer in {[int(role) for role in TransitionRole]}; received {value!r}.",
+        )
+    return int(value)
+
+
+def _check_transition_role(edge, data):
+    """Validate ``transition_role`` against the edge's transition weight and stochastic id.
+
+    NONE is the role of every edge without a transition weight and of no edge with one;
+    GLOBAL is the role of exactly the transitions stamped -1. Sampling decides by the role, so
+    a graph that contradicts itself here is refused instead of silently mis-firing.
+    """
+    role = _transition_role_value(edge, data)
+    is_transition = data.get(_TRANSITION_NAME, 0) > 0
+    if (role == TransitionRole.NONE) != (not is_transition):
+        raise IncompatibleGenerativeGraphSchema(
+            _TRANSITION_ROLE_NAME,
+            "edges",
+            node_id=edge,
+            reason="invalid",
+            detail=f"Role {role} on an edge with transition weight {data.get(_TRANSITION_NAME, 0)!r}; NONE (0) is the role of exactly the edges without a transition weight.",
+        )
+    if is_transition and (role == TransitionRole.GLOBAL) != (data.get(_EDGE_STOCHASTIC_ID_NAME) == -1):
+        raise IncompatibleGenerativeGraphSchema(
+            _TRANSITION_ROLE_NAME,
+            "edges",
+            node_id=edge,
+            reason="invalid",
+            detail=f"Role {role} with stochastic id {data.get(_EDGE_STOCHASTIC_ID_NAME)!r}; GLOBAL (4) is the role of exactly the transitions stamped -1.",
+        )
+    return role
 
 
 def _atomic_number(node, data):
@@ -495,6 +570,8 @@ def generative_graph_json_data(generative_graph):
     # edited here; _json_safe detaches every nested container before returning.
     data = nx.node_link_data(generative_graph, edges="edges")
     _normalize_connector_placeholder_flags((node["id"], node) for node in data["nodes"])
+    for edge_dict in data["edges"]:
+        _transition_role_value((edge_dict["source"], edge_dict["target"]), edge_dict)
     labels = derive_unit_labels(generative_graph)
     for node_dict in data["nodes"]:
         node = node_dict["id"]
@@ -955,16 +1032,44 @@ class GraphCreator:
 
                     if forced_nested_sto_id is not None:
                         data["sto_id"] = forced_nested_sto_id
+                        data["role"] = int(TransitionRole.FORCED_ENTRY)
                     else:
-                        managing_so = graph.nodes[source_node]["stochastic_obj"]
+                        source_so = graph.nodes[source_node]["stochastic_obj"]
+                        managing_so = source_so
                         for _ in range(max_rank):
                             if managing_so.stochastic_parent is not None:
                                 managing_so = managing_so.stochastic_parent
                             else:
                                 break
                         data["sto_id"] = self._stochastic_id_map[id(managing_so)]
+                        data["role"] = int(TransitionRole.STOCHASTIC)
+
+                        # Special case -- "forced exit" transition: the target lies outside the
+                        # source's SO (its parent's own text, or a sibling SO joined directly) and
+                        # no bond connector of an enclosing SO lies on the path, so the enclosing
+                        # level has no stochastic decision to make. The exit is stamped with the
+                        # nearest common ancestor of the two SOs: the parent for a literal tail,
+                        # the shared parent for a join between two nested objects.
+                        target_node = self.node_path[-1]
+                        if "stochastic_obj" in graph.nodes[target_node]:
+                            target_so = graph.nodes[target_node]["stochastic_obj"]
+                            target_chain = [target_so, *_stochastic_ancestors(target_so)]
+                            # Two SOs without a common ancestor belong to different families: that
+                            # transition is global (stamped -1 below), not a forced exit.
+                            common_so = next((so for so in [source_so, *_stochastic_ancestors(source_so)] if any(so is other for other in target_chain)), None)
+                            if common_so is not None and target_so is not source_so and not any(so is source_so for so in target_chain):
+                                enclosing_ids = {self._stochastic_id_map[id(so)] for so in _stochastic_ancestors(source_so)}
+                                interior_ids = {
+                                    self._stochastic_id_map[id(graph.nodes[bc_node]["stochastic_obj"])]
+                                    for bc_node in self.node_path[1 : len(self.node_path) - 1]
+                                    if "stochastic_obj" in graph.nodes[bc_node]
+                                }
+                                if not interior_ids & enclosing_ids:
+                                    data["sto_id"] = self._stochastic_id_map[id(common_so)]
+                                    data["role"] = int(TransitionRole.FORCED_EXIT)
                 else:
                     data["sto_id"] = None
+                    data["role"] = int(TransitionRole.STOCHASTIC)
 
                 last_weight_type = _STATIC_NAME
                 for weight_type in weight_type_list:
@@ -1137,6 +1242,7 @@ class GraphCreator:
         transition_name=_TRANSITION_NAME,
         static_name=_STATIC_NAME,
         stochastic_id_name=_EDGE_STOCHASTIC_ID_NAME,
+        transition_role_name=_TRANSITION_ROLE_NAME,
         aromatic_name=_AROMATIC_NAME,
         bond_type_name=_BOND_TYPE_NAME,
         smi_bond_mapping=smi_bond_mapping,
@@ -1167,6 +1273,7 @@ class GraphCreator:
         - **{termination_name}**: float Termination Probabilities. If bond connectors terminate with end-groups after the molecular weight is reached, this is the probability \in [0, 1].
         - **{transition_name}**: float Transition Probabilities. If transitioning between stochastic objects, this is the probability to take.
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
+        - **{transition_role_name}**: int Role of the bond (the ``TransitionRole`` encoding, stable across versions, present on every edge): 0 not a transition; 1 stochastic -- mediated by a bond connector of the managing stochastic object, competes as a weighted option at that level; 2 forced entry -- into a nested stochastic object with no parent bond connector on the path; 3 forced exit -- out of a nested stochastic object through its terminal bond connector with no bond connector of an enclosing object on the path, fires when the instance owning the source finalizes; 4 global -- stochastic id -1. The graph with bond connectors carries 0 on every edge, its transitions are not contracted.
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
 
@@ -1187,9 +1294,15 @@ class GraphCreator:
         :func:`derive_unit_labels`. The node and edge properties listed above
         are the full graph contract: a generative model emitting
         **atomic_num**, **is_connector_placeholder**, **{aromatic_name}**, **charge**, **num_explicit_h**,
-        **init_weight**, the **{static_name}** edge flag and the three
-        non-static weights produces a graph that every consumer, including the
-        label derivation, can handle. Generation requires an explicit boolean
+        **init_weight**, the **{static_name}** edge flag, the three
+        non-static weights and an integer **{transition_role_name}** on every
+        edge produces a graph that every consumer, including the label
+        derivation, can handle. Generation and export require
+        **{transition_role_name}**: 0 on every edge without a transition
+        weight, 4 on the transitions stamped -1, and consistent with the
+        edge's weight and stamp at construction; a graph that omits or
+        contradicts it is refused with ``IncompatibleGenerativeGraphSchema``.
+        Generation requires an explicit boolean
         **is_connector_placeholder** on zero-number nodes: True identifies an
         internal placeholder; False identifies a user wildcard, which can be
         parsed and exported but cannot be used for ensemble generation. Older
@@ -1335,6 +1448,7 @@ class GraphCreator:
             d.setdefault(_TERMINATION_NAME, 0)
             d.setdefault(_TRANSITION_NAME, 0)
             d.setdefault(_EDGE_STOCHASTIC_ID_NAME, -2)  # -2 = unassigned; real ids start at 0, -1 is the global level
+            d.setdefault(_TRANSITION_ROLE_NAME, int(TransitionRole.NONE))
 
             if _BOND_TYPE_NAME in d:
                 d[_BOND_TYPE_NAME] = smi_bond_mapping.get(str(d[_BOND_TYPE_NAME]), 1)
@@ -1358,8 +1472,10 @@ class GraphCreator:
 
                         if source_ids & target_ids:
                             d[_EDGE_STOCHASTIC_ID_NAME] = d["sto_id"]
+                            d[_TRANSITION_ROLE_NAME] = d.get("role", int(TransitionRole.STOCHASTIC))
                         else:
                             d[_EDGE_STOCHASTIC_ID_NAME] = -1
+                            d[_TRANSITION_ROLE_NAME] = int(TransitionRole.GLOBAL)
                     elif d.get(_TERMINATION_NAME, 0) > 0:
                         # Termination edges: stochastic_id = target node's SO.
                         # A node in an inner SO may have terminators at multiple SO levels;
@@ -1372,6 +1488,7 @@ class GraphCreator:
                 for _u, _v, _k, d in generative_graph.out_edges(node, keys=True, data=True):
                     d.pop("rank", None)
                     d.pop("sto_id", None)
+                    d.pop("role", None)
 
         # Set the generation hierarchy of nodes when more than one node can transition from the same SO.
         # First, we set the lowest level of the stochastic tree.

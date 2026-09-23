@@ -31,7 +31,9 @@ from g2rins.exception import (
 FAST_SMI = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
 # Same monofunctional-inner-graft template as test_generation_regressions:
 # every sample is a truncated chain, so every attempt is a counted discard.
-TRUNCATING_SMI = "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+TRUNCATING_SMI = (
+    "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+)
 # Every alternative declared |0|: provably fatal AllZeroSamplingWeights.
 FATAL_SMI = "C{[>][<]CC[>]|0|;;[<]}|poisson(900)|[H]"
 # One productive and one dead source alternative: per-chain source selection
@@ -40,6 +42,8 @@ CONDITIONAL_SOURCE_SMI = "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; [<1][H]|0|, 
 # One productive zero-target global arm and one dead sibling. Every chain must
 # process both declared arms, so the unusable cap rejects every ordering.
 DEAD_ARM_SMI = "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
+# A literal tail after a nested object: a forced exit fired at every instance's finalization.
+FORCED_EXIT_SMI = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
 
 
 def test_n_workers_requires_parallel():
@@ -134,6 +138,17 @@ def test_parallel_seed_equivalence():
     assert serial == pooled
 
 
+def test_parallel_seed_equivalence_with_forced_exits():
+    """Forced exits fire identically in the serial and the spawned path, and every chain gets its tail."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(FORCED_EXIT_SMI).get_graph_creator().get_ensemble_creator()
+        serial = ensemble_creator.create_ensemble(4, output_format="smiles", seed=5)
+        pooled = ensemble_creator.create_ensemble(4, output_format="smiles", seed=5, parallel=True, n_workers=2)
+    assert serial == pooled
+    assert all("Br" in chain for chain in serial)
+
+
 def test_worker_discards_surface_in_parent():
     """Discards inside worker processes must reach the caller: the aggregated
     reason tally, the budget warning, and the serial total-failure verdict
@@ -143,9 +158,7 @@ def test_worker_discards_surface_in_parent():
         ensemble_creator = g2rins.G2rins.make(TRUNCATING_SMI).get_graph_creator().get_ensemble_creator()
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        result = ensemble_creator.create_ensemble(
-            2, output_format="smiles", parallel=True, n_workers=2, max_number_of_discarded_chains=2, seed=0
-        )
+        result = ensemble_creator.create_ensemble(2, output_format="smiles", parallel=True, n_workers=2, max_number_of_discarded_chains=2, seed=0)
     assert result is None
     assert any(isinstance(w.message, TooManyDiscardedChains) for w in caught)
     summaries = [w.message for w in caught if isinstance(w.message, DiscardedSamplingPaths)]
@@ -178,9 +191,7 @@ def test_parallel_partial_ensemble_preserved():
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             try:
-                result = ensemble_creator.create_ensemble(
-                    10, output_format="smiles", parallel=True, n_workers=2, max_number_of_discarded_chains=1, seed=seed
-                )
+                result = ensemble_creator.create_ensemble(10, output_format="smiles", parallel=True, n_workers=2, max_number_of_discarded_chains=1, seed=seed)
             except DeadSamplingPath:
                 continue  # every chain drew the dead source: try another seed
         if result is not None and len(result) < 10:
@@ -206,9 +217,7 @@ def test_parallel_total_failure_reraises_transported_cause():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with pytest.raises(DeadSamplingPath) as raised_info:
-            ensemble_creator.create_ensemble(
-                1, output_format="smiles", parallel=True, n_workers=2, max_number_of_discarded_chains=1, seed=0
-            )
+            ensemble_creator.create_ensemble(1, output_format="smiles", parallel=True, n_workers=2, max_number_of_discarded_chains=1, seed=0)
 
     raised = raised_info.value
     assert raised.__traceback__ is not None  # re-raised in the parent
@@ -233,9 +242,7 @@ def test_unguarded_script_runs_once_and_completes(tmp_path):
         "print(f'UNGUARDED-OK {len(chains)}')\n",
         encoding="utf-8",
     )
-    completed = subprocess.run(
-        [sys.executable, "-u", str(script)], capture_output=True, text=True, timeout=300
-    )
+    completed = subprocess.run([sys.executable, "-u", str(script)], capture_output=True, text=True, timeout=300)
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.count("SCRIPT-BODY") == 1
     assert "UNGUARDED-OK 2" in completed.stdout

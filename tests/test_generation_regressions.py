@@ -163,6 +163,27 @@ def test_truncated_chain_contract():
     assert ensemble is None
 
 
+def test_truncated_chain_keeps_its_declared_end_groups():
+    """A chain that dead-ends below its target still receives the end groups
+    its open sites declare: the cleanup terminates every live instance,
+    deepest first, instead of only the parked ones. An instance decides its
+    termination only while its subtree is quiet, so nothing is parked when a
+    dead end strikes, and every truncated chain used to finalize bare. The
+    second repeat unit here can only be capped (its descriptor has no
+    propagation partner), so every chain truncates once it is drawn."""
+    smi = "{[] [<]CC[>], [<]CC(C)[>2]|0.05|; C[>]; [<][H], [<2]Cl []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(4):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        assert any(issubclass(w.category, PossibleNonRepresentativePolymerChain) for w in caught), f"seed {seed}: the chain did not truncate"
+        chlorines = sum(1 for _node, data in mol_graph.nodes(data=True) if data.get("atomic_num") == 17)
+        assert chlorines == 1, f"seed {seed}: truncated chain finalized with {chlorines} Cl cap(s)"
+
+
 def test_unit_id_deterministic():
     """unit_id numbering must not depend on the (random UUID) node ids: parsing
     the same string repeatedly must label the same atoms with the same units
@@ -1646,6 +1667,307 @@ def test_phosphonium_tracked_mw_matches_rdkit():
     assert abs(rdkit_mw - tracked_mw) < 1.0, f"tracked {tracked_mw:.1f} vs RDKit {rdkit_mw:.1f}"
 
 
+def test_nested_side_chain_so_gets_one_instance_per_junction():
+    """A nested stochastic object with its own MW distribution used as a
+    repeat unit (graft side chains entered through backbone ports) grows one
+    instance with one independent draw per junction. The transition sweep
+    used to file the converted sibling ports under the LANDING instance
+    instead of the fired-level instance: every graft pooled into that single
+    poisson(200) draw, side chains never propagated past the junction unit,
+    the unfired ports were destroyed with the instance's terminate-time wipe,
+    and the outer target became unreachable — every chain was discarded as
+    non-representative."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; " "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; " "[<2][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        _reset_rngs(seed)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        bad = [w.category.__name__ for w in caught if issubclass(w.category, (PossibleNonRepresentativePolymerChain, DiscardedSamplingPaths))]
+        assert not bad, f"seed {seed}: graft chain flagged non-representative: {bad}"
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        side_id = next(i for i, d in dist.items() if d == "|poisson(200.0)|")
+        side_masses = tracked[side_id]
+        assert len(side_masses) >= 2, f"seed {seed}: grafts pooled into {len(side_masses)} side-chain instance(s): {side_masses}"
+        # The crossing rounding is all-or-nothing: a kept side chain always
+        # carries the junction plus repeat units. A bare ~59 Da junction means
+        # the ports were captured into a nested instance again.
+        assert min(side_masses) > 90.0, f"seed {seed}: bare junction graft survived: {side_masses}"
+
+
+def test_multifunctional_ports_compete_with_chain_continuation():
+    """A multifunctional initiator's [>1] ports enter a nested arm SO while
+    the chain also continues through units embedding another nested SO. Port
+    initiation and chain continuation must COMPETE in the owner's weighted
+    draw (the multifunctional initiation principle generalized to nested
+    levels): every port grows its own arm with its own MW draw. The deferred
+    continuation used to fire directly from the finished child's bucket,
+    bypassing the owner's pool entirely, so exactly one arm ever grew and the
+    remaining ports were silently wiped at the outer termination."""
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        _reset_rngs(seed)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        bad = [w.category.__name__ for w in caught if issubclass(w.category, (PossibleNonRepresentativePolymerChain, DiscardedSamplingPaths))]
+        assert not bad, f"seed {seed}: chain flagged non-representative: {bad}"
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        # Construction order is parse-stable: gen 1 is the SO embedded in the
+        # chain unit, gen 2 the arm SO entered through the [>1] ports.
+        assert dist[2] == "|poisson(100.0)|"
+        arm_masses = tracked[2]
+        # Not == 3: a port losing every owner-level draw before the outer
+        # target crosses is a legal outcome of the weighted competition, so
+        # exactly-three pins the RNG stream rather than the fix. The broken
+        # hand-off deterministically grew exactly one arm, so >= 2 trips on it.
+        assert len(arm_masses) >= 2, f"seed {seed}: ports never competed with the continuation, got {arm_masses}"
+        assert min(arm_masses) > 40.0, f"seed {seed}: empty arm: {arm_masses}"
+        assert len(tracked[1]) >= 2, f"seed {seed}: chain continuation lost every draw: {tracked[1]}"
+
+
+def test_literal_tail_after_nested_object_is_delivered_on_every_instance():
+    """A unit that writes plain SMILES directly after a nested stochastic
+    object (an exit through the object's terminal bond connector with no bond
+    connector of the enclosing level on the path) delivers that tail on EVERY
+    realized instance of the object: it is literal chemistry of the unit, not a
+    stochastic choice. The exit carries transition_role FORCED_EXIT and fires
+    at the object's finalization, before the owner's cap or promotion, whether
+    or not the owner has parked. A hydrogen tail hides the loss (RDKit restores
+    it as an implicit H), hence the heavy tail here."""
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(12):
+        _reset_rngs(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        nested_gen = next(i for i, d in dist.items() if d == "|poisson(80.0)|")
+        tails = sum(1 for _node, data in mol_graph.nodes(data=True) if data.get("atomic_num") == 35)
+        assert tails == len(tracked[nested_gen]), f"seed {seed}: {len(tracked[nested_gen])} nested instances but {tails} tail(s) delivered"
+
+
+def test_converted_sites_never_file_under_a_terminated_owner():
+    """The transition sweep's owner resolution must file converted sites
+    under a LIVE instance of the fired level. The root/inter-object
+    continuation path fires transition_graph on a source terminate_graph has
+    already finalized; filing the bucket's remaining converted sites back
+    under that terminated instance strands them — no growth, rescue, or cap
+    pass ever reads a terminated parentless bucket again — silently dropping
+    the arms and end groups they carried. The home must be the PRE-EXISTING
+    live instance of the fired level, not a freshly registered one with its
+    own mass draw (that would start a second timeline of the same level)."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+    from g2rins.generative_graph import (
+        _EDGE_STOCHASTIC_ID_NAME,
+        _PROPAGATION_NAME,
+        _TRANSITION_NAME,
+    )
+
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], " "[<1]{[>] [<]CCO[>];; [<]}|poisson(100)|[>]; " "C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    fired_gen = tree[0]
+    entry_ports = [
+        half_bond for half_bond in partial._open_half_bond_map[sto_atom_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
+    ]
+    assert len(entry_ports) >= 2, "the initiator must expose multiple fired-level entry ports"
+    # The live instance of the fired level that must take custody.
+    live_sibling, _sibling_parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:], reuse_existing=False)
+    assert live_sibling != sto_atom_id and not tracker.is_terminated(live_sibling)
+
+    # Reproduce the continuation flow's order: the source is finalized first,
+    # then one of its remaining fired-level sites fires from its bucket.
+    tracker.terminate(sto_atom_id)
+    _new_id, success = partial.transition_graph(sto_atom_id, fired_gen, rng)
+    assert success
+
+    converted_homes = {
+        bucket_id
+        for bucket_id, bonds in partial._open_half_bond_map.items()
+        for half_bond in bonds
+        if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == fired_gen for attr in half_bond._mode_attr_map.get(_PROPAGATION_NAME, []))
+    }
+    assert converted_homes, "the sweep converted no sibling sites"
+    stranded = sorted(bucket_id for bucket_id in converted_homes if tracker.is_terminated(bucket_id))
+    assert not stranded, f"converted sites filed under terminated instance(s) {stranded}"
+    assert converted_homes == {live_sibling}, f"converted sites filed under {sorted(converted_homes)}, not the pre-existing live instance {live_sibling}"
+    assert tracker._stochastic_atom_id_to_gen_id[live_sibling] == fired_gen
+    assert tracker._stochastic_gen_id_to_atom_id[fired_gen] == {sto_atom_id, live_sibling}, "the fire registered a fresh instance of the fired level"
+
+
+def test_transition_from_a_finished_level_without_a_live_instance_raises():
+    """A same-level transition fired from a finished instance whose target is
+    NOT under the fired level (a sibling nested object) leaves no live
+    instance of that level to take custody of the bucket's remaining sites.
+    No valid string reaches this today; the sweep must fail loudly instead of
+    filing the sites under the landing instance's level, where propagation
+    would fire them as that level's own growth."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    # A unit of the first nested object; its exit site carries the join to
+    # the second object. The parser stamps that join with the shared parent
+    # and marks it a forced exit, which is never drawn; recreate the hand-off
+    # this guard protects against with a plain stochastic transition stamped
+    # at the first object's own level, where no live instance can take
+    # custody once that object has finished.
+    source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    join = next(
+        (u, v, key)
+        for u, v, key, data in generative_graph.edges(keys=True, data=True)
+        if data["transition_role"] == int(g2rins.TransitionRole.FORCED_EXIT) and generative_graph.nodes[v]["stochastic_id_tree"][0] == 2
+    )
+    generative_graph.edges[join]["stochastic_id"] = tree[0]
+    generative_graph.edges[join]["transition_role"] = int(g2rins.TransitionRole.STOCHASTIC)
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    tracker.terminate(sto_atom_id)
+    with pytest.raises(RuntimeError, match="no live instance of that level"):
+        partial.transition_graph(sto_atom_id, tree[0], rng)
+
+
+def test_site_draw_frequencies_follow_bond_descriptor_weights():
+    """The site to grow at an owner's step is drawn among its open sites in
+    proportion to their bond-descriptor weights, normalized over the sites open
+    at that moment (molar amounts act only on the incoming unit). A branching
+    unit with a heavy and a light site is entered from a single-port initiator,
+    so the state after the first unit is deterministic; from that state the
+    heavy site must be chosen with frequency 3/4."""
+    import copy
+
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    smi = "{[] [<]CC([>|3.0|])C[>|1.0|]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    _new_id, success = partial.transition_graph(sto_atom_id, tree[0], rng)
+    assert success
+    open_sites = {(half_bond.atom_idx, float(half_bond.weight)) for half_bond in partial._open_half_bond_map[sto_atom_id]}
+    assert sorted(weight for _atom, weight in open_sites) == [1.0, 3.0], f"unexpected basis of open sites: {open_sites}"
+
+    draws = 400
+    heavy = 0
+    for seed in range(draws):
+        trial = copy.deepcopy(partial)
+        trial.propagate_graph(sto_atom_id, np.random.default_rng(seed), True)
+        remaining = {(half_bond.atom_idx, float(half_bond.weight)) for half_bond in trial._open_half_bond_map[sto_atom_id]}
+        (chosen,) = open_sites - remaining
+        heavy += chosen[1] == 3.0
+    frequency = heavy / draws
+    # Binomial 3-sigma band around 3/4 at 400 draws is about +-0.065.
+    assert abs(frequency - 0.75) < 0.07, f"heavy site chosen with frequency {frequency:.3f}, expected 0.75"
+
+
+def test_promoted_site_keeps_its_descriptor_weight_and_owner_tag():
+    """A finished nested instance's owner-level exit is promoted into the
+    owner's pool as an ordinary propagation site: it keeps the descriptor
+    weight of the inner atom it sits on (that is the weight it competes
+    with), carries the owner's native parent tag so the prefer_parent tier
+    ranks it like the owner's own sites, and its owner-level transition edges
+    become propagation edges while the finished level's own propagation modes
+    are dropped."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+    from g2rins.generative_graph import (
+        _EDGE_STOCHASTIC_ID_NAME,
+        _PROPAGATION_NAME,
+        _TRANSITION_NAME,
+    )
+
+    smi = "{[] [<]NNNN{[>] [<]CCO[>];; [<]}|poisson(100)|[>], [<1]{[>] [<]CCO[>|2.0|];; [<]}|poisson(100)|[>]; C(O[>1])C(O[>1])CO[>1]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    owner_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, owner_id, rng)
+    owner_gen = tree[0]
+    # The initial fire enters one arm and registers its instance under the owner.
+    arm_id, success = partial.transition_graph(owner_id, owner_gen, rng)
+    assert success and arm_id != owner_id
+    exits = [half_bond for half_bond in partial._open_half_bond_map[arm_id] if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == owner_gen for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
+    assert len(exits) == 1, "the arm's frontier must carry exactly one owner-level exit"
+    exit_weight = float(exits[0].weight)
+    assert exit_weight == 2.0, "the exit sits on the inner atom carrying [>|2.0|]"
+    owner_pool_before = list(partial._open_half_bond_map[owner_id])
+
+    tracker.terminate(arm_id)
+    assert partial.promote_level_transitions(arm_id, owner_id, owner_gen) == 1
+    promoted = [half_bond for half_bond in partial._open_half_bond_map[owner_id] if half_bond not in owner_pool_before]
+    assert len(promoted) == 1
+    (site,) = promoted
+    assert float(site.weight) == exit_weight
+    assert site.parent == owner_pool_before[0].parent, "a promoted site must rank like the owner's own sites"
+    assert site.has_mode_bonds(_PROPAGATION_NAME) and not site.has_mode_bonds(_TRANSITION_NAME)
+    assert all(attr.get(_EDGE_STOCHASTIC_ID_NAME) == owner_gen for attr in site._mode_attr_map[_PROPAGATION_NAME]), "the finished level's own propagation modes are dropped"
+    assert exits[0] not in partial._open_half_bond_map[arm_id]
+
+
+def test_migrated_heavy_caps_are_priced_into_the_crossing():
+    """Declared end groups whose custody ends in terminated descendants'
+    buckets (side-chain ends of a nested stochastic object used as a repeat
+    unit) must be PRICED by the owner's average-cap estimate as well as
+    delivered by its terminate pass. The estimate used to scan only the
+    owner's own bucket while termination fired the composed custody set, so
+    heavy caps attached after the parking decision arrived unpriced: with Br
+    in place of [H] on this string the realized outer mass overshot its
+    target by ~20% systematically (with ~1 Da hydrogen caps the same bias is
+    invisible)."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; " "{[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; " "[<2]Br []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    masses = []
+    for seed in range(12):
+        _reset_rngs(seed)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _seq, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True)
+        assert any(data.get("atomic_num") == 35 for _node, data in mol_graph.nodes(data=True)), f"seed {seed}: no Br cap delivered"
+        outer_id = next(i for i, d in dist.items() if d == "|poisson(2000.0)|")
+        masses.append(sum(tracked[outer_id]))
+    mean_mass = sum(masses) / len(masses)
+    assert mean_mass < 2000.0 * 1.12, f"unpriced caps: mean outer mass {mean_mass:.0f} systematically overshoots the 2000 Da target"
+    assert mean_mass > 2000.0 * 0.85, f"mean outer mass {mean_mass:.0f} fell far below target"
+
+
 def test_transition_bond_selection_is_level_aware():
     """The dead-end verdict of transition bond selection must be
     deterministic: _pop_random_bond filters candidates by the requested
@@ -1807,10 +2129,12 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     cap, counted as explicit H NODES in the mol graph (SMILES and MolWt are
     blind to a lost cap: it is one implicit hydrogen), even when an arm's
     terminal bond sits parked in a terminated nested instance's bucket at
-    root termination. Chains whose initiator port never grew are skipped —
-    initiator ports carry no termination edges yet — and the seed range stops
-    before 14, whose cap is destroyed earlier by the transition-conversion
-    hand-off; both are known gaps of the follow-up custody change."""
+    root termination, and even when it reaches the root through a
+    transition-conversion hand-off — that path used to rebuild the converted
+    copy without its termination modes, shedding the cap permanently (seed 14
+    was the last such loss; seeds 0 to 15 cover it). Chains whose initiator port never grew are
+    skipped: initiator ports carry no termination edges, which is the one
+    remaining gap."""
     smi = "{[] [<]PP[>], [<]{[>] [<]{[>] [<]CC[>], [<]{[>] [<]NN[>];; [<]}|poisson(100)|[>];; [<]}|poisson(300)|[>], [<]OO[>]; ;[<]}|poisson(1000)|[>]; O([>])[>]; [<][H] []}|poisson(4000)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1819,7 +2143,7 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
     assert len(central) == 1, f"expected one difunctional initiator oxygen, found {len(central)}"
     central_origin = str(central[0])
-    for seed in range(14):
+    for seed in range(16):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
@@ -2013,6 +2337,232 @@ def test_generative_graph_and_ensemble_share_node_ids():
     direct_molecule = direct.sample_mol_graph(rng=np.random.default_rng(0))
     direct_origins = {str(data["origin_idx"]) for _node, data in direct_molecule.nodes(data=True) if "origin_idx" in data}
     assert direct_origins <= {str(node) for node in generative_graph.nodes}
+
+
+# --- forced exits: literal text after a nested object is delivered on every instance ---------------
+
+_FORCED_EXIT_DELIVERY_CASES = [
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", "|poisson(80.0)|", 35, id="one-block-per-unit"),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", "|poisson(80.0)|", 35, id="two-blocks-per-unit"),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CCS[>1])C[>]; C[>]; [<][H], [<1][H] []}|poisson(2000)|", "|poisson(80.0)|", 16, id="tail-with-port"),
+]
+
+
+def _count_atoms(mol_graph, atomic_num):
+    return sum(1 for _node, data in mol_graph.nodes(data=True) if data.get("atomic_num") == atomic_num)
+
+
+@pytest.mark.parametrize(("text", "distribution", "tail_atomic_num"), _FORCED_EXIT_DELIVERY_CASES)
+def test_forced_exits_deliver_one_tail_per_realized_instance(text, distribution, tail_atomic_num):
+    """The literal fragment after a nested object (a terminator, or the atoms
+    before a port) is delivered exactly once per realized instance, parked
+    owners included: it fires at the instance's finalization, not by draw."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(12):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+        instances = sum(len(tracked[gen_id]) for gen_id, text_of in dist.items() if text_of == distribution)
+        assert instances > 0, f"seed {seed}: no nested instance realized"
+        assert _count_atoms(mol_graph, tail_atomic_num) == instances, f"seed {seed}: {instances} instances but {_count_atoms(mol_graph, tail_atomic_num)} tail(s)"
+
+
+@pytest.mark.parametrize("termination_flag", [0, 1])
+def test_forced_exits_are_delivered_under_every_termination_flag(termination_flag):
+    """A forced exit fires at finalization whatever rounding the owner is told to adopt."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(4):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed), termination_flag=termination_flag)
+        instances = sum(len(tracked[gen_id]) for gen_id, text_of in dist.items() if text_of == "|poisson(80.0)|")
+        assert instances > 0 and _count_atoms(mol_graph, 35) == instances, f"seed {seed}: {instances} instances but {_count_atoms(mol_graph, 35)} tail(s)"
+
+
+def test_series_join_grows_the_second_block_on_every_first_block():
+    """Two nested objects in series inside one unit: the join is a forced exit
+    of the first, so the second is registered and grown at every first-block
+    finalization, and its own tail follows it. Before, the join was stamped
+    at the first block's own level and never fired."""
+    from g2rins import ensemble_creator as ensemble_module
+
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(12):
+        ensemble_module._DECISION_TRACE = []
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+            trace = ensemble_module._DECISION_TRACE
+        finally:
+            ensemble_module._DECISION_TRACE = None
+        first, second = sorted(gen_id for gen_id, text_of in dist.items() if text_of == "|poisson(80.0)|")
+        assert len(tracked[first]) > 0
+        assert len(tracked[second]) == len(tracked[first]), f"seed {seed}: {len(tracked[first])} first blocks, {len(tracked[second])} second blocks"
+        assert _count_atoms(mol_graph, 35) == len(tracked[second])
+        # one forced fire per first block (the join) and per second block (the
+        # tail); an owner that rolls back to its undershoot state discards a
+        # grown unit together with the fires that unit recorded, so the trace
+        # can hold more fires than the molecule realized, never fewer
+        assert sum(1 for record in trace if record["kind"] == "forced_exit") >= len(tracked[first]) + len(tracked[second])
+
+
+def test_forced_exits_fire_at_every_nesting_depth():
+    text = "{[] [<]CC({[<] [<]NN({[<] [<]OO[>];; [>]}|poisson(40)|Cl)[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(8):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+        outer = next(gen_id for gen_id, text_of in dist.items() if text_of == "|poisson(80.0)|")
+        inner = next(gen_id for gen_id, text_of in dist.items() if text_of == "|poisson(40.0)|")
+        assert _count_atoms(mol_graph, 35) == len(tracked[outer]), f"seed {seed}"
+        assert _count_atoms(mol_graph, 17) == len(tracked[inner]), f"seed {seed}"
+
+
+def test_forced_exit_is_never_drawn_and_fires_at_finalization():
+    """A forced exit is not an owner-level draw and not a cap candidate; it
+    fires from the finalized instance's bucket into the owner instance."""
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(generative_graph, rng)
+    source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+    bucket = partial._open_half_bond_map[sto_atom_id]
+    forced = [half_bond for half_bond in bucket if any(attr.get("transition_role") == int(g2rins.TransitionRole.FORCED_EXIT) for attr in half_bond._mode_attr_map.get("transition_weight", []))]
+    assert len(forced) == 1
+    owner_gen_id = tree[1]
+    chosen, _unused = partial._pop_random_bond(list(bucket), sto_atom_id, owner_gen_id, rng)
+    assert chosen is None
+    assert partial._transition_blocks_termination(forced[0], tree[0])
+    assert partial._transition_blocks_termination(forced[0], owner_gen_id)
+
+    tracker.terminate(sto_atom_id)
+    assert partial.fire_forced_exits(sto_atom_id, rng) == 1
+    assert forced[0] not in partial._open_half_bond_map[sto_atom_id]
+    assert _count_atoms(partial.atom_graph, 35) == 1
+    owner = parents[-1]
+    assert not tracker.is_terminated(owner)
+    assert partial.fire_forced_exits(sto_atom_id, rng) == 0
+
+
+# --- forced exits: the receiving level decides only once its subtree is quiet ---------------------
+
+_FORCED_EXIT_MASS_CASES = [
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="two-blocks-per-unit"),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="series-blocks"),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CCS[>1])C[>]; C[>]; [<][H], [<1][H] []}|poisson(2000)|", 2000.0, id="tail-with-port"),
+    pytest.param("{[] [<]CC({[<] [>]CC([>1])[<];; [<][H] [<1]}|poisson(200)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="one-tail-per-inner-unit"),
+    pytest.param(
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(60)|{[<] [<]OO[>];; [>]}|poisson(60)|{[<] [<]SS[>], [<]CC[>], [<]OC[>];; [>]}|poisson(400)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|",
+        2000.0,
+        id="joined-copolymer-block",
+    ),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CC{[<] [<]OO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="nested-object-in-tail"),
+    pytest.param(
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(500)|{[<] [<]OO[>];; [>]}|poisson(500)|{[<] [<]SS[>];; [>]}|poisson(500)|Br)C[>]; C[>]; [<][H] []}|poisson(4000)|",
+        4000.0,
+        id="three-blocks-in-series",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "target"), _FORCED_EXIT_MASS_CASES)
+def test_forced_exit_mass_keeps_the_owner_on_target(text, target):
+    """An owner decides its termination only once its subtree is quiet, so
+    whatever its unit delivers through forced exits (a tail, one port per
+    inner unit, a joined block and its own tail) is realized before the
+    decision: the mean realized mass stays within a few percent of the target
+    without any estimate of what the subtree still owes, and every decision
+    finds its undershoot boundary. Deciding early on a projection biased these
+    strings by +4 % to +14 % (tails unpriced or under-priced) and by -42 % (a
+    joined copolymer block priced once per repeat unit). Chains whose deciding
+    step is a large fraction of the target sit on a coarse mass lattice (about
+    1600 or 2400 Da for the one-tail-per-inner-unit string), so the band is
+    the wider of 4 % and 3.5 standard errors of the sample mean."""
+    from g2rins.exception import UndershootSnapshotMissed
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    masses = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for seed in range(40):
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+            masses.append(Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(mol_graph)))
+    assert not any(issubclass(w.category, UndershootSnapshotMissed) for w in caught), "a termination decision found no undershoot boundary"
+    mean = sum(masses) / len(masses)
+    standard_error = np.std(masses, ddof=1) / np.sqrt(len(masses))
+    assert abs(mean - target) < max(0.04 * target, 3.5 * standard_error), f"mean realized mass {mean:.1f} (standard error {standard_error:.1f}) for a {target:.0f} target"
+
+
+def test_owner_decides_only_once_its_subtree_is_quiet():
+    """The root's termination decision is evaluated only while no nested
+    instance is live: every nested instance that grew before a root crossing
+    record was finalized before it. Deciding while a child is still growing
+    would need an estimate of what the child owes the root."""
+    from g2rins import ensemble_creator as ensemble_module
+
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(400)|[H])C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(3):
+        ensemble_module._DECISION_TRACE = []
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+            trace = ensemble_module._DECISION_TRACE
+        finally:
+            ensemble_module._DECISION_TRACE = None
+        root_crossings = [k for k, record in enumerate(trace) if record["kind"] == "crossing" and record["gen"] == 0]
+        assert root_crossings, f"seed {seed}: the root never decided"
+        for k in root_crossings:
+            root = trace[k]["id"]
+            grown = {record["active"] for record in trace[:k] if record["kind"] == "grow" and record["active"] != root}
+            finalized = {record["id"] for record in trace[:k] if record["kind"] == "finalize"}
+            assert grown, f"seed {seed}: no nested instance grew before the root decided"
+            assert grown <= finalized, f"seed {seed}: the root decided while {sorted(grown - finalized)} were still live"
+
+
+def test_forced_join_draws_its_first_unit_by_molar_amount():
+    """A join into a copolymer block draws the block's first unit like every
+    other transition target, by transition weight times the unit's molar
+    amount: a unit declared with amount 0 is never entered (it used to be
+    drawn by transition weight alone, so the forbidden unit started half of
+    the joined blocks)."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>]|0|, [<]CS[>]|1|;; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(6):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+        first, second = sorted(gen_id for gen_id, text_of in dist.items() if text_of == "|poisson(80.0)|")
+        assert len(tracked[second]) == len(tracked[first]) > 0, f"seed {seed}: joins not delivered"
+        assert _count_atoms(mol_graph, 8) == 0, f"seed {seed}: a unit with molar amount 0 was entered"
+        assert _count_atoms(mol_graph, 16) >= len(tracked[second]), f"seed {seed}: joined blocks without their allowed unit"
 
 
 def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):
