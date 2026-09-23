@@ -42,8 +42,8 @@ def test_parser_and_descriptor_diagnostics_preserve_context(diagnostic, copy_met
             3,
             (("DeadSamplingPath", 2), ("EmptyTruncatedDistributionSupport", 1)),
         ),
-        g2rins.exception.NoValidGenerationSource(False),
-        g2rins.exception.NoValidGenerationSource(True),
+        g2rins.exception.NoValidGenerationSource(),
+        g2rins.exception.RepeatUnitInitiation("{[] [<]CC[>];; [<,>][H] []}|poisson(10)|", ("[<]CC[>]",)),
     ),
 )
 def test_sampling_path_diagnostics_pickle_roundtrip(diagnostic):

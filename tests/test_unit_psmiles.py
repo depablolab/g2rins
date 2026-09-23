@@ -394,7 +394,7 @@ def test_corpus_unit_psmiles_follow_template_contract(text):
     expected_error = CORPUS_ERRORS[error_name]
     creator = _make_creator(text)
     if expected_error is not None:
-        # This input intentionally has no default source. Any unexpected
+        # This input intentionally has no automatic source. Any unexpected
         # NoValidGenerationSource from another case must fail the test.
         with pytest.raises(expected_error):
             creator.create_ensemble(1, ensemble_info=True, seed=0)

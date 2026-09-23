@@ -552,7 +552,6 @@ def test_undershoot_rollback_preserves_conditional_provenance(monkeypatch):
         with pytest.raises(DeadSamplingPath) as caught:
             ensemble_creator.sample_mol_graph(
                 source=source,
-                use_repeat_units_as_source=True,
                 rng=np.random.default_rng(0),
                 termination_flag=1,
             )
@@ -687,7 +686,7 @@ def test_zero_target_does_not_bypass_unavoidable_zero_terminator(
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
-    assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert ensemble_creator._automatic_zero_support_is_unavoidable
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(AllZeroSamplingWeights, match="termination MW estimate"):
@@ -721,7 +720,7 @@ def test_exact_zero_target_terminates_at_first_molecular_boundary(monkeypatch):
 
 
 def test_unavoidable_zero_terminator_from_repeat_source_fails_fast():
-    """A repeat unit used as the source exposes its caps before any growth."""
+    """A repeat unit used as the automatic source exposes its caps before any growth."""
     from g2rins.exception import AllZeroSamplingWeights
 
     smi = "{[] [<]CC[>];;[<][H]|0| []}|uniform(80,80)|"
@@ -729,17 +728,15 @@ def test_unavoidable_zero_terminator_from_repeat_source_fails_fast():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
-    assert ensemble_creator._automatic_zero_support_is_unavoidable[True]
+    assert ensemble_creator._repeat_unit_initiation
+    assert ensemble_creator._automatic_zero_support_is_unavoidable
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(
             AllZeroSamplingWeights,
             match="termination MW estimate",
         ):
-            ensemble_creator.sample_mol_graph(
-                use_repeat_units_as_source=True,
-                rng=np.random.default_rng(0),
-            )
+            ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
 
 
 def test_unavoidable_empty_nested_mw_support_fails_fast(monkeypatch):
@@ -761,7 +758,7 @@ def test_unavoidable_empty_nested_mw_support_fails_fast(monkeypatch):
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._statically_empty_nested_mw_sto_gen_ids == frozenset({1})
-    assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert ensemble_creator._automatic_zero_support_is_unavoidable
 
     original_sample = ensemble_creator.sample_mol_graph
     calls = 0
@@ -796,7 +793,7 @@ def test_overlapping_nested_mw_support_stays_retryable():
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert not ensemble_creator._statically_empty_nested_mw_sto_gen_ids
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
     # Whether a chain dies depends on the drawn parent budget (about half of
     # all seeds), so demonstrate both outcomes across seeds instead of one.
@@ -850,14 +847,14 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
     sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I0"],
+            lambda _rng: sources_by_unit["I0"],
         )
         with pytest.raises(DeadSamplingPath) as caught:
             ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
@@ -865,7 +862,7 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I1"],
+            lambda _rng: sources_by_unit["I1"],
         )
         molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
 
@@ -880,7 +877,7 @@ def test_zero_target_global_arm_does_not_skip_dead_sibling():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
@@ -1095,7 +1092,7 @@ def test_asymmetric_static_graph_disables_fatal_template_proof():
     assert reverse_removed, "fixture must contain a bidirectional static edge"
     ensemble_creator = EnsembleCreator(generative_graph)
     assert not ensemble_creator._static_proof_supported
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
 
 def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch):
@@ -1118,7 +1115,7 @@ def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I0"],
+            lambda _rng: sources_by_unit["I0"],
         )
         with pytest.raises(DeadSamplingPath) as caught:
             ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
@@ -1126,7 +1123,7 @@ def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I1"],
+            lambda _rng: sources_by_unit["I1"],
         )
         molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
 
@@ -1198,37 +1195,127 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
     assert all(before_flag == after_flag for (before_flag, _before_rng), (after_flag, _after_rng) in observations), "termination-MW estimation changed live path provenance"
 
 
-@pytest.mark.parametrize(
-    ("smi", "use_repeat_units_as_source"),
-    (
-        pytest.param(
-            ("{[>|1 1 0 0|] [<|0 0 0 0|]CC[<|0 0 0 0|], " "[>|1 1 0 0|]OO[>|1 1 0 0|];; [<]}|uniform(300, 400)|"),
-            False,
-            id="default-source-mode",
-        ),
-        pytest.param(
-            "C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]",
-            True,
-            id="repeat-unit-source-mode",
-        ),
-    ),
-)
-def test_empty_automatic_source_raises_domain_error(
-    smi,
-    use_repeat_units_as_source,
-):
-    """Both automatic-source modes must reject an empty candidate set cleanly."""
+def test_empty_automatic_source_raises_domain_error():
+    """No initiator and no repeat-unit bond connector with weight: the empty candidate set is rejected cleanly."""
     from g2rins.exception import NoValidGenerationSource
+
+    smi = "{[] [<|0|]CC[>|0|];; [<,>][H] []}|uniform(300, 400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        assert ensemble_creator._repeat_unit_initiation
+        with pytest.raises(NoValidGenerationSource):
+            ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
+
+
+def _repeat_unit_initiation_table(smi):
+    """Automatic source table of an initiator-less string, summed per derived unit id."""
+    from collections import defaultdict
+
+    from g2rins.generative_graph import derive_unit_labels
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-        with pytest.raises(NoValidGenerationSource) as caught:
-            ensemble_creator.sample_mol_graph(
-                use_repeat_units_as_source=use_repeat_units_as_source,
-                rng=np.random.default_rng(0),
-            )
-    assert caught.value.use_repeat_units_as_source is use_repeat_units_as_source
+    assert ensemble_creator._repeat_unit_initiation
+    unit_id = derive_unit_labels(ensemble_creator.generative_graph).unit_id
+    table = defaultdict(float)
+    for node, weight in zip(ensemble_creator._starting_node_idx, ensemble_creator._starting_node_weight, strict=True):
+        table[unit_id[node]] += float(weight)
+    return ensemble_creator, dict(table)
+
+
+@pytest.mark.parametrize(
+    ("smi", "expected"),
+    (
+        pytest.param(
+            "{[] [<]CCO[>|2|]|3|, [<]CC(C)O[>|3|];; [<,>][H] []}|uniform(1400,1400)|",
+            {"R0": 9 / 13, "R1": 4 / 13},
+            id="connector-weight-times-molar-amount",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>];; [>][H] [<]}|poisson(300)|{[>] [<]CCN[>];; [<,>][H] []}|poisson(300)|",
+            {"R0": 1.0},
+            id="two-root-objects-start-left",
+        ),
+        pytest.param(
+            "{[] [<]{[>] [<]CC(C)O[>], [<]CCN[>];; [<]}|poisson(100)|[>], [<]CCO[>];; [<,>][H] []}|poisson(500)|",
+            {"R2": 1.0},
+            id="nested-repeat-unit-entered-from-root",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>], [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
+            {"R1": 0.5, "R2": 0.5},
+            id="nested-initiator-without-initiator",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>];; [<]|[>]}|poisson(500)|[>]|[<]|0.3|, {[] [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]|0.7|; [<,>]Br []}|poisson(1000)|",
+            {"R1": 0.3, "R2": 0.7},
+            id="weighted-nested-initiators",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; {[] [<]CCN[>];; [<]|[>]}|poisson(100)|[>]|[<]; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
+            {"R2": 1.0},
+            id="nested-initiator-two-levels-deep",
+        ),
+        pytest.param(
+            "{[] [<]{[>] [<]CC(C)O[>];; [<]}|poisson(100)|[>];; [<,>][H] []}|poisson(500)|",
+            {"R0": 1.0},
+            id="nested-only-repeat-unit",
+        ),
+    ),
+)
+def test_repeat_unit_initiation_sources(smi, expected):
+    """Without an initiator, chains start in the objects nothing enters, at bond-connector weight times molar amount."""
+    _ensemble_creator, table = _repeat_unit_initiation_table(smi)
+    assert table == pytest.approx(expected)
+
+
+def test_repeat_unit_initiation_chains_contain_the_nested_initiator():
+    """The canonical bidirectional form starts inside its block and exits head-to-tail on both sides."""
+    smi = "{[] [<]CCO[>]; {[] [<]CC(C)O[>], [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|"
+    ensemble_creator, _table = _repeat_unit_initiation_table(smi)
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(5):
+            molecule = ensemble_creator.sample_mol_graph(rng=rng)
+            assert any(generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][1] >= 0 for _node, data in molecule.nodes(data=True))
+            assert not any(molecule.nodes[u]["atomic_num"] == 8 and molecule.nodes[v]["atomic_num"] == 8 for u, v in molecule.edges())
+            assert sum(data["atomic_num"] == 35 for _node, data in molecule.nodes(data=True)) == 2
+
+
+def test_repeat_unit_initiation_warns_once_per_creator():
+    """The warning names the source units and fires when the creator is built, not per sample."""
+    from g2rins.exception import RepeatUnitInitiation, UnvalidatedGenerationSource
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make("{[] [<]CCO[>];; [<,>][H] []}|poisson(300)|").get_graph_creator()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble_creator = graph_creator.get_ensemble_creator()
+        rng = np.random.default_rng(0)
+        ensemble_creator.sample_mol_graph(rng=rng)
+        ensemble_creator.sample_mol_graph(rng=rng)
+    issued = [warning for warning in caught if issubclass(warning.category, RepeatUnitInitiation)]
+    assert len(issued) == 1
+    assert "[<]CCO[>]" in str(issued[0].message)
+    assert not any(issubclass(warning.category, UnvalidatedGenerationSource) for warning in caught)
+
+
+def test_declared_initiator_disables_repeat_unit_initiation():
+    """Initiators whose routes all carry zero weight still declare initiation: no fallback, no warning."""
+    from g2rins.exception import RepeatUnitInitiation
+
+    smi = "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; " "CC(C)[>1]|0|, CC(C)[>2]|0|; " "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert not ensemble_creator._repeat_unit_initiation
+    assert ensemble_creator._starting_node_idx == []
+    assert not any(issubclass(warning.category, RepeatUnitInitiation) for warning in caught)
 
 
 def test_create_ensemble_propagates_unexpected_value_error(monkeypatch):

@@ -257,7 +257,7 @@ class NoExplicitInitiation(ParsingWarning):
 
     def __str__(self) -> str:
         string = f"No explicit initiator defined. The stochastic object {str(self.token)} has an empty left terminal bond connector '[]' and an empty list of initiators."
-        # string += "Repeat units will be used as initiators."
+        string += " Chains will start at repeat units instead."
         return string
 
 
@@ -358,15 +358,34 @@ class InvalidGenerationSource(G2RINSError):
 
 
 class NoValidGenerationSource(G2RINSError):
-    """Automatic source selection has no candidates in the requested mode."""
+    """Automatic source selection has no candidate with positive weight."""
 
-    def __init__(self, use_repeat_units_as_source=False):
-        self.use_repeat_units_as_source = bool(use_repeat_units_as_source)
-        super().__init__(self.use_repeat_units_as_source)
+    def __init__(self):
+        super().__init__()
 
     def __str__(self):
-        mode = "repeat-unit" if self.use_repeat_units_as_source else "default"
-        return f"No valid automatic generation source is available in {mode} source mode. " "Supply an explicit valid source or revise the G2RINS initiation paths."
+        return (
+            "No valid automatic generation source is available: no initiation route carries weight, and without a declared "
+            "initiator no repeat-unit bond connector does either. Supply an explicit valid source or revise the G2RINS initiation paths."
+        )
+
+
+class RepeatUnitInitiation(G2RINSWarning):
+    """No initiator is declared: chains start at repeat-unit bond connectors."""
+
+    def __init__(self, g2rins_string, source_units):
+        self.token = g2rins_string
+        self.g2rins_string = g2rins_string
+        self.source_units = tuple(source_units)
+        Warning.__init__(self, g2rins_string, self.source_units)
+
+    def __str__(self):
+        where = f" in {self.g2rins_string!r}" if self.g2rins_string else ""
+        units = ", ".join(str(unit) for unit in self.source_units) or "the repeat units of the stochastic objects that nothing enters"
+        return (
+            f"No initiator is declared{where}: chains start at the bond connectors of {units}, drawn with probability proportional "
+            "to bond-connector weight times molar amount, and grow from every open site of that unit as they would from an initiator."
+        )
 
 
 class PossibleNonRepresentativePolymerChain(G2RINSWarning):
