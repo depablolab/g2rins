@@ -43,8 +43,8 @@ def test_parser_and_descriptor_diagnostics_preserve_context(diagnostic, copy_met
             3,
             (("DeadSamplingPath", 2), ("EmptyTruncatedDistributionSupport", 1)),
         ),
-        g2rins.exception.NoValidGenerationSource(False),
-        g2rins.exception.NoValidGenerationSource(True),
+        g2rins.exception.NoValidGenerationSource(),
+        g2rins.exception.RepeatUnitInitiation("{[] [<]CC[>];; [<,>][H] []}|poisson(10)|", ("[<]CC[>]",)),
     ),
 )
 def test_sampling_path_diagnostics_pickle_roundtrip(diagnostic):
@@ -288,6 +288,38 @@ def test_undefined_distribution(smi):
     with pytest.raises(g2rins.exception.UndefinedDistribution):
         obj = g2rins.G2rins.make(smi)
         obj.get_graph_creator()
+
+
+@pytest.mark.parametrize(
+    "smi",
+    [
+        pytest.param(
+            "{[] [<]CCO[>], [<]|[>]{[>] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|",
+            id="bond-connector-list-meets-single-left-terminal",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>], [<]{[>]|[<] [<]CC(C)O[>];; [<]}|poisson(100)|[>];; [<,>][H] []}|poisson(600)|",
+            id="single-bond-connector-meets-left-terminal-list",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>], [<]{[>] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>];; [<,>][H] []}|poisson(600)|",
+            id="right-terminal-list-meets-single-bond-connector",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>], [<]{[>] [<]CC(C)O[>];; [<]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|",
+            id="single-right-terminal-meets-bond-connector-list",
+        ),
+    ],
+)
+def test_mismatched_bond_connector_lists_are_a_parsing_error(smi):
+    """Lists pair by position, so a list meeting a single connector or a shorter list cannot parse."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(g2rins.exception.MismatchedBondConnectorLists):
+            try:
+                g2rins.G2rins.make(smi)
+            except lark.exceptions.VisitError as exc:
+                raise exc.__context__  # trunk-ignore(ruff/B904)
 
 
 # TODO: implement tests for IncorrectNumberOfBondProbabilities and EmptyBondConnectorInTerminalBondConnectorList. Add nested examples.

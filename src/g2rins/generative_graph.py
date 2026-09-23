@@ -30,6 +30,7 @@ from .exception import (
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
     InheritedTermination,
+    MismatchedBondConnectorLists,
     MissingTermination,
     ShadowedTerminationDeclaration,
     TooManyStochasticObjects,
@@ -750,6 +751,25 @@ class _PartialGraph:
 
     def __getitem__(self, idx):
         return self.g.nodes[idx]
+
+
+def _check_positional_pairing(left_graph, right_half_bonds, right_graph, left_half_bonds, left_token, right_token):
+    """Lists of bond connectors pair by position with the list they meet.
+
+    Members of a bond connector list or of a terminal bond connector list carry
+    a matching index and bond only to the entry with the same index on the
+    other side. When either side of a junction is such a list, both sides must
+    offer the same number of half bonds; otherwise the unmatched entries would
+    never bond and the string would generate silently wrong chains. A side
+    without half bonds (a weight token, an empty terminal) has nothing to pair.
+    """
+    if not right_half_bonds or not left_half_bonds:
+        return
+    indexed = any("matching_index" in left_graph.nodes[half_bond.node_id] for half_bond in right_half_bonds) or any(
+        "matching_index" in right_graph.nodes[half_bond.node_id] for half_bond in left_half_bonds
+    )
+    if indexed and len(right_half_bonds) != len(left_half_bonds):
+        raise MismatchedBondConnectorLists(left_token, right_token, len(right_half_bonds), len(left_half_bonds))
 
 
 def _docstring_format(*args, **kwargs):

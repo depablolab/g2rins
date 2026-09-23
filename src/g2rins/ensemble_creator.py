@@ -39,6 +39,7 @@ from .exception import (
     InvalidUnitPSmiles,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
+    RepeatUnitInitiation,
     TooManyDiscardedChains,
     UndershootSnapshotMissed,
     UnsupportedWildcardGeneration,
@@ -2368,30 +2369,28 @@ class EnsembleCreator:
             self._provably_zero_termination_states = frozenset()
         self._source_provably_dead_cache = {}
 
-        self._starting_node_idx, self._starting_node_weight = self._create_init_weights(self.generative_graph)
-
-        self._repeat_unit_starting_node_idx, self._repeat_unit_starting_node_weight = self._create_repeat_units_as_source(self.generative_graph)
+        # Without a declared initiator, chains start at repeat units.  An
+        # initiator whose every route carries zero weight still declares one:
+        # that string keeps its empty table and NoValidGenerationSource.
+        self._repeat_unit_initiation = not any(data["init_weight"] > 0 for _node, data in self._generative_graph.nodes(data=True))
+        if self._repeat_unit_initiation:
+            self._starting_node_idx, self._starting_node_weight = self._create_repeat_unit_initiation_weights(self._generative_graph)
+            if self._starting_node_idx:
+                warnings.warn(
+                    RepeatUnitInitiation(self._generative_graph.graph.get("g2rins_string"), self._source_unit_texts(self._starting_node_idx)),
+                    stacklevel=2,
+                )
+        else:
+            self._starting_node_idx, self._starting_node_weight = self._create_init_weights(self.generative_graph)
 
         # A sticky branch flag is insufficient on its own: several positive
-        # sources (or repeat-unit choices) may all converge on the same dead
-        # nested expansion.  This conservative proof overrides that flag only
-        # when every source with nonzero selection probability is known dead.
-        self._automatic_zero_support_is_unavoidable = {
-            False: self._all_reachable_sources_are_provably_dead(
-                self._starting_node_idx,
-                self._starting_node_weight,
-            ),
-            True: self._all_reachable_sources_are_provably_dead(
-                self._repeat_unit_starting_node_idx,
-                self._repeat_unit_starting_node_weight,
-            ),
-        }
-        # Both weight vectors are immutable after this point, so whether the
-        # automatic source draw branches is a per-mode constant.
-        self._automatic_source_is_conditional = {
-            False: np.count_nonzero(np.asarray(self._starting_node_weight) > 0.0) > 1,
-            True: np.count_nonzero(np.asarray(self._repeat_unit_starting_node_weight) > 0.0) > 1,
-        }
+        # sources may all converge on the same dead nested expansion.  This
+        # conservative proof overrides that flag only when every source with
+        # nonzero selection probability is known dead.
+        self._automatic_zero_support_is_unavoidable = self._all_reachable_sources_are_provably_dead(self._starting_node_idx, self._starting_node_weight)
+        # The weight vector is immutable after this point, so whether the
+        # automatic source draw branches is a constant.
+        self._automatic_source_is_conditional = np.count_nonzero(np.asarray(self._starting_node_weight) > 0.0) > 1
 
     def _find_statically_empty_nested_mw_sto_gen_ids(self):
         """Find nested MW draws whose truncated support is empty on every chain.
@@ -2920,69 +2919,66 @@ class EnsembleCreator:
         return starting_node_idx, starting_node_weight
 
     @staticmethod
-    # TODO: consider nested stochastic object in the selection of starting nodes from repeat units
-    def _create_repeat_units_as_source(generative_graph):
-        # TODO fix this function, sometimes it brings errors.
+    def _create_repeat_unit_initiation_weights(graph):
+        """Automatic sources of a graph that declares no initiator.
+
+        Chains start in the stochastic objects that nothing enters.  In the
+        flow graph whose nodes are the stochastic objects (the global level
+        counts as one) and whose edges are the propagation and transition
+        edges crossing from one object into another, those are the strongly
+        connected components without incoming edge; inside each, the outermost
+        objects.  A nested object used as initiator without an initiator of
+        its own is such a source at any depth; a nested repeat unit entered
+        from its parent is not.  Termination edges never propagate and are
+        ignored.  Candidates are the connector atoms of the source objects,
+        weighted by their bond-connector weight times the molar amounts along
+        their nesting path.
+        """
+        stochastic_id_tree = {node: data["stochastic_id_tree"] for node, data in graph.nodes(data=True)}
+        flow = nx.DiGraph()
+        flow.add_nodes_from(tree[0] for tree in stochastic_id_tree.values())
+        for u, v, data in graph.edges(data=True):
+            if data.get(_PROPAGATION_NAME, 0) > 0 or data.get(_TRANSITION_NAME, 0) > 0:
+                if stochastic_id_tree[u][0] != stochastic_id_tree[v][0]:
+                    flow.add_edge(stochastic_id_tree[u][0], stochastic_id_tree[v][0])
+
+        depth = {tree[0]: sum(1 for parent in tree[1:] if parent >= 0) for tree in stochastic_id_tree.values()}
+        condensation = nx.condensation(flow)
+        source_objects = set()
+        for component in condensation.nodes:
+            if condensation.in_degree(component) == 0:
+                members = condensation.nodes[component]["members"]
+                outermost = min(depth[member] for member in members)
+                source_objects.update(member for member in members if depth[member] == outermost)
+
         starting_node_idx = []
         starting_node_weight = []
-        graph_transitions = []
-        for u, v, data in generative_graph.edges(data=True):
-            if data[_TRANSITION_NAME] > 0:
-                graph_transitions.append((u, v))
+        for node, data in graph.nodes(data=True):
+            tree = stochastic_id_tree[node]
+            if tree[0] < 0 or tree[0] not in source_objects or not data["gen_weight"] > 0:
+                continue
+            weight = data["gen_weight"]
+            for level in tree:
+                if level >= 0:
+                    weight *= data["unit_molar_amounts"][level]
+            starting_node_idx.append(node)
+            starting_node_weight.append(weight)
 
-        if not graph_transitions:
-            for node_idx, data in generative_graph.nodes(data=True):
-                if (data["init_weight"] == -1) and (data["gen_weight"] > 0):  # and (stochastic_tree_depth[node_idx]) == max_depth:
-                    starting_node_idx.append(node_idx)
-                    starting_node_weight.append(data["gen_weight"])
-        else:
-            list_of_repeat_units = []
-            for u, _ in graph_transitions:
-                visited = set([u])
-                queue = deque([u])
+        starting_node_weight = np.asarray(starting_node_weight, dtype=float)
+        total_weight = np.sum(starting_node_weight)
+        if not total_weight > 0:
+            return [], np.asarray([])
+        return starting_node_idx, starting_node_weight / total_weight
 
-                while queue:
-                    node = queue.popleft()
-
-                    # Outgoing edges
-                    for _, nbr, _key, data in generative_graph.out_edges(node, keys=True, data=True):
-                        if data.get(_TRANSITION_NAME, 0) > 0:
-                            continue  # stop traversal in this direction
-                        if nbr not in visited:
-                            visited.add(nbr)
-                            queue.append(nbr)
-
-                    # Incoming edges
-                    for nbr, _, _key, data in generative_graph.in_edges(node, keys=True, data=True):
-                        if data.get(_TRANSITION_NAME, 0) > 0:
-                            continue  # stop traversal in this direction
-                        if nbr not in visited:
-                            visited.add(nbr)
-                            queue.append(nbr)
-                list_of_repeat_units.append(visited)
-            repeat_units_to_remove = []
-            for repeat_unit in list_of_repeat_units:
-                for node_idx in repeat_unit:
-                    for _u, v in graph_transitions:
-                        if node_idx == v:
-                            if repeat_unit not in repeat_units_to_remove:
-                                repeat_units_to_remove.append(repeat_unit)
-                                continue
-            for repeat_unit in repeat_units_to_remove:
-                if repeat_unit in list_of_repeat_units:
-                    list_of_repeat_units.remove(repeat_unit)
-
-            for node_idx, data in generative_graph.nodes(data=True):
-                if (any(node_idx in repeat_unit for repeat_unit in list_of_repeat_units)) or not list_of_repeat_units:
-                    if (data["init_weight"] == -1) and (data["gen_weight"] > 0):
-                        starting_node_idx.append(node_idx)
-                        starting_node_weight.append(data["gen_weight"])
-
-        if starting_node_idx:
-            starting_node_weight = np.asarray(starting_node_weight)
-            starting_node_weight /= np.sum(starting_node_weight)
-
-        return starting_node_idx, starting_node_weight
+    def _source_unit_texts(self, nodes):
+        """Unit texts of the automatic sources, for the repeat-unit initiation warning."""
+        try:
+            labels = derive_unit_labels(self._generative_graph)
+            texts = _verified_unit_texts(self._generative_graph, labels)
+        except (KeyError, TypeError, ValueError, AttributeError, nx.NetworkXException):
+            return ()
+        unit_ids = sorted({labels.unit_id[node] for node in nodes}, key=str)
+        return tuple(texts.get(unit_id, unit_id) for unit_id in unit_ids)
 
     @staticmethod
     def _create_static_graph(generative_graph):
@@ -2999,16 +2995,10 @@ class EnsembleCreator:
     def generative_graph(self):
         return self._generative_graph.copy()
 
-    def _get_random_start_node(self, rng, use_repeat_units_as_source=False):
-        if use_repeat_units_as_source:
-            candidates = self._repeat_unit_starting_node_idx
-            probabilities = self._repeat_unit_starting_node_weight
-        else:
-            candidates = self._starting_node_idx
-            probabilities = self._starting_node_weight
-        if not candidates:
-            raise NoValidGenerationSource(use_repeat_units_as_source)
-        return rng.choice(candidates, p=probabilities)
+    def _get_random_start_node(self, rng):
+        if not self._starting_node_idx:
+            raise NoValidGenerationSource()
+        return rng.choice(self._starting_node_idx, p=self._starting_node_weight)
 
     @staticmethod
     def get_dot_string(atom_graph, bond_type_colors=None, prefix="") -> str:
@@ -3037,13 +3027,11 @@ class EnsembleCreator:
     def sample_mol_graph(
         self,
         source: Optional[str] = None,
-        use_repeat_units_as_source=False,
         rng=None,
         termination_flag: Optional[int] = None,
         tolerate_incomplete_stochastic_generation_with_no_more_than_X_open_bonds=0,
         molecule_info=False,
     ):
-        # TODO: consider using repeat units as source not an option.
         if rng is None:
             rng = get_global_rng()
 
@@ -3051,9 +3039,9 @@ class EnsembleCreator:
         source_is_conditional = False
         zero_support_is_unavoidable = False
         if automatic_source:
-            zero_support_is_unavoidable = self._automatic_zero_support_is_unavoidable[bool(use_repeat_units_as_source)]
-            source_is_conditional = self._automatic_source_is_conditional[bool(use_repeat_units_as_source)]
-            source = self._get_random_start_node(rng, use_repeat_units_as_source)
+            zero_support_is_unavoidable = self._automatic_zero_support_is_unavoidable
+            source_is_conditional = self._automatic_source_is_conditional
+            source = self._get_random_start_node(rng)
 
         # The generative_graph property copies the whole template graph on every access:
         # take one copy per sample instead of one per use.
@@ -3065,7 +3053,7 @@ class EnsembleCreator:
         if not automatic_source:
             zero_support_is_unavoidable = self._source_is_provably_dead(source)
 
-        if (source not in self._starting_node_idx) and not use_repeat_units_as_source:
+        if source not in self._starting_node_idx:
             warnings.warn(
                 UnvalidatedGenerationSource(source, self._starting_node_idx, generative_graph),
                 stacklevel=2,

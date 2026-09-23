@@ -448,34 +448,43 @@ class StochasticObject(G2rinsBase, GenerationBase):
                         node = graph.nodes[node_idx]["obj"]
                         partial_graph.left_half_bonds.append(_HalfBond(node, node_idx, dict([(_TRANSITION_NAME, prob), ("init_weight", prob)])))
         else:
-            # TODO: loop over left_terminal_bc_list to connect things with all left bond connectors
-            left_partial_graph = self._left_terminal_bc_list.terminal_bond_connectors[0]._generate_partial_graph()
-            left_partial_graph.left_half_bonds = []
-            left_partial_graph.right_half_bonds = []
-            left_idx = list(left_partial_graph.g.nodes)[0]
-            partial_graph.merge(left_partial_graph, [])
-            partial_graph.left_half_bonds.append(_HalfBond(self._left_terminal_bc_list.terminal_bond_connectors[0], left_idx, {}))
-            graph = partial_graph.g
-
-            # With non-empty left bond connectors we connect first to one of the monomers inside.
-            left_bc = self._left_terminal_bc_list.terminal_bond_connectors[0]
-            if left_bc.bond_probabilities is not None:
-                weights = left_bc.bond_probabilities[: len(mono_idx_pos)]
+            # Every left terminal bond connector is an entry; like the right
+            # terminals, list entries carry the position they pair with.
+            if len(self._left_terminal_bc_list.terminal_bond_connectors) > 1:
+                matching_index = 0
             else:
-                weights = [graph.nodes[bc_idx]["obj"].weight for bc_idx in mono_idx_pos]
-            weights = np.asarray(weights)
+                matching_index = -1
 
-            for i, bc_idx in enumerate(mono_idx_pos):
-                if not left_bc.is_compatible(graph.nodes[bc_idx]["obj"]):
-                    weights[i] = 0
+            for left_terminal_bond_connector in self._left_terminal_bc_list.terminal_bond_connectors:
+                left_partial_graph = left_terminal_bond_connector._generate_partial_graph()
+                left_partial_graph.left_half_bonds = []
+                left_partial_graph.right_half_bonds = []
+                left_idx = list(left_partial_graph.g.nodes)[0]
+                partial_graph.merge(left_partial_graph, [])
+                partial_graph.left_half_bonds.append(_HalfBond(left_terminal_bond_connector, left_idx, {}))
+                graph = partial_graph.g
 
-            probabilities = []
-            if weights.sum() > 0:
-                probabilities = weights / weights.sum()
-            for i, prob in enumerate(probabilities):
-                if prob > 0:
-                    node_idx = mono_idx_pos[i]
-                    graph.add_edge(left_idx, node_idx, **dict([(_TRANSITION_NAME, prob)]))
+                graph.nodes[left_idx]["matching_index"] = matching_index
+                matching_index += 1
+
+                # With non-empty left bond connectors we connect first to one of the monomers inside.
+                if left_terminal_bond_connector.bond_probabilities is not None:
+                    weights = left_terminal_bond_connector.bond_probabilities[: len(mono_idx_pos)]
+                else:
+                    weights = [graph.nodes[bc_idx]["obj"].weight for bc_idx in mono_idx_pos]
+                weights = np.asarray(weights)
+
+                for i, bc_idx in enumerate(mono_idx_pos):
+                    if not left_terminal_bond_connector.is_compatible(graph.nodes[bc_idx]["obj"]):
+                        weights[i] = 0
+
+                probabilities = []
+                if weights.sum() > 0:
+                    probabilities = weights / weights.sum()
+                for i, prob in enumerate(probabilities):
+                    if prob > 0:
+                        node_idx = mono_idx_pos[i]
+                        graph.add_edge(left_idx, node_idx, **dict([(_TRANSITION_NAME, prob)]))
 
         # Add out-going bonds
 

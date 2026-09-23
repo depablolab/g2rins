@@ -96,8 +96,7 @@
     "id": "initiator-mixture"
   },
   "{[>][<]OCC(C)(C(=O)OCCOC)COC(=O)[>];;[<]}|uniform(200,300)|OCCCCCCOc(cc1)ccc1C(=O)Oc(cc1(C))ccc1OC(=O)c(cc1)ccc1OCCCCCCO{[>][<]C(=O)OCC(C)(C(=O)OCCOC)CO[>];;[<]}|schulz_zimm(2000, 1000)|": {
-    "id": "no-automatic-source",
-    "expected_error": "NoValidGenerationSource"
+    "id": "dangling-left-terminal-repeat-unit-initiation"
   },
   "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|[H])C({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])C[>]; [<][H]; [>][H] []}|poisson(400)|": {
     "id": "nested-grafts"
