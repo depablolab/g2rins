@@ -2372,8 +2372,11 @@ def test_series_join_grows_the_second_block_on_every_first_block():
         assert len(tracked[first]) > 0
         assert len(tracked[second]) == len(tracked[first]), f"seed {seed}: {len(tracked[first])} first blocks, {len(tracked[second])} second blocks"
         assert _count_atoms(mol_graph, 35) == len(tracked[second])
-        # one forced fire per first block (the join) and per second block (the tail)
-        assert sum(1 for record in trace if record["kind"] == "forced_exit") == len(tracked[first]) + len(tracked[second])
+        # one forced fire per first block (the join) and per second block (the
+        # tail); an owner that rolls back to its undershoot state discards a
+        # grown unit together with the fires that unit recorded, so the trace
+        # can hold more fires than the molecule realized, never fewer
+        assert sum(1 for record in trace if record["kind"] == "forced_exit") >= len(tracked[first]) + len(tracked[second])
 
 
 def test_forced_exits_fire_at_every_nesting_depth():
@@ -2425,74 +2428,85 @@ def test_forced_exit_is_never_drawn_and_fires_at_finalization():
     assert partial.fire_forced_exits(sto_atom_id, rng) == 0
 
 
-# --- forced exits are priced into the receiving instance's projection ------------------------------
+# --- forced exits: the receiving level decides only once its subtree is quiet ---------------------
+
+_FORCED_EXIT_MASS_CASES = [
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="two-blocks-per-unit"),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="series-blocks"),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CCS[>1])C[>]; C[>]; [<][H], [<1][H] []}|poisson(2000)|", 2000.0, id="tail-with-port"),
+    pytest.param("{[] [<]CC({[<] [>]CC([>1])[<];; [<][H] [<1]}|poisson(200)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="one-tail-per-inner-unit"),
+    pytest.param(
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(60)|{[<] [<]OO[>];; [>]}|poisson(60)|{[<] [<]SS[>], [<]CC[>], [<]OC[>];; [>]}|poisson(400)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|",
+        2000.0,
+        id="joined-copolymer-block",
+    ),
+    pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CC{[<] [<]OO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", 2000.0, id="nested-object-in-tail"),
+    pytest.param(
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(500)|{[<] [<]OO[>];; [>]}|poisson(500)|{[<] [<]SS[>];; [>]}|poisson(500)|Br)C[>]; C[>]; [<][H] []}|poisson(4000)|",
+        4000.0,
+        id="three-blocks-in-series",
+    ),
+]
 
 
-def _child_instance_of(text, atomic_num):
-    """A registered instance of the nested object holding the first atom with ``atomic_num``."""
-    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
-    generative_graph = ensemble_creator.generative_graph
-    rng = np.random.default_rng(0)
-    tracker = _StochasticObjectTracker(generative_graph, rng)
-    source = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == atomic_num)
-    tree = generative_graph.nodes[source]["stochastic_id_tree"]
-    sto_atom_id, parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
-    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
-    return ensemble_creator, partial, tracker, sto_atom_id, parents, rng
-
-
-def test_forced_exit_pending_mass_equals_the_realized_credit():
-    """The pending mass of a literal tail is exactly what the fire credits the
-    receiving instance: the fragment's atoms and hydrogens, minus the hydrogen
-    the source endpoint sheds."""
-    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
-    ensemble_creator, partial, tracker, sto_atom_id, parents, rng = _child_instance_of(text, 7)
-    owner = parents[-1]
-    pending = partial._forced_exit_pending_mw(sto_atom_id, ensemble_creator._static_graph, rng)
-    assert pending == pytest.approx(79.904 - 1.008, abs=0.01)
-    before = tracker._sto_atom_id_actual_molw[owner]
-    tracker.terminate(sto_atom_id)
-    assert partial.fire_forced_exits(sto_atom_id, rng) == 1
-    assert tracker._sto_atom_id_actual_molw[owner] - before == pytest.approx(pending, abs=1e-6)
-    assert partial._forced_exit_pending_mw(sto_atom_id, ensemble_creator._static_graph, rng) == 0.0
-
-
-def test_series_join_is_priced_as_the_joined_object_and_its_own_tail():
-    """A join owes the joined object's expected mass plus what that object owes
-    in turn (its tail), read from the graph since the object does not exist yet."""
-    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
-    ensemble_creator, partial, tracker, sto_atom_id, _parents, rng = _child_instance_of(text, 7)
-    pending = partial._forced_exit_pending_mw(sto_atom_id, ensemble_creator._static_graph, rng)
-    assert pending == pytest.approx(80.0 + (79.904 - 1.008), abs=0.01)
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", id="two-blocks-per-unit"),
-        pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", id="series-blocks"),
-        pytest.param("{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|CCS[>1])C[>]; C[>]; [<][H], [<1][H] []}|poisson(2000)|", id="tail-with-port"),
-    ],
-)
-def test_forced_exit_mass_keeps_the_owner_on_target(text):
-    """With every tail delivered, an unpriced tail would bias the owner above
-    its target (measured +4.4 % and +4.5 % on the first two strings); priced,
-    the mean realized mass stays within the usual few-percent band."""
-    from rdkit.Chem import Descriptors
+@pytest.mark.parametrize(("text", "target"), _FORCED_EXIT_MASS_CASES)
+def test_forced_exit_mass_keeps_the_owner_on_target(text, target):
+    """An owner decides its termination only once its subtree is quiet, so
+    whatever its unit delivers through forced exits (a tail, one port per
+    inner unit, a joined block and its own tail) is realized before the
+    decision: the mean realized mass stays within a few percent of the target
+    without any estimate of what the subtree still owes, and every decision
+    finds its undershoot boundary. Deciding early on a projection biased these
+    strings by +4 % to +14 % (tails unpriced or under-priced) and by -42 % (a
+    joined copolymer block priced once per repeat unit). Chains whose deciding
+    step is a large fraction of the target sit on a coarse mass lattice (about
+    1600 or 2400 Da for the one-tail-per-inner-unit string), so the band is
+    the wider of 4 % and 3.5 standard errors of the sample mean."""
+    from g2rins.exception import UndershootSnapshotMissed
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
-        masses = []
+    masses = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         for seed in range(40):
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
             masses.append(Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(mol_graph)))
+    assert not any(issubclass(w.category, UndershootSnapshotMissed) for w in caught), "a termination decision found no undershoot boundary"
     mean = sum(masses) / len(masses)
-    assert abs(mean - 2000.0) / 2000.0 < 0.025, f"mean realized mass {mean:.1f} for a 2000 target"
+    standard_error = np.std(masses, ddof=1) / np.sqrt(len(masses))
+    assert abs(mean - target) < max(0.04 * target, 3.5 * standard_error), f"mean realized mass {mean:.1f} (standard error {standard_error:.1f}) for a {target:.0f} target"
+
+
+def test_owner_decides_only_once_its_subtree_is_quiet():
+    """The root's termination decision is evaluated only while no nested
+    instance is live: every nested instance that grew before a root crossing
+    record was finalized before it. Deciding while a child is still growing
+    would need an estimate of what the child owes the root."""
+    from g2rins import ensemble_creator as ensemble_module
+
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(400)|[H])C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(3):
+        ensemble_module._DECISION_TRACE = []
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+            trace = ensemble_module._DECISION_TRACE
+        finally:
+            ensemble_module._DECISION_TRACE = None
+        root_crossings = [k for k, record in enumerate(trace) if record["kind"] == "crossing" and record["gen"] == 0]
+        assert root_crossings, f"seed {seed}: the root never decided"
+        for k in root_crossings:
+            root = trace[k]["id"]
+            grown = {record["active"] for record in trace[:k] if record["kind"] == "grow" and record["active"] != root}
+            finalized = {record["id"] for record in trace[:k] if record["kind"] == "finalize"}
+            assert grown, f"seed {seed}: no nested instance grew before the root decided"
+            assert grown <= finalized, f"seed {seed}: the root decided while {sorted(grown - finalized)} were still live"
 
 
 def test_forced_join_draws_its_first_unit_by_molar_amount():

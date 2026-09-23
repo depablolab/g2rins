@@ -116,13 +116,6 @@ class StochasticDistribution(StochasticGeneration):
         """
         super().__init__(children)
 
-    def mean_mw(self) -> float:
-        """Expected molecular weight of the distribution: prices mass that is owed but not yet
-        drawn, such as a nested stochastic object joined to one that is finishing."""
-        if self._distribution is None:
-            raise NotImplementedError
-        return float(self._distribution.mean())
-
     def __bool__(self) -> bool:
         """
         Returns True if a statistical distribution is associated with this object.
@@ -783,9 +776,6 @@ class SchulzZimm(StochasticDistribution):
         """
         return super().prob_mw(mw)
 
-    def mean_mw(self) -> float:
-        return float(self._Mn)
-
 
 StochasticDistribution._known_distributions.append(SchulzZimm)
 
@@ -887,9 +877,6 @@ class Gauss(StochasticDistribution):
             return 1.0
         return super().prob_mw(mw)
 
-    def mean_mw(self) -> float:
-        return float(self._mu)
-
 
 StochasticDistribution._known_distributions.append(Gauss)
 
@@ -972,9 +959,6 @@ class Uniform(StochasticDistribution):
         Returns True if the distribution is initialized (i.e., low and high are set).
         """
         return self._distribution is not None
-
-    def mean_mw(self) -> float:
-        return float(self._low + self._high) / 2.0
 
 
 StochasticDistribution._known_distributions.append(Uniform)
@@ -1128,9 +1112,6 @@ class LogNormal(StochasticDistribution):
         """
         return super().prob_mw(mw, Mn=self._M, D=self._D)
 
-    def mean_mw(self) -> float:
-        return float(self._M)
-
 
 StochasticDistribution._known_distributions.append(LogNormal)
 
@@ -1211,9 +1192,6 @@ class Poisson(StochasticDistribution):
         Returns True if the distribution is initialized (i.e., N is set).
         """
         return self._distribution is not None
-
-    def mean_mw(self) -> float:
-        return float(self._N)
 
 
 StochasticDistribution._known_distributions.append(Poisson)
