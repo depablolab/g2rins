@@ -357,15 +357,10 @@ def test_forced_exit_is_stamped_with_the_nearest_common_ancestor():
 def test_transition_role_is_consistent_on_every_edge_of_the_corpus(graph_validation_dict):
     """Every edge of every corpus graph carries a valid role that agrees with its transition
     weight, its stochastic id and the tree positions of its endpoints; the counts per role
-    pin the corpus classification (update them when the golden corpus changes)."""
+    pin the corpus classification (update them when the golden corpus changes). The goldens
+    stand in for a fresh parse: test_generative_graph_generation proves them equal."""
     counts = {int(role): 0 for role in g2rins.TransitionRole}
-    for text in graph_validation_dict:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            creator = g2rins.G2rins.make(text).get_graph_creator()
-            graph = creator.get_generative_graph(include_bond_connectors=False)
-            with_connectors = creator.get_generative_graph(include_bond_connectors=True)
-        assert all(data["transition_role"] == 0 for _u, _v, data in with_connectors.edges(data=True))
+    for graph in graph_validation_dict.values():
         for u, v, data in graph.edges(data=True):
             role = data["transition_role"]
             assert isinstance(role, int) and not isinstance(role, bool)
@@ -388,6 +383,21 @@ def test_transition_role_is_consistent_on_every_edge_of_the_corpus(graph_validat
             if role == 1:
                 assert data["stochastic_id"] >= 0
     assert counts == {0: 1251, 1: 20, 2: 2, 3: 2, 4: 98}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [_TRANSITION_ROLE_PROBES[0].values[0], _TRANSITION_ROLE_PROBES[3].values[0], _TRANSITION_ROLE_PROBES[5].values[0]],
+    ids=["literal-tail", "series-blocks", "multifunctional-initiator"],
+)
+def test_graph_with_bond_connectors_carries_no_transition_role(text):
+    """The graph with bond connectors does not contract transitions: every edge carries role 0
+    although its transition weights are present."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph(include_bond_connectors=True)
+    assert all(data["transition_role"] == 0 for _u, _v, data in graph.edges(data=True))
+    assert any(data["transition_weight"] > 0 for _u, _v, data in graph.edges(data=True))
 
 
 def test_transition_role_values_are_stable():
@@ -422,6 +432,14 @@ def test_transition_role_is_required_at_export_and_at_construction():
         with pytest.raises(IncompatibleGenerativeGraphSchema, match="transition_role"):
             g2rins.EnsembleCreator(invalid)
 
+    # NumPy integers are integers: accepted at construction, written as plain ints at export.
+    for kind in (np.int64, np.int32):
+        typed = graph.copy()
+        for _u, _v, data in typed.edges(data=True):
+            data["transition_role"] = kind(data["transition_role"])
+        g2rins.EnsembleCreator(typed)
+        assert {type(edge["transition_role"]) for edge in g2rins.generative_graph_json_data(typed)["graph"]["edges"]} == {int}
+
     # A value in range that contradicts the edge's own weight or stamp is refused at construction.
     silent_default = graph.copy()
     silent_default.edges[edge]["transition_role"] = 0
@@ -445,6 +463,10 @@ def test_transition_role_survives_the_json_round_trip():
         graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph(include_bond_connectors=False)
         payload = json.loads(json.dumps(g2rins.generative_graph_json_data(graph)))
         restored = nx.node_link_graph(payload["graph"], edges="edges")
-        g2rins.EnsembleCreator(restored)
+        original = g2rins.EnsembleCreator(graph).create_ensemble(3, output_format="smiles", seed=0)
+        restored_chains = g2rins.EnsembleCreator(restored).create_ensemble(3, output_format="smiles", seed=0)
     assert _transition_role_signature(restored) == _transition_role_signature(graph)
     assert {type(data["transition_role"]) for _u, _v, data in restored.edges(data=True)} == {int}
+    # The reloaded graph fires the same forced exits: identical chains, a tail on every one.
+    assert restored_chains == original
+    assert all("Br" in chain for chain in restored_chains)

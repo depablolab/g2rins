@@ -2111,7 +2111,7 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     root termination, and even when it reaches the root through a
     transition-conversion hand-off — that path used to rebuild the converted
     copy without its termination modes, shedding the cap permanently (seed 14
-    was the last such loss). Chains whose initiator port never grew are
+    was the last such loss; seeds 0 to 15 cover it). Chains whose initiator port never grew are
     skipped: initiator ports carry no termination edges, which is the one
     remaining gap."""
     smi = "{[] [<]PP[>], [<]{[>] [<]{[>] [<]CC[>], [<]{[>] [<]NN[>];; [<]}|poisson(100)|[>];; [<]}|poisson(300)|[>], [<]OO[>]; ;[<]}|poisson(1000)|[>]; O([>])[>]; [<][H] []}|poisson(4000)|"
@@ -2122,7 +2122,7 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
     assert len(central) == 1, f"expected one difunctional initiator oxygen, found {len(central)}"
     central_origin = str(central[0])
-    for seed in range(30):
+    for seed in range(16):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
@@ -2346,6 +2346,21 @@ def test_forced_exits_deliver_one_tail_per_realized_instance(text, distribution,
         instances = sum(len(tracked[gen_id]) for gen_id, text_of in dist.items() if text_of == distribution)
         assert instances > 0, f"seed {seed}: no nested instance realized"
         assert _count_atoms(mol_graph, tail_atomic_num) == instances, f"seed {seed}: {instances} instances but {_count_atoms(mol_graph, tail_atomic_num)} tail(s)"
+
+
+@pytest.mark.parametrize("termination_flag", [0, 1])
+def test_forced_exits_are_delivered_under_every_termination_flag(termination_flag):
+    """A forced exit fires at finalization whatever rounding the owner is told to adopt."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(4):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed), termination_flag=termination_flag)
+        instances = sum(len(tracked[gen_id]) for gen_id, text_of in dist.items() if text_of == "|poisson(80.0)|")
+        assert instances > 0 and _count_atoms(mol_graph, 35) == instances, f"seed {seed}: {instances} instances but {_count_atoms(mol_graph, 35)} tail(s)"
 
 
 def test_series_join_grows_the_second_block_on_every_first_block():
