@@ -3247,63 +3247,19 @@ class EnsembleCreator:
         last_checked_proj = {}
         avg_termination_cache = {}
 
-        def _live_forest_children(tracker, live_ids, live_set, sto_atom_id):
-            """Live descendants of sto_atom_id with no live instance strictly
-            between: their subtree's future mass reaches sto_atom_id exactly
-            once (a live intermediate's remainder already contains its own
-            subtree's)."""
-            children = []
-            for candidate in live_ids:
-                if candidate == sto_atom_id:
-                    continue
-                ancestors = tracker.parent_map.get(candidate, [])
-                if sto_atom_id not in ancestors:
-                    continue
-                between = ancestors[ancestors.index(sto_atom_id) + 1 :]
-                if all(ancestor not in live_set for ancestor in between):
-                    children.append(candidate)
-            return children
-
-        def _remaining_credit(tracker, sto_atom_id):
-            """Signed correction that makes a live descendant contribute its
-            drawn target, independent of its temporary or rounded actual mass.
-
-            This applies after parking too.  Replacing it with only pending cap
-            mass makes a child's over/under outcome move every ancestor's
-            projection, even though no ancestor-level unit was added.
-            """
-            expected = tracker._sto_atom_id_expected_molw[sto_atom_id]
-            if expected < 0:
-                return 0.0
-            # Keep this remainder SIGNED.  A child temporarily above its target
-            # must reduce its remaining credit by the same amount its actual
-            # mass just added to the ancestor.  Clamping at zero made an
-            # ancestor appear to cross first and consume the child's fresh
-            # rounding boundary, systematically biasing small nested objects.
-            return expected - tracker._sto_atom_id_actual_molw[sto_atom_id]
-
-        def _projected_molw(tracker, live_ids, sto_atom_id):
-            """Projected final tracked mass of sto_atom_id EXCLUDING its own
-            termination caps (callers add the fresh/cached cap estimate).
-
-            Consulted for a termination decision only while the instance has
-            no live descendant, so everything its units deliver through forced
-            exits (literal tails, per-unit ports, joined sibling objects) is
-            already realized in ``actual``; nothing owed is estimated.
-
-            Only LIVE descendants contribute their signed target correction.
-            A terminated descendant's realized mass stands as-is: freezing its
-            ``expected - actual`` residual into the ancestor (a previous
-            "settled credit" design) made every level inherit its children's
-            structural overshoot — a sub-unit-target child can only land
-            above its target, and the compounded inheritance biased 3-level
-            ensembles +7% — whereas accounting the realized mass lets the
-            ancestor compensate with its own growth."""
-            live_set = set(live_ids)
-            projected = tracker._sto_atom_id_actual_molw[sto_atom_id]
-            for child in _live_forest_children(tracker, live_ids, live_set, sto_atom_id):
-                projected += _remaining_credit(tracker, child)
-            return projected
+        def _projected_molw(tracker, sto_atom_id):
+            """Tracked mass of sto_atom_id EXCLUDING its own termination caps
+            (callers add the fresh/cached cap estimate). Consulted for a
+            termination decision only while the instance has no live
+            descendant, so everything its units deliver through forced exits
+            (literal tails, per-unit ports, joined sibling objects) is already
+            realized in ``actual`` and no live descendant exists whose drawn
+            target could be credited. A terminated descendant's realized mass
+            stands as-is: freezing its ``expected - actual`` residual into the
+            ancestor (a previous "settled credit" design) made every level
+            inherit its children's structural overshoot and biased 3-level
+            ensembles +7 %."""
+            return tracker._sto_atom_id_actual_molw[sto_atom_id]
 
         def _capture_checkpoint(checkpoint_owner):
             """Capture both molecular topology and loop-control state.
@@ -3326,7 +3282,6 @@ class EnsembleCreator:
             )
             return {
                 "graph": copy.deepcopy(partial_atom_graph),
-                "pending": set(pending_termination),
                 "max_step_gain": dict(max_step_gain),
                 "gain_floor": dict(gain_floor),
                 "last_checked_proj": dict(last_checked_proj),
@@ -3443,9 +3398,10 @@ class EnsembleCreator:
 
             growable = [i for i in unterminated_sto_atom_ids if i not in pending_termination]
             if not growable:
-                # All live instances are parked: the deepest one has no live
-                # descendants, so the next pass finalizes it.
-                continue
+                # The finalize block above always consumes a parked instance
+                # without live descendants (the deepest one has none), so this
+                # state cannot occur; a silent pass here would spin forever.
+                raise RuntimeError("Every live instance is parked and none can be finalized. This is a bug, please report on github.")
 
             # Active is the deepest live non-parked instance (every
             # descendant lists all of its ancestors, so one pass suffices).
@@ -3500,11 +3456,7 @@ class EnsembleCreator:
             # unit-with-arms jump that actually crosses it.
             proj_now = {}
             for sto_atom_id in growable:
-                projected = _projected_molw(
-                    tracker,
-                    unterminated_sto_atom_ids,
-                    sto_atom_id,
-                )
+                projected = _projected_molw(tracker, sto_atom_id)
                 proj_now[sto_atom_id] = projected
                 if any(sto_atom_id in parent_map.get(d, []) for d in unterminated_sto_atom_ids):
                     # A step is measured only once its subtree is quiet, so a
@@ -3525,6 +3477,11 @@ class EnsembleCreator:
             # instead of a projection that would need an estimate of what the
             # subtree still owes. An instance cannot grow while a descendant
             # is live, so nothing its decision could affect happens meanwhile.
+            # The price is bounded waste: a rollback discards the subtree the
+            # undone unit spawned after it has grown (at most one subtree per
+            # instance, since a rolled-back instance is parked), where an
+            # early projection would have discarded an unborn one. Deciding
+            # earlier would need exactly the estimate this rule removes.
             # Deepest first among the candidates. The termination-MW estimate
             # is only recomputed once an instance is plausibly near its target
             # (its previous estimate serves as the margin; the active instance
@@ -3568,16 +3525,8 @@ class EnsembleCreator:
                     snapshot_graph = checkpoint["graph"]
                     snapshot_tracker = snapshot_graph.stochastic_tracker
                     if crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw and not snapshot_tracker.is_terminated(crossing_sto_atom_id):
-                        snapshot_live_ids = snapshot_tracker.get_unterminated_sto_atom_ids()
                         under_caps_molw = snapshot_graph.get_average_termination_mw(crossing_sto_atom_id, self._static_graph, rng)
-                        projected_under = (
-                            _projected_molw(
-                                snapshot_tracker,
-                                snapshot_live_ids,
-                                crossing_sto_atom_id,
-                            )
-                            + under_caps_molw
-                        )
+                        projected_under = _projected_molw(snapshot_tracker, crossing_sto_atom_id) + under_caps_molw
                         snapshot_valid = projected_under < expected_molw
                 if termination_flag == 0:
                     adopt_overshoot = True
@@ -3632,7 +3581,6 @@ class EnsembleCreator:
                     # replay the rejected over-step and can loop forever.
                     partial_atom_graph.stochastic_tracker._rng = rng
                     partial_atom_graph.stochastic_tracker.mark_path_conditional()
-                    pending_termination = set(checkpoint["pending"])
                     max_step_gain = dict(checkpoint["max_step_gain"])
                     gain_floor = dict(checkpoint["gain_floor"])
                     last_checked_proj = dict(checkpoint["last_checked_proj"])
@@ -3710,23 +3658,17 @@ class EnsembleCreator:
                         if highest_actual_mol_weight < highest_expected_mol_weight:
                             warnings.warn(PossibleNonRepresentativePolymerChain(), stacklevel=1)
                         # Truncated chain: no growth or transition is possible
-                        # any more. Fire the caps of every parked instance (its
-                        # still-live descendants first, deepest first) so the
-                        # return shape matches a completed chain, then stop and
+                        # any more. Terminate every live instance, deepest
+                        # first, so each fires its declared end groups and the
+                        # return shape matches a completed chain (a dead-ended
+                        # instance's forced exits stay unfired), then stop and
                         # fall through to the normal finalization so the caller
                         # gets a phantom-free graph (the raw early return used
                         # to leak placeholder atoms and break create_ensemble's
                         # tuple unpack).
                         cleanup_tracker = partial_atom_graph.stochastic_tracker
-                        for parked in sorted(pending_termination, key=lambda i: len(cleanup_tracker.parent_map.get(i, [])), reverse=True):
-                            live_now = cleanup_tracker.get_unterminated_sto_atom_ids()
-                            descendants = [d for d in live_now if parked in cleanup_tracker.parent_map.get(d, [])]
-                            descendants.sort(key=lambda i: len(cleanup_tracker.parent_map.get(i, [])), reverse=True)
-                            for descendant in descendants:
-                                partial_atom_graph.terminate_graph(descendant, rng)
-                            if not cleanup_tracker.is_terminated(parked):
-                                partial_atom_graph.terminate_graph(parked, rng)
-                        pending_termination.clear()
+                        for live in sorted(cleanup_tracker.get_unterminated_sto_atom_ids(), key=lambda i: len(cleanup_tracker.parent_map.get(i, [])), reverse=True):
+                            partial_atom_graph.terminate_graph(live, rng)
                         break
 
         # TODO: replace this legacy clique closure in a focused follow-up. It

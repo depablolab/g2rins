@@ -163,6 +163,27 @@ def test_truncated_chain_contract():
     assert ensemble is None
 
 
+def test_truncated_chain_keeps_its_declared_end_groups():
+    """A chain that dead-ends below its target still receives the end groups
+    its open sites declare: the cleanup terminates every live instance,
+    deepest first, instead of only the parked ones. An instance decides its
+    termination only while its subtree is quiet, so nothing is parked when a
+    dead end strikes, and every truncated chain used to finalize bare. The
+    second repeat unit here can only be capped (its descriptor has no
+    propagation partner), so every chain truncates once it is drawn."""
+    smi = "{[] [<]CC[>], [<]CC(C)[>2]|0.05|; C[>]; [<][H], [<2]Cl []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(4):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        assert any(issubclass(w.category, PossibleNonRepresentativePolymerChain) for w in caught), f"seed {seed}: the chain did not truncate"
+        chlorines = sum(1 for _node, data in mol_graph.nodes(data=True) if data.get("atomic_num") == 17)
+        assert chlorines == 1, f"seed {seed}: truncated chain finalized with {chlorines} Cl cap(s)"
+
+
 def test_unit_id_deterministic():
     """unit_id numbering must not depend on the (random UUID) node ids: parsing
     the same string repeatedly must label the same atoms with the same units
