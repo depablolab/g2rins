@@ -1294,9 +1294,15 @@ class GraphCreator:
         :func:`derive_unit_labels`. The node and edge properties listed above
         are the full graph contract: a generative model emitting
         **atomic_num**, **is_connector_placeholder**, **{aromatic_name}**, **charge**, **num_explicit_h**,
-        **init_weight**, the **{static_name}** edge flag and the three
-        non-static weights produces a graph that every consumer, including the
-        label derivation, can handle. Generation requires an explicit boolean
+        **init_weight**, the **{static_name}** edge flag, the three
+        non-static weights and an integer **{transition_role_name}** on every
+        edge produces a graph that every consumer, including the label
+        derivation, can handle. Generation and export require
+        **{transition_role_name}**: 0 on every edge without a transition
+        weight, 4 on the transitions stamped -1, and consistent with the
+        edge's weight and stamp at construction; a graph that omits or
+        contradicts it is refused with ``IncompatibleGenerativeGraphSchema``.
+        Generation requires an explicit boolean
         **is_connector_placeholder** on zero-number nodes: True identifies an
         internal placeholder; False identifies a user wildcard, which can be
         parsed and exported but cannot be used for ensemble generation. Older
