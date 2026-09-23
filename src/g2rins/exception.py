@@ -280,6 +280,25 @@ class EmptyBondConnectorInTerminalBondConnectorList(ParsingError):
         return f"The terminal bond connector list {self.terminal_bond_connectors} of the stochastic object:\n{self.stochastic_object}\nhas empty bonds.\nEmpty bonds in lists of terminal bond connectors with length > 1 are not allowed."
 
 
+class MismatchedBondConnectorLists(ParsingError):
+    """Neighbouring bond connector lists pair by position but differ in length."""
+
+    def __init__(self, left_token, right_token, left_count, right_count):
+        Exception.__init__(self, left_token, right_token, left_count, right_count)
+        self.token = left_token
+        self.left_token = left_token
+        self.right_token = right_token
+        self.left_count = left_count
+        self.right_count = right_count
+
+    def __str__(self) -> str:
+        return (
+            f"The bond connectors of '{str(self.left_token)}' ({self.left_count}) meet the bond connectors of '{str(self.right_token)}' ({self.right_count}). "
+            "A bond connector list and the terminal bond connector list it meets pair entry by entry, in order, so both need the same length; "
+            "a single bond connector meets a single terminal bond connector."
+        )
+
+
 class IncorrectNumberOfBondProbabilities(ParsingError):
     def __init__(self, token, bond_connector, expected_length):
         super().__init__(token)

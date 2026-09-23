@@ -13,7 +13,7 @@ from .exception import (
     SmilesHasNonZeroBondConnectors,
     UnmatchedCounterion,
 )
-from .generative_graph import _BOND_TYPE_NAME, _PartialGraph
+from .generative_graph import _BOND_TYPE_NAME, _check_positional_pairing, _PartialGraph
 
 
 class Branch(G2rinsBase, GenerationBase):
@@ -65,8 +65,9 @@ class Branch(G2rinsBase, GenerationBase):
                     raise DoubleBondSymbolDefinition(partial_graph, self._bond_symbol, lhb.bond_attributes)
                 lhb.bond_attributes[_BOND_TYPE_NAME] = self._bond_symbol
 
-        for element in self._elements[1:]:
+        for previous_element, element in zip(self._elements, self._elements[1:]):
             element_partial_graph = element._generate_partial_graph()
+            _check_positional_pairing(partial_graph.g, partial_graph.right_half_bonds, element_partial_graph.g, element_partial_graph.left_half_bonds, previous_element, element)
             bonds_to_add = product(partial_graph.right_half_bonds, element_partial_graph.left_half_bonds)
             # Transfer right_half_bonds to new partial graph
             partial_graph.right_half_bonds = element_partial_graph.right_half_bonds
@@ -137,6 +138,7 @@ class BranchedAtom(G2rinsBase, GenerationBase):
         # Adding branches
         for branch in self._branches:
             branch_partial_graph = branch._generate_partial_graph()
+            _check_positional_pairing(partial_graph.g, partial_graph.right_half_bonds, branch_partial_graph.g, branch_partial_graph.left_half_bonds, self._atom_stand_in, branch)
             bonds_to_add = product(partial_graph.right_half_bonds, branch_partial_graph.left_half_bonds)
             # Branches have empty right hand half bonds, so only resetting left ones.
             branch_partial_graph.left_half_bonds = []

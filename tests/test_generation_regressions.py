@@ -1305,6 +1305,53 @@ def test_repeat_unit_initiation_warns_once_per_creator():
     assert not any(issubclass(warning.category, UnvalidatedGenerationSource) for warning in caught)
 
 
+def _cross_level_junctions(generative_graph):
+    """Entries (propagation) into and exits (transition) out of a depth-1 object, as (outer Z, inner Z)."""
+    from g2rins.generative_graph import _PROPAGATION_NAME, _TRANSITION_NAME
+
+    entries, exits = set(), set()
+    for u, v, data in generative_graph.edges(data=True):
+        outer_u = generative_graph.nodes[u]["stochastic_id_tree"][1] == -2
+        outer_v = generative_graph.nodes[v]["stochastic_id_tree"][1] == -2
+        z_u, z_v = generative_graph.nodes[u]["atomic_num"], generative_graph.nodes[v]["atomic_num"]
+        if data.get(_PROPAGATION_NAME, 0) > 0 and outer_u and not outer_v:
+            entries.add((z_u, z_v))
+        if data.get(_TRANSITION_NAME, 0) > 0 and outer_v and not outer_u:
+            exits.add((z_v, z_u))
+    return entries, exits
+
+
+def test_left_terminal_bond_connector_list_pairs_by_position():
+    """Each outer bond connector meets the terminal bond connector at its position on both sides of the
+    nested object, so a double-headed repeat unit enters and leaves it head-to-tail from either side."""
+    smi = "{[] [<]CCO[>], [<]|[>]{[>]|[<] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    entries, exits = _cross_level_junctions(generative_graph)
+    assert entries == {(8, 6), (6, 8)}
+    assert exits == {(8, 6), (6, 8)}
+
+    junctions = set()
+    nested_chains = 0
+    rng = np.random.default_rng(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(20):
+            molecule = ensemble_creator.sample_mol_graph(rng=rng)
+            inner = {node for node, data in molecule.nodes(data=True) if generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][1] >= 0}
+            nested_chains += bool(inner)
+            for u, v in molecule.edges():
+                assert not (molecule.nodes[u]["atomic_num"] == 8 and molecule.nodes[v]["atomic_num"] == 8)
+                if (u in inner) != (v in inner):
+                    outer, nested = (v, u) if u in inner else (u, v)
+                    if molecule.nodes[outer]["atomic_num"] > 1:  # hydrogen caps from the outer end group are not junctions
+                        junctions.add((molecule.nodes[outer]["atomic_num"], molecule.nodes[nested]["atomic_num"]))
+    assert nested_chains == 20
+    assert junctions == {(8, 6), (6, 8)}
+
+
 def test_declared_initiator_disables_repeat_unit_initiation():
     """Initiators whose routes all carry zero weight still declare initiation: no fallback, no warning."""
     from g2rins.exception import RepeatUnitInitiation
