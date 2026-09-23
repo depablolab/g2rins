@@ -2495,6 +2495,26 @@ def test_forced_exit_mass_keeps_the_owner_on_target(text):
     assert abs(mean - 2000.0) / 2000.0 < 0.025, f"mean realized mass {mean:.1f} for a 2000 target"
 
 
+def test_forced_join_draws_its_first_unit_by_molar_amount():
+    """A join into a copolymer block draws the block's first unit like every
+    other transition target, by transition weight times the unit's molar
+    amount: a unit declared with amount 0 is never entered (it used to be
+    drawn by transition weight alone, so the forbidden unit started half of
+    the joined blocks)."""
+    text = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>]|0|, [<]CS[>]|1|;; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(6):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+        first, second = sorted(gen_id for gen_id, text_of in dist.items() if text_of == "|poisson(80.0)|")
+        assert len(tracked[second]) == len(tracked[first]) > 0, f"seed {seed}: joins not delivered"
+        assert _count_atoms(mol_graph, 8) == 0, f"seed {seed}: a unit with molar amount 0 was entered"
+        assert _count_atoms(mol_graph, 16) >= len(tracked[second]), f"seed {seed}: joined blocks without their allowed unit"
+
+
 def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):
     """The ensemble section of the JSON file (unit subgraphs, node-link chains,
     weights) is normalized like the graph section: NumPy values become JSON

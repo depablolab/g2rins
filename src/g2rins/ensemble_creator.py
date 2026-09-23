@@ -2306,12 +2306,16 @@ class _PartialAtomGraph:
         return fired
 
     def _fire_forced_exit(self, bucket_id, half_bond, sto_atom_id, rng):
-        all_attr, all_idx, _all_molar = half_bond.get_mode_bonds(_TRANSITION_NAME)
+        all_attr, all_idx, all_molar = half_bond.get_mode_bonds(_TRANSITION_NAME)
         indices = [i for i, attr in enumerate(all_attr) if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT]
-        if len(indices) == 1:
+        # Several targets means a join into an object with several units: the
+        # first unit is drawn like every other transition target, by transition
+        # weight times the unit's molar amount in its own object (a unit declared
+        # with amount 0 is never entered). A literal tail has one target.
+        weights = np.asarray([all_attr[i][_TRANSITION_NAME] * all_molar[i][self.generative_graph.nodes[all_idx[i]]["stochastic_id_tree"][0]] for i in indices], dtype=float)
+        if len(indices) == 1 and weights[0] > 0:
             chosen = indices[0]
         else:
-            weights = np.asarray([all_attr[i][_TRANSITION_NAME] for i in indices], dtype=float)
             chosen = indices[self.stochastic_tracker.choose(rng, len(indices), weights, "forced exit target selection")]
         target_idx = all_idx[chosen]
         selected_attr = self.gen_edge_attr_to_bond_attr(all_attr[chosen])
