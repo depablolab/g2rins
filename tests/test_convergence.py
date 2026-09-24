@@ -284,11 +284,13 @@ def test_native_convergence_handles_branched_polythioester_without_initiator():
             output_format="smiles",
             seed=5,
             use_repeat_units_as_source=True,
+            unit_junctions=True,
         )
 
     assert result is not None
     assert len(result.chains) == 1
     assert result.chains[0]
+    assert result.unit_junction_statistics["diagnostics"]["motifs"] > 0
 
 
 def test_ensemble_info_reports_final_chain_molecular_weights():
@@ -743,6 +745,7 @@ def test_seeded_convergence_checkpoint_resumes_exactly():
         uninterrupted.weight_average_molecular_weight
     )
     assert resumed.unit_path_statistics == uninterrupted.unit_path_statistics
+    assert resumed.unit_junction_statistics == uninterrupted.unit_junction_statistics
 
 
 def test_statistics_checkpoint_is_compact_and_omits_retained_payloads():
@@ -796,6 +799,7 @@ def test_statistics_checkpoint_resume_preserves_statistics_without_payloads():
             seed=41,
             reservoir_size=2,
             checkpoint_policy="statistics",
+            unit_junctions=True,
             checkpoint_callback=checkpoints.append,
         )
         checkpoint = pickle.loads(pickle.dumps(checkpoints[-1]))
@@ -808,6 +812,7 @@ def test_statistics_checkpoint_resume_preserves_statistics_without_payloads():
             seed=41,
             reservoir_size=2,
             checkpoint_policy="statistics",
+            unit_junctions=True,
             checkpoint=checkpoint,
             checkpoint_callback=resumed_checkpoints.append,
         )
@@ -820,6 +825,7 @@ def test_statistics_checkpoint_resume_preserves_statistics_without_payloads():
             seed=41,
             reservoir_size=2,
             checkpoint_policy="statistics",
+            unit_junctions=True,
             checkpoint_callback=uninterrupted_checkpoints.append,
         )
 
@@ -846,7 +852,9 @@ def test_statistics_checkpoint_resume_preserves_statistics_without_payloads():
         == uninterrupted_checkpoints[-1].reservoir_rng_state
     )
     assert resumed.unit_path_statistics == uninterrupted.unit_path_statistics
+    assert resumed.unit_junction_statistics == uninterrupted.unit_junction_statistics
     assert resumed_checkpoints[-1].unit_path_counts == uninterrupted_checkpoints[-1].unit_path_counts
+    assert resumed_checkpoints[-1].unit_junction_counts == uninterrupted_checkpoints[-1].unit_junction_counts
 
 
 def test_serial_and_parallel_unit_path_statistics_match():

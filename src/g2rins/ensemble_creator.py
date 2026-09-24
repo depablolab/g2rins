@@ -1304,6 +1304,7 @@ class ConvergedEnsembleData(EnsembleData):
     dispersity: float
     unit_path_statistics: dict | None = None
     representative_counts: list | None = None
+    unit_junction_statistics: dict | None = None
 
 
 @dataclass
@@ -1329,6 +1330,7 @@ class ConvergenceCheckpoint:
     representative_counts: tuple = ()
     unit_path_counts: dict | None = None
     unit_path_diagnostics: dict | None = None
+    unit_junction_counts: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -1349,6 +1351,7 @@ def _normalized_sparse_counts(counts):
 
 
 _UNIT_PATH_STATISTICS_SCHEMA = "unit-graph-simple-paths/v2"
+_UNIT_JUNCTION_STATISTICS_SCHEMA = "unit-graph-three-arm-junctions/v1"
 _UNIT_PATH_UNIT_KEY = "canonical-psmiles/v1"
 _UNIT_PATH_NODE_TOKEN = "canonical-unit-key+occurrence-degree/v1"
 _UNIT_PATH_EDGE_TOKEN = "bond-type+aromatic+canonical-attachment-sites/v2"
@@ -1373,7 +1376,7 @@ def _reverse_unit_path_motif(motif):
     return tuple(reversed_motif)
 
 
-def _unit_path_counts(metadata, graph, max_motifs=None):
+def _unit_path_counts(metadata, graph, max_motifs=None, junction_counts=None):
     """Count undirected simple occurrence paths while compact metadata exists."""
     occurrences = metadata.occurrences
     adjacency = [[] for _ in occurrences]
@@ -1466,6 +1469,33 @@ def _unit_path_counts(metadata, graph, max_motifs=None):
                     (left, left_center, right_center, right),
                     (_reverse_unit_path_edge_token(left_edge), center_edge, right_edge),
                 )
+    if junction_counts is not None:
+        linked_pairs = {frozenset((left, right)) for left, right, _edge in edges}
+        for center, neighbors in enumerate(adjacency):
+            neighbor_multiplicity = Counter(neighbor for neighbor, _edge in neighbors)
+            for arms in combinations(neighbors, 3):
+                arm_nodes = [neighbor for neighbor, _edge in arms]
+                if any(neighbor_multiplicity[node] != 1 for node in arm_nodes):
+                    continue
+                if any(
+                    frozenset(pair) in linked_pairs
+                    for pair in combinations(arm_nodes, 2)
+                ):
+                    continue
+                if len({neighbor for neighbor, _edge in arms}) != 3:
+                    continue
+                motif = (("N",) + node_tokens[center],) + tuple(
+                    sorted(
+                        (("E",) + edge, ("N",) + node_tokens[neighbor])
+                        for neighbor, edge in arms
+                    )
+                )
+                junction_counts[motif] += 1
+                emitted_motifs += 1
+                if max_motifs is not None and emitted_motifs > max_motifs:
+                    raise ValueError(
+                        "Unit-path/junction motif limit exceeded; increase unit_path_max_motifs"
+                    )
     return counts
 
 
@@ -1514,7 +1544,9 @@ def _public_unit_path_statistics(counts, units, accepted_chains, diagnostics=Non
         "aggregation": "raw-counts-over-all-accepted-chains",
         "diagnostics": {
             "accepted_chains": accepted_chains,
-            "motifs": {str(k): int(sum(counter.values())) for k, counter in counts.items()},
+            "motifs": {
+                str(k): int(sum(counter.values())) for k, counter in counts.items()
+            },
             "motifs_per_chain": {
                 "min": int(diagnostics.get("motif_min", 0)),
                 "max": int(diagnostics.get("motif_max", 0)),
@@ -1542,6 +1574,48 @@ def _public_unit_path_statistics(counts, units, accepted_chains, diagnostics=Non
             ]
             for k, counter in public_counts.items()
         },
+    }
+
+
+def _public_unit_junction_statistics(counts, units, accepted_chains):
+    """Convert junction unit IDs into canonical chemistry keys."""
+    public = Counter()
+    for (center, *arms), count in counts.items():
+
+        def node_key(node):
+            key = units.get(node[1], {}).get("psmiles")
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"No canonical chemistry key for unit {node[1]!r}")
+            return ("N", key, node[2])
+
+        public[
+            (
+                node_key(center),
+                tuple(sorted((edge, node_key(node)) for edge, node in arms)),
+            )
+        ] += count
+
+    return {
+        "schema": _UNIT_JUNCTION_STATISTICS_SCHEMA,
+        "k_values": [4],
+        "unit_key": _UNIT_PATH_UNIT_KEY,
+        "node_token": _UNIT_PATH_NODE_TOKEN,
+        "edge_token": _UNIT_PATH_EDGE_TOKEN,
+        "aggregation": "raw-counts-over-all-accepted-chains",
+        "diagnostics": {
+            "accepted_chains": accepted_chains,
+            "motifs": sum(public.values()),
+        },
+        "counts": [
+            {
+                "token": [
+                    list(center),
+                    [[list(edge), list(node)] for edge, node in arms],
+                ],
+                "count": count,
+            }
+            for (center, arms), count in sorted(public.items())
+        ],
     }
 
 
@@ -6400,6 +6474,7 @@ class EnsembleCreator:
         max_worker_restarts=2,
         checkpoint_policy="full",
         unit_path_max_motifs=1_000_000,
+        unit_junctions=False,
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=True,
         fallback_on_worker_crash=True,
@@ -6423,6 +6498,9 @@ class EnsembleCreator:
         ``unit_path_max_motifs`` bounds the exact k=2,3,4 path motifs emitted
         for one accepted chain; exceeding it fails rather than truncating or
         sampling the descriptor.
+        ``unit_junctions=True`` additionally collects exact four-unit three-arm
+        stars, excluding arm-to-arm closure bonds. The same per-chain motif
+        limit covers paths and stars; this opt-in can be expensive at branch hubs.
         ``representative_distance`` enables an online feature-space cover:
         retained representatives differ by more than the threshold in at least
         one of log molecular weight, log building-block count, building-block
@@ -6533,6 +6611,7 @@ class EnsembleCreator:
             "representative_distance": representative_distance,
             "checkpoint_policy": checkpoint_policy,
             "unit_path_max_motifs": unit_path_max_motifs,
+            "unit_junctions": bool(unit_junctions),
             "use_repeat_units_as_source": bool(use_repeat_units_as_source),
             "strip_unresolved_directional_markers": bool(
                 strip_unresolved_directional_markers
@@ -6550,6 +6629,7 @@ class EnsembleCreator:
             aggregate_unit_path_counts = {
                 k: Counter() for k in _UNIT_PATH_K_VALUES
             }
+            aggregate_unit_junction_counts = Counter()
             aggregate_unit_path_diagnostics = {
                 "chains": 0,
                 "motif_total": 0,
@@ -6584,6 +6664,7 @@ class EnsembleCreator:
             # strict resume settings.
             saved_settings.setdefault("smiles_policy", smiles_policy)
             saved_settings.setdefault("unit_path_max_motifs", unit_path_max_motifs)
+            saved_settings.setdefault("unit_junctions", False)
             if saved_settings != checkpoint_settings:
                 raise ValueError("checkpoint settings do not match this convergence run.")
             aggregate_unit_counts = Counter(
@@ -6602,6 +6683,9 @@ class EnsembleCreator:
                 k: Counter((getattr(checkpoint, "unit_path_counts", {}) or {}).get(k, {}))
                 for k in _UNIT_PATH_K_VALUES
             }
+            if metadata and unit_junctions and checkpoint.accepted_count and getattr(checkpoint, "unit_junction_counts", None) is None:
+                raise ValueError("Checkpoint lacks junction counts; cannot resume exact junction statistics")
+            aggregate_unit_junction_counts = Counter(getattr(checkpoint, "unit_junction_counts", None) or {})
             aggregate_unit_path_diagnostics = dict(
                 getattr(checkpoint, "unit_path_diagnostics", None)
                 or {
@@ -6718,11 +6802,15 @@ class EnsembleCreator:
                     metadata_record = sample.metadata
                     molecular_weight = deferred.molecular_weight
                     if metadata:
+                        chain_junction_counts = Counter() if unit_junctions else None
                         path_counts = _unit_path_counts(
                             metadata_record,
                             sample.graph,
                             unit_path_max_motifs,
+                            junction_counts=chain_junction_counts,
                         )
+                        if unit_junctions:
+                            aggregate_unit_junction_counts.update(chain_junction_counts)
                         chain_motif_count = sum(
                             sum(counts.values())
                             for counts in path_counts.values()
@@ -6955,6 +7043,7 @@ class EnsembleCreator:
                             for k, counts in aggregate_unit_path_counts.items()
                         },
                         unit_path_diagnostics=dict(aggregate_unit_path_diagnostics),
+                        unit_junction_counts=dict(aggregate_unit_junction_counts) if unit_junctions else None,
                     )
                 )
 
@@ -7055,6 +7144,7 @@ class EnsembleCreator:
                 "representative_distance": representative_distance,
                 "checkpoint_policy": checkpoint_policy,
                 "unit_path_max_motifs": unit_path_max_motifs,
+                "unit_junctions": bool(unit_junctions),
                 "use_repeat_units_as_source": bool(
                     use_repeat_units_as_source
                 ),
@@ -7073,6 +7163,10 @@ class EnsembleCreator:
                 )
                 if metadata
                 else None
+            ),
+            unit_junction_statistics=(
+                _public_unit_junction_statistics(aggregate_unit_junction_counts, materialized_units, accepted_count)
+                if metadata and unit_junctions else None
             ),
             representative_counts=returned_representative_counts,
         )
