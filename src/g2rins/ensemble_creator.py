@@ -142,6 +142,16 @@ def _transition_competes_at(attr, sto_gen_id):
     return attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attr.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
 
 
+def _forced_exit_owner(generative_graph, half_bond, attr):
+    """Stochastic id of the object whose finalization fires the forced exit ``attr`` on
+    ``half_bond``: the outermost object the exit leaves, just below its stamp (the nearest
+    common ancestor) on the source atom's chain, or None if ``attr`` is no forced exit."""
+    if attr.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT:
+        return None
+    tree = list(generative_graph.nodes[half_bond.node_idx]["stochastic_id_tree"])
+    return tree[tree.index(attr[_EDGE_STOCHASTIC_ID_NAME]) - 1]
+
+
 def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit_h=-1, aromatic=False) -> int:
     """Number of hydrogens completing an atom's valence for MW tracking.
 
@@ -1371,8 +1381,8 @@ class _PartialAtomGraph:
         tracker = self.stochastic_tracker
         for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []):
             if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT:
-                # Owed unconditionally: fired by fire_forced_exits at the source
-                # instance's finalization, whatever the owner level's liveness.
+                # Owed unconditionally: fired by fire_forced_exits when the outermost
+                # object it leaves finalizes, whatever the owner level's liveness.
                 return True
             level = attr.get(_EDGE_STOCHASTIC_ID_NAME)
             if level == -1:
@@ -1622,12 +1632,18 @@ class _PartialAtomGraph:
         junction bond (the termination flavor of the transition rescue)."""
         tracker = self.stochastic_tracker
         gen_sto_id = tracker._stochastic_atom_id_to_gen_id[level_sto_atom_id]
+        owner_gen_id = tracker._stochastic_atom_id_to_gen_id[owner_sto_atom_id]
         bucket_ids = self._custody_bucket_ids(owner_sto_atom_id)
         for bucket_id in bucket_ids:
             bucket = self._open_half_bond_map.get(bucket_id, [])
             for half_bond in list(bucket):
-                if any(attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])):
+                exit_owners = {_forced_exit_owner(self.generative_graph, half_bond, attr) for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])} - {None}
+                if owner_gen_id in exit_owners:
                     raise RuntimeError("A forced exit survived its instance's finalization unfired and reached the junction cap. This is a bug, please report on github.")
+                if exit_owners:
+                    # Owed by an enclosing object the exit leaves too: that object's
+                    # finalization fires it from this bucket.
+                    continue
                 all_attributes, all_ids, all_molar = half_bond.get_mode_bonds(_TERMINATION_NAME)
                 level_indices = [i for i, attr in enumerate(all_attributes) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == gen_sto_id]
                 if not level_indices:
@@ -1818,10 +1834,12 @@ class _PartialAtomGraph:
         — that continuation is still owed and the bond travels onward at its
         own level's turn — and a channel with neither terminators nor
         retained transitions is retired unfired by the terminate-time wipe,
-        the weighted competition's legal zero-growth outcome. A forced exit
-        (the finished object's terminal bond connector bonded straight to the
+        the weighted competition's legal zero-growth outcome. A forced exit the
+        finished object owes (its terminal bond connector bonded straight to the
         enclosing unit's plain SMILES, or to a sibling object) never reaches
-        promotion: fire_forced_exits delivers it first.
+        promotion: fire_forced_exits delivers it first. One owed by an
+        enclosing object that the exit leaves too rides along as a retained
+        transition until that object finalizes.
         The finished level's own propagation modes are dropped: that level is
         decided. Scans the child's bucket plus its terminated descendants'
         buckets (a frontier can end inside a deeper instance), the same
@@ -1829,6 +1847,7 @@ class _PartialAtomGraph:
         """
         tracker = self.stochastic_tracker
         bucket_ids = self._custody_bucket_ids(child_sto_atom_id)
+        child_gen_id = tracker._stochastic_atom_id_to_gen_id[child_sto_atom_id]
         owner_parents = tracker.parent_map.get(owner_sto_atom_id, [])
         # Pool-native parent tag: a promoted option must rank exactly like
         # the owner's own bonds under the prefer_parent filter.
@@ -1838,7 +1857,7 @@ class _PartialAtomGraph:
             kept_bonds = []
             for half_bond in self._open_half_bond_map.get(bucket_id, []):
                 attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
-                if any(attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT for attr in attr_list):
+                if any(_forced_exit_owner(self.generative_graph, half_bond, attr) == child_gen_id for attr in attr_list):
                     raise RuntimeError("A forced exit survived its instance's finalization unfired and reached promotion. This is a bug, please report on github.")
                 level_indices = [i for i, attr in enumerate(attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
                 if not level_indices:
@@ -2190,21 +2209,26 @@ class _PartialAtomGraph:
         nested stochastic object inside a unit, or a sibling object joined to it directly:
         chemistry of the enclosing unit that must not depend on a later draw. It fires here,
         after the instance's own end groups and before its remaining sites are capped or
-        promoted, whether or not the owner has parked. The custody set is the instance's
-        bucket plus its terminated descendants' buckets, as terminate_graph scans it; bonds
-        fire in bucket order so a seeded run stays reproducible.
+        promoted, whether or not the owner has parked. An exit that also leaves an enclosing
+        object (the nested object ends that object's repeat unit) is owed by the outermost
+        object it leaves and fires at that object's finalization; until then it rides with
+        its site. The custody set is the instance's bucket plus its terminated descendants'
+        buckets, as terminate_graph scans it; bonds fire in bucket order so a seeded run
+        stays reproducible.
         """
         fired = 0
+        gen_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
         for bucket_id in self._custody_bucket_ids(sto_atom_id):
             for half_bond in list(self._open_half_bond_map.get(bucket_id, [])):
-                if any(attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])):
+                if any(_forced_exit_owner(self.generative_graph, half_bond, attr) == gen_id for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])):
                     self._fire_forced_exit(bucket_id, half_bond, sto_atom_id, rng)
                     fired += 1
         return fired
 
     def _fire_forced_exit(self, bucket_id, half_bond, sto_atom_id, rng):
         all_attr, all_idx, all_molar = half_bond.get_mode_bonds(_TRANSITION_NAME)
-        indices = [i for i, attr in enumerate(all_attr) if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT]
+        gen_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+        indices = [i for i, attr in enumerate(all_attr) if _forced_exit_owner(self.generative_graph, half_bond, attr) == gen_id]
         # Several targets means a join into an object with several units: the
         # first unit is drawn like every other transition target, by transition
         # weight times the unit's molar amount in its own object (a unit declared

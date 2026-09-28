@@ -309,10 +309,19 @@ _TRANSITION_ROLE_PROBES = [
     ),
     pytest.param(
         # a join into a block whose repeat unit is itself a nested block is still a forced exit
-        # of the first block, although its target atom sits two levels below the shared parent
+        # of the first block, although its target atom sits two levels below the shared parent;
+        # the tail leaves the inner and the outer block at once and is forced too, while the
+        # outer block's next unit through its own connectors stays a stochastic choice
         "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
-        {((6, 0), (7, 1), 2), ((7, 1), (8, 3), 3), ((8, 3), (8, 3), 1), ((8, 3), (35, 0), 1), ((6, 0), (6, 0), 1)},
+        {((6, 0), (7, 1), 2), ((7, 1), (8, 3), 3), ((8, 3), (8, 3), 1), ((8, 3), (35, 0), 3), ((6, 0), (6, 0), 1)},
         id="join-into-a-block-of-blocks",
+    ),
+    pytest.param(
+        # the backbone enters a pendant block whose repeat unit is a nested block: the entry
+        # lands two levels down, and the tail after the pendant is forced
+        "{[] [<]CC({[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
+        {((6, 0), (8, 2), 2), ((8, 2), (8, 2), 1), ((8, 2), (35, 0), 3), ((6, 0), (6, 0), 1)},
+        id="entry-into-a-block-of-blocks",
     ),
     pytest.param(
         # top level: no enclosing object, both connections are global

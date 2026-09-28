@@ -2482,6 +2482,11 @@ _FORCED_EXIT_MASS_CASES = [
         4000.0,
         id="three-blocks-in-series",
     ),
+    pytest.param(
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
+        1000.0,
+        id="join-into-a-block-of-blocks",
+    ),
 ]
 
 
@@ -2597,6 +2602,39 @@ def test_blocks_of_blocks_are_built_on_every_pendant(text):
         assert instances["|poisson(60.0)|"] >= outer, f"seed {seed}: an outer block without an inner block"
         if "|poisson(80.0)|" in instances:
             assert instances["|poisson(80.0)|"] == outer, f"seed {seed}: {instances['|poisson(80.0)|']} first blocks but {outer} joined blocks"
+
+
+_BLOCK_OF_BLOCKS_THREE_LEVELS = "{[] [<]CC({[>] [<]{[>] [<]{[>] [<]OO[>];; [<]}|poisson(40)|[>];; [<]}|poisson(120)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|"
+
+
+@pytest.mark.parametrize(
+    ("text", "inner"),
+    [
+        pytest.param(_BLOCK_OF_BLOCKS_JOIN, "|poisson(60.0)|", id="join"),
+        pytest.param(_BLOCK_OF_BLOCKS_ENTRY, "|poisson(60.0)|", id="entry"),
+        pytest.param(_BLOCK_OF_BLOCKS_THREE_LEVELS, "|poisson(120.0)|", id="three-levels"),
+    ],
+)
+def test_tail_after_a_block_of_blocks_fires_when_the_outer_block_finalizes(text, inner):
+    """The literal text after a block whose repeat unit ends with a nested block leaves both
+    blocks at once: a forced exit owed by the outer block, delivered exactly once per outer
+    block, after its last inner block. It was a stochastic transition of the enclosing level,
+    lost whenever that level stopped first; firing it when an inner block finalizes would have
+    consumed the site the outer block continues from, one inner block per outer block."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    outer_total = inner_total = 0
+    for seed in range(12):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+        instances = {text_of: len(tracked.get(gen_id, [])) for gen_id, text_of in dist.items()}
+        outer = instances["|poisson(300.0)|"]
+        assert outer > 0 and _count_atoms(mol_graph, 35) == outer, f"seed {seed}: {outer} outer blocks but {_count_atoms(mol_graph, 35)} tail(s)"
+        outer_total += outer
+        inner_total += instances[inner]
+    assert inner_total >= 2 * outer_total, f"{inner_total} inner blocks in {outer_total} outer blocks"
 
 
 def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):

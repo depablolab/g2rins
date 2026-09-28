@@ -53,11 +53,13 @@ class TransitionRole(IntEnum):
     NONE marks an edge that is not a transition. A STOCHASTIC transition is mediated by a bond
     connector of the managing stochastic object and competes as a weighted option at that
     level. A FORCED_ENTRY enters a nested stochastic object from its parent with no parent
-    bond connector on the path. A FORCED_EXIT leaves a nested stochastic object through its
-    terminal bond connector without crossing a bond connector of any enclosing object, so the
-    enclosing level has no decision to make; it fires when the instance that owns the source
-    site finalizes. A GLOBAL transition crosses stochastic families (stochastic id -1) and
-    fires after every instance has terminated. The integer encoding is stable across versions.
+    bond connector on the path. A FORCED_EXIT leaves one or more nested stochastic objects
+    through their terminal bond connectors without crossing a bond connector of the nearest
+    common ancestor of source and target or of any object above it, so no level that stays
+    open has a decision to make; it is stamped with that common ancestor and fires when the
+    outermost object it leaves finalizes. A GLOBAL transition crosses stochastic families
+    (stochastic id -1) and fires after every instance has terminated. The integer encoding is
+    stable across versions.
     """
 
     NONE = 0
@@ -1060,11 +1062,14 @@ class GraphCreator:
                         data["role"] = int(TransitionRole.STOCHASTIC)
 
                         # Special case -- "forced exit" transition: the target lies outside the
-                        # source's SO (its parent's own text, or a sibling SO joined directly) and
-                        # no bond connector of an enclosing SO lies on the path, so the enclosing
-                        # level has no stochastic decision to make. The exit is stamped with the
-                        # nearest common ancestor of the two SOs: the parent for a literal tail,
-                        # the shared parent for a join between two nested objects.
+                        # source's SO (an ancestor's own text, or a sibling SO joined directly) and
+                        # no bond connector of the nearest common ancestor or above lies on the
+                        # path, so no level that stays open has a stochastic decision to make. The
+                        # connectors of the SOs the path leaves (the source and any SO between it
+                        # and the common ancestor) only say where each of them ends; the exit is
+                        # owed when the outermost of them finalizes. It is stamped with the
+                        # nearest common ancestor: the parent for a literal tail, the shared
+                        # parent for a join between two nested objects.
                         target_node = self.node_path[-1]
                         if "stochastic_obj" in graph.nodes[target_node]:
                             target_so = graph.nodes[target_node]["stochastic_obj"]
@@ -1073,13 +1078,13 @@ class GraphCreator:
                             # transition is global (stamped -1 below), not a forced exit.
                             common_so = next((so for so in [source_so, *_stochastic_ancestors(source_so)] if any(so is other for other in target_chain)), None)
                             if common_so is not None and target_so is not source_so and not any(so is source_so for so in target_chain):
-                                enclosing_ids = {self._stochastic_id_map[id(so)] for so in _stochastic_ancestors(source_so)}
+                                deciding_ids = {self._stochastic_id_map[id(so)] for so in [common_so, *_stochastic_ancestors(common_so)]}
                                 interior_ids = {
                                     self._stochastic_id_map[id(graph.nodes[bc_node]["stochastic_obj"])]
                                     for bc_node in self.node_path[1 : len(self.node_path) - 1]
                                     if "stochastic_obj" in graph.nodes[bc_node]
                                 }
-                                if not interior_ids & enclosing_ids:
+                                if not interior_ids & deciding_ids:
                                     data["sto_id"] = self._stochastic_id_map[id(common_so)]
                                     data["role"] = int(TransitionRole.FORCED_EXIT)
                 else:
