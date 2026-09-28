@@ -1286,6 +1286,21 @@ def test_repeat_unit_initiation_chains_contain_the_nested_initiator():
             assert sum(data["atomic_num"] == 35 for _node, data in molecule.nodes(data=True)) == 2
 
 
+def test_repeat_unit_source_enters_its_own_nested_object():
+    """A source unit that carries a nested object enters it at once, so every nested object gets its own instance."""
+    import networkx as nx
+
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>];; [<,>]Cl []}|poisson(2000)|"
+    ensemble_creator, _table = _repeat_unit_initiation_table(smi)
+    generative_graph = ensemble_creator.generative_graph
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for seed in range(5):
+            molecule, _units, _bonds, _seq, tracked, _dist = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed), molecule_info=True)
+            nested = [node for node, data in molecule.nodes(data=True) if generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][0] == 1]
+            assert len(tracked[1]) == nx.number_connected_components(molecule.subgraph(nested))
+
+
 def test_repeat_unit_initiation_warns_once_per_creator():
     """The warning names the source units and fires when the creator is built, not per sample."""
     from g2rins.exception import RepeatUnitInitiation, UnvalidatedGenerationSource

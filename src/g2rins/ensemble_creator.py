@@ -2982,6 +2982,8 @@ class EnsembleCreator:
             # condition.
             partial_atom_graph.stochastic_tracker.terminate(sto_atom_id)
         else:
+            # Built here, not merged by a transition: fire its nested entries as every merged unit does.
+            partial_atom_graph.nested_transition(sto_atom_id, rng)
             partial_atom_graph.transition_graph(sto_atom_id, source_sto_gen_id, rng)
 
         # Pending-termination bookkeeping (P1-02 rework). An instance whose
