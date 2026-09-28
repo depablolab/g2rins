@@ -91,7 +91,15 @@ def _stochastic_ancestors(stochastic_obj):
 def _transition_role_value(edge, data):
     """Validated integer ``transition_role`` of one edge; raises IncompatibleGenerativeGraphSchema."""
     if _TRANSITION_ROLE_NAME not in data:
-        raise IncompatibleGenerativeGraphSchema(_TRANSITION_ROLE_NAME, "edges", node_id=edge)
+        raise IncompatibleGenerativeGraphSchema(
+            _TRANSITION_ROLE_NAME,
+            "edges",
+            node_id=edge,
+            detail=(
+                "A graph saved before this field existed cannot be migrated, because a forced exit and a stochastic exit look the same in the graph; "
+                "rebuild it from the G2RINS string stored in its graph attribute 'g2rins_string'."
+            ),
+        )
     value = data[_TRANSITION_ROLE_NAME]
     valid = isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and int(value) in {int(role) for role in TransitionRole}
     if not valid:

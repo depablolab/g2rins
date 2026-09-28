@@ -246,6 +246,8 @@
     "getmaskarray",
     "dtypes",
     "deques",
-    "setrecursionlimit"
+    "setrecursionlimit",
+    "goldens",
+    "ddof"
   ]
 }

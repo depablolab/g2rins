@@ -568,7 +568,8 @@ class IncompatibleGenerativeGraphSchema(G2RINSError):
     def __str__(self):
         message = f"The '{self.missing_attribute}' attribute is {self.reason} on {self.location} in the provided generative_graph"
         if self.node_id is not None:
-            message += f" (node_id={self.node_id!r})"
+            label = "edge" if self.location == "edges" else "node_id"
+            message += f" ({label}={self.node_id!r})"
         message += ". "
         if self.detail:
             message += self.detail + " "
