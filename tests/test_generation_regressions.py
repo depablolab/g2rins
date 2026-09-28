@@ -1263,6 +1263,11 @@ def _repeat_unit_initiation_table(smi):
             {"R0": 1.0},
             id="nested-only-repeat-unit",
         ),
+        pytest.param(
+            "{[] [<]CC(c1ccccc1)[>], [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>];; [<,>]Cl []}|poisson(3000)|",
+            {"R0": 0.5, "R1": 0.5},
+            id="pendant-entry-is-no-start-site",
+        ),
     ),
 )
 def test_repeat_unit_initiation_sources(smi, expected):

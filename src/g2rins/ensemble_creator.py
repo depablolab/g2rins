@@ -2819,7 +2819,9 @@ class EnsembleCreator:
         from its parent is not.  Termination edges never propagate and are
         ignored.  Candidates are the connector atoms of the source objects,
         weighted by their bond-connector weight times the molar amounts along
-        their nesting path.
+        their nesting path; a site whose growth only enters a nested object
+        written in its own unit grows that pendant after the chain starts and
+        is no candidate.
         """
         stochastic_id_tree = {node: data["stochastic_id_tree"] for node, data in graph.nodes(data=True)}
         flow = nx.DiGraph()
@@ -2838,11 +2840,19 @@ class EnsembleCreator:
                 outermost = min(depth[member] for member in members)
                 source_objects.update(member for member in members if depth[member] == outermost)
 
+        def enters_only_own_nested_objects(node):
+            # Same test as nested_transition's special targets: a transition into a child object written in the unit.
+            growth = [(v, edge) for _u, v, edge in graph.out_edges(node, data=True) if edge.get(_PROPAGATION_NAME, 0) > 0 or edge.get(_TRANSITION_NAME, 0) > 0]
+            return bool(growth) and all(
+                edge.get(_TRANSITION_NAME, 0) > 0 and edge.get(_EDGE_STOCHASTIC_ID_NAME) == stochastic_id_tree[v][0] and stochastic_id_tree[node][0] in stochastic_id_tree[v][1:]
+                for v, edge in growth
+            )
+
         starting_node_idx = []
         starting_node_weight = []
         for node, data in graph.nodes(data=True):
             tree = stochastic_id_tree[node]
-            if tree[0] < 0 or tree[0] not in source_objects or not data["gen_weight"] > 0:
+            if tree[0] < 0 or tree[0] not in source_objects or not data["gen_weight"] > 0 or enters_only_own_nested_objects(node):
                 continue
             weight = data["gen_weight"]
             for level in tree:
