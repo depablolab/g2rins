@@ -2565,6 +2565,40 @@ def test_forced_join_draws_its_first_unit_by_molar_amount():
         assert _count_atoms(mol_graph, 16) >= len(tracked[second]), f"seed {seed}: joined blocks without their allowed unit"
 
 
+_BLOCK_OF_BLOCKS_JOIN = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|"
+_BLOCK_OF_BLOCKS_ENTRY = "{[] [<]CC({[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|"
+
+
+def _pendant_carriers(ensemble_creator):
+    """Template ids of the root-level atoms whose forced entry starts a pendant."""
+    graph = ensemble_creator.generative_graph
+    return {str(u) for u, _v, data in graph.edges(data=True) if data["transition_role"] == int(g2rins.TransitionRole.FORCED_ENTRY) and graph.nodes[u]["stochastic_id_tree"][0] == 0}
+
+
+@pytest.mark.parametrize("text", [pytest.param(_BLOCK_OF_BLOCKS_JOIN, id="join"), pytest.param(_BLOCK_OF_BLOCKS_ENTRY, id="entry")])
+def test_blocks_of_blocks_are_built_on_every_pendant(text):
+    """A pendant block whose repeat unit is itself a nested block is built on every backbone
+    unit, holding at least one inner block. Entered from the backbone's own text, the entry
+    lands two levels down and was never fired, so the pendant was silently missing; joined
+    to a first block, the join was read as that block's own propagation, so every step of it
+    could jump into the inner block."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    carriers = _pendant_carriers(ensemble_creator)
+    for seed in range(12):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph, _units, _bonds, _sequences, tracked, dist = ensemble_creator.sample_mol_graph(molecule_info=True, rng=np.random.default_rng(seed))
+        instances = {text_of: len(tracked.get(gen_id, [])) for gen_id, text_of in dist.items()}
+        pendants = sum(1 for _node, data in mol_graph.nodes(data=True) if str(data.get("origin_idx")) in carriers)
+        outer = instances["|poisson(300.0)|"]
+        assert outer == pendants > 0, f"seed {seed}: {pendants} pendant-carrying units but {outer} outer blocks"
+        assert instances["|poisson(60.0)|"] >= outer, f"seed {seed}: an outer block without an inner block"
+        if "|poisson(80.0)|" in instances:
+            assert instances["|poisson(80.0)|"] == outer, f"seed {seed}: {instances['|poisson(80.0)|']} first blocks but {outer} joined blocks"
+
+
 def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):
     """The ensemble section of the JSON file (unit subgraphs, node-link chains,
     weights) is normalized like the graph section: NumPy values become JSON

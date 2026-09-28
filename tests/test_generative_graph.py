@@ -308,6 +308,13 @@ _TRANSITION_ROLE_PROBES = [
         id="series-blocks",
     ),
     pytest.param(
+        # a join into a block whose repeat unit is itself a nested block is still a forced exit
+        # of the first block, although its target atom sits two levels below the shared parent
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>];; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
+        {((6, 0), (7, 1), 2), ((7, 1), (8, 3), 3), ((8, 3), (8, 3), 1), ((8, 3), (35, 0), 1), ((6, 0), (6, 0), 1)},
+        id="join-into-a-block-of-blocks",
+    ),
+    pytest.param(
         # top level: no enclosing object, both connections are global
         "CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C",
         {((6, -1), (7, 0), 4), ((7, 0), (35, -1), 4)},

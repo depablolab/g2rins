@@ -223,7 +223,10 @@ class _HalfAtomBond:
                 if d[_TRANSITION_NAME] > 0:
                     target_stochastic_id = graph.nodes[v]["stochastic_id_tree"][0]
                     target_parents_stochastic_id = graph.nodes[v]["stochastic_id_tree"][1:]
-                    if self.stochastic_id in target_parents_stochastic_id and d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id and target_stochastic_id != -1:
+                    # A forced entry is stamped with the first object it enters, which is not the
+                    # target atom's own object when that object's repeat unit begins with a nested one.
+                    entered_here = d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id or d.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_ENTRY
+                    if self.stochastic_id in target_parents_stochastic_id and entered_here and target_stochastic_id != -1:
                         special_target_list += [(v, d)]
                         special_target_weight += [d[_TRANSITION_NAME]]
                         special_target_molar_amounts += [graph.nodes[v]["unit_molar_amounts"]]
@@ -2220,8 +2223,11 @@ class _PartialAtomGraph:
         # The instance that receives the fragment and its mass. A literal tail belongs to
         # the finalized instance's own ancestor at the target's level, parked or not, taken
         # from its recorded parent chain. A join into a sibling object registers that
-        # object's instance now, at the first object's finalization, under the same parent
-        # chain: an instance is created by the fire that attaches its first unit.
+        # object's instance now, at the first object's finalization, under the ancestors the
+        # two share: an instance is created by the fire that attaches its first unit. When
+        # the joined object's repeat unit begins with a nested object, the target atom sits
+        # deeper, and every level between the shared ancestors and it is registered,
+        # outermost first.
         target_sto_atom_id = None
         parent_list = tracker.parent_map.get(sto_atom_id, [])
         for ancestor in reversed(parent_list):
@@ -2229,10 +2235,15 @@ class _PartialAtomGraph:
                 target_sto_atom_id = ancestor
                 break
         if target_sto_atom_id is None:
-            parent_expected_molw = tracker._sto_atom_id_expected_molw.get(parent_list[-1]) if parent_list else None
-            target_sto_atom_id = tracker.register_new_atom_instance(target_gen_id, sto_atom_id, parent_expected_molw, False)
-            if parent_list:
-                tracker.parent_map[target_sto_atom_id] = list(parent_list)
+            chain = [ancestor for ancestor in parent_list if tracker._stochastic_atom_id_to_gen_id[ancestor] in target_tree]
+            shared_gen_ids = {tracker._stochastic_atom_id_to_gen_id[ancestor] for ancestor in chain}
+            for gen_id in [gen_id for gen_id in reversed(target_tree) if gen_id >= 0 and gen_id not in shared_gen_ids]:
+                parent_expected_molw = tracker._sto_atom_id_expected_molw.get(chain[-1]) if chain else None
+                new_sto_atom_id = tracker.register_new_atom_instance(gen_id, sto_atom_id, parent_expected_molw, False)
+                if chain:
+                    tracker.parent_map[new_sto_atom_id] = list(chain)
+                chain.append(new_sto_atom_id)
+            target_sto_atom_id = chain[-1]
         if _DECISION_TRACE is not None:
             _DECISION_TRACE.append({"kind": "forced_exit", "id": sto_atom_id, "bucket": bucket_id, "target": target_sto_atom_id, "target_gen": target_gen_id})
 

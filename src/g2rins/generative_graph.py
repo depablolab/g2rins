@@ -999,6 +999,13 @@ class GraphCreator:
                                 target_parent = self._stochastic_id_map[id(graph.nodes[v]["stochastic_obj"].stochastic_parent)]
                                 if graph.nodes[u]["stochastic_id"] == target_parent:
                                     last_rank -= 1
+                            # A hop between the terminals of two sibling objects climbs to
+                            # their shared parent and descends again, so a join never reads
+                            # as a descent from the source's own unit.
+                            u_so = graph.nodes[u]["stochastic_obj"]
+                            v_so = graph.nodes[v]["stochastic_obj"]
+                            if u_so is not v_so and u_so.stochastic_parent is not None and u_so.stochastic_parent is v_so.stochastic_parent:
+                                max_rank = max(max_rank, last_rank + 1)
                         #    if termination: rank +=1 ?
                         else:
                             last_rank += 1
