@@ -179,11 +179,29 @@ def test_warn_empty_terminal_bond_connector_without_end_groups(smi):
         g2rins.G2rins.make(smi)
 
 
-@pytest.mark.parametrize("smi", [])
+@pytest.mark.parametrize(
+    "smi",
+    [
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
+            id="only-initiator-is-a-nested-object-without-one",
+        ),
+    ],
+)
 def test_warn_no_initiation_for_stochastic_object(smi):
     with pytest.warns(g2rins.exception.NoInitiationForStochasticObject):
         obj = g2rins.G2rins.make(smi)
         obj.get_graph_creator()
+
+
+def test_object_without_initiator_warns_no_explicit_initiation_only():
+    """NoExplicitInitiation already reports an object that declares no initiator; NoInitiationForStochasticObject would repeat it."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make("{[] [<]CCO[>];; [<,>][H] []}|poisson(1000)|").get_graph_creator()
+    categories = {warning.category for warning in caught}
+    assert g2rins.exception.NoExplicitInitiation in categories
+    assert g2rins.exception.NoInitiationForStochasticObject not in categories
 
 
 @pytest.mark.parametrize("smi", ["{[$] [>]CC[<];; [>]}|flory_schulz(0.9)|"])

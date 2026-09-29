@@ -257,7 +257,7 @@ class NoExplicitInitiation(ParsingWarning):
 
     def __str__(self) -> str:
         string = f"No explicit initiator defined. The stochastic object {str(self.token)} has an empty left terminal bond connector '[]' and an empty list of initiators."
-        string += " Chains will start at repeat units instead."
+        string += " If the string declares no initiator anywhere, chains start at repeat units instead."
         return string
 
 
@@ -317,7 +317,10 @@ class NoInitiationForStochasticObject(ParsingWarning):
         self.partial_graph = partial_graph
 
     def __str__(self):
-        return f"The stochastic object {str(self.token)} cannot generate entry points to start initiations. Check if the left terminal bond connector is meant to be empty or if you have correct end groups that can act as initiators."
+        return (
+            f"The stochastic object {str(self.token)} cannot generate entry points to start initiations. Check if the left terminal bond connector is meant to be empty or if you have correct end groups that can act as initiators. "
+            "If the string declares no initiator anywhere, chains start at repeat units instead."
+        )
 
 
 class NoTerminationForStochasticObject(ParsingWarning):
