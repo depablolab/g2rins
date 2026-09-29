@@ -14,7 +14,7 @@ from rdkit import Chem
 
 import g2rins
 from g2rins.ensemble_creator import EnsembleCreator
-from g2rins.exception import InvalidUnitPSmiles, NoValidGenerationSource
+from g2rins.exception import InvalidUnitPSmiles
 from g2rins.nx_rdkit_mol import mol_graph_to_rdkit_mol
 
 PEI = "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(200)|"
@@ -29,15 +29,14 @@ PARTNERLESS_CASES = [
 ]
 
 # Keep every input, including ordinary units that can expose an over-strict
-# validator. Names and expected outcomes are keyed by input text, so reordering
-# smi.json cannot move the expected failure onto a different input.
+# validator. Names are keyed by input text, so reordering smi.json cannot move
+# a test ID onto a different input.
 CORPUS_CASES = json.loads(Path(__file__).with_name("unit_psmiles_corpus.json").read_text(encoding="utf-8"))
 CORPUS_TEXTS = json.loads(Path(__file__).with_name("smi.json").read_text(encoding="utf-8"))["g2rins"]
-CORPUS_ERRORS = {None: None, "NoValidGenerationSource": NoValidGenerationSource}
 
 
 def test_corpus_metadata_covers_inputs():
-    assert set(CORPUS_CASES) == set(CORPUS_TEXTS), "Give every corpus input a descriptive test ID and expected outcome."
+    assert set(CORPUS_CASES) == set(CORPUS_TEXTS), "Give every corpus input a descriptive test ID."
     assert all(isinstance(case, dict) and isinstance(case.get("id"), str) for case in CORPUS_CASES.values()), "Each corpus case needs a string test ID."
     assert len({case["id"] for case in CORPUS_CASES.values()}) == len(CORPUS_CASES), "Corpus test IDs must be unique."
 
@@ -388,17 +387,7 @@ def test_sequence_finalizer_drops_only_identified_inactive_placeholders():
 def test_corpus_unit_psmiles_follow_template_contract(text):
     case = CORPUS_CASES[text]
     assert isinstance(case, dict), "Corpus case metadata must be an object."
-    error_name = case.get("expected_error")
-    assert error_name is None or isinstance(error_name, str), "Expected error must be a known name."
-    assert error_name in CORPUS_ERRORS, f"Unknown expected error: {error_name!r}"
-    expected_error = CORPUS_ERRORS[error_name]
     creator = _make_creator(text)
-    if expected_error is not None:
-        # This input intentionally has no automatic source. Any unexpected
-        # NoValidGenerationSource from another case must fail the test.
-        with pytest.raises(expected_error):
-            creator.create_ensemble(1, ensemble_info=True, seed=0)
-        return
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         result = creator.create_ensemble(1, output_format="mol_graph", ensemble_info=True, max_number_of_discarded_chains=2, seed=0)

@@ -257,7 +257,7 @@ class NoExplicitInitiation(ParsingWarning):
 
     def __str__(self) -> str:
         string = f"No explicit initiator defined. The stochastic object {str(self.token)} has an empty left terminal bond connector '[]' and an empty list of initiators."
-        string += " Chains will start at repeat units instead."
+        string += " If the string declares no initiator anywhere, chains start at repeat units instead."
         return string
 
 
@@ -281,7 +281,7 @@ class EmptyBondConnectorInTerminalBondConnectorList(ParsingError):
 
 
 class MismatchedBondConnectorLists(ParsingError):
-    """Neighbouring bond connector lists pair by position but differ in length."""
+    """Neighboring bond connector lists pair by position but differ in length."""
 
     def __init__(self, left_token, right_token, left_count, right_count):
         Exception.__init__(self, left_token, right_token, left_count, right_count)
@@ -293,9 +293,9 @@ class MismatchedBondConnectorLists(ParsingError):
 
     def __str__(self) -> str:
         return (
-            f"The bond connectors of '{str(self.left_token)}' ({self.left_count}) meet the bond connectors of '{str(self.right_token)}' ({self.right_count}). "
+            f"'{str(self.left_token)}' and '{str(self.right_token)}' meet with {self.left_count} and {self.right_count} bonds. "
             "A bond connector list and the terminal bond connector list it meets pair entry by entry, in order, so both need the same length; "
-            "a single bond connector meets a single terminal bond connector."
+            "a single bond connector meets a single terminal bond connector, and an atom or end group cannot meet a list."
         )
 
 
@@ -317,7 +317,10 @@ class NoInitiationForStochasticObject(ParsingWarning):
         self.partial_graph = partial_graph
 
     def __str__(self):
-        return f"The stochastic object {str(self.token)} cannot generate entry points to start initiations. Check if the left terminal bond connector is meant to be empty or if you have correct end groups that can act as initiators."
+        return (
+            f"The stochastic object {str(self.token)} cannot generate entry points to start initiations. Check if the left terminal bond connector is meant to be empty or if you have correct end groups that can act as initiators. "
+            "If the string declares no initiator anywhere, chains start at repeat units instead."
+        )
 
 
 class NoTerminationForStochasticObject(ParsingWarning):

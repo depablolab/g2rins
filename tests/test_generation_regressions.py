@@ -1209,19 +1209,20 @@ def test_empty_automatic_source_raises_domain_error():
 
 
 def _repeat_unit_initiation_table(smi):
-    """Automatic source table of an initiator-less string, summed per derived unit id."""
+    """Automatic source table of an initiator-less string, summed per unit text."""
     from collections import defaultdict
 
-    from g2rins.generative_graph import derive_unit_labels
+    from g2rins.generative_graph import _verified_unit_texts, derive_unit_labels
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
     assert ensemble_creator._repeat_unit_initiation
-    unit_id = derive_unit_labels(ensemble_creator.generative_graph).unit_id
+    labels = derive_unit_labels(ensemble_creator.generative_graph)
+    unit_text = _verified_unit_texts(ensemble_creator.generative_graph, labels)
     table = defaultdict(float)
     for node, weight in zip(ensemble_creator._starting_node_idx, ensemble_creator._starting_node_weight, strict=True):
-        table[unit_id[node]] += float(weight)
+        table[unit_text[labels.unit_id[node]]] += float(weight)
     return ensemble_creator, dict(table)
 
 
@@ -1230,38 +1231,43 @@ def _repeat_unit_initiation_table(smi):
     (
         pytest.param(
             "{[] [<]CCO[>|2|]|3|, [<]CC(C)O[>|3|];; [<,>][H] []}|uniform(1400,1400)|",
-            {"R0": 9 / 13, "R1": 4 / 13},
+            {"[<]CCO[>|2.0|]|3.0|": 9 / 13, "[<]CC(C)O[>|3.0|]": 4 / 13},
             id="connector-weight-times-molar-amount",
         ),
         pytest.param(
             "{[] [<]CCO[>];; [>][H] [<]}|poisson(300)|{[>] [<]CCN[>];; [<,>][H] []}|poisson(300)|",
-            {"R0": 1.0},
+            {"[<]CCO[>]": 1.0},
             id="two-root-objects-start-left",
         ),
         pytest.param(
             "{[] [<]{[>] [<]CC(C)O[>], [<]CCN[>];; [<]}|poisson(100)|[>], [<]CCO[>];; [<,>][H] []}|poisson(500)|",
-            {"R2": 1.0},
+            {"[<]CCO[>]": 1.0},
             id="nested-repeat-unit-entered-from-root",
         ),
         pytest.param(
             "{[] [<]CCO[>]; {[] [<]CC(C)O[>], [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
-            {"R1": 0.5, "R2": 0.5},
+            {"[<]CC(C)O[>]": 0.5, "[<]CCN[>]": 0.5},
             id="nested-initiator-without-initiator",
         ),
         pytest.param(
             "{[] [<]CCO[>]; {[] [<]CC(C)O[>];; [<]|[>]}|poisson(500)|[>]|[<]|0.3|, {[] [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]|0.7|; [<,>]Br []}|poisson(1000)|",
-            {"R1": 0.3, "R2": 0.7},
+            {"[<]CC(C)O[>]": 0.3, "[<]CCN[>]": 0.7},
             id="weighted-nested-initiators",
         ),
         pytest.param(
             "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; {[] [<]CCN[>];; [<]|[>]}|poisson(100)|[>]|[<]; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
-            {"R2": 1.0},
+            {"[<]CCN[>]": 1.0},
             id="nested-initiator-two-levels-deep",
         ),
         pytest.param(
             "{[] [<]{[>] [<]CC(C)O[>];; [<]}|poisson(100)|[>];; [<,>][H] []}|poisson(500)|",
-            {"R0": 1.0},
+            {"[<]CC(C)O[>]": 1.0},
             id="nested-only-repeat-unit",
+        ),
+        pytest.param(
+            "{[] [<]CC(c1ccccc1)[>], [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>];; [<,>]Cl []}|poisson(3000)|",
+            {"[<]CC(c1ccccc1)[>]": 0.5, "[<]CC({[<] [<]NN[>]; ;  [>]}|poisson(80.0)|Br)C[>]": 0.5},
+            id="pendant-entry-is-no-start-site",
         ),
     ),
 )
@@ -1284,6 +1290,21 @@ def test_repeat_unit_initiation_chains_contain_the_nested_initiator():
             assert any(generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][1] >= 0 for _node, data in molecule.nodes(data=True))
             assert not any(molecule.nodes[u]["atomic_num"] == 8 and molecule.nodes[v]["atomic_num"] == 8 for u, v in molecule.edges())
             assert sum(data["atomic_num"] == 35 for _node, data in molecule.nodes(data=True)) == 2
+
+
+def test_repeat_unit_source_enters_its_own_nested_object():
+    """A source unit that carries a nested object enters it at once, so every nested object gets its own instance."""
+    import networkx as nx
+
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>];; [<,>]Cl []}|poisson(2000)|"
+    ensemble_creator, _table = _repeat_unit_initiation_table(smi)
+    generative_graph = ensemble_creator.generative_graph
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for seed in range(5):
+            molecule, _units, _bonds, _seq, tracked, _dist = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed), molecule_info=True)
+            nested = [node for node, data in molecule.nodes(data=True) if generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][0] == 1]
+            assert len(tracked[1]) == nx.number_connected_components(molecule.subgraph(nested))
 
 
 def test_repeat_unit_initiation_warns_once_per_creator():

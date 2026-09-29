@@ -546,11 +546,13 @@ class StochasticObject(G2rinsBase, GenerationBase):
 
     def _post_validate_partial_graph(self, partial_graph, bc_idx):
 
-        if len(partial_graph.left_half_bonds) == 0:
+        if len(partial_graph.left_half_bonds) == 0 and len(self._initiation_residues) > 0:
             # Only reachable with an empty '[]' left terminal: a declared left
             # symbol always creates a left half-bond (unconditional append in
             # _generate_partial_graph), and a declared entry that generation
-            # cannot use is reported by StochasticMissingPath below.
+            # cannot use is reported by StochasticMissingPath below. Without any
+            # initiator NoExplicitInitiation has already reported the object, so
+            # this remains for initiators that are nested objects without one.
             warnings.warn(NoInitiationForStochasticObject(self, partial_graph), stacklevel=1)
 
         # The right side needs no warning at all: a declared right terminal
