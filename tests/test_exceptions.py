@@ -19,6 +19,7 @@ from g2rins.atom import AtomSymbol
         g2rins.exception.MissingAtomSymbol("Atom"),
         g2rins.exception.TooManyTokens("Atom", "C", "N"),
         g2rins.exception.UnsupportedBondDescriptor("[<]", "O=[<]C[>]", 2),
+        g2rins.exception.MismatchedBondConnectorLists("[<]|[>]", "[>]", 2, 1),
     ],
 )
 @pytest.mark.parametrize("copy_method", ["pickle", "deepcopy"])
@@ -240,15 +241,23 @@ def test_undefined_distribution(smi):
             "{[] [<]CCO[>], [<]{[>] [<]CC(C)O[>];; [<]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|",
             id="single-right-terminal-meets-bond-connector-list",
         ),
+        pytest.param(
+            "[H]{[>]|[<] [<]CC[>];; [<]|[>]}|poisson(10)|[H]",
+            id="atoms-meet-terminal-lists-outside-every-object",
+        ),
     ],
 )
 def test_mismatched_bond_connector_lists_are_a_parsing_error(smi):
-    """Lists pair by position, so a list meeting a single connector or a shorter list cannot parse."""
+    """Lists pair by position, so a list meeting a single connector, an atom or a shorter list is rejected.
+
+    Inside a stochastic object the parser raises it; a junction outside every object raises it when the
+    graph creator is built.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(g2rins.exception.MismatchedBondConnectorLists):
             try:
-                g2rins.G2rins.make(smi)
+                g2rins.G2rins.make(smi).get_graph_creator()
             except lark.exceptions.VisitError as exc:
                 raise exc.__context__  # trunk-ignore(ruff/B904)
 

@@ -281,7 +281,7 @@ class EmptyBondConnectorInTerminalBondConnectorList(ParsingError):
 
 
 class MismatchedBondConnectorLists(ParsingError):
-    """Neighbouring bond connector lists pair by position but differ in length."""
+    """Neighboring bond connector lists pair by position but differ in length."""
 
     def __init__(self, left_token, right_token, left_count, right_count):
         Exception.__init__(self, left_token, right_token, left_count, right_count)
@@ -293,9 +293,9 @@ class MismatchedBondConnectorLists(ParsingError):
 
     def __str__(self) -> str:
         return (
-            f"The bond connectors of '{str(self.left_token)}' ({self.left_count}) meet the bond connectors of '{str(self.right_token)}' ({self.right_count}). "
+            f"'{str(self.left_token)}' and '{str(self.right_token)}' meet with {self.left_count} and {self.right_count} bonds. "
             "A bond connector list and the terminal bond connector list it meets pair entry by entry, in order, so both need the same length; "
-            "a single bond connector meets a single terminal bond connector."
+            "a single bond connector meets a single terminal bond connector, and an atom or end group cannot meet a list."
         )
 
 

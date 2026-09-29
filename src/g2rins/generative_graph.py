@@ -608,7 +608,8 @@ def _check_positional_pairing(left_graph, right_half_bonds, right_graph, left_ha
     other side. When either side of a junction is such a list, both sides must
     offer the same number of half bonds; otherwise the unmatched entries would
     never bond and the string would generate silently wrong chains. A side
-    without half bonds (a weight token, an empty terminal) has nothing to pair.
+    without half bonds (a weight token, an empty right terminal) has nothing
+    to pair; an empty left terminal offers its initiators' half bonds.
     """
     if not right_half_bonds or not left_half_bonds:
         return
