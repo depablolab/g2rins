@@ -152,6 +152,52 @@ def _forced_exit_owner(generative_graph, half_bond, attr):
     return tree[tree.index(attr[_EDGE_STOCHASTIC_ID_NAME]) - 1]
 
 
+def _molar_at(molar_amounts, sto_gen_id):
+    try:
+        return float(molar_amounts[sto_gen_id])
+    except (IndexError, KeyError, TypeError):
+        return 1.0
+
+
+def _level_target_weights(generative_graph, target_idx, edge_weights, molar_amounts, sto_gen_id):
+    """Weights that draw one target among ``target_idx`` level by level from ``sto_gen_id``.
+
+    The repeat units of ``sto_gen_id`` compete by edge weight times their molar amount at
+    that level; a repeat unit that is itself a nested object competes with the summed
+    edge weight of its targets (the edge weights split the bond-connector weights level by
+    level, so that sum is the unit's own bond weight) and passes its share to that
+    object's units, which compete the same way inside it, down to the target atom's
+    object. Without such a target the weights are edge weight times molar amount at
+    ``sto_gen_id``, as before.
+    """
+    paths = []
+    for idx in target_idx:
+        tree = list(generative_graph.nodes[idx]["stochastic_id_tree"])
+        paths.append(tree[: tree.index(sto_gen_id) + 1][::-1] if sto_gen_id in tree else [sto_gen_id])
+    if all(len(path) == 1 for path in paths):
+        return np.asarray([float(weight) * _molar_at(molar, sto_gen_id) for weight, molar in zip(edge_weights, molar_amounts, strict=True)], dtype=float)
+    shares = np.zeros(len(target_idx), dtype=float)
+
+    def split(members, depth, share):
+        level = paths[members[0]][depth]
+        groups = {}
+        for i in members:
+            key = paths[i][depth + 1] if len(paths[i]) > depth + 1 else ("unit", i)
+            groups.setdefault(key, []).append(i)
+        group_weights = {key: sum(float(edge_weights[i]) for i in group) * _molar_at(molar_amounts[group[0]], level) for key, group in groups.items()}
+        total = sum(group_weights.values())
+        if total <= 0:
+            return
+        for key, group in groups.items():
+            if isinstance(key, tuple):
+                shares[group[0]] = share * group_weights[key] / total
+            else:
+                split(group, depth + 1, share * group_weights[key] / total)
+
+    split(list(range(len(target_idx))), 0, 1.0)
+    return shares
+
+
 def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit_h=-1, aromatic=False) -> int:
     """Number of hydrogens completing an atom's valence for MW tracking.
 
@@ -242,17 +288,17 @@ class _HalfAtomBond:
                         special_target_molar_amounts += [graph.nodes[v]["unit_molar_amounts"]]
 
         if len(special_target_weight) > 0:
-            weights = np.asarray(special_target_weight, dtype=float)
-            # Weight each entry unit by its declared molar amount at its OWN
-            # (managing child-SO) level — the same slot the normal transition
-            # draw uses. The parent-SO slot is shared by every candidate here,
-            # so it would cancel in normalization and silently ignore the
-            # declared entry ratios.
-            molar = np.asarray(
-                [m[graph.nodes[v]["stochastic_id_tree"][0]] for (v, _d), m in zip(special_target_list, special_target_molar_amounts)],
-                dtype=float,
-            )
-            weights *= molar
+            # The entered object's repeat units compete by weight times their molar
+            # amount at that object's level (not at the parent's, which every candidate
+            # shares), and an entry that lands inside a nested repeat unit competes on,
+            # level by level, among that object's units.
+            entered = {list(graph.nodes[v]["stochastic_id_tree"])[list(graph.nodes[v]["stochastic_id_tree"]).index(self.stochastic_id) - 1] for v, _d in special_target_list}
+            if len(entered) == 1:
+                weights = _level_target_weights(graph, [v for v, _d in special_target_list], special_target_weight, special_target_molar_amounts, entered.pop())
+            else:
+                weights = np.asarray(
+                    [w * m[graph.nodes[v]["stochastic_id_tree"][0]] for w, (v, _d), m in zip(special_target_weight, special_target_list, special_target_molar_amounts)], dtype=float
+                )
             chosen = stochastic_tracker.choose(
                 rng,
                 len(special_target_list),
@@ -1922,14 +1968,12 @@ class _PartialAtomGraph:
 
         target_weights = np.asarray([attr[_TRANSITION_NAME] for attr in target_attr])
         if sto_gen_id >= 0:
-            target_amounts = [molar_amount[sto_gen_id] for molar_amount in all_target_amounts]
-        else:
-            # -1 (global) level: unit_molar_amounts has no slot for it — a negative
-            # index would silently read the last SO's slot (same guard as
-            # trigger_global_transitions).
-            target_amounts = [1.0] * len(all_target_amounts)
-        molar_amounts = np.asarray(target_amounts)
-        target_weights *= molar_amounts
+            # The level's repeat units compete by weight times molar amount, and a
+            # target inside a nested repeat unit competes on, level by level.
+            target_weights = _level_target_weights(self.generative_graph, target_idx, target_weights, all_target_amounts, sto_gen_id)
+        # A -1 (global) level has no slot in unit_molar_amounts (a negative index would
+        # silently read the last SO's slot, same guard as trigger_global_transitions):
+        # its weights stand as they are.
         target_id = self.stochastic_tracker.choose(
             rng,
             len(target_idx),
@@ -2114,11 +2158,10 @@ class _PartialAtomGraph:
             raise IncompleteStochasticGeneration(self)
 
         target_attr, target_idx, all_target_molar_amounts = stochastic_bond.get_mode_bonds(_PROPAGATION_NAME)
-        target_weights = np.asarray([attr[_PROPAGATION_NAME] for attr in target_attr])
         gen_sto_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
-        target_molar_amounts = [molar_amount[gen_sto_id] for molar_amount in all_target_molar_amounts]
-        molar_amounts = np.asarray(target_molar_amounts)
-        target_weights *= molar_amounts
+        # The level's repeat units compete by weight times molar amount, and a target
+        # inside a nested repeat unit competes on, level by level.
+        target_weights = _level_target_weights(self.generative_graph, target_idx, [attr[_PROPAGATION_NAME] for attr in target_attr], all_target_molar_amounts, gen_sto_id)
         target_id = self.stochastic_tracker.choose(
             rng,
             len(target_idx),
@@ -2230,10 +2273,17 @@ class _PartialAtomGraph:
         gen_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
         indices = [i for i, attr in enumerate(all_attr) if _forced_exit_owner(self.generative_graph, half_bond, attr) == gen_id]
         # Several targets means a join into an object with several units: the
-        # first unit is drawn like every other transition target, by transition
-        # weight times the unit's molar amount in its own object (a unit declared
-        # with amount 0 is never entered). A literal tail has one target.
-        weights = np.asarray([all_attr[i][_TRANSITION_NAME] * all_molar[i][self.generative_graph.nodes[all_idx[i]]["stochastic_id_tree"][0]] for i in indices], dtype=float)
+        # first unit is drawn like every other transition target, level by level
+        # from the joined object (the one just below the exit's stamp), by weight
+        # times molar amount (a unit declared with amount 0 is never entered). A
+        # literal tail has one target.
+        stamp = all_attr[indices[0]][_EDGE_STOCHASTIC_ID_NAME]
+        trees = [list(self.generative_graph.nodes[all_idx[i]]["stochastic_id_tree"]) for i in indices]
+        joined = {stamp if tree[0] == stamp else tree[tree.index(stamp) - 1] for tree in trees}
+        if len(joined) == 1:
+            weights = _level_target_weights(self.generative_graph, [all_idx[i] for i in indices], [all_attr[i][_TRANSITION_NAME] for i in indices], [all_molar[i] for i in indices], joined.pop())
+        else:
+            weights = np.asarray([all_attr[i][_TRANSITION_NAME] * all_molar[i][tree[0]] for i, tree in zip(indices, trees, strict=True)], dtype=float)
         if len(indices) == 1 and weights[0] > 0:
             chosen = indices[0]
         else:

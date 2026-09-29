@@ -2637,6 +2637,72 @@ def test_tail_after_a_block_of_blocks_fires_when_the_outer_block_finalizes(text,
     assert inner_total >= 2 * outer_total, f"{inner_total} inner blocks in {outer_total} outer blocks"
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("{[] [<]CC({[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>]|0|, [<]NN[>]|1|;; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|", id="entry"),
+        pytest.param(
+            "{[] [<]CC({[<] [<]SS[>];; [>]}|poisson(80)|{[>] [<]{[>] [<]OO[>];; [<]}|poisson(60)|[>]|0|, [<]NN[>]|1|;; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|", id="join"
+        ),
+    ],
+)
+def test_nested_repeat_unit_with_molar_amount_zero_never_grows(text):
+    """A nested repeat unit declared with molar amount 0 never grows, whether its object is
+    entered from the enclosing unit's text, joined from a sibling object or grows its next
+    unit: the object's repeat units compete by weight times molar amount before the nested
+    unit's own units do. A forced entry or join used to weigh each candidate by the molar
+    amount inside its own object only, so the nested unit started almost half the objects."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(text).get_graph_creator().get_ensemble_creator()
+    for seed in range(12):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        assert _count_atoms(mol_graph, 7) > 0, f"seed {seed}: no outer object grew"
+        assert _count_atoms(mol_graph, 8) == 0, f"seed {seed}: the nested repeat unit with molar amount 0 grew"
+
+
+_LEVEL_DRAW_CASES = [
+    pytest.param(
+        "{[] [<]CC({[>] [<]{[>] [<]OO[>]|2|, [<]PP[>]|1.5|;; [<]}|poisson(60)|[>]|0.5|, [<]NN[>]|1|;; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
+        {7: 1 / 1.5, 8: 0.5 / 1.5 * 2 / 3.5, 15: 0.5 / 1.5 * 1.5 / 3.5},
+        id="molar-amounts",
+    ),
+    pytest.param(
+        "{[] [<]CC({[>] [<|0.2|]{[>] [<|3|]OO[>]|2|, [<|1|]PP[>]|1.5|;; [<]}|poisson(60)|[>]|0.5|, [<|0.8|]NN[>]|1|;; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
+        {7: 0.8 / 0.9, 8: 0.1 / 0.9 * 6 / 7.5, 15: 0.1 / 0.9 * 1.5 / 7.5},
+        id="single-number-weights",
+    ),
+    pytest.param(
+        "{[] [<]CC({[>|0.2 0 0.8 0|] [<]{[>|3 0 1 0|] [<]OO[>]|2|, [<]PP[>]|1.5|;; [<]}|poisson(60)|[>]|0.5|, [<]NN[>]|1|;; [<]}|poisson(300)|Br)C[>]; C[>]; [<][H] []}|poisson(1000)|",
+        {7: 0.8 / 0.9, 8: 0.1 / 0.9 * 6 / 7.5, 15: 0.1 / 0.9 * 1.5 / 7.5},
+        id="weight-lists",
+    ),
+]
+
+
+@pytest.mark.parametrize(("text", "expected"), _LEVEL_DRAW_CASES)
+def test_forced_entry_draws_its_first_unit_level_by_level(text, expected):
+    """The first unit of an entered object is drawn level by level: the object's repeat units
+    compete by bond weight times molar amount (NN against the nested repeat unit), and the
+    chosen nested repeat unit's units compete the same way inside it (OO against PP). Bond
+    weights count whether written on the units' bond descriptors or as lists on the terminals."""
+    from g2rins.ensemble_creator import _level_target_weights
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    carrier = next(u for u, _v, data in graph.edges(data=True) if data["transition_role"] == int(g2rins.TransitionRole.FORCED_ENTRY) and graph.nodes[u]["stochastic_id_tree"][0] == 0)
+    entries = [(v, data) for _u, v, data in graph.out_edges(carrier, data=True) if data["transition_role"] == int(g2rins.TransitionRole.FORCED_ENTRY)]
+    entered = next(graph.nodes[v]["stochastic_id_tree"][0] for v, _data in entries if graph.nodes[v]["atomic_num"] == 7)
+    weights = _level_target_weights(
+        graph, [v for v, _data in entries], [data["transition_weight"] for _v, data in entries], [graph.nodes[v]["unit_molar_amounts"] for v, _data in entries], entered
+    )
+    drawn = {graph.nodes[v]["atomic_num"]: weight / weights.sum() for (v, _data), weight in zip(entries, weights, strict=True)}
+    assert drawn == pytest.approx(expected)
+
+
 def test_ensemble_json_normalizes_numpy_values_in_the_ensemble_section(tmp_path):
     """The ensemble section of the JSON file (unit subgraphs, node-link chains,
     weights) is normalized like the graph section: NumPy values become JSON
