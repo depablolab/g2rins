@@ -4,154 +4,68 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 ## [Unreleased]
 
+### Breaking changes
+
+**Generative-graph JSON format v2 requires explicit identity on zero-number nodes.** Graph export and ensemble construction now raise `IncompatibleGenerativeGraphSchema` if any node with `atomic_num=0` lacks the boolean `is_connector_placeholder` attribute. `True` identifies an internal split-atom placeholder; `False` identifies a user wildcard, which can still be parsed and exported but cannot be used for ensemble generation. Graphs without zero-number nodes may omit this attribute. Changing the JSON `format.version` field alone does not migrate node identity.
+
+- **Preferred upgrade:** rebuild legacy graphs from their original G2RINS strings using `G2rins.make(text).get_graph_creator().get_generative_graph()` before export or generation.
+- **Migration without source strings requires known provenance:** use `mark_legacy_connector_placeholders(graph)` only when every unmarked zero-number node with exactly one static neighbor is known to be an internal placeholder. A pendant user wildcard such as `CC(*)O` has that same topology and will otherwise be marked `True`, incorrectly treating it as an internal placeholder. The helper cannot recover this distinction from graph structure. If the assumption cannot be established, recover the node identities from the graph producer before migrating.
+- **A migration warning is not verification:** `G2RINSWarning` reports counts, not affected node IDs, and does not establish that the assumption is correct. The helper returns a copy and preserves existing valid flags; compare the input and returned node flags to audit which identities it assigned.
+
+**Ensemble output format v2.** `EnsembleData.units` records are `{"psmiles", "g2rins", "subgraph", "count"}` (`frequency` renamed to `count`) and `EnsembleData.bonds` records are `{"labels", "nodes", "count"}` (`between` renamed to `labels`); the `ensemble` section of JSON files uses the same keys and shares `format.version` 2 with the generative-graph JSON format above. `subgraph` holds a networkx graph, so a unit record is no longer JSON-serializable as is (use `json_file`, or `nx.node_link_data(record["subgraph"], edges="edges")` before `json.dump`), and every template node and edge attribute must be deep-copyable when ensemble information is requested (checked before sampling starts). The `mol` output format of `create_ensemble` is removed. JSON files written with the default `output_format="mol_graph"` now store node-link chain graphs instead of SMILES strings; pass `output_format="smiles"` to keep the compact chains of version 1. `EnsembleData` equality is structural.
+
+**Automatic source selection has one candidate table.** `EnsembleCreator.sample_mol_graph` no longer takes `use_repeat_units_as_source`, and `NoValidGenerationSource` takes no argument: a G2RINS string without a declared initiator now starts its chains at repeat units automatically (see [Added](#added)), so the separate repeat-unit source mode is gone. Keyword arguments are unaffected; positional arguments after `source` move up by one.
+
 ### Added
 
-- `poisson(Mw, Mn)` and `flory_schulz(Mw, Mn)` now define moment-scaled
-  molar-mass target distributions while preserving the historical one-argument
-  forms. Their serialized layout supports both legacy ten-value vectors and the
-  new twelve-value vectors.
-- The mass-form `poisson(Mw, Mn)` now uses a zero-truncated Poisson law on
-  strictly positive chain counts. This makes the model physically meaningful for
-  polymers: the zero-count event is treated as a boundary/termination event,
-  not as a realizable zero-mass chain. The truncation is explicit in the code
-  and documentation because an idealized polymer chain must have positive mass.
-- Generative-graph exports now preserve optional stereochemistry provenance:
-  `atom_chiral_token` on chiral bracket atoms and `bond_symbol_raw` for
-  slash/backslash directional single bonds.
-- Convergence-driven ensemble generation accepts
-  `use_repeat_units_as_source=True`, enabling iterative sampling of polymers
-  without an initiator.
-- Convergence checkpoints support an opt-in `statistics` policy that stores
-  resumable convergence counters, history, aggregate metadata, and reservoir
-  RNG state without embedding retained chain graphs. The compatible default
-  remains `full`.
-- Sampling benchmarks support concise median-only matrices and sampling-only CPU attribution by implementation category; the post-optimization profile documents why NetworkX remains the internal graph backend for now.
-- Convergence sampling supports bounded chain/sequence reservoirs, per-chain streaming callbacks, optional returned metadata, and serializable seeded checkpoints for exact batch-boundary resume.
-- Convergence sampling supports an optional feature-space representative cover
-  over molecular weight, building-block count/composition, and contact
-  frequencies. Returned representatives include aligned population counts;
-  `0.15` is the recommended initial distance. The fixed-size uniform reservoir
-  remains available as a mutually exclusive alternative.
+- Automatic repeat-unit initiation. When no initiator is declared anywhere in a G2RINS string, `create_ensemble` and `sample_mol_graph` start chains at repeat-unit bond connectors instead of raising `NoValidGenerationSource`. The source stochastic objects are those that no propagation or transition edge enters from another object (the leftmost objects of a left-to-right flow, the outermost objects of a circular one); a nested object used as initiator that has no initiator of its own is such a source at any depth, while a nested repeat unit entered from its parent is not. Within the source objects every bond connector with positive weight is a candidate, drawn with probability proportional to its bond-connector weight times the molar amounts along its nesting path, and the chosen unit grows from all of its open sites exactly as an initiator does. A site that only enters a nested stochastic object written in its own unit is no candidate: that object grows once the chain has started. `RepeatUnitInitiation` is issued once, when the ensemble creator is built, naming the source units. Candidates whose weights are all zero still raise `NoValidGenerationSource`.
+- Terminal bond connector lists pair by position with the bond connector list they meet, on both sides of a nested stochastic object: in `[<]|[>]{[>]|[<] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>]|[<]` the first outer bond connector meets the first terminal and the second the second, whatever their symbols, and compatibility then decides which units each entry bonds to. Both lists must have the same length, a single bond connector meets a single terminal, and an atom or end group cannot meet a list; a mismatch raises `MismatchedBondConnectorLists` when the string is parsed, or, for a junction outside every stochastic object, when its graph creator is built (before, unmatched right entries never bonded, every outer bond connector funneled into the first left terminal, and an atom next to a list bonded to every entry).
+- `mark_legacy_connector_placeholders(graph)` provides explicit migration for legacy datasets with known placeholder semantics; see [Breaking changes](#breaking-changes) for its assumptions and limitations. It marks unmarked zero-number nodes whose static degree is not one (a terminal `[<]*`, a backbone `C*C`) as user wildcards. Migration and ensemble validation count incoming and outgoing static neighbors, including when a reverse non-static edge exists. Export and generation require explicit identity on zero-number nodes.
+- `UnitLabels.unit_nodes` exposes the per-unit node partition behind `unit_id` and `bond_id`, so consumers no longer rebuild it by scanning every node.
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
-- Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, and `MissingTermination`. The canonical configuration — a site capped in the step that grows it — stays silent.
-- Unit records in the ensemble output carry the unit's static subgraph of the generative graph (`subgraph`: original node ids, static edges only, `unit_id` stamped on the copy's nodes; node-link encoded in JSON files).
+- Unit records in the ensemble output carry the unit's static subgraph of the generative graph (`subgraph`: original node ids, static edges only, nodes in derivation order and edges in template order, `unit_id` stamped on the copy's nodes, no graph-level attributes; node-link encoded in JSON files).
 - Bond records carry the generative-graph node ids of the two connection atoms (`nodes`, positionally aligned with `labels`; labels survive a fresh parse, node ids are only valid for the graph they came from).
-- Ensemble JSON files follow the requested `output_format` for their stored chains — SMILES strings or node-link graph dicts — and record the choice in `format.chain_format`. Sequences are written as SMILES regardless.
+- Ensemble JSON files follow the requested `output_format` for their stored chains — SMILES strings or node-link graph dicts — and record the choice in `format.chain_format`; chain nodes carry the atom attributes and their template provenance (`origin_idx`, as the template's own node key), chain bonds the bond type and aromaticity, and no sampler bookkeeping. Sequences are written as SMILES regardless. The whole `ensemble` section is normalized like the graph section (NumPy values become JSON values, non-finite values raise `ValueError` before the file is opened), and the file bytes do not depend on the interpreter's hash seed.
+- Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, and `MissingTermination`. The canonical configuration — a site capped in the step that grows it — stays silent.
 
 ### Changed
 
-- SMILES-producing APIs now default to `smiles_policy="fast"`, using RDKit's
-  native non-canonical writer for ordinary molecules and retaining the
-  extended-label direct writer for huge ring-rich molecules and ring-label
-  overflow. Pass `smiles_policy="auto"` or `"canonical"` when canonical text
-  is required.
-- `mol_graph_to_rdkit_mol` now applies preserved chirality and directional-bond
-  metadata before stereochemistry assignment, and tolerates duplicate directed
-  edges by ignoring already-added atom pairs.
-- Double-bond directional annotations that are incomplete, ambiguous, or
-  conflicting now emit explicit runtime warnings. Ambiguous/conflicting
-  directional stereoinformation is discarded, leaving E/Z stereochemistry
-  unspecified instead of silently forcing an interpretation.
-- Generative graphs now retain `double_bond_stereo_defined` provenance for each
-  double bond and parallel ensemble creation aggregates directional stereochemistry
-  warnings across worker failures and accepted chains without dropping the
-  underlying signal.
-- Native crash-diagnostic recovery scans JSONL logs backward in bounded chunks
-  instead of loading the complete file, and accepted private chain records are
-  frozen before checkpoint retention.
-- Parallel convergence now keeps one bounded, restartable worker pool across
-  successful batches instead of paying process startup per batch. Broken pools
-  are replaced without losing completed ordered chains, and nested callback
-  sampling uses an independent scheduler.
-- Convergence now aggregates each accepted chain immediately and defers
-  sequence/requested-format conversion until after callback or reservoir
-  selection. Unretained chains are discarded without batch/final compatibility
-  conversion, while molecular-weight moments, contacts, units, checkpoints,
-  callbacks, and seeded reservoir behavior remain unchanged.
-- Sampling now uses explicit private metadata levels for graph-only, counts,
-  compact-sequence, and full legacy records. Convergence without retained
-  sequences uses stable unit IDs and endpoint counts without materializing
-  graph-valued units, while callbacks and public outputs retain their full
-  compatibility payloads.
-- Sampling prepares source-specific static-unit and half-bond templates once
-  per ensemble creator, and merges incoming graph data directly by atom-ID
-  offset instead of repeatedly traversing and relabeling static graphs.
-- Sampling prepares stochastic distributions once per ensemble creator and
-  reuses those immutable templates across attempts and termination estimates.
-- Sampling precomputes invariant termination-fragment masses per ensemble
-  creator; boundary lookahead now evaluates only live endpoint hydrogen loss
-  and dynamic target probabilities instead of constructing temporary graphs.
-- Parallel ensembles now initialize one persistent creator per worker, submit compact chain jobs with at most twice the worker count in flight, cap numerical-library threads, and recycle workers where supported. Broken pools preserve completed ordered results and restart up to `max_worker_restarts`, then raise `WorkerProcessFailure` with the last valid native diagnostic state.
-- Worker-crash fallback now retries unfinished chains in a fresh isolated
-  one-worker pool instead of executing native sampling in the caller process;
-  a repeated native fault raises `WorkerProcessFailure` safely.
-- Accepted chains now construct and sanitize one RDKit molecule and reuse it for molecular weight and requested canonical SMILES. Optional durable native-stage diagnostics include chain/seed context and library versions, `faulthandler` is enabled automatically, and enlarged-stack protection covers construction, sanitization, descriptors, and SMILES generation for large molecules.
-- Convergence uses the sampler's final hydrogen-reconciled molecular weight
-  instead of rebuilding an RDKit molecule solely for `MolWt`. Retained and
-  callback outputs are materialized once in their sampling worker rather than
-  rebuilt and sanitized again serially in the coordinator.
-- Fixed-size and convergence-driven ensemble creation now share one ordered per-chain sampling engine. Convergence updates molecular-weight moments and contact frequencies online instead of rescanning all accumulated samples after every batch.
-- Ensemble sampling now tracks unit counts, contacts, and branching sequences with compact IDs and direct atom indexes, materializing the legacy graph-valued metadata only when returning it. This removes per-unit molecule scans and per-occurrence NetworkX copies without changing the public output.
-- Exact stochastic rounding now restores rejected growth steps through sparse first-write mutation journals and append watermarks instead of copying the partial molecule, frontier, stochastic tracker, and compact metadata at checkpoint capture. The consumed random stream is deliberately not rewound.
+- `NoExplicitInitiation` and `NoInitiationForStochasticObject` say that chains start at repeat units when the string declares no initiator anywhere, and an object that declares no initiator gets `NoExplicitInitiation` only. Strings that used to raise `NoValidGenerationSource` for lack of an initiator now generate: a root object whose non-empty left terminal has nothing attached to it starts at its own repeat units, and a root whose only repeat unit is a nested object starts inside that object.
+- User-written wildcard atoms (`*` and `[*]`) remain supported for parsing and generative-graph export, but now raise `UnsupportedWildcardGeneration` when an ensemble creator is built. They are no longer silently removed from generated chains or reported as internal rendering failures. Diagnostics include the node ID, derived unit ID, and verified source unit text when available, and survive pickling and deep copying; the node diagnostic remains available if unit-label derivation fails. Use explicit atoms and end groups, such as `[<][H]` for a hydrogen terminator.
+- The extra graph information returned by `get_generative_graph(return_extra_graph_info=True)` no longer includes the unused `0: "None"` entry. Zero denotes a wildcard or a flagged connector placeholder; negative entries still label non-atom graph objects.
 - Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
+- The CI, trunk and release-build workflows also run for pushes and pull requests to the `next` branch, the release-candidate line that collects reviewed changes ahead of the next release.
+- The full Linux/Windows/macOS compatibility matrix can be run on demand, through a manual workflow dispatch, on any branch that carries the trigger, so a release candidate is checked on all three platforms before it lands.
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
+- The ensemble output format — the `ensemble` section of JSON files and `EnsembleData` — is version 2, sharing the `format.version` field with the generative-graph JSON format v2 above: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
+- The ensemble creator's private copy of the generative graph carries `is_connector_placeholder` on every node, filling `False` where a legacy graph omits it on a real atom, and drops the derived `unit_id`/`bond_id` node attributes that a graph loaded back from a JSON export carries, so unit subgraphs always expose the flag and carry the current `unit_id` only.
+- `EnsembleData` equality compares graph-valued members (unit subgraphs, and molecule-graph chains or sequences) by structure instead of object identity, so two ensembles with the same content compare equal. Structural equality is defined for `None`, booleans, integers, floats (NaN unequal unless the same object), strings and bytes; NumPy scalars and arrays of numeric, boolean, string, object and structured dtypes (structured data only against structured data of the same dtype) and masked arrays (by mask and unmasked values); dicts; lists, tuples and deques (element-wise); and networkx graphs. A collection never equals a scalar, and metadata that refers back to itself compares unequal. Any other object compares best effort, by identity or its own `==`, and a comparison that raises or is ambiguous means unequal.
 - When a nested stochastic object finishes, its continuation and the level's remaining entry sites compete in one weighted draw at the owning level, instead of the continuation firing unconditionally.
 - Which terminator caps an open site is resolved at graph construction: the declaration nearest the site wins, and termination edges that can never fire are removed from the generative graph. The stochastic object that owns the site's bond descriptor fires the cap, and the cap's mass counts toward that object's molecular weight target.
 - A nested stochastic object used as an initiator now inherits the enclosing object's terminators for its exposed chain ends, as one used as a repeat unit already did.
-- Exported graph and ensemble JSON is format version 2: the unit record key `frequency` is renamed to `count`, the bond record key `between` is renamed to `labels`, and unit records list `psmiles`, `g2rins`, `subgraph`, `count` in that order.
 
 ### Removed
 
-- Matplotlib is no longer a runtime dependency; an unused internal plotting
-  helper had loaded it during ordinary parsing.
-- The `mol` output format of `create_ensemble`. Request `mol_graph` and convert chains with `g2rins.mol_graph_to_rdkit_mol`, or parse the SMILES output.
+- The `mol` output format of `create_ensemble`. Request `mol_graph` and convert chains with `g2rins.mol_graph_to_rdkit_mol`, or parse the SMILES output. Sequence fragments have dangling inter-unit valences, so convert them with `g2rins.mol_graph_to_rdkit_mol(unit, kekulize=False)`.
+- The `use_repeat_units_as_source` argument of `EnsembleCreator.sample_mol_graph` and the argument of `NoValidGenerationSource`; see [Breaking changes](#breaking-changes).
 
 ### Fixed
 
-- Valid initiator-free homopolymers are now accepted when a single repeat unit
-  is genuinely self-initiating through a matching opposite bond-descriptor pair
-  such as `[<]`/`[>]`, `[<1]`/`[>1]`, or `[$]`/`[$]`. Empty or mismatched
-  repeat-unit source sets still raise `NoValidGenerationSource` rather than
-  silently falling back to another source mode.
-- Bond-connector removal no longer enumerates exponentially many impossible
-  atom paths and invalid consecutive-transition routes when constructing
-  branched, ring-containing initiator-free polymer graphs.
-- Adjacent phantom connector nodes are now traversed as one component and
-  collapsed using the realized junction's bond attributes, preserving the
-  intended bond between their real-atom endpoints.
-- Large, ring-rich cyclic polymers now recover from RDKit's open-ring labeling
-  overflow during SMILES serialization by retrying non-canonical traversals
-  from multiple atom roots and, when necessary, deterministic breadth-first
-  atom orderings, independently seeded randomized traversals, and a
-  stereo-aware direct writer using RDKit's extended ring-label syntax. The
-  direct writer adjusts tetrahedral parity for its emitted neighbor order and
-  preserves directional alkene bonds, supporting cyclic chiral biopolymers
-  while preventing failures such as "Too many rings open at once. SMILES cannot
-  be generated."
-- Added forced-fallback compatibility coverage for the alpha-1,4-linked maltose
-  motif found in starch, including molecular formula and all ten stereocenters.
-- Added explicit regression coverage for long cyclic-monomer generation and
-  RDKit serialization failures to prevent the issue from returning when new
-  generation or serialization logic is added.
-- Extremely large, non-stereochemical fused-ring polymers bypass RDKit's
-  pathological symmetric-SSSR and canonical-ranking paths. Their existing
-  aromatic graph assignments are validated through RDKit's strict property
-  cache, rings are initialized with `FastFindRings`, and the bounded direct
-  writer emits an equivalent non-canonical SMILES with extended ring labels.
-- Repeated sequence-unit graphs are now serialized once per distinct realized
-  structure instead of invoking RDKit for every occurrence. After canonical
-  ring-label overflow, the deterministic extended-label writer is attempted
-  before randomized and renumbered RDKit traversals.
-- SMILES-producing APIs accept `smiles_policy="auto"` (canonical with safe
-  fallback), `"canonical"` (strict canonical output), or `"fast"`
-  (deterministic non-canonical output without an initial canonical-ranking
-  attempt).
-- The default ensemble-convergence mass tolerance is now 1% instead of 0.2%,
-  allowing broad molecular-mass distributions to stabilize within the default
-  1,500-sample cap; callers can still request stricter tolerances explicitly.
+- A nested stochastic object wired only the first entry of its left terminal bond connector list; every entry now receives its own entry bonds, so a double-headed repeat unit enters and leaves a nested object head-to-tail from either side.
+- A chain started at a repeat unit that carries a nested stochastic object (automatic repeat-unit initiation, or an explicit `source`) now enters that object as it starts; before, the entry waited for the next unit and shared its nested instance and molecular-weight draw.
+- Split atoms with several connection sites now render one dummy per active site in ensemble unit pSMILES and sequence fragments, eliminating duplicate dummy atoms. Split placeholders become mapped pSMILES stars; recorded sequence stubs attach directly to the real atom and preserve the realized junction bond order. Active split sites without a recorded stub retain their unmapped `*`, including in carbanion fragments. Partnerless split sites, identified as internal placeholders without a template bond ID, are omitted from both representations so they do not consume implicit-hydrogen valence. The generative graph, JSON graph export, and DOT view retain these inactive sites without bond IDs. Completed chains and template bond records are unchanged. Sequence fragments are still hydrogen-capped in isolation, so their masses need not sum to the chain mass.
+- Unit pSMILES is validated against template map numbers, connection-star degrees, and real-atom counts before export. Inconsistent output raises `InvalidUnitPSmiles` with normalized diagnostics that survive pickling and deep copying.
+- Sequence connection stubs and their attachment bonds are non-aromatic, and stubs are neutral even when their far-side atom is charged. This prevents aromatic inter-unit bonds from producing non-ring aromatic dummy atoms that fail fragment sanitization with `AtomKekulizeException`. Stubs carry `is_connector_placeholder=False` and retain origin and connection provenance without copying sampling bookkeeping.
+- Descriptors with multiple atom neighbors now raise the user-facing `UnsupportedBondDescriptor` when descriptors are removed for generation, JSON export, or the default DOT rendering. This includes descriptors embedded between atoms and placements where ring closures or branches attach additional atom neighbors; these previously produced incorrect graphs. The raw parsed graph with `include_bond_connectors=True` remains available for inspection.
+- Ensemble creators validate atomic numbers and placeholder structure at construction: atomic numbers must be non-negative integers, excluding booleans, and each connector placeholder must have exactly one static neighbor that is a real atom. Schema errors distinguish missing attributes from invalid values and identify the affected node. NumPy integer atomic numbers and boolean placeholder flags are normalized in the creator's own graph copy without changing the caller's input. This sampling support is limited to those fields: NumPy charge and aromatic values still fail during sampling, as in v1.0.0.
+- JSON export normalizes supported NumPy integer, real floating-point, boolean, and string scalars throughout the payload, including nested arrays in node, edge, and graph metadata. This includes charge and aromatic values that are not normalized for sampling. Export validates placeholder identity without imposing generation's atomic-number restrictions; raw descriptor graphs retain negative atomic numbers and export unavailable descriptor charges as `null`. Unsupported types, other non-finite values, and dictionary keys that would collide in JSON raise errors identifying their location. All exported containers are detached from the input, so editing a payload no longer changes its source graph.
+- Parsed graphs preserve optional unit membership in the graph-level `unit_node_ids` mapping. Wildcard diagnostics and ensemble metadata use it to verify source unit text after units are removed or labels are reassigned, including when JSON nodes are reordered. Unit text is omitted when membership differs or a saved record is missing or malformed. Legacy graphs without the mapping retain their `unit_g2rins` texts when every saved unit ID is still derived; a present but empty or malformed map does not activate this fallback. Generation remains supported without parser provenance.
+- Aromatic selenium and arsenic symbols now map to atomic numbers 34 and 33 instead of negative graph-object IDs, through the aromatic aliases of `atom_name_num`.
+- `ParsingError` and `TooManyTokens` preserve their context when pickled or deep-copied. Atoms without a symbol are rejected during construction with `MissingAtomSymbol`, a `ParsingError` subclass.
+- Bare wildcard atoms (`*`) retain their symbol when a parsed G2RINS string is serialized or exported, instead of incorrectly becoming `None`.
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
 - Nested stochastic objects used as repeat units could not grow their own instances after a transition fired; chains fell short of the outer target and were discarded.

@@ -21,11 +21,7 @@ COMMA_MULTIBLOCK = (
 STAR_CORE = "[H]{[$] [$]C(C[<])(C[<])(C[<]), [>]CC[<];; [>][H] []}|gauss(600, 150)|"
 ALTERNATING = "{[] [<]CC[>2], [<2]NN[>]; [H][>,>2]; [<2,<][H] []}|gauss(140,0.01)|"
 HOMOPOLYMER = "{[] [<]CCO[>]; CCCCO[>]; [<][H] []}|log_normal(298,1.05)|"
-NESTED = (
-    "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; "
-    "{[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<]}|gauss(680.0, 215.0)|[>]; "
-    "[<][H] []}|gauss(1649.0, 521.5)|"
-)
+NESTED = "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; " "{[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<]}|gauss(680.0, 215.0)|[>]; " "[<][H] []}|gauss(1649.0, 521.5)|"
 NO_INITIATOR = "{[] [<]CCC[>], [<]NNN[>]|2|; ; [<]Cl []}|poisson(400)|"
 
 CCC_FORMULA = ((6, 3),)
@@ -106,11 +102,7 @@ def test_junction_pseudo_units_are_linkers_and_modes_agree():
     labels_plain = g2rins.derive_unit_labels(graph_plain).unit_id
     labels_bc = g2rins.derive_unit_labels(graph_bc).unit_id
 
-    pseudo_only = {
-        label
-        for label in set(labels_bc.values())
-        if all(graph_bc.nodes[n]["atomic_num"] < 0 for n in graph_bc.nodes if labels_bc[n] == label)
-    }
+    pseudo_only = {label for label in set(labels_bc.values()) if all(graph_bc.nodes[n]["atomic_num"] < 0 for n in graph_bc.nodes if labels_bc[n] == label)}
     assert pseudo_only == {"L0"}
     for node, label in labels_plain.items():
         assert labels_bc[node][0] == label[0]
@@ -125,3 +117,15 @@ def test_no_initiator_keeps_every_bond():
     roles = Counter(label[0] for label in set(unit_id.values()))
     assert roles == {"R": 2, "T": 1}
     assert not any(data["init_weight"] > 0 for _n, data in graph.nodes(data=True))
+
+
+def test_unit_nodes_partition_matches_unit_ids():
+    graph = g2rins.G2rins.make(NESTED).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    labels = g2rins.derive_unit_labels(graph)
+    assert set(labels.unit_nodes) == set(labels.unit_id.values())
+    partitioned = [node for nodes in labels.unit_nodes.values() for node in nodes]
+    assert len(partitioned) == graph.number_of_nodes()
+    assert set(partitioned) == set(graph.nodes)
+    for unit_id, nodes in labels.unit_nodes.items():
+        assert all(labels.unit_id[node] == unit_id for node in nodes)
+        assert [labels.bond_id[node] for node in nodes if node in labels.bond_id] == list(range(1, sum(node in labels.bond_id for node in nodes) + 1))

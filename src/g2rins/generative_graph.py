@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import json
+import math
 import uuid
 import warnings
 from collections import defaultdict
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import networkx as nx
+import numpy as np
 from scipy.stats import rankdata
 
 try:
@@ -24,11 +26,15 @@ from .chem_resource import (
 )
 from .exception import (
     ForeignControlledTermination,
+    G2RINSWarning,
     IncompatibleBondTypeBondConnector,
+    IncompatibleGenerativeGraphSchema,
     InheritedTermination,
+    MismatchedBondConnectorLists,
     MissingTermination,
     ShadowedTerminationDeclaration,
     TooManyStochasticObjects,
+    UnsupportedBondDescriptor,
 )
 from .util import _determine_darkness_from_hex
 
@@ -39,9 +45,7 @@ _STATIC_NAME = "static"
 _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
-_ATOM_CHIRAL_TOKEN_NAME = "atom_chiral_token"
-_BOND_SYMBOL_RAW_NAME = "bond_symbol_raw"
-_DOUBLE_BOND_STEREO_DEFINED_NAME = "double_bond_stereo_defined"
+_CONNECTOR_PLACEHOLDER_NAME = "is_connector_placeholder"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 10
 
@@ -56,50 +60,120 @@ def is_static_edge(edge_data):
     return not weight > 0
 
 
-def _mark_defined_double_bond_stereochemistry(generative_graph):
-    """Annotate double bonds that have complete source directional context.
-
-    A bond is marked true only when exactly one slash/backslash-bearing
-    neighboring single bond exists on each side and each of those neighbors has
-    a single unambiguous token. This captures source-defined E/Z intent and
-    lets downstream conversion warn only if that information is later lost.
-    """
-
-    def directional_token_sets(atom_idx, partner_idx):
-        tokens_by_bond = {}
-
-        def add_token(other_idx, edge_data):
-            if other_idx == partner_idx:
-                return
-            if edge_data.get(_BOND_TYPE_NAME, 1) != 1:
-                return
-            token = edge_data.get(_BOND_SYMBOL_RAW_NAME)
-            if token not in {"/", "\\"}:
-                return
-            bond_key = frozenset((atom_idx, other_idx))
-            tokens_by_bond.setdefault(bond_key, set()).add(token)
-
-        for _u_idx, v_idx, _key, edge_data in generative_graph.out_edges(atom_idx, keys=True, data=True):
-            add_token(v_idx, edge_data)
-        for u_idx, _v_idx, _key, edge_data in generative_graph.in_edges(atom_idx, keys=True, data=True):
-            add_token(u_idx, edge_data)
-
-        return tokens_by_bond
-
-    for u_idx, v_idx, edge_data in generative_graph.edges(data=True):
-        if edge_data.get(_BOND_TYPE_NAME, 1) != 2:
-            continue
-
-        left_token_sets = list(directional_token_sets(u_idx, v_idx).values())
-        right_token_sets = list(directional_token_sets(v_idx, u_idx).values())
-        edge_data[_DOUBLE_BOND_STEREO_DEFINED_NAME] = (
-            len(left_token_sets) == 1
-            and len(right_token_sets) == 1
-            and all(len(token_set) == 1 for token_set in left_token_sets + right_token_sets)
-        )
-
-
 _DERIVED_NODE_FIELDS = ("unit_id", "bond_id")
+
+
+def _atomic_number(node, data):
+    """Validate a generation node's integer identity and normalize its type."""
+    if "atomic_num" not in data:
+        raise IncompatibleGenerativeGraphSchema("atomic_num", "nodes", node_id=node)
+    atomic_num = data["atomic_num"]
+    if not isinstance(atomic_num, (int, np.integer)) or isinstance(atomic_num, (bool, np.bool_)):
+        raise IncompatibleGenerativeGraphSchema(
+            "atomic_num",
+            "nodes",
+            node_id=node,
+            reason="invalid",
+            detail=f"Expected an integer; received {atomic_num!r}.",
+        )
+    return int(atomic_num)
+
+
+def _connector_placeholder_flag(node, data):
+    """Validate node identity and return a Python bool without mutating data."""
+    if "atomic_num" not in data:
+        raise IncompatibleGenerativeGraphSchema("atomic_num", "nodes", node_id=node)
+    if data["atomic_num"] == 0 and _CONNECTOR_PLACEHOLDER_NAME not in data:
+        raise IncompatibleGenerativeGraphSchema(_CONNECTOR_PLACEHOLDER_NAME, "zero-number nodes", node_id=node)
+    placeholder = data.get(_CONNECTOR_PLACEHOLDER_NAME, False)
+    if not isinstance(placeholder, (bool, np.bool_)):
+        raise IncompatibleGenerativeGraphSchema(
+            _CONNECTOR_PLACEHOLDER_NAME,
+            "nodes",
+            node_id=node,
+            reason="invalid",
+            detail=f"Expected a Python or NumPy boolean; received {placeholder!r}.",
+        )
+    if placeholder and data["atomic_num"] != 0:
+        raise IncompatibleGenerativeGraphSchema(
+            _CONNECTOR_PLACEHOLDER_NAME,
+            "nodes",
+            node_id=node,
+            reason="invalid",
+            detail="True is only valid when atomic_num is zero.",
+        )
+    return bool(placeholder)
+
+
+def _is_connector_placeholder(data):
+    """True for an internal split-atom connector placeholder.
+
+    The flag is the single placeholder predicate. Zero-number nodes without it
+    are user wildcards in template graphs and mapped connection stubs or stars
+    in rendered unit graphs, which carry an explicit ``connection`` instead.
+    """
+    return bool(data.get(_CONNECTOR_PLACEHOLDER_NAME, False))
+
+
+def _static_neighbors(graph, node):
+    """Distinct static neighbors of ``node``, ignoring edge direction and self-loops."""
+    neighbors = {v for _u, v, data in graph.edges(node, data=True) if v != node and is_static_edge(data)}
+    if graph.is_directed():
+        neighbors.update(u for u, _v, data in graph.in_edges(node, data=True) if u != node and is_static_edge(data))
+    return neighbors
+
+
+def _normalize_connector_placeholder_flags(nodes):
+    """Validate and normalize flags in detached node dictionaries."""
+    for node, data in nodes:
+        placeholder = _connector_placeholder_flag(node, data)
+        if _CONNECTOR_PLACEHOLDER_NAME in data:
+            data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+
+
+def mark_legacy_connector_placeholders(generative_graph):
+    """Copy a legacy graph, treating its unmarked zero-number nodes as placeholders.
+
+    Calling this helper explicitly asserts that every unmarked zero-number node
+    that could be a placeholder is one, never a user wildcard. Prefer rebuilding
+    from source when available. For datasets without source, the caller must know
+    how zero-number nodes were encoded; topology alone cannot recover their intent.
+
+    A placeholder always has exactly one static neighbor, its split atom. An
+    unmarked zero-number node with any other static degree (a terminal ``[<]*``,
+    a backbone ``C*C``) is provably a user wildcard and is marked False so that
+    EnsembleCreator reports it as UnsupportedWildcardGeneration instead of
+    silently dropping it. A pendant wildcard such as ``CC(*)O`` has static
+    degree one and remains indistinguishable from a partnerless placeholder.
+
+    A G2RINSWarning reports these assumptions when any nodes are marked. Existing
+    flags are validated and preserved, including False on known user wildcards.
+    The input graph and its nested attributes are unchanged. This helper only
+    migrates placeholder identity; it does not repair other schema attributes.
+    """
+    graph = deepcopy(generative_graph)
+    marked = 0
+    wildcards = 0
+    for node, data in graph.nodes(data=True):
+        if data.get("atomic_num") == 0 and _CONNECTOR_PLACEHOLDER_NAME not in data:
+            if len(_static_neighbors(graph, node)) == 1:
+                data[_CONNECTOR_PLACEHOLDER_NAME] = True
+                marked += 1
+            else:
+                data[_CONNECTOR_PLACEHOLDER_NAME] = False
+                wildcards += 1
+    _normalize_connector_placeholder_flags(graph.nodes(data=True))
+    if marked or wildcards:
+        sentences = []
+        if marked:
+            sentences.append(f"Assuming {marked} unmarked zero-number nodes are internal connector placeholders.")
+        if wildcards:
+            sentences.append(f"Marked {wildcards} unmarked zero-number nodes with a static degree other than one as user wildcards.")
+        if marked:
+            # Only meaningful where something was assumed to be a placeholder.
+            sentences.append("Legacy pendant user wildcards cannot be distinguished; use this migration only when their absence is known.")
+        warnings.warn(" ".join(sentences), G2RINSWarning, stacklevel=2)
+    return graph
 
 
 @dataclass(frozen=True)
@@ -108,6 +182,106 @@ class UnitLabels:
 
     unit_id: dict
     bond_id: dict
+    unit_nodes: dict = field(default_factory=dict)
+
+
+def _validate_json_numpy_dtype(dtype, path):
+    """Reject date/time fields before NumPy discards their type information."""
+    if dtype.kind in "Mm":
+        raise TypeError(f"Unsupported JSON value at {path}: {dtype.name}")
+    if dtype.subdtype is not None:
+        _validate_json_numpy_dtype(dtype.subdtype[0], path)
+    elif dtype.names is not None:
+        for name in dtype.names:
+            _validate_json_numpy_dtype(dtype.fields[name][0], f"{path}[{name!r}]")
+
+
+def _json_safe(value, path="$"):
+    """Recursively convert NumPy data to Python JSON types.
+
+    NumPy integers, real floats, booleans and strings have native JSON
+    equivalents; arrays and structured scalars become nested lists. Types with
+    no JSON equivalent (including complex numbers, bytes and datetimes) raise
+    TypeError identifying their location instead of silently becoming strings.
+    Non-finite floats and keys that collide when encoded raise ValueError.
+    """
+    if isinstance(value, (np.generic, np.ndarray)):
+        # item()/tolist() can turn timestamps into integers or None, including
+        # fields nested inside structured records and subarrays.
+        _validate_json_numpy_dtype(value.dtype, path)
+    if isinstance(value, np.floating):
+        # longdouble.item() can return another NumPy scalar on platforms with
+        # extended precision, so convert explicitly to Python's JSON float.
+        return _json_safe(float(value), path)
+    if isinstance(value, np.generic):
+        native_value = value.item()
+        if isinstance(native_value, np.generic):
+            raise TypeError(f"Unsupported JSON value at {path}: {type(value).__name__}")
+        return _json_safe(native_value, path)
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist(), path)
+    if isinstance(value, dict):
+        result = {}
+        encoded_keys = set()
+        for key, item in value.items():
+            native_key = _json_safe(key, path)
+            if native_key is not None and not isinstance(native_key, (str, int, float, bool)):
+                raise TypeError(f"Unsupported JSON key at {path}: {type(native_key).__name__}")
+            encoded_key = native_key if isinstance(native_key, str) else json.dumps(native_key, allow_nan=False)
+            if encoded_key in encoded_keys:
+                raise ValueError(f"Duplicate JSON key at {path}: {encoded_key!r}")
+            encoded_keys.add(encoded_key)
+            result[native_key] = _json_safe(item, f"{path}[{native_key!r}]")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item, f"{path}[{index}]") for index, item in enumerate(value)]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"Non-finite JSON value at {path}: {value!r}")
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"Unsupported JSON value at {path}: {type(value).__name__}")
+
+
+def _verified_unit_texts(generative_graph, labels):
+    """Return source texts whose saved unit membership still matches the labels.
+
+    ``unit_node_ids`` records the node membership each text was composed
+    against, so changed node membership yields no text rather than a mislabeled
+    one. This does not detect atom or bond edits that preserve node membership.
+
+    Absence of that key means the graph was written before it existed, not that
+    nothing matches: rather than discard its texts, fall back to the weaker
+    guard used then, accepting them only if every saved unit id is still a
+    derived unit id, which catches a renamed or removed unit but not a
+    membership change within one. A key that is present but empty or malformed
+    is evidence of a current graph asserting no membership, so it verifies
+    nothing and no text is returned.
+    """
+    texts = generative_graph.graph.get("unit_g2rins", {})
+    if not isinstance(texts, dict):
+        return {}
+    if "unit_node_ids" not in generative_graph.graph:
+        derived = set(labels.unit_id.values())
+        if not set(texts).issubset(derived):
+            return {}
+        return {unit_id: text for unit_id, text in texts.items() if isinstance(text, str)}
+    saved_units = generative_graph.graph["unit_node_ids"]
+    if not isinstance(saved_units, dict):
+        return {}
+    verified = {}
+    for unit_id, nodes in labels.unit_nodes.items():
+        saved_nodes = saved_units.get(unit_id)
+        text = texts.get(unit_id)
+        if not isinstance(text, str) or not isinstance(saved_nodes, (list, tuple)):
+            continue
+        try:
+            matches = set(saved_nodes) == set(nodes)
+        except TypeError:
+            # Optional provenance from an external graph may be malformed.
+            continue
+        if matches:
+            verified[unit_id] = text
+    return verified
 
 
 def derive_unit_labels(generative_graph, node_sort_key=None):
@@ -158,8 +332,9 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     insertion order — parse order on parsed graphs, emission order on
     generated ones — which is reproducible while node ids (UUIDs) are not.
 
-    Returns a :class:`UnitLabels` with ``unit_id`` (node -> e.g. ``"R0"``) and
-    ``bond_id`` (connection node -> int).
+    Returns a :class:`UnitLabels` with ``unit_id`` (node -> e.g. ``"R0"``),
+    ``bond_id`` (connection node -> int) and ``unit_nodes`` (unit id -> the
+    unit's nodes as a tuple in derivation order, the partition behind both).
     """
     if node_sort_key is None:
         _node_order = {node: index for index, node in enumerate(generative_graph.nodes())}
@@ -184,11 +359,7 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     # Propagation bonds the generation can form, as unordered connection-atom
     # pairs (mirrored directions collapse; without initiators nothing prunes).
     used_edges = GraphCreator._used_nonstatic_edges(generative_graph, node_to_unit)
-    propagation_bonds = {
-        frozenset((u, v))
-        for u, v, k, d in generative_graph.edges(keys=True, data=True)
-        if d.get(_PROPAGATION_NAME, 0) > 0 and (used_edges is None or (u, v, k) in used_edges)
-    }
+    propagation_bonds = {frozenset((u, v)) for u, v, k, d in generative_graph.edges(keys=True, data=True) if d.get(_PROPAGATION_NAME, 0) > 0 and (used_edges is None or (u, v, k) in used_edges)}
 
     # Walk states per connection atom: "bonded" = arrived through a bond,
     # "crossed" = arrived through the unit interior. A propagation path back
@@ -225,9 +396,7 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     unit_role = []
     for unit_index, unit_nodes in enumerate(units):
         is_initiator = any(generative_graph.nodes[n]["init_weight"] > 0 for n in unit_nodes)
-        has_outgoing_non_static = any(
-            not is_static_edge(d) for n in unit_nodes for _u, _v, d in generative_graph.out_edges(n, data=True)
-        )
+        has_outgoing_non_static = any(not is_static_edge(d) for n in unit_nodes for _u, _v, d in generative_graph.out_edges(n, data=True))
         if is_initiator:
             unit_role.append("I")
         elif not has_outgoing_non_static:
@@ -273,7 +442,9 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
             unit_id_by_index[unit_index] = f"{prefix}{counter}"
 
     unit_id = {}
+    nodes_by_unit = {}
     for unit_index, unit_nodes in enumerate(units):
+        nodes_by_unit[unit_id_by_index[unit_index]] = tuple(unit_nodes)
         for n in unit_nodes:
             unit_id[n] = unit_id_by_index[unit_index]
 
@@ -286,7 +457,7 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
                 bond_id[n] = counter
                 counter += 1
 
-    return UnitLabels(unit_id=unit_id, bond_id=bond_id)
+    return UnitLabels(unit_id=unit_id, bond_id=bond_id, unit_nodes=nodes_by_unit)
 
 
 @dataclass
@@ -448,11 +619,43 @@ def generative_graph_json_data(generative_graph):
     Load the graph back with
     ``networkx.node_link_graph(data["graph"], edges="edges")``; strip the
     ``derived_node_fields`` before ML training.
+
+    ``is_connector_placeholder`` is a structural node attribute and must be
+    retained: True identifies an internal split-atom placeholder, while False
+    identifies a user-written atom, including a wildcard. Wildcards can be
+    exported but cause UnsupportedWildcardGeneration when an EnsembleCreator
+    is built. Format version 2 requires explicit identity on every zero-number
+    node; ambiguous older graphs must be rebuilt from their original G2RINS
+    strings or explicitly migrated before export or generation. Graphs without zero-number nodes may
+    omit the attribute. Python and NumPy boolean flags are accepted and exported
+    as JSON booleans without changing the input graph. The returned payload is
+    detached, including nested node, edge, and graph-level attributes. NumPy
+    scalars with JSON equivalents and arrays are normalized throughout those
+    attributes. Unsupported values such as complex numbers raise TypeError with
+    their location. Non-finite floats and keys that collide when JSON encodes
+    them raise ValueError. Negative descriptor IDs remain supported for raw
+    graph export; their unavailable NaN charges become null. Atom-number type
+    validation remains the ensemble creator's responsibility. To migrate
+    a source-less legacy dataset with known placeholder semantics, explicitly use
+    :func:`mark_legacy_connector_placeholders`.
+
+    Inactive split-atom placeholders are retained, even when their descriptor
+    has no compatible partner. They have no bond_id and are omitted from unit
+    pSMILES. The graph and DOT view preserve these encoded connector sites;
+    a partnerless descriptor on an unsplit atom needs no extra node. The export
+    represents the generative graph, not a contracted molecular structure.
     """
-    labels = derive_unit_labels(generative_graph)
+    # node_link_data builds fresh top-level node dictionaries. Only those are
+    # edited here; _json_safe detaches every nested container before returning.
     data = nx.node_link_data(generative_graph, edges="edges")
+    _normalize_connector_placeholder_flags((node["id"], node) for node in data["nodes"])
+    labels = derive_unit_labels(generative_graph)
     for node_dict in data["nodes"]:
         node = node_dict["id"]
+        charge = node_dict.get("charge")
+        atomic_num = node_dict["atomic_num"]
+        if isinstance(atomic_num, (int, np.integer)) and atomic_num < 0 and isinstance(charge, (float, np.floating)) and np.isnan(charge):
+            node_dict["charge"] = None
         node_dict["unit_id"] = labels.unit_id[node]
         if node in labels.bond_id:
             node_dict["bond_id"] = labels.bond_id[node]
@@ -467,7 +670,7 @@ def generative_graph_json_data(generative_graph):
                 " subgraph nodes carry unit_id only. Strip derived_node_fields before ML training."
             ),
         },
-        "graph": data,
+        "graph": _json_safe(data),
     }
 
 
@@ -550,6 +753,26 @@ class _PartialGraph:
         return self.g.nodes[idx]
 
 
+def _check_positional_pairing(left_graph, right_half_bonds, right_graph, left_half_bonds, left_token, right_token):
+    """Lists of bond connectors pair by position with the list they meet.
+
+    Members of a bond connector list or of a terminal bond connector list carry
+    a matching index and bond only to the entry with the same index on the
+    other side. When either side of a junction is such a list, both sides must
+    offer the same number of half bonds; otherwise the unmatched entries would
+    never bond and the string would generate silently wrong chains. A side
+    without half bonds (a weight token, an empty right terminal) has nothing
+    to pair; an empty left terminal offers its initiators' half bonds.
+    """
+    if not right_half_bonds or not left_half_bonds:
+        return
+    indexed = any("matching_index" in left_graph.nodes[half_bond.node_id] for half_bond in right_half_bonds) or any(
+        "matching_index" in right_graph.nodes[half_bond.node_id] for half_bond in left_half_bonds
+    )
+    if indexed and len(right_half_bonds) != len(left_half_bonds):
+        raise MismatchedBondConnectorLists(left_token, right_token, len(right_half_bonds), len(left_half_bonds))
+
+
 def _docstring_format(*args, **kwargs):
     def dec(obj):
         obj.__doc__ = obj.__doc__.format(*args, **kwargs)
@@ -559,6 +782,13 @@ def _docstring_format(*args, **kwargs):
 
 
 class GraphCreator:
+    """Build graphs from parsed structures, rejecting ambiguous bond sites.
+
+    Raw graphs with explicit descriptors remain available for parsing and
+    inspection. Removing descriptors for generation or JSON export rejects
+    descriptors between unit atoms with UnsupportedBondDescriptor.
+    """
+
     def __init__(self, final_partial_graph: _PartialGraph, text: str = ""):
         self._partial_graph = final_partial_graph
         self._graph_without_bond_connectors = None
@@ -571,6 +801,17 @@ class GraphCreator:
         self._build_molar_amount_dict()
         self._bc_idx_set = self._create_bc_idx_set(self.g)
         self._split_atoms_with_multiple_bond_connectors()
+
+    def _validate_bond_descriptor_anchors(self):
+        from .atom import Atom
+
+        graph = self._g
+        for node, data in graph.nodes(data=True):
+            if node not in self._bc_idx_set:
+                continue
+            neighbors = {v for _, v, edge_data in graph.out_edges(node, data=True) if is_static_edge(edge_data) and isinstance(graph.nodes[v]["obj"], Atom)}
+            if len(neighbors) > 1:
+                raise UnsupportedBondDescriptor(data["obj"], data.get("token_text", self.text), len(neighbors))
 
     @staticmethod
     def _create_bc_idx_set(graph):
@@ -642,7 +883,7 @@ class GraphCreator:
 
                 new_node_idx = str(uuid.uuid4())
 
-                self._g.add_node(new_node_idx)
+                self._g.add_node(new_node_idx, **{_CONNECTOR_PLACEHOLDER_NAME: True})
                 self._g.nodes[new_node_idx]["smi_text"] = "[*]"
                 obj = self._create_bracket_atom("[*]")
                 self._g.nodes[new_node_idx]["obj"] = obj
@@ -723,6 +964,8 @@ class GraphCreator:
         return self._g.copy()
 
     def get_graph_without_bond_connectors(self):
+        self._validate_bond_descriptor_anchors()
+
         def conditional_traversal(graph, source, stop_condition):
             """
             Perform a graph traversal starting from the source node.
@@ -872,7 +1115,7 @@ class GraphCreator:
                     if max_rank == 0 and last_rank < 0:
                         first_descendant_so_id = None
                         parent_bc_present = False
-                        for bc_node in self.node_path[1:len(self.node_path)-1]:
+                        for bc_node in self.node_path[1 : len(self.node_path) - 1]:
                             if "stochastic_obj" not in graph.nodes[bc_node]:
                                 continue
                             bc_so_id = self._stochastic_id_map[id(graph.nodes[bc_node]["stochastic_obj"])]
@@ -926,7 +1169,7 @@ class GraphCreator:
 
             @property
             def only_bond_connectors(self):
-                return len(self.node_path) > 2 and set(self.node_path[1:len(self.node_path)-1]).issubset(bc_idx_set)
+                return len(self.node_path) > 2 and set(self.node_path[1 : len(self.node_path) - 1]).issubset(bc_idx_set)
 
             def contains_bc(self, bc_idx):
                 return bc_idx in self.node_path
@@ -959,7 +1202,7 @@ class GraphCreator:
                     except KeyError:
                         stochastic_id = -1
 
-                    if len(stochastic_id_list) == 0 or stochastic_id_list[len(stochastic_id_list)-1] != stochastic_id:
+                    if len(stochastic_id_list) == 0 or stochastic_id_list[len(stochastic_id_list) - 1] != stochastic_id:
                         stochastic_id_list += [stochastic_id]
 
                 return stochastic_id_list
@@ -996,35 +1239,6 @@ class GraphCreator:
 
         edges_to_add = []
 
-        def connector_paths(source, target):
-            """Yield simple connector-only paths that can still be valid."""
-            allowed_nodes = bc_idx_set | {source, target}
-
-            def visit(node, path, visited, previous_was_non_static):
-                if node == target:
-                    yield tuple(path)
-                    return
-                for u, v, key, data in graph.out_edges(
-                    node,
-                    keys=True,
-                    data=True,
-                ):
-                    if v not in allowed_nodes or v in visited:
-                        continue
-                    is_non_static = any(
-                        data.get(attribute, 0) > 0
-                        for attribute in _NON_STATIC_ATTR
-                    )
-                    if previous_was_non_static and is_non_static:
-                        continue
-                    visited.add(v)
-                    path.append((u, v, key))
-                    yield from visit(v, path, visited, is_non_static)
-                    path.pop()
-                    visited.remove(v)
-
-            yield from visit(source, [], {source}, False)
-
         # Iterating SETS of (uuid string) node ids is PYTHONHASHSEED-dependent;
         # the loops below build weighted edges in iteration order, which must be
         # parse-stable so the generated graph is reproducible across processes.
@@ -1042,13 +1256,8 @@ class GraphCreator:
                     traversal_condition = GraphDecider(bc_idx_set, in_idx)
                     non_bond_connector_successor = conditional_traversal(graph, in_idx, traversal_condition)
                     for target in sorted(non_bond_connector_successor, key=_graph_node_order.__getitem__):
-                        # BondConnectorPath.valid rejects every path containing
-                        # an internal atom. Enumerating those paths in the full
-                        # molecular graph is therefore wasted work and can be
-                        # exponential for branched, ring-containing repeat
-                        # units. The bounded traversal also stops as soon as
-                        # consecutive stochastic edges make a route invalid.
-                        for path in connector_paths(in_idx, target):
+                        all_paths = list(nx.all_simple_edge_paths(graph, in_idx, target))
+                        for path in all_paths:
                             bond_connector_path = BondConnectorPath(path, graph)
                             if bond_connector_path.valid(bc_idx):
                                 data = bond_connector_path.combined_attr
@@ -1104,8 +1313,6 @@ class GraphCreator:
         stochastic_id_name=_EDGE_STOCHASTIC_ID_NAME,
         aromatic_name=_AROMATIC_NAME,
         bond_type_name=_BOND_TYPE_NAME,
-        atom_chiral_name=_ATOM_CHIRAL_TOKEN_NAME,
-        bond_symbol_raw_name=_BOND_SYMBOL_RAW_NAME,
         smi_bond_mapping=smi_bond_mapping,
     )
     def get_generative_graph(self, include_bond_connectors=False, return_extra_graph_info=False):
@@ -1115,6 +1322,7 @@ class GraphCreator:
         Nodes (Atoms) have the following properties:
 
         - **atomic_num**: int Atomic number, can be converted to Chemical Symbol Name or one-hot encoding.
+        - **is_connector_placeholder**: bool True only for internal split-atom connector placeholders. User-written atoms, including wildcards, carry False.
         - **{aromatic_name}**: bool Indicating the aromaticity of the atom.
         - **charge**: float Nominal charge (not partial charge in Force-Fields) in elementary unit *e*.
         - **molecular_weight_distribution**: array[float] representing the molecular weight distribution of each stochastic object in the graph. The index of each vector is the stochastic id.
@@ -1125,7 +1333,6 @@ class GraphCreator:
         - **gen_weight** float Weight to select this atom for the next generation step.
         - **gen_hierarchy**: int Hierarchy for the selection of the atom for the next generation step. Default is 0. Atoms with a higher hierarchy number will be chosen first.
         - **stochastic_id_tree**: vector[int] Identification of the stochastic objects to which the node belongs. The vector is ordered from nearest to farthest ancestor (e.g., first element is node stochastic id, second element is parent, third is grandparent, etc.).  All elements are -1 if not a stochastic object, element is -2 if ancestor is absent.
-        - **{atom_chiral_name}**: string Optional chirality token written on a bracket atom (for example ``@`` or ``@@``).
 
         Edges (Bonds) have the following properties:
 
@@ -1136,29 +1343,37 @@ class GraphCreator:
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
-        - **{bond_symbol_raw_name}**: string Optional original written bond token (for example ``/`` or ``\\``).
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
         the G2RINS text of the token each unit originates from as the
-        graph-level attribute **unit_g2rins**. Graph-level attributes are
-        parser provenance: only a parsed graph carries them, and no consumer
-        may require them.
+        graph-level attribute **unit_g2rins**. The graph-level **unit_node_ids**
+        mapping saves each unit's node IDs as a list at parse time. Consumers
+        use it to verify unit membership before quoting source text: removed
+        nodes or reassigned labels make that text unavailable. Older graphs
+        without this mapping retain unit text only if every saved unit ID is
+        still derived. A present but empty or malformed map verifies no text.
+        These attributes
+        are optional parser provenance, never required for generation.
 
         Unit and bond labels (``unit_id``, ``bond_id``) are NOT stored on
         nodes; they are derived annotations — compute them on demand with
         :func:`derive_unit_labels`. The node and edge properties listed above
         are the full graph contract: a generative model emitting
-        **atomic_num**, **{aromatic_name}**, **charge**, **num_explicit_h**,
+        **atomic_num**, **is_connector_placeholder**, **{aromatic_name}**, **charge**, **num_explicit_h**,
         **init_weight**, the **{static_name}** edge flag and the three
         non-static weights produces a graph that every consumer, including the
-        label derivation, can handle.
+        label derivation, can handle. Generation requires an explicit boolean
+        **is_connector_placeholder** on zero-number nodes: True identifies an
+        internal placeholder; False identifies a user wildcard, which can be
+        parsed and exported but cannot be used for ensemble generation. Older
+        graphs without zero-number nodes may omit this attribute.
         """
 
         from .distribution import StochasticDistribution
 
-        extra_graph_info = {0: "None"}
-        extra_graph_info_reverse = {"None": 0}
+        extra_graph_info = {}
+        extra_graph_info_reverse = {}
 
         if include_bond_connectors:
             graph = self.g.copy()
@@ -1169,8 +1384,7 @@ class GraphCreator:
         generative_graph.graph["g2rins_string"] = self.text
 
         graph_with_bond_connectors = self.g.copy()
-        empty_vector = StochasticDistribution.get_empty_serial_vector()
-        MW_distribution_array = [empty_vector.copy() for _ in range(_STOCHASTIC_TREE_DEPTH)]
+        MW_distribution_array = [StochasticDistribution.get_empty_serial_vector()] * 10
 
         for node, data in graph_with_bond_connectors.nodes(data=True):
             try:
@@ -1186,9 +1400,8 @@ class GraphCreator:
                 aromatic = obj.aromatic
             except AttributeError:
                 aromatic = False
+            # atom_name_num carries the lowercase aromatic aliases (c, n, se, ...).
             atomic_symbol = str(obj.symbol)
-            if aromatic:
-                atomic_symbol = atomic_symbol.upper()
             try:
                 atomic_num = int(atom_name_num[atomic_symbol])
             except KeyError:
@@ -1196,7 +1409,7 @@ class GraphCreator:
                 if string in extra_graph_info_reverse:
                     atomic_num = extra_graph_info_reverse[string]
                 else:
-                    idx = min(extra_graph_info.keys()) - 1
+                    idx = min(extra_graph_info, default=0) - 1
                     atomic_num = idx
                     extra_graph_info[idx] = string
                     extra_graph_info_reverse[string] = idx
@@ -1227,7 +1440,6 @@ class GraphCreator:
             # written count on non-aromatic atoms produced radicals when
             # under-coordinated and over-valence crashes when over-coordinated.
             num_explicit_h = -1
-            atom_chiral_token = None
             if aromatic:
                 try:
                     h_count = obj.h_count
@@ -1235,12 +1447,6 @@ class GraphCreator:
                         num_explicit_h = h_count.num
                 except AttributeError:
                     num_explicit_h = -1
-            try:
-                chiral = obj.chiral
-                if chiral is not None:
-                    atom_chiral_token = str(chiral)
-            except AttributeError:
-                atom_chiral_token = None
 
             if "stochastic_obj" not in data or data["stochastic_obj"].stochastic_generation is None:
                 stochastic_id = -1
@@ -1277,24 +1483,24 @@ class GraphCreator:
                         current_stochastic_obj = current_stochastic_obj.stochastic_parent
                         depth_idx += 1
 
-            node_attributes = {
-                "atomic_num": atomic_num,
-                _AROMATIC_NAME: aromatic,
-                "charge": charge,
-                "num_explicit_h": int(num_explicit_h),
-                "molecular_weight_distribution": MW_distribution_array,
-                "mol_molecular_weight": mol_molecular_weight,
-                "total_molecular_weight": total_molecular_weight,
-                "unit_molar_amounts": molar_amount,
-                "init_weight": float(init_weight),
-                "gen_weight": float(gen_weight),
-                "gen_hierarchy": 0,
-                "stochastic_id_tree": stochastic_id_tree,
-            }
-            if atom_chiral_token is not None:
-                node_attributes[_ATOM_CHIRAL_TOKEN_NAME] = atom_chiral_token
-
-            generative_graph.add_node(node, **node_attributes)
+            generative_graph.add_node(
+                node,
+                **{
+                    "atomic_num": atomic_num,
+                    _CONNECTOR_PLACEHOLDER_NAME: data.get(_CONNECTOR_PLACEHOLDER_NAME, False),
+                    _AROMATIC_NAME: aromatic,
+                    "charge": charge,
+                    "num_explicit_h": int(num_explicit_h),
+                    "molecular_weight_distribution": MW_distribution_array,
+                    "mol_molecular_weight": mol_molecular_weight,
+                    "total_molecular_weight": total_molecular_weight,
+                    "unit_molar_amounts": molar_amount,
+                    "init_weight": float(init_weight),
+                    "gen_weight": float(gen_weight),
+                    "gen_hierarchy": 0,
+                    "stochastic_id_tree": stochastic_id_tree,
+                },
+            )
 
         for u, v, _k, d in graph.edges(keys=True, data=True):
 
@@ -1305,17 +1511,12 @@ class GraphCreator:
             d.setdefault(_EDGE_STOCHASTIC_ID_NAME, -2)  # -2 = unassigned; real ids start at 0, -1 is the global level
 
             if _BOND_TYPE_NAME in d:
-                bond_symbol_raw = str(d[_BOND_TYPE_NAME])
-                if bond_symbol_raw in ("/", "\\"):
-                    d[_BOND_SYMBOL_RAW_NAME] = bond_symbol_raw
-                d[_BOND_TYPE_NAME] = smi_bond_mapping.get(bond_symbol_raw, 1)
+                d[_BOND_TYPE_NAME] = smi_bond_mapping.get(str(d[_BOND_TYPE_NAME]), 1)
             else:
                 d[_BOND_TYPE_NAME] = 1
             d.setdefault(_AROMATIC_NAME, False)
 
             generative_graph.add_edge(u, v, **d)
-
-        _mark_defined_double_bond_stereochemistry(generative_graph)
 
         if not include_bond_connectors:
             for node in generative_graph.nodes():
@@ -1445,15 +1646,16 @@ class GraphCreator:
         # token_text is parser provenance: it is read from the generative graph
         # and never copied onto generative_graph nodes (unit/bond labels are likewise
         # not stored -- consumers derive them with derive_unit_labels).
-        unit_id_map = derive_unit_labels(generative_graph).unit_id
+        labels = derive_unit_labels(generative_graph)
         unit_g2rins = {}
-        for n, unit_id in unit_id_map.items():
+        for n, unit_id in labels.unit_id.items():
             if unit_id not in unit_g2rins and "token_text" in graph.nodes[n]:
                 unit_g2rins[unit_id] = graph.nodes[n]["token_text"]
         generative_graph.graph["unit_g2rins"] = unit_g2rins
+        generative_graph.graph["unit_node_ids"] = {unit_id: list(nodes) for unit_id, nodes in labels.unit_nodes.items()}
 
         if not include_bond_connectors:
-            _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, termination_resolutions)
+            _warn_termination_levels(generative_graph, labels.unit_id, unit_g2rins, termination_resolutions)
 
         if return_extra_graph_info:
             return generative_graph, extra_graph_info
@@ -1468,8 +1670,9 @@ class GraphCreator:
         Load the graph back with
         ``networkx.node_link_graph(json.load(fp)["graph"], edges="edges")``.
         """
+        data = generative_graph_json_data(self.get_generative_graph())
         with open(filename, "w") as file_handle:
-            json.dump(generative_graph_json_data(self.get_generative_graph()), file_handle, indent=2)
+            json.dump(data, file_handle, indent=2)
 
     _DEFAULT_EDGE_COLOR = {
         _STATIC_NAME: "#000000",
@@ -1548,6 +1751,11 @@ class GraphCreator:
     def get_dot_string(self, include_bond_connectors=False, edge_colors=None, bond_to_arrow=None, node_prefix="", max_digits_count: int = -1, color_by="atom", hide_unused_nonstatic_bonds=True):
         """
         Render the generative graph as a Graphviz DOT string.
+
+        With ``include_bond_connectors=False`` (default) descriptors are removed
+        first, so a descriptor embedded between two unit atoms raises
+        UnsupportedBondDescriptor here as it does for generation and JSON export;
+        pass ``include_bond_connectors=True`` to draw the raw parsed graph.
 
         Parameters
         ----------
@@ -1664,7 +1872,13 @@ class GraphCreator:
         return dot_str
 
     def get_ensemble_creator(self):
+        """Build an ensemble creator from the graph without bond connectors.
+
+        Raises:
+            UnsupportedWildcardGeneration: The input contains a user-written
+                wildcard atom. Parsing and graph export remain supported;
+                generation requires explicit atoms and end groups.
+        """
         from .ensemble_creator import EnsembleCreator
 
         return EnsembleCreator(self.get_generative_graph(include_bond_connectors=False))
-
