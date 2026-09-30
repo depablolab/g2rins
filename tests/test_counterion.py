@@ -33,11 +33,7 @@ def _association_pairs(generative_graph):
 def _association_degrees(generative_graph, atomic_num):
     """Sorted association-edge counts of every atom of the given element."""
     pairs = _association_pairs(generative_graph)
-    return sorted(
-        sum(1 for pair in pairs if node in pair)
-        for node, data in generative_graph.nodes(data=True)
-        if data["atomic_num"] == atomic_num
-    )
+    return sorted(sum(1 for pair in pairs if node in pair) for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == atomic_num)
 
 
 MONOVALENT = "{[] [<]CC(C[NH3+])[>].[Cl-]; C[>]; [<][H] []}|poisson(500.0)|"
@@ -188,5 +184,8 @@ def test_ionic_unit_through_derived_label_pipeline():
         assert labels.unit_id[node] == "R0"
         assert node not in labels.bond_id
 
-    endpoints = {endpoint for record in data.bonds for endpoint in record["between"]}
+    endpoints = {endpoint for record in data.bonds for endpoint in record["labels"]}
     assert endpoints == {"I0.1", "R0.1", "R0.2", "T0.1"}
+    # The counterion rides inside its unit's static subgraph, association
+    # edge included.
+    assert any(data["atomic_num"] == 17 for _node, data in repeat_unit["subgraph"].nodes(data=True))

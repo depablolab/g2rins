@@ -1,0 +1,117 @@
+{
+  "CCO{[<] [<]C(N)C[>|2|];; [>]}|uniform(500, 600)|{[<] [<|0 1|]C(=O)C[>];; [>]}|uniform(500, 600)|CCN.|2000|": {
+    "id": "linear-blocks"
+  },
+  "CC(O{[<] [<]C(N)C[>|2|];;[>]}|uniform(500, 600)|{[<][<|0 1|]C(=O)C[>];; [>]}|uniform(500, 600)|C)CN.|2000|": {
+    "id": "branched-blocks"
+  },
+  "CC(O{[<][<]C(N)C[>];; [>]}|uniform(500, 600)|{[<][<]C(=O)C[>];; [>]}|uniform(400,600)|C)CN": {
+    "id": "branched-blocks-unweighted"
+  },
+  "{[] [$][C-][$]; [$][H];[$][H] []}|gauss(2000., 20.)|": {
+    "id": "split-carbanion-decimals"
+  },
+  "{[][$][C-][$]; [$][H]; [$][H] []}|gauss(2000,20)|": {
+    "id": "split-carbanion-compact"
+  },
+  "{[] [$][C-][$]; [$][H];[$][H] []}|gauss(2000.0,20)|": {
+    "id": "split-carbanion-spacing"
+  },
+  "CCOC(=O)C(C)(C){[>] [<]CC([>])c1ccccc1, [<]CC([>])C(=O)OC;; [<]}|schulz_zimm(1500, 1400)|[Br].|5e5|": {
+    "id": "random-copolymer"
+  },
+  "CCOC(=O)C(C)(C){[>][<|8|]CC([>|8|])c1ccccc1, [<|2|]CC([>|2|])C(=O)OC; ;[<]}|schulz_zimm(1500, 1400)|[Br].|5e5|": {
+    "id": "weighted-copolymer"
+  },
+  "CCOC(=O)C(C)(C){[>][<|0 7 0 3|]CC([>|7 0 3 0|])c1ccccc1, [<|0 3 0 7|]CC([>|3 0 7 0|])C(=O)OC;; [<]}|schulz_zimm(1500, 1400)|[Br].|5e5|": {
+    "id": "transition-matrix"
+  },
+  "CCOC(=O)C(C)(C){[>][<|0 7 0 3|]CC([>|7 0 3 0|])c1ccccc1, [<|0 8 0 2|]CC([>|8 0 2 0|])C(=O)OC; ; [<]}|schulz_zimm(2500, 2400)|[Br].|5e5|": {
+    "id": "asymmetric-matrix"
+  },
+  "CCOC(=O)C(C)(C){[>][<|0 0 0 1|]CC([>|0 0 1 0|])c1ccccc1, [<|0 1 0 0|]CC([>|1 0 0 0|])C(=O)OC ;;[<]}|schulz_zimm(1000, 900)|[Br]": {
+    "id": "alternating-copolymer"
+  },
+  "CCOC(=O)C(C)(C){[>][<]CC([>])c1ccccc1;; [<]}|schulz_zimm(1000,900)|{[>][<]CC([>])C(=O)OC;;[<]}|schulz_zimm(1000, 900)|[Br]": {
+    "id": "diblock"
+  },
+  "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; CC(C)[>1|2|], CC(C)[>2]; [<1|2|][Br], [<2][Br][]}|schulz_zimm(700, 600)|": {
+    "id": "indexed-copolymer"
+  },
+  "CC(C){[>][<]CC([>])c1ccccc1;;[<]}|schulz_zimm(700, 600)|[Br].|5000|CC(C){[>][<]CC([>])C(=O)OC;;[<]}|schulz_zimm(700, 600)|[Br].|1500|": {
+    "id": "polymer-mixture"
+  },
+  "C{[>][<]CC(C)[>];;[<]}|poisson(900)|[H]": {
+    "id": "polypropylene"
+  },
+  "C{[>][<]C[C@H](C)[>];;[<]}|poisson(900)|[H]": {
+    "id": "isotactic-polypropylene"
+  },
+  "C{[>][<|0 0 0 1|]C[C@H](C)[>|0 0 1 0|], [<|0 1 0 0|]C[C@@H](C)[>|1 0 0 0|];; [<]}|poisson(900)|[H]": {
+    "id": "syndiotactic-polypropylene"
+  },
+  "C{[>][<|3|]C[C@H](C)[>|3|], [<]C[C@@H](C)[>];; [<]}|poisson(900)|[H]": {
+    "id": "weighted-tacticity"
+  },
+  "N#CC(C)(C){[$][$]CC(C(=O)OC)[$];;[$]}|poisson(1000)|{[$][$]CC(C(=O)OC)[$];;[$]}|poisson(1000)|C(C)(C)C#N": {
+    "id": "symmetric-diblock"
+  },
+  "N#CC(C)(C){[$][$]CC(C(=O)OC)[$];;[$]}|poisson(1000)|[H]": {
+    "id": "hydrogen-capped-chain"
+  },
+  "{[][<]C(=O)CCCCC(=O)[<],[>]NCCCCCCN[>]; [<][H]; [>]O []}|flory_schulz(4e-3)|": {
+    "id": "nylon"
+  },
+  "O{[>][<]C(=O)CCCCC(=O)[<],[>]NCCCCCCN[>]; [<][H]; [>]NCCCCCCN[H] []}|flory_schulz(1e-3)|": {
+    "id": "nylon-explicit-initiator"
+  },
+  "N#CC(C)(C){[$] O([<|3|])(C([$])C[$]), [>]CCO[<|0 0 0 1 0 |] ;; [>][H] [$]}|poisson(900)|Br": {
+    "id": "branched-ether"
+  },
+  "[H]{[$] [$]C(C[<])(C[<])(C[<]), [>]CC[<];; [>][H] []}|gauss(600, 150)|": {
+    "id": "three-arm"
+  },
+  "[H]{[$][$]C(C[<])(C[<])(C[<2]), [>]CC[<], [>2]OCO[<2];;[>][H], [>2]O []}|gauss(600, 150)|": {
+    "id": "indexed-three-arm"
+  },
+  "[H]{[$] [$]C(C[<])(C[<])(C[<2|2|]), [>]CC[<], [>2|2|]OCO[<2|2|];; [>][H], [>2]O []}|gauss(800, 200)|": {
+    "id": "weighted-three-arm"
+  },
+  "C{[$] [$]C(CC[<])C[$2|0.001|], [>]CC[<];; [>][H] [$2]}|uniform(100,101)|": {
+    "id": "rare-transition"
+  },
+  "C{[$][$]CC(CC[$])(CC[$]),[$]CC[$]; ;[$][H][$]}|flory_schulz(1e-3)|[H]": {
+    "id": "branched-flory"
+  },
+  "C{[$][$|.1|]CC(CC[$|.1|])(CC[$|.1|]),[$]CC[$];; [$][H][$]}|flory_schulz(5e-3)|[H]": {
+    "id": "weighted-branched-flory"
+  },
+  "{[][<]CC([>])c1ccccc1; CCOC(=O)C(C)(C)[>], CC(CN)[>]; [<]}|schulz_zimm(1000, 900)|[Br].|5e5|": {
+    "id": "mixed-initiators"
+  },
+  "{[][<]CC([>])c1ccccc1; CCOC(=O)C(C)(C)[>|10|], CC(CN)[>]; [<]}|schulz_zimm(1000, 900)|[Br].|5e5|": {
+    "id": "weighted-initiators"
+  },
+  "CCOC(=O)C(C)(C){[>][<]CC([>])c1ccccc1;; [<]}|schulz_zimm(1000, 900)|[Br].|5e5|CC(CN){[>][<]CC([>])c1ccccc1;;[<]}|schulz_zimm(1200, 1100)|[Br].|15e5|": {
+    "id": "initiator-mixture"
+  },
+  "{[>][<]OCC(C)(C(=O)OCCOC)COC(=O)[>];;[<]}|uniform(200,300)|OCCCCCCOc(cc1)ccc1C(=O)Oc(cc1(C))ccc1OC(=O)c(cc1)ccc1OCCCCCCO{[>][<]C(=O)OCC(C)(C(=O)OCCOC)CO[>];;[<]}|schulz_zimm(2000, 1000)|": {
+    "id": "no-automatic-source",
+    "expected_error": "NoValidGenerationSource"
+  },
+  "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|[H])C({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])C[>]; [<][H]; [>][H] []}|poisson(400)|": {
+    "id": "nested-grafts"
+  },
+  "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; [H][>0]; [<0]Br [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|gauss(8000.0, 1000.0)|": {
+    "id": "nested-star"
+  },
+  "{[] [<]CC(C[NH3+])[>].[Cl-]; C[>]; [<][H] []}|poisson(500.0)|": {
+    "id": "ammonium-counterion"
+  },
+  "{[] [<]CC([>])(C(=O)[O-])C(=O)[O-].[Na+].[Na+]; C[>]; [<][H] []}|poisson(500.0)|": {
+    "id": "dianion-counterions"
+  },
+  "{[] [<]CC(c1cc[n+](C)cc1)[>].c1cc[cH-]c1; C[>]; [<][H] []}|poisson(600.0)|": {
+    "id": "aromatic-counterion"
+  }
+}
