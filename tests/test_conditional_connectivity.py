@@ -476,7 +476,9 @@ def test_terminal_descriptor_edges_carry_unit_side_annotation():
         g2rins.EnsembleCreator(generative_graph)
 
 
-MULTILEVEL_EXCLUSION_TEXT = "{[] [<,<2]C(=O)CC[>2]; {[] [<1]CC[>1]; {[] [<1]CCN([>1,>[]])([>1,>[]]), [<1]CCO[>1]; O[>1]; [<]|[<1]}|poisson(1000)|[>]|[>1]; [<]}|poisson(3000)|[>]; [<1][H] []}|poisson(5000)|"
+MULTILEVEL_EXCLUSION_TEXT = (
+    "{[] [<,<2]C(=O)CC[>2]; {[] [<1]CC[>1]; {[] [<1]CCN([>1,>[]])([>1,>[]]), [<1]CCO[>1]; O[>1]; [<]|[<1]}|poisson(1000)|[>]|[>1]; [<]}|poisson(3000)|[>]; [<1][H] []}|poisson(5000)|"
+)
 
 
 def test_group_rule_survives_bond_connector_path_across_levels():

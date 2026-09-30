@@ -2230,7 +2230,9 @@ class EnsembleCreator:
                     group_rules.add(GroupRule(edge_data[key]).name)
         if group_rules:
             # Temporary gate: sampling cannot honor group rules yet.
-            raise NotImplementedError(f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for group rules lands in a later implementation phase.")
+            raise NotImplementedError(
+                f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for group rules lands in a later implementation phase."
+            )
 
         self._static_graph = self._create_static_graph(self.generative_graph)
         # A placeholder is one half of a split atom. Its sole static neighbor

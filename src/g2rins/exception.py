@@ -623,7 +623,9 @@ class MixedRulesInGroup(ParsingError):
         self.stochastic_obj = stochastic_obj
 
     def __str__(self):
-        return f"All members of group {self.group_id} in the unit {str(self.owner)} of the stochastic object {str(self.stochastic_obj)} must declare the same group rule, but the group mixes rules."
+        return (
+            f"All members of group {self.group_id} in the unit {str(self.owner)} of the stochastic object {str(self.stochastic_obj)} must declare the same group rule, but the group mixes rules."
+        )
 
 
 class MixedOuterSymbolsInGroup(ParsingError):
