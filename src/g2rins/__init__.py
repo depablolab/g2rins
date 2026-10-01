@@ -54,6 +54,7 @@ from .ensemble_creator import EnsembleCreator
 from .g2rins_molecule import DotGeneration, DotSystemSize, G2rins, G2rinsMolecule
 from .generative_graph import (
     GraphCreator,
+    TransitionRole,
     UnitLabels,
     derive_unit_labels,
     generative_graph_json_data,
@@ -136,6 +137,7 @@ __all__ = [
     "mol_graph_to_rdkit_mol",
     "mol_graph_to_smiles",
     "rdkit_mol_to_smiles",
+    "TransitionRole",
     "UnitLabels",
     "derive_unit_labels",
     "generative_graph_json_data",
