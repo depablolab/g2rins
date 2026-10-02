@@ -53,7 +53,9 @@ from .generative_graph import (
     _EDGE_STOCHASTIC_ID_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
+    _SOURCE_GROUP_NAME,
     _SOURCE_RULE_NAME,
+    _TARGET_GROUP_NAME,
     _TARGET_RULE_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
@@ -243,9 +245,11 @@ def _detach_tracebacks(error):
 
 
 class _HalfAtomBond:
-    def __init__(self, atom_idx: int, node_idx: str, graph, stochastic_tracker, rng):
+    def __init__(self, atom_idx: int, node_idx: str, graph, stochastic_tracker, rng, instance: int):
         self.atom_idx: int = atom_idx
         self.node_idx: str = node_idx
+        # Unit instance this site belongs to; group rules act on siblings sharing the tag.
+        self.instance: int = instance
         self.weight: float = graph.nodes[node_idx]["gen_weight"]
         self.molar_amounts: float = graph.nodes[node_idx]["unit_molar_amounts"]
         self.gen_hierarchy: int = graph.nodes[node_idx]["gen_hierarchy"]
@@ -332,6 +336,29 @@ class _HalfAtomBond:
         except KeyError:
             return [], [], []
 
+    def exclusion_groups(self):
+        """Group ids of the EXCLUSION channels this site still holds, derived from its live edges."""
+        return {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.EXCLUSION}
+
+    def drop_edges(self, keep):
+        """Drop the edges whose attrs fail ``keep`` from every mode, menus kept aligned; a dropped forced entry is forgotten."""
+        for mode in list(self._mode_attr_map):
+            attr_list = self._mode_attr_map[mode]
+            kept = [i for i, attrs in enumerate(attr_list) if keep(attrs)]
+            if len(kept) == len(attr_list):
+                continue
+            if self._special_target is not None and any(self._special_target[1] is attrs for i, attrs in enumerate(attr_list) if i not in kept):
+                self._special_target = None
+            for mode_map in (self._mode_attr_map, self._mode_target_map, self._mode_target_molar_amounts_map):
+                if kept:
+                    mode_map[mode] = [mode_map[mode][i] for i in kept]
+                else:
+                    del mode_map[mode]
+
+    def block(self):
+        """Full kill: the site keeps no edge in any mode and leaves the open pool (implicit-hydrogen closure)."""
+        self.drop_edges(lambda _attrs: False)
+
     def __str__(self):
         return f"HalfAtomBond({self.atom_idx}, {self.node_idx}, {self.weight}, {self._mode_attr_map}, {self._mode_target_map})"
 
@@ -366,6 +393,8 @@ class _StochasticObjectTracker:
         self._terminated_sto_atom_ids = set()
         self.parent_map = {}
         self._parent_molw = {}
+        # Unit-instance tags for group-rule dispatch; deep-copied with snapshots, so a rollback replays them.
+        self._unit_instances = 0
 
         for _node_idx, data in generative_graph.nodes(data=True):
             for index, _stochastic_vector in enumerate(data["molecular_weight_distribution"]):
@@ -420,6 +449,11 @@ class _StochasticObjectTracker:
         """Draw one index among ``n_candidates`` weighted by ``weights``."""
         probabilities = self.normalized_probabilities(weights, context)
         return rng.choice(n_candidates, p=probabilities)
+
+    def next_unit_instance(self):
+        """Tag of the unit instance being instantiated: monotone, one per add_static_sub_graph call."""
+        self._unit_instances += 1
+        return self._unit_instances
 
     def has_sto_gen_id_unterminated_sto_ids(self, sto_gen_id: int):
         if sto_gen_id not in self._stochastic_gen_id_to_atom_id:
@@ -1056,6 +1090,7 @@ class _PartialAtomGraph:
 
         self.atom_graph = nx.Graph()
         self._open_half_bond_map: dict[int, list[_HalfAtomBond]] = {}
+        self._consumed_half_bond = None  # the target site popped for the incoming bond (read by realize_bond)
         self.add_static_sub_graph(source_node, sto_atom_id, rng)
 
         self.bonds_idx = {}
@@ -1078,7 +1113,47 @@ class _PartialAtomGraph:
             setattr(new_graph, key, copy.deepcopy(value, memo))
         return new_graph
 
+    def realize_bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr):
+        """Apply the group rules the fired edge triggers, then weld ``other`` on with ``merge``.
+
+        Every bond the sampler realizes passes through here (growth, termination,
+        transition, nested entry, forced exit, junction cap, global transition): the
+        exclusion rule reads only the channel of ``fired_edge`` on each side, never the
+        mode that fired it or the level it crosses.
+        """
+        self._consume_sites(source_half_bond, fired_edge, other)
+        self.merge(other, source_half_bond.atom_idx, other_idx, bond_attr)
+
+    def _consume_sites(self, source_half_bond, fired_edge, other):
+        """Exclusion rule for the two sites ``fired_edge`` consumes: one in this molecule, one in the fresh unit.
+
+        Through an exclusion-typed channel the group's other sites of that unit instance
+        are blocked; through any other channel they lose their exclusion-typed channels
+        and keep the plain ones. Membership is read from the sites' live edges, so a
+        killed channel drops its site from the group with no bookkeeping.
+        """
+        sides = (
+            (source_half_bond, fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_SOURCE_RULE_NAME, 0), self._open_half_bond_map),
+            (other._consumed_half_bond, fired_edge.get(_TARGET_GROUP_NAME, -1), fired_edge.get(_TARGET_RULE_NAME, 0), other._open_half_bond_map),
+        )
+        for consumed, group, rule, pool in sides:
+            if consumed is None:
+                continue
+            groups = consumed.exclusion_groups()
+            if not groups:
+                continue
+            for bucket in pool.values():
+                for sibling in bucket:
+                    if sibling is consumed or sibling.instance != consumed.instance:
+                        continue
+                    if rule == GroupRule.EXCLUSION and group in sibling.exclusion_groups():
+                        sibling.block()
+                    else:
+                        sibling.drop_edges(lambda attrs, dead=groups: attrs.get(_SOURCE_GROUP_NAME, -1) not in dead)
+                bucket[:] = [sibling for sibling in bucket if sibling.has_any_bonds()]
+
     def merge(self, other, self_idx, other_idx, bond_attr):
+        # Bonds are realized through realize_bond (group rules first); merge only welds.
         # relabel other idx
         remapping_dict = {idx: idx + self._atom_id for idx in other.atom_graph.nodes}
         other_graph = nx.relabel_nodes(other.atom_graph, remapping_dict, copy=True)
@@ -1215,6 +1290,7 @@ class _PartialAtomGraph:
     def add_static_sub_graph(self, source, sto_atom_id, rng):
         atom_key_to_gen_key = {}
         gen_key_to_atom_key = {}
+        instance = self.stochastic_tracker.next_unit_instance()
 
         def add_node(node_idx):
             data = self.gen_node_attr_to_atom_attr(self.generative_graph.nodes[node_idx])
@@ -1227,6 +1303,7 @@ class _PartialAtomGraph:
                 self.generative_graph,
                 self.stochastic_tracker,
                 rng,
+                instance,
             )
 
             atom_total_bond = self._compute_total_bond(node_idx)
@@ -1319,6 +1396,7 @@ class _PartialAtomGraph:
             return possible_connections[0]
 
         target_half_bond = self._open_half_bond_map[sto_atom_idx].pop(found_target_index)
+        self._consumed_half_bond = target_half_bond
         return target_half_bond.atom_idx
 
     def _pop_random_bond(self, half_bonds, sto_atom_id, sto_gen_id, rng):
@@ -1638,12 +1716,7 @@ class _PartialAtomGraph:
             other_partial_graph = _PartialAtomGraph(terminated_graph.generative_graph, terminated_graph.static_graph, selected_target, self.stochastic_tracker, sto_atom_id, rng)
             other_half_bond_atom_idx = other_partial_graph.pop_target_open_half_bond(sto_atom_id, selected_target)
             pre_merge_watermark = terminated_graph._atom_id
-            terminated_graph.merge(
-                other_partial_graph,
-                termination_bond.atom_idx,
-                other_half_bond_atom_idx,
-                selected_attr,
-            )
+            terminated_graph.realize_bond(other_partial_graph, termination_bond, target_attributes[selected_target_idx], other_half_bond_atom_idx, selected_attr)
             last_unit = terminated_graph.add_new_unit_and_bond(pre_merge_watermark)
             terminated_graph.add_unit_to_sequence(last_unit)
 
@@ -1653,6 +1726,8 @@ class _PartialAtomGraph:
             # must not be re-opened for transitions (-1 or otherwise).
             if any(bond is consumed for consumed in consumed_half_bonds):
                 continue
+            if not bond.has_any_bonds():
+                continue  # blocked by a group rule during this pass: it left the pool for good
             terminated_graph._open_half_bond_map[sto_atom_id] += [bond]
 
         terminated_graph.stochastic_tracker.terminate(sto_atom_id)
@@ -1715,12 +1790,7 @@ class _PartialAtomGraph:
                 other_partial_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, selected_target, self.stochastic_tracker, level_sto_atom_id, rng)
                 other_half_bond_atom_idx = other_partial_graph.pop_target_open_half_bond(level_sto_atom_id, selected_target)
                 pre_merge_watermark = self._atom_id
-                self.merge(
-                    other_partial_graph,
-                    half_bond.atom_idx,
-                    other_half_bond_atom_idx,
-                    selected_attr,
-                )
+                self.realize_bond(other_partial_graph, half_bond, target_attributes[selected_target_idx], other_half_bond_atom_idx, selected_attr)
                 last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
                 self.add_unit_to_sequence(last_unit)
                 bucket.remove(half_bond)
@@ -1800,7 +1870,7 @@ class _PartialAtomGraph:
         )
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, half_bond.atom_idx, other_half_bond_atom_idx, selected_attr)
+        self.realize_bond(other_graph, half_bond, target_attr[chosen], other_half_bond_atom_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -2121,7 +2191,7 @@ class _PartialAtomGraph:
 
         other_target_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, transition_bond.atom_idx, other_target_idx, selected_attr)
+        self.realize_bond(other_graph, transition_bond, target_attr[target_id], other_target_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -2191,7 +2261,7 @@ class _PartialAtomGraph:
 
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, stochastic_bond.atom_idx, other_half_bond_atom_idx, selected_attr)
+        self.realize_bond(other_graph, stochastic_bond, target_attr[target_id], other_half_bond_atom_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -2243,7 +2313,7 @@ class _PartialAtomGraph:
             other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
 
             pre_merge_watermark = self._atom_id
-            self.merge(other_graph, nested_transition_bond.atom_idx, other_half_bond_atom_idx, selected_attr)
+            self.realize_bond(other_graph, nested_transition_bond, selected_edge_attr, other_half_bond_atom_idx, selected_attr)
             last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
             self.add_unit_to_sequence(last_unit)
             self.nested_transition(new_sto_atom_id, rng)
@@ -2328,7 +2398,7 @@ class _PartialAtomGraph:
         other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, target_idx, tracker, target_sto_atom_id, rng)
         other_target_idx = other_graph.pop_target_open_half_bond(target_sto_atom_id, target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, half_bond.atom_idx, other_target_idx, selected_attr)
+        self.realize_bond(other_graph, half_bond, all_attr[chosen], other_target_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(target_sto_atom_id, rng)
@@ -2524,10 +2594,10 @@ class EnsembleCreator:
             for key in (_SOURCE_RULE_NAME, _TARGET_RULE_NAME):
                 if edge_data.get(key, 0):
                     group_rules.add(GroupRule(edge_data[key]).name)
-        if group_rules:
-            # Temporary gate: sampling cannot honor group rules yet.
+        if group_rules - {GroupRule.EXCLUSION.name}:
+            # Temporary gate: sampling honors EXCLUSION; LADDER and ALL land in later phases.
             raise NotImplementedError(
-                f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for group rules lands in a later implementation phase."
+                f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for the rules other than EXCLUSION lands in a later implementation phase."
             )
 
         self._static_graph = self._create_static_graph(self.generative_graph)

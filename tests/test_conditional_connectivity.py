@@ -8,16 +8,21 @@ rules (ladder / exclusion / all), the compatibility matrix (ladder rigidity) and
 the stochastic-object validation set. Phase 1 -- the generative-graph encoding:
 every edge carries the four group-rule attributes, one edge per distinct group
 annotation of a compatible bond connector pair, terminal-descriptor edges
-annotated on the unit side, and the temporary generation gate in EnsembleCreator.
+annotated on the unit side. Phase 2 -- generation honors the EXCLUSION rule: a
+site consumed through an exclusion-typed channel blocks its group siblings, a
+site consumed through a plain channel removes their exclusion-typed channels
+(whatever mode fired the bond, at any level); LADDER and ALL stay gated.
 """
 
 import warnings
 
 import lark
+import numpy as np
 import pytest
 
 import g2rins
 from g2rins import GroupRule
+from g2rins import ensemble_creator as _ec
 from g2rins.exception import (
     GroupPartnerNotPlain,
     GroupRuleOnNestedObjectBondConnector,
@@ -331,6 +336,9 @@ def test_indistinguishable_symbols_warn(text):
 # --- Phase 1: generative-graph encoding ---------------------------------------
 
 EXCLUSION_TEXT = "{[] [>,>1[]1]N([>,>1[]1])CCN([>,>1[]2])[>,>1[]2], [<1]C(=O)CCCCCO[<1], [<]CCO[>]; O[>1]; [H][<], [H][<1] []}|poisson(500)|"
+EMBEDDED_EXIT_TEXT = "CC{[<] [<]CC([>,>1[]1])[>]; ; [H][<] [<1]}|poisson(200)|CC"
+EXIT_INTO_ENCLOSING_TEXT = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F [<1]}|poisson(100)|[>]; [>][H]; [<][H] []}|poisson(400)|"
+NESTED_BLOCK_TEXT = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
 LADDER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
 DUAL_CHANNEL_TEXT = "{[] [<1,<[<]2]OC(O[<1,<[<]2])CC(O[>1,>[>]1])O[>1,>[>]1]; C(O[>1,>[>]1])O[>1,>[>]1]; [<1][H] []}|poisson(1000)|"
 DUAL_CHANNEL_SWAPPED_TEXT = "{[] [<[<]2,<1]OC(O[<[<]2,<1])CC(O[>[>]1,>1])O[>[>]1,>1]; C(O[>[>]1,>1])O[>[>]1,>1]; [<1][H] []}|poisson(1000)|"
@@ -468,12 +476,11 @@ def test_terminal_descriptor_edges_carry_unit_side_annotation():
     assert {values for source, target, _mode, values in exit_edges if target == "[<1]"} == {(1, 2, -1, 0)}
     entry_edges = _bond_connector_edges("{[>1] [<,<1[]1]CC([<,<1[]1])[>]; ; [H][<] [>]}|poisson(200)|")
     assert {values for source, target, _mode, values in entry_edges if source == "[>1]"} == {(-1, 0, 1, 2)}
-    # Embedded, the exit edge reaches the bond-connector-free graph and gates generation.
-    generative_graph = _generative_graph(_graph_creator("CC{[<] [<]CC([>,>1[]1])[>]; ; [H][<] [<1]}|poisson(200)|CC"))
+    # Embedded, the exit edge reaches the bond-connector-free graph and generation accepts it.
+    generative_graph = _generative_graph(_graph_creator(EMBEDDED_EXIT_TEXT))
     annotated = [data for _u, _v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL]
     assert [(_group_values(data), _mode(data)) for data in annotated] == [((1, 2, -1, 0), "transition_weight")]
-    with pytest.raises(NotImplementedError, match="EXCLUSION"):
-        g2rins.EnsembleCreator(generative_graph)
+    g2rins.EnsembleCreator(generative_graph)
 
 
 MULTILEVEL_EXCLUSION_TEXT = (
@@ -496,18 +503,18 @@ def test_group_rule_survives_bond_connector_path_across_levels():
         assert generative_graph.nodes[u]["atomic_num"] == 0
         assert 7 in {generative_graph.nodes[w]["atomic_num"] for w in generative_graph.neighbors(u)}
         assert generative_graph.nodes[v]["atomic_num"] == 6
-    with pytest.raises(NotImplementedError, match="EXCLUSION"):
-        g2rins.EnsembleCreator(generative_graph)
+    # Builds; sampling it almost never completes under the rule: its only route back to
+    # the outermost object is the typed channel, which a sibling's plain growth removes
+    # first (measured 0 of 100 attempts).
+    g2rins.EnsembleCreator(generative_graph)
 
 
-def test_group_rule_exit_into_enclosing_object_reaches_gate():
-    # A ruled exit followed by plain relays used to contract to sentinels and
-    # slip past the generation gate.
-    text = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F [<1]}|poisson(100)|[>]; [>][H]; [<][H] []}|poisson(400)|"
-    generative_graph = _generative_graph(_graph_creator(text))
+def test_group_rule_exit_into_enclosing_object_reaches_generation():
+    # A ruled exit followed by plain relays used to contract to sentinels; the
+    # annotation now survives to the graph the sampler consumes.
+    generative_graph = _generative_graph(_graph_creator(EXIT_INTO_ENCLOSING_TEXT))
     assert {_group_values(data) for _u, _v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL} == {(1, 2, -1, 0)}
-    with pytest.raises(NotImplementedError, match="EXCLUSION"):
-        g2rins.EnsembleCreator(generative_graph)
+    g2rins.EnsembleCreator(generative_graph)
 
 
 def test_group_rules_on_both_path_ends_are_refused():
@@ -522,24 +529,21 @@ def test_group_rules_on_both_path_ends_are_refused():
 
 def test_group_rules_at_one_level_survive_nesting():
     # A bond crossing a level carries at most one annotation here, so it contracts.
-    text = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
-    generative_graph = _generative_graph(_graph_creator(text))
+    generative_graph = _generative_graph(_graph_creator(NESTED_BLOCK_TEXT))
     assert {(-1, 0, 0, 2), (0, 2, -1, 0), (-1, 0, 1, 2), (1, 2, -1, 0)} <= {_group_values(data) for _u, _v, data in generative_graph.edges(data=True)}
 
 
-def test_generation_gate():
+def test_exclusion_only_graphs_build_an_ensemble_creator():
     text = "{[] [<]C([>1[]1])C([>1[]1])C[>]; ; [H][<], [H][<1] []}|poisson(200)|"
     graph_creator = _graph_creator(text)
-    # The bond-connector-free graph is a complete, exportable product ...
+    # The bond-connector-free graph is a complete, exportable product, and the
+    # creator builds whichever way it is constructed (EXCLUSION is no longer gated).
     generative_graph = _generative_graph(graph_creator)
     assert (1, 2, -1, 0) in {_group_values(data) for _u, _v, data in generative_graph.edges(data=True)}
     exported = g2rins.generative_graph_json_data(generative_graph)
     assert all(set(GROUP_KEYS) <= set(edge) for edge in exported["graph"]["edges"])
-    # ... but sampling cannot honor group rules yet, whichever way the creator is built.
-    with pytest.raises(NotImplementedError, match="EXCLUSION"):
-        g2rins.EnsembleCreator(generative_graph)
-    with pytest.raises(NotImplementedError):
-        graph_creator.get_ensemble_creator()
+    g2rins.EnsembleCreator(generative_graph)
+    graph_creator.get_ensemble_creator()
 
 
 def test_consumers_read_absent_group_keys_as_sentinels():
@@ -595,3 +599,201 @@ def test_all_star_string_encoding():
     assert all(edge == ("[>[all]]", "[<]", "transition_weight", (0, 3, -1, 0)) for edge in annotated)
     with pytest.raises(NotImplementedError, match="ALL"):
         g2rins.EnsembleCreator(_generative_graph(_graph_creator(ALL_STAR_TEXT)))
+
+
+# -- Phase 2: generation under the EXCLUSION rule --------------------------------------
+
+
+def _timeline(monkeypatch):
+    """Record every realized bond (fresh unit's tag, consumed source site, consumed target site); a site is
+    (instance tag, exclusion groups held, channel group, channel rule). Unit tags are logged too: tag 1 opens a
+    chain, a tag drawn again inside a chain is a checkpoint rollback that discarded the units from that tag on."""
+    log = []
+    next_tag, realize = _ec._StochasticObjectTracker.next_unit_instance, _ec._PartialAtomGraph.realize_bond
+
+    def tag(self):
+        value = next_tag(self)
+        log.append(("unit", value))
+        return value
+
+    def site(half_bond, group, rule):
+        return None if half_bond is None else (half_bond.instance, frozenset(half_bond.exclusion_groups()), group, rule)
+
+    def bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr):
+        source = site(source_half_bond, fired_edge.get("source_group", -1), fired_edge.get("source_rule", 0))
+        target = site(other._consumed_half_bond, fired_edge.get("target_group", -1), fired_edge.get("target_rule", 0))
+        log.append(("bond", self.stochastic_tracker._unit_instances, source, target))
+        return realize(self, other, source_half_bond, fired_edge, other_idx, bond_attr)
+
+    monkeypatch.setattr(_ec._StochasticObjectTracker, "next_unit_instance", tag)
+    monkeypatch.setattr(_ec._PartialAtomGraph, "realize_bond", bond)
+    return log
+
+
+def _surviving_bonds_per_chain(log):
+    chains, high = [], 0
+    for event in log:
+        if event[0] == "unit":
+            if event[1] == 1:
+                chains.append([])
+            elif event[1] <= high:
+                chains[-1][:] = [bond for bond in chains[-1] if bond[1] < event[1]]
+            high = event[1]
+        else:
+            chains[-1].append(event)
+    return chains
+
+
+def _rule_violations(bonds):
+    """Per instance and group: after a member fired through the typed channel no member fires again; after a member
+    fired through a plain channel no member fires through the typed one. Returns (violations, typed consumptions)."""
+    engaged, bystander, violations, typed = set(), set(), 0, 0
+    for _kind, _fresh_tag, source, target in bonds:
+        for site in (source, target):
+            if site is None or not site[1]:
+                continue
+            tag, groups, group, rule = site
+            is_typed = rule == GroupRule.EXCLUSION and group in groups
+            violations += sum(1 for g in groups if (tag, g) in engaged or (is_typed and (tag, g) in bystander))
+            (engaged if is_typed else bystander).update((tag, g) for g in groups)
+            typed += is_typed
+    return violations, typed
+
+
+def _sample(text, n_chains, seed=7, output_format="mol_graph"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format=output_format, seed=seed)
+
+
+@pytest.mark.parametrize("text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8)])
+def test_sampling_obeys_the_channel_rule_at_every_level(monkeypatch, text, n_chains):
+    # Same-level growth and caps, exits through terminal bond connectors into the
+    # enclosing object, and a nested block: the rule holds on the sampler's own
+    # bond events, and the typed channel does fire in each string.
+    log = _timeline(monkeypatch)
+    chains = _sample(text, n_chains)
+    assert chains is not None and len(chains) == n_chains
+    assert all(data["atomic_num"] > 0 for chain in chains for _node, data in chain.nodes(data=True))
+    results = [_rule_violations(bonds) for bonds in _surviving_bonds_per_chain(log)]
+    assert sum(violations for violations, _typed in results) == 0
+    assert sum(typed for _violations, typed in results) > 0
+
+
+def _site_nodes(generative_graph, origin):
+    """The atom plus the connector placeholders split off it (static edges); they hold the atom's site edges."""
+    nodes, queue = {origin}, [origin]
+    while queue:
+        current = queue.pop()
+        for u, v, data in list(generative_graph.out_edges(current, data=True)) + list(generative_graph.in_edges(current, data=True)):
+            other = v if u == current else u
+            if data.get("static") and generative_graph.nodes[other]["atomic_num"] == 0 and other not in nodes:
+                nodes.add(other)
+                queue.append(other)
+    return nodes
+
+
+def _bond_channel(generative_graph, site_origin, neighbour_origin):
+    """'typed' or 'plain' for a realized non-static bond, read from the generative edge that fired it; 'static' otherwise."""
+    site_nodes, neighbour_nodes = _site_nodes(generative_graph, site_origin), _site_nodes(generative_graph, neighbour_origin)
+    for node in site_nodes:
+        for _u, v, data in generative_graph.out_edges(node, data=True):
+            if v in neighbour_nodes and not data.get("static"):
+                return "typed" if data.get("source_rule", 0) == GroupRule.EXCLUSION else "plain"
+        for u, _v, data in generative_graph.in_edges(node, data=True):
+            if u in neighbour_nodes and not data.get("static"):
+                return "typed" if data.get("target_rule", 0) == GroupRule.EXCLUSION else "plain"
+    return "static"
+
+
+def _grouped_site_bond_counts(generative_graph, chains):
+    """(typed, plain) realized bond counts of every atom holding exclusion channels, over all chains."""
+    grouped = {
+        str(node)
+        for node, data in generative_graph.nodes(data=True)
+        if data["atomic_num"] > 0
+        and any(edge.get("source_rule", 0) == GroupRule.EXCLUSION for site in _site_nodes(generative_graph, node) for _u, _v, edge in generative_graph.out_edges(site, data=True))
+    }
+    counts = []
+    for chain in chains:
+        for node, data in chain.nodes(data=True):
+            if data["origin_idx"] in grouped:
+                kinds = [_bond_channel(generative_graph, data["origin_idx"], chain.nodes[neighbour]["origin_idx"]) for neighbour in chain.neighbors(node)]
+                counts.append((kinds.count("typed"), kinds.count("plain")))
+    return counts
+
+
+def test_exclusion_sites_follow_the_channel_rule_in_the_output():
+    # Output-level form of the rule on the canonical string (its grouped atoms' static
+    # neighbours differ from every growth target, so bonds classify unambiguously):
+    # one typed bond and nothing else on the atom, or two plain bonds; both occur;
+    # never one typed beside a plain one, never two typed.
+    graph_creator = _graph_creator(EXCLUSION_TEXT)
+    generative_graph = _generative_graph(graph_creator)
+    with warnings.catch_warnings():  # one parse: the chains' origin ids must be this graph's node ids
+        warnings.simplefilter("ignore")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(24, output_format="mol_graph", seed=7)
+    counts = _grouped_site_bond_counts(generative_graph, chains)
+    assert counts
+    assert all(typed <= 1 and not (typed == 1 and plain) for typed, plain in counts)
+    assert {(1, 0), (0, 2)} <= set(counts)
+
+
+def test_exclusion_generation_is_seed_reproducible():
+    assert list(_sample(EXCLUSION_TEXT, 6, seed=11, output_format="smiles")) == list(_sample(EXCLUSION_TEXT, 6, seed=11, output_format="smiles"))
+
+
+def _instantiate(generative_graph, static_graph, tracker, source_node, rng):
+    """A fresh unit containing ``source_node``, registered as its own instance."""
+    tree = list(generative_graph.nodes[source_node]["stochastic_id_tree"])
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], [level for level in tree[1:] if level >= 0])
+    return _ec._PartialAtomGraph(generative_graph, static_graph, source_node, tracker, sto_atom_id, rng), sto_atom_id
+
+
+@pytest.mark.parametrize("mode", ["propagation_weight", "termination_weight"])
+@pytest.mark.parametrize("rule, outcome", [(GroupRule.EXCLUSION, "blocked"), (GroupRule.NONE, "plain channels only")])
+def test_source_site_rule_reads_the_channel_not_the_mode(mode, rule, outcome):
+    # The same channel gives the same outcome whether a growth or a termination edge fired it.
+    generative_graph = _generative_graph(_graph_creator(EXCLUSION_TEXT))
+    static_graph = _ec.EnsembleCreator._create_static_graph(generative_graph)
+    tracker, rng = _ec._StochasticObjectTracker(generative_graph), np.random.default_rng(0)
+    nitrogen = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
+    molecule, sto_atom_id = _instantiate(generative_graph, static_graph, tracker, nitrogen, rng)
+    pool = molecule._open_half_bond_map[sto_atom_id]
+    consumed = next(site for site in pool if site.exclusion_groups())
+    sibling = next(site for site in pool if site is not consumed and site.exclusion_groups() == consumed.exclusion_groups())
+    edges, targets, _molar = consumed.get_mode_bonds(mode)
+    index = next(i for i, edge in enumerate(edges) if edge.get("source_rule", 0) == rule)
+    pool.remove(consumed)  # the sampler pops the fired site before realizing the bond
+    fresh, fresh_id = _instantiate(generative_graph, static_graph, tracker, targets[index], rng)
+    fresh.pop_target_open_half_bond(fresh_id, targets[index])
+    molecule._consume_sites(consumed, edges[index], fresh)
+    if outcome == "blocked":
+        assert sibling not in pool and not sibling.has_any_bonds()
+    else:
+        assert sibling in pool and sibling.has_any_bonds() and not sibling.exclusion_groups()
+    assert all(site.exclusion_groups() for site in pool if site is not sibling)  # the other group is untouched
+
+
+@pytest.mark.parametrize("rule, outcome", [(GroupRule.EXCLUSION, "blocked"), (GroupRule.NONE, "plain channels only")])
+def test_entered_site_sibling_follows_the_channel_rule(rule, outcome):
+    # A site of another unit fires INTO a grouped site of a fresh unit: the fresh
+    # unit's sibling follows the same rule before the unit joins the pool.
+    generative_graph = _generative_graph(_graph_creator(EXCLUSION_TEXT))
+    static_graph = _ec.EnsembleCreator._create_static_graph(generative_graph)
+    tracker, rng = _ec._StochasticObjectTracker(generative_graph), np.random.default_rng(0)
+    nitrogen = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 7)
+    grouped_sites = _site_nodes(generative_graph, nitrogen)
+    u, v, fired = next((u, v, data) for u, v, data in generative_graph.edges(data=True) if v in grouped_sites and data.get("propagation_weight", 0) > 0 and data.get("target_rule", 0) == rule)
+    source_unit, source_id = _instantiate(generative_graph, static_graph, tracker, u, rng)
+    consumed = next(site for site in source_unit._open_half_bond_map[source_id] if site.node_idx == u)
+    source_unit._open_half_bond_map[source_id].remove(consumed)
+    fresh, fresh_id = _instantiate(generative_graph, static_graph, tracker, v, rng)
+    fresh.pop_target_open_half_bond(fresh_id, v)
+    source_unit._consume_sites(consumed, fired, fresh)
+    remaining = sorted(sorted(site.exclusion_groups()) for site in fresh._open_half_bond_map[fresh_id])
+    if outcome == "blocked":
+        assert remaining == [[2], [2]]  # the entered group's sibling is gone, the other group is intact
+    else:
+        assert remaining == [[], [2], [2]]  # the sibling stays, without its exclusion-typed channel
+        assert all(site.has_any_bonds() for site in fresh._open_half_bond_map[fresh_id])
