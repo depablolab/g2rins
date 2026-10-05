@@ -30,6 +30,10 @@ We use plain GitHub flow — short-lived branches off `main`, merged back via pu
 4. Update documentation (README, docstrings, `CHANGELOG.md`) when user-facing behavior changes.
 5. Open a pull request against `main` and make sure CI passes.
 
+## Versioning
+
+Releases are the repository's `v*` git tags and follow `MAJOR.MINOR.PATCH`. Major versions are reserved for changes to the generation algorithm or to the scope of the representation. Minor versions add features and may change the grammar, the APIs and the output formats; every incompatible change is listed under _Breaking changes_ in the release's `CHANGELOG.md` section together with its migration path. Patch versions contain fixes only.
+
 ## Linting
 
 The repository uses [Trunk](https://docs.trunk.io) for linting and formatting; it runs automatically in CI. Running it locally before pushing is optional:

@@ -39,16 +39,16 @@ G²RINS is described in our ChemRxiv preprint:
 
 Requires Python ≥ 3.10.
 
-Install the tagged v1.0.0 release directly from GitHub:
+Install the tagged v1.1.0 release directly from GitHub:
 
 ```bash
-pip install "g2rins @ git+https://github.com/depablolab/g2rins.git@v1.0.0"
+pip install "g2rins @ git+https://github.com/depablolab/g2rins.git@v1.1.0"
 ```
 
-To install the latest development version from `main`:
+To install the latest development version from `next`, the branch that collects reviewed changes ahead of the next release:
 
 ```bash
-pip install "g2rins @ git+https://github.com/depablolab/g2rins.git@main"
+pip install "g2rins @ git+https://github.com/depablolab/g2rins.git@next"
 ```
 
 For local development, clone the repository and install it in editable mode:

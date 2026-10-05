@@ -1,8 +1,10 @@
 # Changelog
 
-Notable, user-visible changes to G²RINS. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions correspond to the repository's `v*` git tags.
+Notable, user-visible changes to G²RINS. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions correspond to the repository's `v*` git tags. Major versions are reserved for changes to the generation algorithm or to the scope of the representation, so a minor version may carry incompatible changes; each release lists them under _Breaking changes_ with their migration path, and patch versions contain fixes only (policy in `CONTRIBUTING.md`).
 
 ## [Unreleased]
+
+## [1.1.0] - 2026-10-05
 
 ### Breaking changes
 
@@ -74,5 +76,6 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 Initial public release.
 
-[Unreleased]: https://github.com/depablolab/g2rins/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/depablolab/g2rins/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/depablolab/g2rins/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/depablolab/g2rins/tree/v1.0.0
