@@ -19,6 +19,7 @@ import warnings
 import lark
 import numpy as np
 import pytest
+from rdkit.Chem import Descriptors
 
 import g2rins
 from g2rins import GroupRule
@@ -341,6 +342,9 @@ EXIT_INTO_ENCLOSING_TEXT = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F 
 NESTED_BLOCK_TEXT = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
 # The typed site [<1[]1] is only ever entered (no outgoing edge): the group rule must still see it when the chain starts there.
 ENTRY_ONLY_SITE_TEXT = "{[] [<1[]1]C([>2[]1])[>], [<]CC[>]; O[>1]; [<][H], [<2]F []}|poisson(100)|"
+# Two typed sibling cap sites per unit realize one cap; the one-site string is the reference for the mass they add.
+TYPED_SIBLING_CAPS_TEXT = "{[] [<]CC([>1[]1])([>1[]1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
+SINGLE_CAP_SITE_TEXT = "{[] [<]CC([>1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
 LADDER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
 DUAL_CHANNEL_TEXT = "{[] [<1,<[<]2]OC(O[<1,<[<]2])CC(O[>1,>[>]1])O[>1,>[>]1]; C(O[>1,>[>]1])O[>1,>[>]1]; [<1][H] []}|poisson(1000)|"
 DUAL_CHANNEL_SWAPPED_TEXT = "{[] [<[<]2,<1]OC(O[<[<]2,<1])CC(O[>[>]1,>1])O[>[>]1,>1]; C(O[>[>]1,>1])O[>[>]1,>1]; [<1][H] []}|poisson(1000)|"
@@ -841,3 +845,58 @@ def test_entry_through_the_typed_channel_counts_as_a_typed_consumption(monkeypat
         grouped = [(side, site) for _kind, _tag, source, target in bonds for side, site in (("source", source), ("target", target)) if site is not None and site[1]]
         assert len(grouped) == 1 and grouped[0][0] == "target" and grouped[0][1][1:] == (frozenset({1}), 1, GroupRule.EXCLUSION)
     assert sum(_rule_violations(bonds)[0] for bonds in chains) == 0
+
+
+# -- Termination-mass estimate under the EXCLUSION rule ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "members, expected",
+    [
+        # two typed-only siblings: whichever fires first blocks the other, one cap is realized
+        ([(1.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 1.0, 80.0)])] * 2, 80.0),
+        # the first to fire is drawn by site weight
+        ([(3.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 1.0, 80.0)]), (1.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 1.0, 10.0)])], 0.75 * 80.0 + 0.25 * 10.0),
+        # dual channels: a typed first draw ends the group, a plain one leaves the sibling its plain cap
+        ([(1.0, frozenset({1}), [(-1, GroupRule.NONE, 0.5, 79.0), (1, GroupRule.EXCLUSION, 0.5, 126.0)])] * 2, 0.5 * 126.0 + 0.5 * (79.0 + 79.0)),
+        # two groups of one instance never reach each other
+        ([(1.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 1.0, 80.0)]), (1.0, frozenset({2}), [(2, GroupRule.EXCLUSION, 1.0, 80.0)])], 160.0),
+        # a member of both groups: its typed cap blocks group 1 and kills group 2's typed channel on the
+        # third site, which then takes its plain cap; by hand (100 + 130 + 130) / 3 over the three first movers
+        (
+            [
+                (1.0, frozenset({1, 2}), [(1, GroupRule.EXCLUSION, 1.0, 80.0)]),
+                (1.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 1.0, 80.0)]),
+                (1.0, frozenset({2}), [(2, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 20.0)]),
+            ],
+            120.0,
+        ),
+    ],
+)
+def test_cluster_cap_estimate_follows_the_firing_sequence(members, expected):
+    assert _ec._PartialAtomGraph._expected_cluster_cap_mw(members) == pytest.approx(expected)
+
+
+def _unit_termination_estimate(text):
+    """Termination-mass estimate of one freshly instantiated repeat unit of ``text``."""
+    generative_graph = _generative_graph(_graph_creator(text))
+    static_graph = _ec.EnsembleCreator._create_static_graph(generative_graph)
+    tracker, rng = _ec._StochasticObjectTracker(generative_graph), np.random.default_rng(0)
+    carbon = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
+    unit, sto_atom_id = _instantiate(generative_graph, static_graph, tracker, carbon, rng)
+    return unit.get_average_termination_mw(sto_atom_id, static_graph, rng)
+
+
+def test_typed_sibling_caps_are_priced_as_one_cap():
+    # Whichever typed sibling fires first blocks the other, so the unit with two typed cap sites
+    # budgets the same termination mass as the unit with one.
+    typed, single = _unit_termination_estimate(TYPED_SIBLING_CAPS_TEXT), _unit_termination_estimate(SINGLE_CAP_SITE_TEXT)
+    assert typed > 0 and typed == pytest.approx(single)
+
+
+def test_typed_sibling_caps_keep_the_number_average_on_target():
+    # A margin that budgeted both sibling caps parked growth early; both strings land on the target.
+    for text in (TYPED_SIBLING_CAPS_TEXT, SINGLE_CAP_SITE_TEXT):
+        chains = _sample(text, 40, seed=1)
+        number_average = np.mean([Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) for chain in chains])
+        assert abs(number_average - 600) / 600 < 0.1, f"Mn {number_average:.0f} vs target 600 for {text}"

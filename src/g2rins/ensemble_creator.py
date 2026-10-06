@@ -1540,14 +1540,14 @@ class _PartialAtomGraph:
         # descendant's bucket is attached at finalization, so leaving it out
         # of the margin let heavy end groups overshoot the target mass.
         termination_bonds = [half_bond for bucket_id in self._custody_bucket_ids(owner_sto_atom_id) for half_bond in self._get_level_termination_bonds(bucket_id, level_sto_atom_id)]
-        avg_termination_mw = 0
+        gen_sto_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[level_sto_atom_id]
         # The source endpoint's hydrogen loss only depends on the attach order,
         # not on which terminator fires: share it across candidates.
         source_delta_by_order = {}
 
-        for termination_bond in termination_bonds:
+        def priced_channels(termination_bond):
+            """This level's terminators of the bond as (group, rule, probability, net mass) per channel."""
             all_attributes, all_ids, all_molar = termination_bond.get_mode_bonds(_TERMINATION_NAME)
-            gen_sto_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[level_sto_atom_id]
             # Same level filter as terminate_graph: the estimate must average over
             # the terminators that termination would actually attach.
             level_indices = [i for i, attr in enumerate(all_attributes) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == gen_sto_id]
@@ -1564,6 +1564,7 @@ class _PartialAtomGraph:
                 record_branch=False,
             )
             source_delta_by_order.clear()
+            channels = []
             for i, node_id in enumerate(target_ids):
                 terminator_atom_graph = _get_terminator_atom_graph(node_id)
                 attach_order = target_attributes[i].get(_BOND_TYPE_NAME, 1)
@@ -1576,8 +1577,55 @@ class _PartialAtomGraph:
                 terminator_weight = self._fragment_gross_mw(terminator_atom_graph, node_id, attach_order)
                 if attach_order not in source_delta_by_order:
                     source_delta_by_order[attach_order] = self._source_attach_delta(termination_bond.atom_idx, attach_order)
-                avg_termination_mw += target_prob[i] * (terminator_weight + source_delta_by_order[attach_order])
+                group, rule = target_attributes[i].get(_SOURCE_GROUP_NAME, -1), target_attributes[i].get(_SOURCE_RULE_NAME, 0)
+                channels.append((group, rule, target_prob[i], terminator_weight + source_delta_by_order[attach_order]))
+            return channels
+
+        avg_termination_mw = 0
+        clusters = {}
+        for termination_bond in termination_bonds:
+            channels = priced_channels(termination_bond)
+            groups = termination_bond.exclusion_groups()
+            if groups:
+                # Grouped caps of one unit instance reach each other through the exclusion rule: priced as a set.
+                clusters.setdefault(termination_bond.instance, []).append((termination_bond.weight, frozenset(groups), channels))
+            else:
+                for _group, _rule, probability, mass in channels:
+                    avg_termination_mw += probability * mass
+        for members in clusters.values():
+            avg_termination_mw += self._expected_cluster_cap_mw(members)
         return avg_termination_mw
+
+    @staticmethod
+    def _expected_cluster_cap_mw(members):
+        """Expected cap mass of the grouped termination sites of one unit instance, ``(weight, groups,
+        channels)`` each, under the sequence terminate_graph realizes: a waiting member fires with
+        probability proportional to its weight, draws among its live channels, and the rule reaches the
+        rest as realize_bond applies it (a typed channel drops the siblings holding its group; any
+        channel kills the consumed site's groups on them, whose menus renormalize)."""
+
+        @functools.lru_cache(maxsize=None)
+        def expect(remaining, dead):
+            live = []
+            for index in remaining:
+                weight, groups, channels = members[index]
+                channels = [channel for channel in channels if channel[0] not in dead]
+                probability_sum = sum(probability for _group, _rule, probability, _mass in channels)
+                if probability_sum > 0:
+                    live.append((index, weight, groups - dead, channels, probability_sum))
+            weight_sum = sum(weight for _index, weight, _groups, _channels, _probability_sum in live)
+            if weight_sum <= 0:
+                return 0.0
+            expected = 0.0
+            for index, weight, groups, channels, probability_sum in live:
+                for group, rule, probability, mass in channels:
+                    rest = tuple(other for other in remaining if other != index)
+                    if rule == GroupRule.EXCLUSION:
+                        rest = tuple(other for other in rest if group not in members[other][1] - dead)
+                    expected += (weight / weight_sum) * (probability / probability_sum) * (mass + expect(rest, dead | groups))
+            return expected
+
+        return expect(tuple(range(len(members))), frozenset())
 
     def _observational_fragment(self, source, static_graph, estimator_rng):
         """Build the static fragment that starts at ``source`` under a throwaway tracker, so an
