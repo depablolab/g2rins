@@ -339,6 +339,8 @@ EXCLUSION_TEXT = "{[] [>,>1[]1]N([>,>1[]1])CCN([>,>1[]2])[>,>1[]2], [<1]C(=O)CCC
 EMBEDDED_EXIT_TEXT = "CC{[<] [<]CC([>,>1[]1])[>]; ; [H][<] [<1]}|poisson(200)|CC"
 EXIT_INTO_ENCLOSING_TEXT = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F [<1]}|poisson(100)|[>]; [>][H]; [<][H] []}|poisson(400)|"
 NESTED_BLOCK_TEXT = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
+# The typed site [<1[]1] is only ever entered (no outgoing edge): the group rule must still see it when the chain starts there.
+ENTRY_ONLY_SITE_TEXT = "{[] [<1[]1]C([>2[]1])[>], [<]CC[>]; O[>1]; [<][H], [<2]F []}|poisson(100)|"
 LADDER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
 DUAL_CHANNEL_TEXT = "{[] [<1,<[<]2]OC(O[<1,<[<]2])CC(O[>1,>[>]1])O[>1,>[>]1]; C(O[>1,>[>]1])O[>1,>[>]1]; [<1][H] []}|poisson(1000)|"
 DUAL_CHANNEL_SWAPPED_TEXT = "{[] [<[<]2,<1]OC(O[<[<]2,<1])CC(O[>[>]1,>1])O[>[>]1,>1]; C(O[>[>]1,>1])O[>[>]1,>1]; [<1][H] []}|poisson(1000)|"
@@ -607,14 +609,23 @@ def test_all_star_string_encoding():
 def _timeline(monkeypatch):
     """Record every realized bond (fresh unit's tag, consumed source site, consumed target site); a site is
     (instance tag, exclusion groups held, channel group, channel rule). Unit tags are logged too: tag 1 opens a
-    chain, a tag drawn again inside a chain is a checkpoint rollback that discarded the units from that tag on."""
-    log = []
-    next_tag, realize = _ec._StochasticObjectTracker.next_unit_instance, _ec._PartialAtomGraph.realize_bond
+    chain, a tag drawn again inside a chain is a checkpoint rollback that discarded the units from that tag on.
+    The fragments the termination-mass estimate builds on a throwaway tracker draw tags as well; they are skipped."""
+    log, observing = [], []
+    next_tag, realize, observe = _ec._StochasticObjectTracker.next_unit_instance, _ec._PartialAtomGraph.realize_bond, _ec._PartialAtomGraph._observational_fragment
 
     def tag(self):
         value = next_tag(self)
-        log.append(("unit", value))
+        if not observing:
+            log.append(("unit", value))
         return value
+
+    def fragment(self, *args):
+        observing.append(True)
+        try:
+            return observe(self, *args)
+        finally:
+            observing.pop()
 
     def site(half_bond, group, rule):
         return None if half_bond is None else (half_bond.instance, frozenset(half_bond.exclusion_groups()), group, rule)
@@ -627,6 +638,7 @@ def _timeline(monkeypatch):
 
     monkeypatch.setattr(_ec._StochasticObjectTracker, "next_unit_instance", tag)
     monkeypatch.setattr(_ec._PartialAtomGraph, "realize_bond", bond)
+    monkeypatch.setattr(_ec._PartialAtomGraph, "_observational_fragment", fragment)
     return log
 
 
@@ -666,7 +678,7 @@ def _sample(text, n_chains, seed=7, output_format="mol_graph"):
         return _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format=output_format, seed=seed)
 
 
-@pytest.mark.parametrize("text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8)])
+@pytest.mark.parametrize("text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12)])
 def test_sampling_obeys_the_channel_rule_at_every_level(monkeypatch, text, n_chains):
     # Same-level growth and caps, exits through terminal bond connectors into the
     # enclosing object, and a nested block: the rule holds on the sampler's own
@@ -797,3 +809,35 @@ def test_entered_site_sibling_follows_the_channel_rule(rule, outcome):
     else:
         assert remaining == [[], [2], [2]]  # the sibling stays, without its exclusion-typed channel
         assert all(site.has_any_bonds() for site in fresh._open_half_bond_map[fresh_id])
+
+
+def test_entry_only_site_keeps_its_group_membership():
+    # The entered site has no outgoing edge, so it never joins the pool; popping it as the
+    # target still hands the rule its channel: the group's sibling is blocked, the plain site stays.
+    generative_graph = _generative_graph(_graph_creator(ENTRY_ONLY_SITE_TEXT))
+    static_graph = _ec.EnsembleCreator._create_static_graph(generative_graph)
+    tracker, rng = _ec._StochasticObjectTracker(generative_graph), np.random.default_rng(0)
+    u, v, fired = next((u, v, data) for u, v, data in generative_graph.edges(data=True) if data.get("target_rule", 0) == GroupRule.EXCLUSION)
+    source_unit, source_id = _instantiate(generative_graph, static_graph, tracker, u, rng)
+    consumed = next(site for site in source_unit._open_half_bond_map[source_id] if site.node_idx == u)
+    source_unit._open_half_bond_map[source_id].remove(consumed)
+    fresh, fresh_id = _instantiate(generative_graph, static_graph, tracker, v, rng)
+    assert all(site.node_idx != v for site in fresh._open_half_bond_map[fresh_id])
+    fresh.pop_target_open_half_bond(fresh_id, v)
+    assert fresh._consumed_half_bond is not None and fresh._consumed_half_bond.exclusion_groups() == {1}
+    source_unit._consume_sites(consumed, fired, fresh)
+    assert [sorted(site.exclusion_groups()) for site in fresh._open_half_bond_map[fresh_id]] == [[]]
+
+
+def test_entry_through_the_typed_channel_counts_as_a_typed_consumption(monkeypatch):
+    # Every chain of this string starts by entering the typed entry-only site: the timeline
+    # records that entry as the unit's one grouped bond, and the sibling's typed channel (the
+    # only route to the second terminator) never fires afterwards.
+    log = _timeline(monkeypatch)
+    assert len(_sample(ENTRY_ONLY_SITE_TEXT, 6)) == 6
+    chains = _surviving_bonds_per_chain(log)
+    assert len(chains) == 6
+    for bonds in chains:
+        grouped = [(side, site) for _kind, _tag, source, target in bonds for side, site in (("source", source), ("target", target)) if site is not None and site[1]]
+        assert len(grouped) == 1 and grouped[0][0] == "target" and grouped[0][1][1:] == (frozenset({1}), 1, GroupRule.EXCLUSION)
+    assert sum(_rule_violations(bonds)[0] for bonds in chains) == 0

@@ -260,6 +260,8 @@ class _HalfAtomBond:
         self._mode_attr_map = {}
         self._mode_target_map = {}
         self._mode_target_molar_amounts_map = {}
+        # Exclusion channels read off the incoming edges: an entry-only site holds them with no outgoing edge.
+        self._entry_groups = {d.get(_TARGET_GROUP_NAME, -1) for _u, _v, d in graph.in_edges(node_idx, data=True) if not d["static"] and d.get(_TARGET_RULE_NAME, 0) == GroupRule.EXCLUSION}
 
         self._special_target = None
         special_target_list = []
@@ -337,14 +339,16 @@ class _HalfAtomBond:
             return [], [], []
 
     def exclusion_groups(self):
-        """Group ids of the EXCLUSION channels this site still holds, derived from its live edges."""
-        return {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.EXCLUSION}
+        """Group ids of the EXCLUSION channels this site still holds, derived from its live edges on either side."""
+        held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.EXCLUSION}
+        return held | self._entry_groups
 
     def drop_edges(self, keep):
-        """Drop the edges whose attrs fail ``keep`` from every mode, menus kept aligned; a dropped forced entry is forgotten."""
+        """Drop the channels whose group id fails ``keep`` on either side, menus kept aligned; a dropped forced entry is forgotten."""
+        self._entry_groups = {group for group in self._entry_groups if keep(group)}
         for mode in list(self._mode_attr_map):
             attr_list = self._mode_attr_map[mode]
-            kept = [i for i, attrs in enumerate(attr_list) if keep(attrs)]
+            kept = [i for i, attrs in enumerate(attr_list) if keep(attrs.get(_SOURCE_GROUP_NAME, -1))]
             if len(kept) == len(attr_list):
                 continue
             if self._special_target is not None and any(self._special_target[1] is attrs for i, attrs in enumerate(attr_list) if i not in kept):
@@ -357,7 +361,7 @@ class _HalfAtomBond:
 
     def block(self):
         """Full kill: the site keeps no edge in any mode and leaves the open pool (implicit-hydrogen closure)."""
-        self.drop_edges(lambda _attrs: False)
+        self.drop_edges(lambda _group: False)
 
     def __str__(self):
         return f"HalfAtomBond({self.atom_idx}, {self.node_idx}, {self.weight}, {self._mode_attr_map}, {self._mode_target_map})"
@@ -1091,6 +1095,7 @@ class _PartialAtomGraph:
         self.atom_graph = nx.Graph()
         self._open_half_bond_map: dict[int, list[_HalfAtomBond]] = {}
         self._consumed_half_bond = None  # the target site popped for the incoming bond (read by realize_bond)
+        self._entry_sites = {}  # grouped sites kept out of the pool (no weight or no outgoing edge), by template node
         self.add_static_sub_graph(source_node, sto_atom_id, rng)
 
         self.bonds_idx = {}
@@ -1129,8 +1134,8 @@ class _PartialAtomGraph:
 
         Through an exclusion-typed channel the group's other sites of that unit instance
         are blocked; through any other channel they lose their exclusion-typed channels
-        and keep the plain ones. Membership is read from the sites' live edges, so a
-        killed channel drops its site from the group with no bookkeeping.
+        and keep the plain ones. Membership is read from the sites' live edges on either
+        side, so a killed channel drops its site from the group with no bookkeeping.
         """
         sides = (
             (source_half_bond, fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_SOURCE_RULE_NAME, 0), self._open_half_bond_map),
@@ -1149,7 +1154,7 @@ class _PartialAtomGraph:
                     if rule == GroupRule.EXCLUSION and group in sibling.exclusion_groups():
                         sibling.block()
                     else:
-                        sibling.drop_edges(lambda attrs, dead=groups: attrs.get(_SOURCE_GROUP_NAME, -1) not in dead)
+                        sibling.drop_edges(lambda group, dead=groups: group not in dead)
                 bucket[:] = [sibling for sibling in bucket if sibling.has_any_bonds()]
 
     def merge(self, other, self_idx, other_idx, bond_attr):
@@ -1333,6 +1338,8 @@ class _PartialAtomGraph:
                     self._open_half_bond_map[sto_atom_id] += [half_bond]
                 except KeyError:
                     self._open_half_bond_map[sto_atom_id] = [half_bond]
+            elif half_bond.exclusion_groups():
+                self._entry_sites[node_idx] = half_bond
 
         # Initiate with first node
         add_node(source)
@@ -1393,6 +1400,7 @@ class _PartialAtomGraph:
             possible_connections = self._find_origin_to_atom(target_idx)
             if len(possible_connections) != 1:
                 raise RuntimeError("There should only be one possible connection left. Please report this bug on github.")
+            self._consumed_half_bond = self._entry_sites.get(target_idx)
             return possible_connections[0]
 
         target_half_bond = self._open_half_bond_map[sto_atom_idx].pop(found_target_index)
