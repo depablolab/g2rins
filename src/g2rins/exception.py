@@ -257,7 +257,7 @@ class NoExplicitInitiation(ParsingWarning):
 
     def __str__(self) -> str:
         string = f"No explicit initiator defined. The stochastic object {str(self.token)} has an empty left terminal bond connector '[]' and an empty list of initiators."
-        # string += "Repeat units will be used as initiators."
+        string += " If the string declares no initiator anywhere, chains start at repeat units instead."
         return string
 
 
@@ -280,6 +280,25 @@ class EmptyBondConnectorInTerminalBondConnectorList(ParsingError):
         return f"The terminal bond connector list {self.terminal_bond_connectors} of the stochastic object:\n{self.stochastic_object}\nhas empty bonds.\nEmpty bonds in lists of terminal bond connectors with length > 1 are not allowed."
 
 
+class MismatchedBondConnectorLists(ParsingError):
+    """Neighboring bond connector lists pair by position but differ in length."""
+
+    def __init__(self, left_token, right_token, left_count, right_count):
+        Exception.__init__(self, left_token, right_token, left_count, right_count)
+        self.token = left_token
+        self.left_token = left_token
+        self.right_token = right_token
+        self.left_count = left_count
+        self.right_count = right_count
+
+    def __str__(self) -> str:
+        return (
+            f"'{str(self.left_token)}' and '{str(self.right_token)}' meet with {self.left_count} and {self.right_count} bonds. "
+            "A bond connector list and the terminal bond connector list it meets pair entry by entry, in order, so both need the same length; "
+            "a single bond connector meets a single terminal bond connector, and an atom or end group cannot meet a list."
+        )
+
+
 class IncorrectNumberOfBondProbabilities(ParsingError):
     def __init__(self, token, bond_connector, expected_length):
         super().__init__(token)
@@ -298,7 +317,10 @@ class NoInitiationForStochasticObject(ParsingWarning):
         self.partial_graph = partial_graph
 
     def __str__(self):
-        return f"The stochastic object {str(self.token)} cannot generate entry points to start initiations. Check if the left terminal bond connector is meant to be empty or if you have correct end groups that can act as initiators."
+        return (
+            f"The stochastic object {str(self.token)} cannot generate entry points to start initiations. Check if the left terminal bond connector is meant to be empty or if you have correct end groups that can act as initiators. "
+            "If the string declares no initiator anywhere, chains start at repeat units instead."
+        )
 
 
 class NoTerminationForStochasticObject(ParsingWarning):
@@ -358,15 +380,34 @@ class InvalidGenerationSource(G2RINSError):
 
 
 class NoValidGenerationSource(G2RINSError):
-    """Automatic source selection has no candidates in the requested mode."""
+    """Automatic source selection has no candidate with positive weight."""
 
-    def __init__(self, use_repeat_units_as_source=False):
-        self.use_repeat_units_as_source = bool(use_repeat_units_as_source)
-        super().__init__(self.use_repeat_units_as_source)
+    def __init__(self):
+        super().__init__()
 
     def __str__(self):
-        mode = "repeat-unit" if self.use_repeat_units_as_source else "default"
-        return f"No valid automatic generation source is available in {mode} source mode. " "Supply an explicit valid source or revise the G2RINS initiation paths."
+        return (
+            "No valid automatic generation source is available: no initiation route carries weight, and without a declared "
+            "initiator no repeat-unit bond connector does either. Supply an explicit valid source or revise the G2RINS initiation paths."
+        )
+
+
+class RepeatUnitInitiation(G2RINSWarning):
+    """No initiator is declared: chains start at repeat-unit bond connectors."""
+
+    def __init__(self, g2rins_string, source_units):
+        self.token = g2rins_string
+        self.g2rins_string = g2rins_string
+        self.source_units = tuple(source_units)
+        Warning.__init__(self, g2rins_string, self.source_units)
+
+    def __str__(self):
+        where = f" in {self.g2rins_string!r}" if self.g2rins_string else ""
+        units = ", ".join(str(unit) for unit in self.source_units) or "the repeat units of the stochastic objects that nothing enters"
+        return (
+            f"No initiator is declared{where}: chains start at the bond connectors of {units}, drawn with probability proportional "
+            "to bond-connector weight times molar amount, and grow from every open site of that unit as they would from an initiator."
+        )
 
 
 class PossibleNonRepresentativePolymerChain(G2RINSWarning):
