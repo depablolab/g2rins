@@ -27,6 +27,7 @@ from .chem_resource import (
 )
 from .exception import (
     G2RINSWarning,
+    GroupRulesOnBothPathEnds,
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
     MismatchedBondConnectorLists,
@@ -45,6 +46,13 @@ _BOND_TYPE_NAME = "bond_type"
 _CONNECTOR_PLACEHOLDER_NAME = "is_connector_placeholder"
 _TRANSITION_ROLE_NAME = "transition_role"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
+_SOURCE_GROUP_NAME = "source_group"
+_SOURCE_RULE_NAME = "source_rule"
+_TARGET_GROUP_NAME = "target_group"
+_TARGET_RULE_NAME = "target_rule"
+# Group-rule attributes carried by EVERY edge (fixed schema); -1 = no group, 0 = GroupRule.NONE.
+_GROUP_EDGE_ATTR = (_SOURCE_GROUP_NAME, _SOURCE_RULE_NAME, _TARGET_GROUP_NAME, _TARGET_RULE_NAME)
+_GROUP_EDGE_SENTINELS = (-1, 0, -1, 0)
 _STOCHASTIC_TREE_DEPTH = 10
 
 
@@ -1140,6 +1148,24 @@ class GraphCreator:
                 return len(self.node_path)
 
             @property
+            def group_values(self):
+                """Group attributes of the contracted bond: the source side of the first bond connector edge on the path and the target side of the last.
+
+                The bond connectors in between (terminal descriptors and the bond connectors
+                that attach a nested stochastic object) are plain by validation, so a path
+                across nesting levels carries the rule of the unit it leaves or of the unit
+                it reaches; both at once is refused.
+                """
+                edges = [d for d in self.data_path if any(d.get(attr, 0) > 0 for attr in _NON_STATIC_ATTR)]
+                if not edges:
+                    return _GROUP_EDGE_SENTINELS
+                source = tuple(edges[0].get(key, sentinel) for key, sentinel in zip(_GROUP_EDGE_ATTR[:2], _GROUP_EDGE_SENTINELS[:2]))
+                target = tuple(edges[-1].get(key, sentinel) for key, sentinel in zip(_GROUP_EDGE_ATTR[2:], _GROUP_EDGE_SENTINELS[2:]))
+                if len(edges) > 1 and source[1] != 0 and target[1] != 0:
+                    raise GroupRulesOnBothPathEnds(str(self.graph.nodes[self.node_path[1]]["obj"]), source, str(self.graph.nodes[self.node_path[-2]]["obj"]), target)
+                return source + target
+
+            @property
             def only_bond_connectors(self):
                 return len(self.node_path) > 2 and set(self.node_path[1 : len(self.node_path) - 1]).issubset(bc_idx_set)
 
@@ -1233,6 +1259,7 @@ class GraphCreator:
                             bond_connector_path = BondConnectorPath(path, graph)
                             if bond_connector_path.valid(bc_idx):
                                 data = bond_connector_path.combined_attr
+                                data.update(zip(_GROUP_EDGE_ATTR, bond_connector_path.group_values))
                                 edges_to_add.append((in_idx, target, data))
                                 if bond_connector_path.init_weight is not None:
                                     graph.nodes[in_idx]["init_weight"] = bond_connector_path.init_weight
@@ -1254,6 +1281,7 @@ class GraphCreator:
                                 bond_connector_path = BondConnectorPath(path, graph)
                                 if bond_connector_path.valid(bc_idx):
                                     data = bond_connector_path.combined_attr
+                                    data.update(zip(_GROUP_EDGE_ATTR, bond_connector_path.group_values))
                                     edges_to_add.append((in_u, out_v, data))
 
         for edge in edges_to_add:
@@ -1286,6 +1314,10 @@ class GraphCreator:
         transition_role_name=_TRANSITION_ROLE_NAME,
         aromatic_name=_AROMATIC_NAME,
         bond_type_name=_BOND_TYPE_NAME,
+        source_group_name=_SOURCE_GROUP_NAME,
+        source_rule_name=_SOURCE_RULE_NAME,
+        target_group_name=_TARGET_GROUP_NAME,
+        target_rule_name=_TARGET_RULE_NAME,
         smi_bond_mapping=smi_bond_mapping,
     )
     def get_generative_graph(self, include_bond_connectors=False, return_extra_graph_info=False):
@@ -1317,6 +1349,8 @@ class GraphCreator:
         - **{transition_role_name}**: int Role of the bond (the ``TransitionRole`` encoding, stable across versions, present on every edge): 0 not a transition; 1 stochastic -- mediated by a bond connector of the managing stochastic object, competes as a weighted option at that level; 2 forced entry -- into a nested stochastic object with no parent bond connector on the path; 3 forced exit -- out of a nested stochastic object through its terminal bond connector with no bond connector of an enclosing object on the path, fires when the instance owning the source finalizes; 4 global -- stochastic id -1. The graph with bond connectors carries 0 on every edge, its transitions are not contracted.
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
+        - **{source_group_name}**, **{target_group_name}**: int Group id declared by the bond connector symbol of the unit the bond leaves from, respectively arrives at (conditional connectivity). -1 when that symbol declares no group.
+        - **{source_rule_name}**, **{target_rule_name}**: int Group rule of that symbol: 0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL (the ``GroupRule`` encoding, stable across versions). A bond across nesting levels passes through terminal bond connectors and the bond connectors that attach the nested stochastic object; those are plain, so the bond carries the rule of the unit it leaves or of the unit it reaches, and a bond ruled at both ends is refused (``GroupRulesOnBothPathEnds``, raised when the graph without bond connectors is built; the graph with bond connectors stays available). Static bonds and the terminal-bond-connector side of a stochastic object's entry or exit carry the sentinels -1 and 0. One bond per distinct group annotation of a compatible bond connector pair: a pair whose symbols match in two differently grouped ways yields two parallel bonds sharing that pair's weight.
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
@@ -1338,7 +1372,8 @@ class GraphCreator:
         **init_weight**, the **{static_name}** edge flag, the three
         non-static weights and an integer **{transition_role_name}** on every
         edge produces a graph that every consumer, including the label
-        derivation, can handle. Generation and export require
+        derivation, can handle; consumers read absent group-rule attributes
+        as their sentinels (no group, rule NONE). Generation and export require
         **{transition_role_name}**: 0 on every edge without a transition
         weight, 4 on the transitions stamped -1, and consistent with the
         edge's weight and stamp at construction; a graph that omits or
@@ -1489,6 +1524,8 @@ class GraphCreator:
             d.setdefault(_TERMINATION_NAME, 0)
             d.setdefault(_TRANSITION_NAME, 0)
             d.setdefault(_EDGE_STOCHASTIC_ID_NAME, -2)  # -2 = unassigned; real ids start at 0, -1 is the global level
+            for key, sentinel in zip(_GROUP_EDGE_ATTR, _GROUP_EDGE_SENTINELS):
+                d.setdefault(key, sentinel)
             d.setdefault(_TRANSITION_ROLE_NAME, int(TransitionRole.NONE))
 
             if _BOND_TYPE_NAME in d:

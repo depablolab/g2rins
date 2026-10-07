@@ -27,7 +27,6 @@ def _make_parser(filename=None, start_tokens=None):
             "molar_amount",
             "bond_connector_symbol",
             "bond_connector_generation",
-            "ladder_bond_connector",
             "non_covalent_bond_connector",
             "bond_connector",
             "simple_bond_connector",

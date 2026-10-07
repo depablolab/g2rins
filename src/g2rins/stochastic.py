@@ -10,6 +10,8 @@ import numpy as np
 from .g2rins_molecule import G2rinsMolecule
 from .bond import (
     BondConnector,
+    GroupRule,
+    TerminalBondConnector,
     TerminalBondConnectorList,
 )
 from .core import G2rinsBase, GenerationBase
@@ -18,15 +20,27 @@ from .exception import (
     ConcatenatedBondConnectors,
     EmptyBondConnectorInTerminalBondConnectorList,
     EndGroupHasBondConnectors,
+    GroupPartnerNotPlain,
+    GroupRuleOnNestedObjectBondConnector,
+    GroupRuleOnTerminalBondConnector,
+    IncompatibleGroupPair,
     IncorrectNumberOfBondProbabilities,
+    IndistinguishableSymbolsInSite,
+    MixedOuterSymbolsInGroup,
+    MixedRulesInGroup,
     MonomerHasTwoOrMoreBondConnectors,
     NoExplicitInitiation,
     NoExplicitTermination,
     NoInitiationForStochasticObject,
+    RepeatedGroupInSite,
+    SingleMemberGroup,
     StochasticMissingPath,
     UndefinedDistribution,
 )
 from .generative_graph import (
+    _GROUP_EDGE_ATTR,
+    _GROUP_EDGE_SENTINELS,
+    _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
@@ -35,6 +49,42 @@ from .generative_graph import (
     is_static_edge,
 )
 from .smiles import Counterion, Smiles, _attach_counterions_to_partial_graph
+
+
+def _inner_class_counts(symbols):
+    """Count one ladder group's members per inner pairing class (symbol char, idx)."""
+    counts = {}
+    for symbol in symbols:
+        inner = symbol.group_suffix.inner_symbol
+        key = (inner.symbol_char, inner.idx)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _inner_classes_conjugate(symbols_a, symbols_b):
+    """True iff class-wise matching between the two member sets can never strand a member."""
+    counts_a = _inner_class_counts(symbols_a)
+    counts_b = _inner_class_counts(symbols_b)
+    if sum(counts_a.values()) != sum(counts_b.values()):
+        return False
+    for (char, idx), count in counts_a.items():
+        partner = ("$", idx) if char == "$" else ((">", idx) if char == "<" else ("<", idx))
+        if counts_b.get(partner, 0) != count:
+            return False
+    return True
+
+
+def _terminal_edge_attrs(terminal_bc, unit_bc, unit_is_source):
+    """Group-rule edge attributes between a terminal descriptor and a unit's bond connector: the unit side comes from its compatible symbols, the terminal side is the sentinel."""
+    unit_values = []
+    for symbol in unit_bc.symbol or []:
+        if any(symbol.is_compatible(terminal_symbol) for terminal_symbol in terminal_bc.symbol or []) and symbol.group_edge_values not in unit_values:
+            unit_values.append(symbol.group_edge_values)
+    attrs = []
+    for values in unit_values:
+        ordered = values + _GROUP_EDGE_SENTINELS[2:] if unit_is_source else _GROUP_EDGE_SENTINELS[:2] + values
+        attrs.append(dict(zip(_GROUP_EDGE_ATTR, ordered)))
+    return attrs
 
 
 class StochasticObject(G2rinsBase, GenerationBase):
@@ -124,6 +174,8 @@ class StochasticObject(G2rinsBase, GenerationBase):
                                 stochastic_id = generative_graph.nodes(data=True)[v]["stochastic_id_tree"][0]
                                 if (v in graph_creator._bc_idx_set) and (data["stochastic_id_tree"][0] == stochastic_id):
                                     raise ConcatenatedBondConnectors(element, self)
+                if element is not self:
+                    self._reject_group_rules_on_nested_object_bond_connectors(element, graph_creator)
         except UndefinedDistribution:
             pass
 
@@ -158,6 +210,112 @@ class StochasticObject(G2rinsBase, GenerationBase):
         if len(self._right_terminal_bc_list.terminal_bond_connectors) > 1:
             if None in [bond_connector.symbol for bond_connector in self._right_terminal_bc_list.terminal_bond_connectors]:
                 raise EmptyBondConnectorInTerminalBondConnectorList(self._right_terminal_bc_list, self)
+
+        for tbc_list in (self._left_terminal_bc_list, self._right_terminal_bc_list):
+            for bond_connector in tbc_list.terminal_bond_connectors:
+                if any(symbol.group_suffix is not None for symbol in bond_connector.symbol or []):
+                    raise GroupRuleOnTerminalBondConnector(bond_connector, self)
+
+        self._validate_group_rules()
+
+    def _reject_group_rules_on_nested_object_bond_connectors(self, residue, graph_creator):
+        """A bond connector that attaches a nested stochastic object relays bonds between levels and stays plain."""
+        graph = graph_creator.g
+        for u, v, data in graph.edges(data=True):
+            if u not in graph_creator._bc_idx_set or v not in graph_creator._bc_idx_set or any(attr in data for attr in _NON_STATIC_ATTR):
+                continue
+            # Static bond connector adjacency arises only where a nested object's terminal descriptor meets the enclosing unit text.
+            for node in (u, v):
+                bond_connector = graph.nodes[node]["obj"]
+                if isinstance(bond_connector, TerminalBondConnector):
+                    continue
+                if any(symbol.group_suffix is not None for symbol in bond_connector.symbol or []):
+                    raise GroupRuleOnNestedObjectBondConnector(bond_connector, residue, self)
+
+    def _collect_group_symbols(self, bond_connectors):
+        """Group table (group id -> [(bond connector, symbol)]) plus all symbols of one unit text."""
+        table = {}
+        symbols = []
+        for bc in bond_connectors:
+            seen_in_site = set()
+            for symbol in bc.symbol or []:
+                symbols.append((bc, symbol))
+                suffix = symbol.group_suffix
+                if suffix is None:
+                    continue
+                if suffix.group_id in seen_in_site:
+                    raise RepeatedGroupInSite(suffix.group_id, bc, self)
+                seen_in_site.add(suffix.group_id)
+                table.setdefault(suffix.group_id, []).append((bc, symbol))
+        return table, symbols
+
+    def _validate_group_rules(self):
+        scopes = []
+        for kind, residues in (("repeat", self._repeat_residues), ("initiation", self._initiation_residues), ("termination", self._termination_residues)):
+            for residue in residues:
+                scopes.append((residue, kind) + self._collect_group_symbols(residue.bond_connectors))
+
+        if not any(table for _owner, _kind, table, _symbols in scopes):
+            return
+
+        repeat_bond_connectors = [bc for residue in self._repeat_residues for bc in residue.bond_connectors]
+        # An initiator reaches the terminators only when no repeat unit takes it (connect_initiators_to_terminators).
+        partnerless_initiators = {id(bc) for residue in self._initiation_residues for bc in residue.bond_connectors if not any(bc.is_compatible(other) for other in repeat_bond_connectors)}
+
+        def can_bond(kind_a, bc_a, kind_b, bc_b):
+            # Initiators never bond to initiators and terminators never to terminators.
+            if kind_a == kind_b:
+                return kind_a == "repeat"
+            if {kind_a, kind_b} == {"initiation", "termination"}:
+                return id(bc_a if kind_a == "initiation" else bc_b) in partnerless_initiators
+            return True
+
+        ladder_groups = []
+        for owner, kind, table, _symbols in scopes:
+            for group_id, members in table.items():
+                rules = {symbol.group_rule for _bc, symbol in members}
+                if len(rules) > 1:
+                    raise MixedRulesInGroup(group_id, owner, self)
+                rule = next(iter(rules))
+                if rule == GroupRule.LADDER:
+                    outers = {(symbol.symbol_char, symbol.idx) for _bc, symbol in members}
+                    if len(outers) > 1:
+                        raise MixedOuterSymbolsInGroup(group_id, owner, self)
+                    ladder_groups.append((owner, kind, group_id, members))
+                if len(members) == 1:
+                    warnings.warn(SingleMemberGroup(group_id, rule.name, owner), stacklevel=1)
+
+        # A plain symbol beside an exclusion- or all-typed one with the same outer symbol and index
+        # gives partners no way to pick the channel (ladder symbols are rigid, so never affected).
+        for owner, _kind, _table, symbols in scopes:
+            plain_keys = {}
+            for bc, symbol in symbols:
+                if symbol.group_suffix is None:
+                    plain_keys.setdefault(id(bc), set()).add((symbol.symbol_char, symbol.idx))
+            for bc, symbol in symbols:
+                if symbol.group_rule in (GroupRule.EXCLUSION, GroupRule.ALL) and (symbol.symbol_char, symbol.idx) in plain_keys.get(id(bc), ()):
+                    warnings.warn(IndistinguishableSymbolsInSite(symbol, bc, owner), stacklevel=1)
+
+        for i, (owner_a, kind_a, group_a, members_a) in enumerate(ladder_groups):
+            for owner_b, kind_b, group_b, members_b in ladder_groups[i:]:
+                # Partners are groups that can engage: some member pair is compatible (outer AND inner);
+                # groups with disjoint inner channels never meet, however their outer symbols conjugate.
+                if not any(can_bond(kind_a, bc_a, kind_b, bc_b) and symbol_a.is_compatible(symbol_b) for bc_a, symbol_a in members_a for bc_b, symbol_b in members_b):
+                    continue
+                if len(members_a) != len(members_b):
+                    raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the member counts differ")
+                if not _inner_classes_conjugate([symbol for _bc, symbol in members_a], [symbol for _bc, symbol in members_b]):
+                    raise IncompatibleGroupPair(group_a, owner_a, group_b, owner_b, self, "the inner class multisets are not conjugate")
+
+        every_symbol = [(kind, bc, symbol) for _owner, kind, _table, symbols in scopes for bc, symbol in symbols]
+        for _owner, kind, table, _symbols in scopes:
+            for members in table.values():
+                for bc, symbol in members:
+                    if symbol.group_rule not in (GroupRule.EXCLUSION, GroupRule.ALL):
+                        continue
+                    for other_kind, other_bc, other in every_symbol:
+                        if other.group_suffix is not None and can_bond(kind, bc, other_kind, other_bc) and symbol.is_compatible(other):
+                            raise GroupPartnerNotPlain(symbol, other, self)
 
     def _residue_string(self, residue, extension: bool) -> str:
         string = residue.generate_string(extension)
@@ -274,12 +432,15 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 # Set weights to zero if bond are incompatible, note different lengths from above.
                 if prints:
                     print("before checking compatibility, probabilities are ", probabilities)
+                edge_attrs_per_target = []
                 for i in range(len(probabilities)):
                     bc_idx_b = full_idx[i]
                     obj_b = graph.nodes[bc_idx_b]["obj"]
                     if prints:
                         print("target node is: ", graph.nodes[bc_idx_b])
-                    if not obj_a.is_compatible(obj_b):
+                    # One edge per distinct compatible symbol pair; no pair = incompatible target.
+                    edge_attrs_per_target.append(obj_a.group_edge_attrs(obj_b))
+                    if not edge_attrs_per_target[i]:
                         probabilities[i] = 0
                 if prints:
                     print("after checking compatibility, probabilities are ", probabilities)
@@ -290,7 +451,12 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 for i, prob in enumerate(probabilities):
                     if prob > 0:
                         bc_idx_b = full_idx[i]
-                        graph.add_edge(bc_idx_a, bc_idx_b, **dict([(attr_name, prob)]))
+                        edge_attrs = edge_attrs_per_target[i]
+                        if len(edge_attrs) > 1:
+                            # Parallel edges of one descriptor pair share its probability.
+                            prob = prob / len(edge_attrs)
+                        for group_attrs in edge_attrs:
+                            graph.add_edge(bc_idx_a, bc_idx_b, **{attr_name: prob}, **group_attrs)
                 if prints:
                     print("At the end, probabilities are: ", probabilities)
                 if sum(probabilities) == 0:
@@ -475,7 +641,11 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 for i, prob in enumerate(probabilities):
                     if prob > 0:
                         node_idx = mono_idx_pos[i]
-                        graph.add_edge(left_idx, node_idx, **dict([(_TRANSITION_NAME, prob)]))
+                        edge_attrs = _terminal_edge_attrs(left_terminal_bond_connector, graph.nodes[node_idx]["obj"], unit_is_source=False)
+                        if len(edge_attrs) > 1:
+                            prob = prob / len(edge_attrs)
+                        for group_attrs in edge_attrs:
+                            graph.add_edge(left_idx, node_idx, **{_TRANSITION_NAME: prob}, **group_attrs)
 
         # Add out-going bonds
 
@@ -524,7 +694,11 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 for i, prob in enumerate(probabilities):
                     if prob > 0:
                         bc_idx = full_bc_idx[i]
-                        graph.add_edge(bc_idx, right_idx, **dict([(_TRANSITION_NAME, prob)]))
+                        edge_attrs = _terminal_edge_attrs(right_terminal_bond_connector, graph.nodes[bc_idx]["obj"], unit_is_source=True)
+                        if len(edge_attrs) > 1:
+                            prob = prob / len(edge_attrs)
+                        for group_attrs in edge_attrs:
+                            graph.add_edge(bc_idx, right_idx, **{_TRANSITION_NAME: prob}, **group_attrs)
 
         # Add mol weight distribution to all nodes
         for node_idx in partial_graph.g:
