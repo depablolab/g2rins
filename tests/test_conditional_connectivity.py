@@ -489,9 +489,10 @@ def test_terminal_descriptor_edges_carry_unit_side_annotation():
     g2rins.EnsembleCreator(generative_graph)
 
 
-MULTILEVEL_EXCLUSION_TEXT = (
-    "{[] [<,<2]C(=O)CC[>2]; {[] [<1]CC[>1]; {[] [<1]CCN([>1,>[]])([>1,>[]]), [<1]CCO[>1]; O[>1]; [<]|[<1]}|poisson(1000)|[>]|[>1]; [<]}|poisson(3000)|[>]; [<1][H] []}|poisson(5000)|"
-)
+# Each level-2 nitrogen holds two dual-channel sites: the typed channel is the level-0 unit's only entry and fires as
+# promoted growth after two hand-offs, the plain one grows at levels 2 and 1. The level masses leave level 1 little
+# growth, so enough typed channels survive to the level-0 hand-off for every chain to complete.
+MULTILEVEL_EXCLUSION_TEXT = "{[] [<,<2]C(=O)CC[>2]; {[] [<1]CC[>1]; {[] [<1]CC(CCN([>1,>[]])([>1,>[]]))CCN([>1,>[]])([>1,>[]]), [<1]CCO[>1]; O[>1]; [<]|[<1]}|poisson(4000)|[>]|[>1]; [<1][H] [<]}|poisson(4250)|[>]; [<2][H] []}|poisson(4600)|"
 
 
 def test_group_rule_survives_bond_connector_path_across_levels():
@@ -502,17 +503,13 @@ def test_group_rule_survives_bond_connector_path_across_levels():
     _assert_no_diagnostics(MULTILEVEL_EXCLUSION_TEXT)
     generative_graph = _generative_graph(_graph_creator(MULTILEVEL_EXCLUSION_TEXT))
     annotated = [(u, v, _mode(data), _group_values(data)) for u, v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL]
-    assert len(annotated) == 2  # one per site of the level-2 unit
+    assert len(annotated) == 4  # one per nitrogen site of the level-2 unit
     for u, v, mode, values in annotated:
         assert (mode, values) == ("transition_weight", (0, 2, -1, 0))
         # From a split node of the level-2 nitrogen to the level-0 carbonyl carbon.
         assert generative_graph.nodes[u]["atomic_num"] == 0
         assert 7 in {generative_graph.nodes[w]["atomic_num"] for w in generative_graph.neighbors(u)}
         assert generative_graph.nodes[v]["atomic_num"] == 6
-    # Builds; sampling it almost never completes under the rule: its only route back to
-    # the outermost object is the typed channel, which a sibling's plain growth removes
-    # first (measured 0 of 100 attempts).
-    g2rins.EnsembleCreator(generative_graph)
 
 
 def test_group_rule_exit_into_enclosing_object_reaches_generation():
@@ -682,11 +679,14 @@ def _sample(text, n_chains, seed=7, output_format="mol_graph"):
         return _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format=output_format, seed=seed)
 
 
-@pytest.mark.parametrize("text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12)])
+@pytest.mark.parametrize(
+    "text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12), (MULTILEVEL_EXCLUSION_TEXT, 6)]
+)
 def test_sampling_obeys_the_channel_rule_at_every_level(monkeypatch, text, n_chains):
     # Same-level growth and caps, exits through terminal bond connectors into the
-    # enclosing object, and a nested block: the rule holds on the sampler's own
-    # bond events, and the typed channel does fire in each string.
+    # enclosing object, a nested block, and a typed channel that fires as promoted
+    # growth two hand-offs after its unit was placed: the rule holds on the sampler's
+    # own bond events, and the typed channel does fire in each string.
     log = _timeline(monkeypatch)
     chains = _sample(text, n_chains)
     assert chains is not None and len(chains) == n_chains
