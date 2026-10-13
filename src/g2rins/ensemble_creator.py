@@ -29,6 +29,7 @@ from .chem_resource import (
 )
 from .distribution import StochasticDistribution
 from .exception import (
+    AllGroupOvershoot,
     AllZeroSamplingWeights,
     DeadSamplingPath,
     DiscardedSamplingPaths,
@@ -342,6 +343,13 @@ class _HalfAtomBond:
         """Group ids of the EXCLUSION channels this site still holds, derived from its live edges on either side."""
         held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.EXCLUSION}
         return held | self._entry_groups
+
+    def holds_rule(self, mode, rule, sto_gen_id):
+        """Whether a live ``mode`` channel of this site at level ``sto_gen_id`` carries the group rule ``rule`` (forced exits never compete)."""
+        return any(
+            attrs.get(_SOURCE_RULE_NAME, 0) == rule and attrs.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attrs.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
+            for attrs in self._mode_attr_map.get(mode, [])
+        )
 
     def drop_edges(self, keep):
         """Drop the channels whose group id fails ``keep`` on either side, menus kept aligned; a dropped forced entry is forgotten."""
@@ -1216,6 +1224,16 @@ class _PartialAtomGraph:
                 idx = parent_idx
         return idx, open_half_bonds
 
+    def all_tier(self, sto_atom_id, mode, sto_gen_id):
+        """The instance's own open sites still holding an ALL-typed ``mode`` channel at its level.
+
+        The all rule: while any exists, that instance's ``mode`` draw is restricted to them and
+        the instance cannot stop, whatever its mass. Read from the pool the draw reads, the
+        instance's own bucket: an owner-level site never waits in a child's bucket, promotion
+        moves it with its rule.
+        """
+        return [half_bond for half_bond in self._open_half_bond_map.get(sto_atom_id, []) if half_bond.holds_rule(mode, GroupRule.ALL, sto_gen_id)]
+
     def _apply_realized_bond(self, u_idx, v_idx, bond_attr):
         """A junction bond just became real: charge each endpoint's occupied
         valence by the bond order and re-infer its hydrogens, crediting the
@@ -1448,6 +1466,10 @@ class _PartialAtomGraph:
             # remain in the bucket): report "no transition possible" instead of
             # crashing on an empty draw.
             return None, non_used_half_bonds
+        # The all rule: a site holding an ALL-typed transition at this level fires before any other.
+        tier = [half_bond for half_bond in filtered_half_bonds if half_bond.holds_rule(_TRANSITION_NAME, GroupRule.ALL, sto_gen_id)]
+        if tier:
+            filtered_half_bonds = tier
         if len(filtered_half_bonds) == 1:
             # Deterministic pick: skip the draw so it consumes no RNG state.
             chosen = filtered_half_bonds[0]
@@ -2257,10 +2279,16 @@ class _PartialAtomGraph:
     def propagate_graph(self, sto_atom_id, rng, prefer_parent_bonds):
 
         def pop_random_stochastic_bond():
-            # Find a transition bond
+            # The all rule: sites still holding an ALL-typed growth channel are drawn before
+            # any other site of the pool; the tier is read before the prefer_parent filter.
+            tier = {id(half_bond) for half_bond in self.all_tier(sto_atom_id, _PROPAGATION_NAME, self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id])}
+            if tier:
+                candidates = [(i, half_bond) for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id), strict=False) if id(half_bond) in tier]
+            else:
+                candidates = zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False)
             stochastic_idx = []
             propagation_weight = []
-            for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False):
+            for i, half_bond in candidates:
                 if half_bond.propagation_suitable:
                     # TODO carefully check if stochastic bonds have the right weight here!
                     propagation_weight += [half_bond.weight]
@@ -2650,10 +2678,10 @@ class EnsembleCreator:
             for key in (_SOURCE_RULE_NAME, _TARGET_RULE_NAME):
                 if edge_data.get(key, 0):
                     group_rules.add(GroupRule(edge_data[key]).name)
-        if group_rules - {GroupRule.EXCLUSION.name}:
-            # Temporary gate: sampling honors EXCLUSION; LADDER and ALL land in later phases.
+        if group_rules - {GroupRule.EXCLUSION.name, GroupRule.ALL.name}:
+            # Temporary gate: sampling honors EXCLUSION and ALL; LADDER lands in a later phase.
             raise NotImplementedError(
-                f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for the rules other than EXCLUSION lands in a later implementation phase."
+                f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for the LADDER rule lands in a later implementation phase."
             )
 
         self._static_graph = self._create_static_graph(self.generative_graph)
@@ -3453,6 +3481,8 @@ class EnsembleCreator:
         checkpoints = {}
         owner_epochs = {}
         forced_overshoot_no_boundary = set()
+        # Instances the all rule kept growing past their drawn target (reported once per chain).
+        all_group_overshoot = set()
         mutations = 0
 
         def _commit_mutation():
@@ -3469,6 +3499,11 @@ class EnsembleCreator:
         gain_floor = {}
         last_checked_proj = {}
         avg_termination_cache = {}
+
+        def _all_tier_open(graph, sto_atom_id):
+            """Whether ``sto_atom_id`` still holds an unfired ALL-typed site in ``graph``, growth or transition."""
+            gen_id = graph.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+            return any(graph.all_tier(sto_atom_id, mode, gen_id) for mode in (_PROPAGATION_NAME, _TRANSITION_NAME))
 
         def _projected_molw(tracker, sto_atom_id):
             """Tracked mass of sto_atom_id EXCLUDING its own termination caps
@@ -3511,6 +3546,7 @@ class EnsembleCreator:
                 "avg_termination_cache": dict(avg_termination_cache),
                 "owner_epochs": dict(owner_epochs),
                 "forced_overshoot_no_boundary": set(forced_overshoot_no_boundary),
+                "all_group_overshoot": set(all_group_overshoot),
                 "checkpoints": {owner: checkpoint for owner, checkpoint in checkpoints.items() if owner in compatible_ancestors},
                 "owner": checkpoint_owner,
                 "epoch": owner_epochs.get(checkpoint_owner, 0),
@@ -3726,6 +3762,21 @@ class EnsembleCreator:
                 avg_termination_weight = partial_atom_graph.get_average_termination_mw(sto_atom_id, self._static_graph, rng)
                 avg_termination_cache[sto_atom_id] = avg_termination_weight
                 if proj_now[sto_atom_id] + avg_termination_weight >= expected_i:
+                    if _all_tier_open(partial_atom_graph, sto_atom_id):
+                        # The all rule: an instance with an unfired ALL-typed site cannot
+                        # stop; it grows past its drawn target and the chain reports it.
+                        all_group_overshoot.add(sto_atom_id)
+                        if _DECISION_TRACE is not None:
+                            _DECISION_TRACE.append(
+                                {
+                                    "kind": "all_tier_blocked",
+                                    "id": sto_atom_id,
+                                    "gen": tracker._stochastic_atom_id_to_gen_id[sto_atom_id],
+                                    "expected": expected_i,
+                                    "proj_over": proj_now[sto_atom_id] + avg_termination_weight,
+                                }
+                            )
+                        continue
                     crossing_sto_atom_id = sto_atom_id
                     crossing_projected = proj_now[sto_atom_id] + avg_termination_weight
                     break
@@ -3750,7 +3801,9 @@ class EnsembleCreator:
                     if crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw and not snapshot_tracker.is_terminated(crossing_sto_atom_id):
                         under_caps_molw = snapshot_graph.get_average_termination_mw(crossing_sto_atom_id, self._static_graph, rng)
                         projected_under = _projected_molw(snapshot_tracker, crossing_sto_atom_id) + under_caps_molw
-                        snapshot_valid = projected_under < expected_molw
+                        # A checkpoint still holding an unfired ALL-typed site is no boundary:
+                        # restoring it would un-place a site the all rule forces.
+                        snapshot_valid = projected_under < expected_molw and not _all_tier_open(snapshot_graph, crossing_sto_atom_id)
                 if termination_flag == 0:
                     adopt_overshoot = True
                 elif not snapshot_valid:
@@ -3810,6 +3863,7 @@ class EnsembleCreator:
                     avg_termination_cache = dict(checkpoint["avg_termination_cache"])
                     owner_epochs = dict(checkpoint["owner_epochs"])
                     forced_overshoot_no_boundary = set(checkpoint["forced_overshoot_no_boundary"])
+                    all_group_overshoot = set(checkpoint["all_group_overshoot"])
                     restored_tracker = partial_atom_graph.stochastic_tracker
                     restored_live = set(restored_tracker.get_unterminated_sto_atom_ids())
                     checkpoints = {owner: prior for owner, prior in checkpoint["checkpoints"].items() if (owner in restored_live and prior["epoch"] + 1 == owner_epochs.get(owner, 0))}
@@ -4000,6 +4054,11 @@ class EnsembleCreator:
         # ancestor can compensate; warning at the provisional crossing made
         # correctly undershooting final chains look like failures.
         final_tracker = partial_atom_graph.stochastic_tracker
+        if any(
+            sto_atom_id in final_tracker._sto_atom_id_actual_molw and final_tracker._sto_atom_id_actual_molw[sto_atom_id] > final_tracker._sto_atom_id_expected_molw[sto_atom_id] + 1e-9
+            for sto_atom_id in all_group_overshoot
+        ):
+            warnings.warn(AllGroupOvershoot(), stacklevel=1)
         if termination_flag == 1:
             for sto_atom_id in sorted(forced_overshoot_no_boundary):
                 if (
@@ -4222,6 +4281,9 @@ class EnsembleCreator:
         total_discards = 0
         discard_reasons = Counter()
         first_discard_cause = None
+        # Chains the all rule grew past a drawn target: one aggregate warning per ensemble.
+        all_group_overshoot_chains = 0
+        chain_overshoot = False
 
         if parallel and n_workers > 1:
             # One independent stream per CHAIN INDEX (not per worker): the
@@ -4240,8 +4302,11 @@ class EnsembleCreator:
 
             records = []
             for chain_result in chain_results:
+                if chain_result["record"] is not None and any(issubclass(category, AllGroupOvershoot) for _message, category, _filename, _lineno in chain_result["warnings"]):
+                    all_group_overshoot_chains += 1
                 for message, category, filename, lineno in chain_result["warnings"]:
-                    warnings.warn_explicit(message, category, filename, lineno)
+                    if not issubclass(category, AllGroupOvershoot):
+                        warnings.warn_explicit(message, category, filename, lineno)
                 total_discards += chain_result["discards"]
                 discard_reasons.update(dict(chain_result["reasons"]))
                 if chain_result["record"] is not None:
@@ -4277,8 +4342,11 @@ class EnsembleCreator:
             while len(records) < n_samples:
                 rng = chain_rngs[len(records)] if chain_rngs is not None else None
                 sample, attempt_reasons, discard_cause, deferred_warnings = _attempt_chain(self, collect_info, termination_flag, rng)
+                if any(issubclass(caught.category, AllGroupOvershoot) for caught in deferred_warnings):
+                    chain_overshoot = True
                 for caught in deferred_warnings:
-                    warnings.warn_explicit(caught.message, caught.category, caught.filename, caught.lineno)
+                    if not issubclass(caught.category, AllGroupOvershoot):
+                        warnings.warn_explicit(caught.message, caught.category, caught.filename, caught.lineno)
                 if sample is None:
                     consecutive_discards += 1
                     total_discards += 1
@@ -4305,6 +4373,8 @@ class EnsembleCreator:
                     continue
                 consecutive_discards = 0
                 first_discard_cause = None
+                all_group_overshoot_chains += chain_overshoot
+                chain_overshoot = False
                 records.append(_convert_chain(sample, molecule_format, collect_info))
 
         if total_discards:
@@ -4312,6 +4382,8 @@ class EnsembleCreator:
                 DiscardedSamplingPaths(total_discards, tuple(discard_reasons.items())),
                 stacklevel=2,
             )
+        if all_group_overshoot_chains:
+            warnings.warn(AllGroupOvershoot(all_group_overshoot_chains, len(records)), stacklevel=2)
 
         list_of_molecules = [record["molecule"] for record in records]
 

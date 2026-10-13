@@ -410,6 +410,27 @@ class UndershootSnapshotMissed(G2RINSWarning):
         return f"{self._MESSAGE} Token: {self.token}"
 
 
+class AllGroupOvershoot(G2RINSWarning):
+    """A stochastic object grew past its drawn target because sites of an all-group were still unfired.
+
+    The all rule places every all-typed site of a unit instance before the object may stop, so a
+    target too small for the written architecture is exceeded, never cut. The sampler emits it once
+    per chain; ``create_ensemble`` folds those into one warning carrying the chain count.
+    """
+
+    def __init__(self, chain_count=1, chain_total=1):
+        self.chain_count = int(chain_count)
+        self.chain_total = int(chain_total)
+        Warning.__init__(self, self.chain_count, self.chain_total)
+
+    def __str__(self):
+        return (
+            f"In {self.chain_count} of {self.chain_total} chain(s) a stochastic object grew past its drawn "
+            "molecular weight target because sites of an all-group were still waiting to fire: the all rule "
+            "places them before the object may stop. Raise the target if the overshoot is unintended."
+        )
+
+
 class ForcedOvershootNoBoundary(G2RINSWarning):
     """A final explicit undershoot remained impossible because no valid
     owner-level boundary existed below the target.

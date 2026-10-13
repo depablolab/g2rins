@@ -11,7 +11,7 @@ annotation of a compatible bond connector pair, terminal-descriptor edges
 annotated on the unit side. Phase 2 -- generation honors the EXCLUSION rule: a
 site consumed through an exclusion-typed channel blocks its group siblings, a
 site consumed through a plain channel removes their exclusion-typed channels
-(whatever mode fired the bond, at any level); LADDER and ALL stay gated.
+(whatever mode fired the bond, at any level); LADDER stays gated.
 """
 
 import warnings
@@ -25,6 +25,7 @@ import g2rins
 from g2rins import GroupRule
 from g2rins import ensemble_creator as _ec
 from g2rins.exception import (
+    AllGroupOvershoot,
     GroupPartnerNotPlain,
     GroupRuleOnNestedObjectBondConnector,
     GroupRuleOnTerminalBondConnector,
@@ -600,8 +601,8 @@ def test_all_star_string_encoding():
     # Three initiator sites x two repeat units, all transitions through the all-group.
     assert len(annotated) == 6
     assert all(edge == ("[>[all]]", "[<]", "transition_weight", (0, 3, -1, 0)) for edge in annotated)
-    with pytest.raises(NotImplementedError, match="ALL"):
-        g2rins.EnsembleCreator(_generative_graph(_graph_creator(ALL_STAR_TEXT)))
+    # ALL is no longer gated: the creator builds; sampling is pinned by the phase-3 tests.
+    g2rins.EnsembleCreator(_generative_graph(_graph_creator(ALL_STAR_TEXT)))
 
 
 # -- Phase 2: generation under the EXCLUSION rule --------------------------------------
@@ -900,3 +901,82 @@ def test_typed_sibling_caps_keep_the_number_average_on_target():
         chains = _sample(text, 40, seed=1)
         number_average = np.mean([Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) for chain in chains])
         assert abs(number_average - 600) / 600 < 0.1, f"Mn {number_average:.0f} vs target 600 for {text}"
+
+
+# -- Phase 3: generation under the ALL rule ---------------------------------------------
+
+# Two all-typed initiator sites beside a plain one: the plain site waits, at the opening move too.
+MIXED_ALL_TEXT = "{[] [<]CCO[>]; C(O[>[all]1])(CO[>[all]1])(CO[>]); [H][<] []}|poisson(300)|"
+# Target below the initiator plus one unit per all-typed site: every chain must overshoot.
+SMALL_TARGET_ALL_TEXT = "{[] [<]CCO[>]; C(O[>[all]1])(CO[>[all]1])(CO[>[all]1]); [H][<] []}|poisson(120)|"
+
+
+def _all_rule_violations(bonds):
+    """Bonds fired from a plain source channel before the chain's last bond fired from an all-typed one: the
+    all rule places every all-typed site before any other growth, so none may occur."""
+    rules = [source[3] for _kind, _fresh_tag, source, _target in bonds if source is not None]
+    last_all = max((i for i, rule in enumerate(rules) if rule == GroupRule.ALL), default=-1)
+    return sum(1 for rule in rules[:last_all] if rule != GroupRule.ALL), last_all >= 0
+
+
+@pytest.mark.parametrize("text, n_chains", [(ALL_TEXT, 12), (ALL_STAR_TEXT, 4), (MIXED_ALL_TEXT, 12), (SMALL_TARGET_ALL_TEXT, 12)])
+def test_all_typed_sites_fire_before_any_other_growth(monkeypatch, text, n_chains):
+    log = _timeline(monkeypatch)
+    chains = _sample(text, n_chains)
+    assert chains is not None and len(chains) == n_chains
+    results = [_all_rule_violations(bonds) for bonds in _surviving_bonds_per_chain(log)]
+    assert len(results) == n_chains
+    assert sum(violations for violations, _fired in results) == 0
+    assert all(fired for _violations, fired in results)
+
+
+def _all_typed_oxygen_origins(generative_graph):
+    return {
+        str(node)
+        for node, data in generative_graph.nodes(data=True)
+        if data["atomic_num"] == 8
+        and any(edge.get("source_rule", 0) == GroupRule.ALL for site in _site_nodes(generative_graph, node) for _u, _v, edge in generative_graph.out_edges(site, data=True))
+    }
+
+
+def _chains_with_every_all_typed_site_used(generative_graph, chains):
+    origins = _all_typed_oxygen_origins(generative_graph)
+    assert len(origins) == 3
+    return sum(1 for chain in chains if sum(1 for node, data in chain.nodes(data=True) if data["origin_idx"] in origins and chain.degree(node) == 2) == 3)
+
+
+@pytest.mark.parametrize("text, n_chains", [(ALL_TEXT, 8), (ALL_STAR_TEXT, 3)])
+def test_every_all_typed_site_is_used_in_the_output(text, n_chains):
+    graph_creator = _graph_creator(text)
+    generative_graph = _generative_graph(graph_creator)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(n_chains, output_format="mol_graph", seed=7)
+    assert _chains_with_every_all_typed_site_used(generative_graph, chains) == n_chains
+
+
+@pytest.mark.parametrize("termination_flag", [None, 1])
+def test_all_rule_overshoots_a_small_target_and_warns_once(termination_flag):
+    graph_creator = _graph_creator(SMALL_TARGET_ALL_TEXT)
+    generative_graph = _generative_graph(graph_creator)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(6, output_format="mol_graph", termination_flag=termination_flag, seed=3)
+    assert _chains_with_every_all_typed_site_used(generative_graph, chains) == 6
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert len(reported) == 1
+    assert (reported[0].chain_count, reported[0].chain_total) == (6, 6)
+
+
+def test_all_rule_warning_is_aggregated_on_the_parallel_path():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parallel = _graph_creator(SMALL_TARGET_ALL_TEXT).get_ensemble_creator().create_ensemble(4, output_format="smiles", parallel=True, n_workers=2, seed=3)
+    serial = _sample(SMALL_TARGET_ALL_TEXT, 4, seed=3, output_format="smiles")
+    assert list(parallel) == list(serial)
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert len(reported) == 1 and (reported[0].chain_count, reported[0].chain_total) == (4, 4)
+
+
+def test_all_generation_is_seed_reproducible():
+    assert list(_sample(ALL_TEXT, 4, seed=5, output_format="smiles")) == list(_sample(ALL_TEXT, 4, seed=5, output_format="smiles"))
