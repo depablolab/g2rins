@@ -1058,11 +1058,14 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
         first_cause = None
         deferred_warnings = []
         record = None
+        all_group_overshoot = False
         while True:
             sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(atom_graph, collect_info, termination_flag, rng)
             deferred_warnings.extend(attempt_warnings)
             if sample is not None:
                 record = _convert_chain(sample, molecule_format, collect_info)
+                # A discarded attempt's overshoot died with it: only the kept attempt counts.
+                all_group_overshoot = any(issubclass(caught.category, AllGroupOvershoot) for caught in attempt_warnings)
                 break
             discards += 1
             reasons.update(attempt_reasons)
@@ -1077,6 +1080,7 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
                 "discards": discards,
                 "reasons": tuple(reasons.items()),
                 "first_cause": first_cause,
+                "all_group_overshoot": all_group_overshoot,
                 "warnings": [_portable_warning(caught) for caught in deferred_warnings],
             }
         )
@@ -4292,9 +4296,8 @@ class EnsembleCreator:
         total_discards = 0
         discard_reasons = Counter()
         first_discard_cause = None
-        # Chains the all rule grew past a drawn target: one aggregate warning per ensemble.
+        # Returned chains the all rule grew past a drawn target: one aggregate warning per ensemble.
         all_group_overshoot_chains = 0
-        chain_overshoot = False
 
         if parallel and n_workers > 1:
             # One independent stream per CHAIN INDEX (not per worker): the
@@ -4313,8 +4316,7 @@ class EnsembleCreator:
 
             records = []
             for chain_result in chain_results:
-                if chain_result["record"] is not None and any(issubclass(category, AllGroupOvershoot) for _message, category, _filename, _lineno in chain_result["warnings"]):
-                    all_group_overshoot_chains += 1
+                all_group_overshoot_chains += chain_result["all_group_overshoot"]
                 for message, category, filename, lineno in chain_result["warnings"]:
                     if not issubclass(category, AllGroupOvershoot):
                         warnings.warn_explicit(message, category, filename, lineno)
@@ -4353,8 +4355,6 @@ class EnsembleCreator:
             while len(records) < n_samples:
                 rng = chain_rngs[len(records)] if chain_rngs is not None else None
                 sample, attempt_reasons, discard_cause, deferred_warnings = _attempt_chain(self, collect_info, termination_flag, rng)
-                if any(issubclass(caught.category, AllGroupOvershoot) for caught in deferred_warnings):
-                    chain_overshoot = True
                 for caught in deferred_warnings:
                     if not issubclass(caught.category, AllGroupOvershoot):
                         warnings.warn_explicit(caught.message, caught.category, caught.filename, caught.lineno)
@@ -4384,8 +4384,8 @@ class EnsembleCreator:
                     continue
                 consecutive_discards = 0
                 first_discard_cause = None
-                all_group_overshoot_chains += chain_overshoot
-                chain_overshoot = False
+                # A discarded attempt's overshoot died with it: only the kept attempt counts.
+                all_group_overshoot_chains += any(issubclass(caught.category, AllGroupOvershoot) for caught in deferred_warnings)
                 records.append(_convert_chain(sample, molecule_format, collect_info))
 
         if total_discards:

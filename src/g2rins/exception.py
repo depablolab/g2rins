@@ -415,7 +415,7 @@ class AllGroupOvershoot(G2RINSWarning):
 
     The all rule places every all-typed site of a unit instance before the object may stop, so a
     target too small for the written architecture is exceeded, never cut. The sampler emits it once
-    per chain; ``create_ensemble`` folds those into one warning carrying the chain count.
+    per chain; ``create_ensemble`` folds those of the returned chains into one warning with the count.
     """
 
     def __init__(self, chain_count=1, chain_total=1):

@@ -934,6 +934,9 @@ def test_typed_sibling_caps_keep_the_number_average_on_target():
 MIXED_ALL_TEXT = "{[] [<]CCO[>]; C(O[>[all]1])(CO[>[all]1])(CO[>]); [H][<] []}|poisson(300)|"
 # Target below the initiator plus one unit per all-typed site: every chain must overshoot.
 SMALL_TARGET_ALL_TEXT = "{[] [<]CCO[>]; C(O[>[all]1])(CO[>[all]1])(CO[>[all]1]); [H][<] []}|poisson(120)|"
+# A nested initiator whose all-group overshoots its own target, beside a plain one; the second repeat unit's exit
+# only matches a terminator, so the enclosing object sometimes ends below target and that attempt is discarded.
+NESTED_OVERSHOOT_DISCARD_TEXT = "{[] [<]CC[>]|0.95|, [<]CC[>1]|0.05|; {[] [<]CCO[>]; C(O[>[all]])CO[>[all]]; [<][H] [<]}|uniform(80,80)|[>], C[>]; [<][H], [<1][H] []}|uniform(300,300)|"
 
 
 def _all_rule_violations(bonds):
@@ -1001,6 +1004,33 @@ def test_all_rule_warning_is_aggregated_on_the_parallel_path():
     assert list(parallel) == list(serial)
     reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
     assert len(reported) == 1 and (reported[0].chain_count, reported[0].chain_total) == (4, 4)
+
+
+def test_all_rule_overshoot_counts_returned_chains_only(monkeypatch):
+    attempts = []
+    attempt_chain = _ec._attempt_chain
+
+    def recording(*args):
+        result = attempt_chain(*args)
+        attempts.append((result[0] is not None, any(issubclass(caught.category, AllGroupOvershoot) for caught in result[3])))
+        return result
+
+    monkeypatch.setattr(_ec, "_attempt_chain", recording)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        serial = _graph_creator(NESTED_OVERSHOOT_DISCARD_TEXT).get_ensemble_creator().create_ensemble(8, output_format="smiles", seed=1)
+    # At least one discarded attempt overshot: that is what the count must leave out.
+    assert sum(1 for accepted, overshoot in attempts if not accepted and overshoot) >= 1
+    expected = sum(1 for accepted, overshoot in attempts if accepted and overshoot)
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert [(message.chain_count, message.chain_total) for message in reported] == [(expected, 8)]
+    # The workers run the unpatched attempt helper; same seed, same chains, same count.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parallel = _graph_creator(NESTED_OVERSHOOT_DISCARD_TEXT).get_ensemble_creator().create_ensemble(8, output_format="smiles", parallel=True, n_workers=2, seed=1)
+    assert list(parallel) == list(serial)
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert [(message.chain_count, message.chain_total) for message in reported] == [(expected, 8)]
 
 
 def test_all_generation_is_seed_reproducible():
