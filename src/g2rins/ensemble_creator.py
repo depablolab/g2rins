@@ -1635,13 +1635,24 @@ class _PartialAtomGraph:
                 probability_sum = sum(probability for _group, _rule, probability, _mass in channels)
                 if probability_sum > 0:
                     live.append((index, weight, groups - dead, channels, probability_sum))
+            # Members that share no live group never reach each other, and the weighted race keeps
+            # the relative firing order inside each connected set: price the sets alone and add them
+            # up, else n independent pairs cost 4**n joint states.
+            sets = []
+            for entry in live:
+                joined = [group_set for group_set in sets if group_set[0] & entry[2]]
+                for group_set in joined:
+                    sets.remove(group_set)
+                sets.append((entry[2].union(*(group_set[0] for group_set in joined)), [member for group_set in joined for member in group_set[1]] + [entry]))
+            if len(sets) > 1:
+                return sum(expect(tuple(index for index, _weight, _groups, _channels, _probability_sum in entries), dead) for _groups, entries in sets)
             weight_sum = sum(weight for _index, weight, _groups, _channels, _probability_sum in live)
             if weight_sum <= 0:
                 return 0.0
             expected = 0.0
             for index, weight, groups, channels, probability_sum in live:
                 for group, rule, probability, mass in channels:
-                    rest = tuple(other for other in remaining if other != index)
+                    rest = tuple(other for other, _weight, _groups, _channels, _probability_sum in live if other != index)
                     if rule == GroupRule.EXCLUSION:
                         rest = tuple(other for other in rest if group not in members[other][1] - dead)
                     expected += (weight / weight_sum) * (probability / probability_sum) * (mass + expect(rest, dead | groups))

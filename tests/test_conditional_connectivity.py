@@ -14,6 +14,7 @@ site consumed through a plain channel removes their exclusion-typed channels
 (whatever mode fired the bond, at any level); LADDER stays gated.
 """
 
+import time
 import warnings
 
 import lark
@@ -878,6 +879,17 @@ def test_cluster_cap_estimate_follows_the_firing_sequence(members, expected):
     assert _ec._PartialAtomGraph._expected_cluster_cap_mw(members) == pytest.approx(expected)
 
 
+def test_independent_cluster_members_are_priced_apart():
+    # Ten pairs of typed-plus-plain siblings in one unit instance never reach each other: the estimate
+    # is ten times the pair's, and the recursion prices the pairs apart instead of enumerating their
+    # 4**10 joint states (over a minute before the split).
+    pair = [(1.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 19.0)])] * 2
+    members = [(1.0, frozenset({group}), [(group, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 19.0)]) for group in range(1, 11) for _ in range(2)]
+    started = time.perf_counter()
+    assert _ec._PartialAtomGraph._expected_cluster_cap_mw(members) == pytest.approx(10 * _ec._PartialAtomGraph._expected_cluster_cap_mw(pair))
+    assert time.perf_counter() - started < 5.0
+
+
 def _unit_termination_estimate(text):
     """Termination-mass estimate of one freshly instantiated repeat unit of ``text``."""
     generative_graph = _generative_graph(_graph_creator(text))
@@ -886,6 +898,19 @@ def _unit_termination_estimate(text):
     carbon = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
     unit, sto_atom_id = _instantiate(generative_graph, static_graph, tracker, carbon, rng)
     return unit.get_average_termination_mw(sto_atom_id, static_graph, rng)
+
+
+# One repeat unit carrying ten exclusion groups, each a pair of sites with a typed and a plain cap channel.
+TEN_GROUP_UNIT_TEXT = (
+    "{[] [<]C([>1[]1,>2])([>1[]1,>2])C([>1[]2,>2])([>1[]2,>2])C([>1[]3,>2])([>1[]3,>2])C([>1[]4,>2])([>1[]4,>2])C([>1[]5,>2])([>1[]5,>2])"
+    "C([>1[]6,>2])([>1[]6,>2])C([>1[]7,>2])([>1[]7,>2])C([>1[]8,>2])([>1[]8,>2])C([>1[]9,>2])([>1[]9,>2])C([>1[]10,>2])([>1[]10,>2])[>]; O[>]; [<][H], [<1]Br, [<2]F []}|poisson(3000)|"
+)
+ONE_GROUP_UNIT_TEXT = "{[] [<]C([>1[]1,>2])([>1[]1,>2])[>]; O[>]; [<][H], [<1]Br, [<2]F []}|poisson(3000)|"
+
+
+def test_ten_independent_groups_price_as_ten_pairs():
+    ten, one = _unit_termination_estimate(TEN_GROUP_UNIT_TEXT), _unit_termination_estimate(ONE_GROUP_UNIT_TEXT)
+    assert one > 0 and ten == pytest.approx(10 * one)
 
 
 def test_typed_sibling_caps_are_priced_as_one_cap():
