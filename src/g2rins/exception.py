@@ -508,6 +508,26 @@ class EmptyTruncatedDistributionSupport(DeadSamplingPath):
         )
 
 
+class LadderMemberWithoutPartner(DeadSamplingPath):
+    """A site of a committed ladder group found no free partner in the fresh unit.
+
+    The bond that committed the group, or an earlier rung of the same junction,
+    took every partner the site's edges allow (bond weights can leave it one),
+    so the junction cannot close. Chain-local: another draw pairs the members
+    differently, so create_ensemble counts the attempt as a discard and retries.
+    """
+
+    def __init__(self, context, group):
+        self.group = group
+        super().__init__(context, group)
+
+    def __str__(self):
+        return (
+            f"A site of ladder group {self.group} found no free partner in the unit its group bonded during '{self.context}': "
+            "the bond that committed the group or an earlier rung took every partner its edges allow, so the junction cannot close."
+        )
+
+
 class AllZeroSamplingWeights(G2RINSError):
     """Every candidate of a sampling decision carries zero weight.
 

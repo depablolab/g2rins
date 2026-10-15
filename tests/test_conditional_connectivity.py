@@ -31,12 +31,14 @@ from g2rins import GroupRule
 from g2rins import ensemble_creator as _ec
 from g2rins.exception import (
     AllGroupOvershoot,
+    DiscardedSamplingPaths,
     GroupPartnerNotPlain,
     GroupRuleOnNestedObjectBondConnector,
     GroupRuleOnTerminalBondConnector,
     GroupRulesOnBothPathEnds,
     IncompatibleGroupPair,
     IndistinguishableSymbolsInSite,
+    LadderMemberWithoutPartner,
     MixedOuterSymbolsInGroup,
     MixedRulesInGroup,
     RepeatedGroupInSite,
@@ -1057,6 +1059,10 @@ REGIO_LADDER_TEXT = "{[] [<[<1]2]OC(O[<[<2]2])CC(O[>[>1]1])O[>[>2]1]; C(O[>[>1]1
 # completion draws (three sites on one atom would give parallel bonds a simple graph cannot hold).
 THREE_RUNG_TEXT = "{[] [<[<]2]OC(O[<[<]2])(O[<[<]2])CC(O[>[>]1])(O[>[>]1])O[>[>]1]; C(O[>[>]1])(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
 COMPLETION_DRAW = "ladder completion partner selection"
+# Ladder sites whose partners all sit on the initiator only receive bonds: no outgoing edge, never in the pool.
+INCOMING_ONLY_LADDER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2]; [<][H] []}|uniform(400,400)|"
+# The second exit site may only pair with the first entry site; a first exit that fires and takes it leaves no partner.
+RESTRICTED_PARTNER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1|1 1 0 0|])O[>[>]1|1 0 0 0|]; C(O[>[>]1])O[>[>]1]; [<][H] []}|uniform(500,500)|"
 
 
 def _unit_anchors(ensemble):
@@ -1147,3 +1153,39 @@ def test_plain_consumption_strips_the_ladder_group(monkeypatch):
 
 def test_ladder_generation_is_seed_reproducible():
     assert list(_sample(LADDER_TEXT, 4, seed=5, output_format="smiles")) == list(_sample(LADDER_TEXT, 4, seed=5, output_format="smiles"))
+
+
+def _cycle_rank(chain):
+    undirected = nx.Graph(chain)
+    return undirected.number_of_edges() - undirected.number_of_nodes() + nx.number_connected_components(undirected)
+
+
+def test_incoming_only_ladder_sites_close_the_junction():
+    # The initiator's two-rung junction closes one ring per chain; the rest of the chain is linear.
+    ensemble = _ensemble(INCOMING_ONLY_LADDER_TEXT, 6)
+    assert [_cycle_rank(chain) for chain in ensemble.chains] == [1] * 6
+    assert sum(_junction_records(ensemble, "I0", "L0").values()) == 2 * 6
+
+
+def test_member_without_a_free_partner_discards_the_attempt(monkeypatch):
+    causes = []
+    attempt_chain = _ec._attempt_chain
+
+    def recording(*args):
+        result = attempt_chain(*args)
+        causes.append(result[2])
+        return result
+
+    monkeypatch.setattr(_ec, "_attempt_chain", recording)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble = _graph_creator(RESTRICTED_PARTNER_TEXT).get_ensemble_creator().create_ensemble(6, output_format="mol_graph", ensemble_info=True, seed=7)
+    rejected = [cause for cause in causes if isinstance(cause, LadderMemberWithoutPartner)]
+    assert rejected and all(cause.group == 1 for cause in rejected)
+    reported = [record.message for record in caught if issubclass(record.category, DiscardedSamplingPaths)]
+    assert len(reported) == 1 and dict(reported[0].reasons)["LadderMemberWithoutPartner"] == len(rejected)
+    # Every returned chain closes all of its junctions.
+    anchors = _unit_anchors(ensemble)
+    for chain in ensemble.chains:
+        units = sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] in anchors)
+        assert _cycle_rank(chain) == units - 1

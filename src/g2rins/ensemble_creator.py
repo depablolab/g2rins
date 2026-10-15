@@ -39,6 +39,7 @@ from .exception import (
     IncompleteStochasticGeneration,
     InvalidGenerationSource,
     InvalidUnitPSmiles,
+    LadderMemberWithoutPartner,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
     TooManyDiscardedChains,
@@ -261,8 +262,9 @@ class _HalfAtomBond:
         self._mode_attr_map = {}
         self._mode_target_map = {}
         self._mode_target_molar_amounts_map = {}
-        # Exclusion channels read off the incoming edges: an entry-only site holds them with no outgoing edge.
-        self._entry_groups = {d.get(_TARGET_GROUP_NAME, -1) for _u, _v, d in graph.in_edges(node_idx, data=True) if not d["static"] and d.get(_TARGET_RULE_NAME, 0) == GroupRule.EXCLUSION}
+        # Grouped channels read off the incoming edges, by group: an entry-only site holds them with no outgoing edge.
+        entering = [d for _u, _v, d in graph.in_edges(node_idx, data=True) if not d["static"]]
+        self._entry_rules = {d.get(_TARGET_GROUP_NAME, -1): d.get(_TARGET_RULE_NAME, 0) for d in entering if d.get(_TARGET_RULE_NAME, 0) in (GroupRule.EXCLUSION, GroupRule.LADDER)}
 
         self._special_target = None
         special_target_list = []
@@ -342,11 +344,12 @@ class _HalfAtomBond:
     def exclusion_groups(self):
         """Group ids of the EXCLUSION channels this site still holds, derived from its live edges on either side."""
         held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.EXCLUSION}
-        return held | self._entry_groups
+        return held | {group for group, rule in self._entry_rules.items() if rule == GroupRule.EXCLUSION}
 
     def ladder_groups(self):
-        """Group ids of the LADDER channels this site still holds (a ladder site holds its edges both ways)."""
-        return {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER}
+        """Group ids of the LADDER channels this site still holds, derived from its live edges on either side."""
+        held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER}
+        return held | {group for group, rule in self._entry_rules.items() if rule == GroupRule.LADDER}
 
     def holds_rule(self, mode, rule, sto_gen_id):
         """Whether a live ``mode`` channel of this site at level ``sto_gen_id`` carries the group rule ``rule`` (forced exits never compete)."""
@@ -357,7 +360,7 @@ class _HalfAtomBond:
 
     def drop_edges(self, keep):
         """Drop the channels whose group id fails ``keep`` on either side, menus kept aligned; a dropped forced entry is forgotten."""
-        self._entry_groups = {group for group in self._entry_groups if keep(group)}
+        self._entry_rules = {group: rule for group, rule in self._entry_rules.items() if keep(group)}
         for mode in list(self._mode_attr_map):
             attr_list = self._mode_attr_map[mode]
             kept = [i for i, attrs in enumerate(attr_list) if keep(attrs.get(_SOURCE_GROUP_NAME, -1))]
@@ -1144,9 +1147,9 @@ class _PartialAtomGraph:
         channel commits its group: the remaining members bond the fresh unit now.
         """
         self._consume_sites(source_half_bond, fired_edge, other)
-        self.merge(other, source_half_bond.atom_idx, other_idx, bond_attr)
+        offset = self.merge(other, source_half_bond.atom_idx, other_idx, bond_attr)
         if fired_edge.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and other._consumed_half_bond is not None:
-            self._complete_ladder(source_half_bond, fired_edge, other._consumed_half_bond.instance, rng)
+            self._complete_ladder(source_half_bond, fired_edge, other, offset, rng)
 
     def _consume_sites(self, source_half_bond, fired_edge, other):
         """Group rules for the two sites ``fired_edge`` consumes: one in this molecule, one in the fresh unit."""
@@ -1178,16 +1181,23 @@ class _PartialAtomGraph:
                     sibling.drop_edges(lambda group, dead=dead: group not in dead)
             bucket[:] = [sibling for sibling in bucket if sibling.has_any_bonds()]
 
-    def _complete_ladder(self, source_half_bond, fired_edge, fresh_instance, rng):
+    def _complete_ladder(self, source_half_bond, fired_edge, other, offset, rng):
         """The ladder rule: the fired member committed its group, so every other member of the source
-        instance bonds a member of the fresh instance in this same step, through the edges of the same
-        group pair (the inner classes are in the edge set). Members go in template order; one with a
-        single free partner takes it without touching the random stream, one with several draws by the
-        weight of its live edge to each (a member's edges need not sit in the mode that fired: an
-        initiator's other sites reach the repeat units through growth edges once the chain started)."""
+        instance bonds a site of the fresh unit ``other`` (merged at atom ``offset``) in this same step,
+        through the edges of the same group pair (the inner classes are in the edge set). Members go in
+        template order; one with a single free partner takes it without touching the random stream, one
+        with several draws by the weight of its live edge to each (a member's edges need not sit in the
+        mode that fired: an initiator's other sites reach the repeat units through growth edges once the
+        chain started). A member whose partners were all taken ends the attempt: the junction cannot close."""
         source_group, target_group = fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_TARGET_GROUP_NAME, -1)
         members = [site for bucket in self._open_half_bond_map.values() for site in bucket if site.instance == source_half_bond.instance and source_group in site.ladder_groups()]
+        fresh_instance = other._consumed_half_bond.instance
         free = {site.node_idx: site for bucket in self._open_half_bond_map.values() for site in bucket if site.instance == fresh_instance}
+        # The fresh unit's entry-only sites never join the pool; they are partners all the same, at their merged atom indices.
+        for site in other._entry_sites.values():
+            if site is not other._consumed_half_bond:
+                free[site.node_idx] = copy.copy(site)
+                free[site.node_idx].atom_idx += offset
         rungs = []
         for member in members:
             candidates = {}
@@ -1197,7 +1207,7 @@ class _PartialAtomGraph:
                     if target in free and edge.get(_SOURCE_GROUP_NAME, -1) == source_group and edge.get(_TARGET_GROUP_NAME, -1) == target_group:
                         candidates.setdefault(target, (edge, edge[mode]))
             if not candidates:
-                continue
+                raise LadderMemberWithoutPartner("ladder completion", source_group)
             options = list(candidates.values())
             chosen = 0 if len(options) == 1 else self.stochastic_tracker.choose(rng, len(options), [weight for _edge, weight in options], "ladder completion partner selection")
             edge, partner = options[chosen][0], free[list(candidates)[chosen]]
@@ -1219,21 +1229,21 @@ class _PartialAtomGraph:
         self._apply_realized_bond(member.atom_idx, partner.atom_idx, bond_attr)
 
     def merge(self, other, self_idx, other_idx, bond_attr):
-        # Bonds are realized through realize_bond (group rules first); merge only welds.
-        # relabel other idx
-        remapping_dict = {idx: idx + self._atom_id for idx in other.atom_graph.nodes}
+        """Weld ``other`` on (bonds are realized through realize_bond, group rules first); returns the offset its atoms were relabeled by."""
+        offset = self._atom_id
+        remapping_dict = {idx: idx + offset for idx in other.atom_graph.nodes}
         other_graph = nx.relabel_nodes(other.atom_graph, remapping_dict, copy=True)
         other_open_half_bond_map = {}
         for stochastic_id in other._open_half_bond_map:
             for half_bond in other._open_half_bond_map[stochastic_id]:
                 new_half_bond = copy.copy(half_bond)
-                new_half_bond.atom_idx += self._atom_id
+                new_half_bond.atom_idx += offset
                 try:
                     other_open_half_bond_map[stochastic_id] += [new_half_bond]
                 except KeyError:
                     other_open_half_bond_map[stochastic_id] = [new_half_bond]
 
-        other_idx += self._atom_id
+        other_idx += offset
 
         # Now we can do the actual merging
         self._atom_id += other._atom_id
@@ -1249,6 +1259,7 @@ class _PartialAtomGraph:
                 self._open_half_bond_map[stochastic_id] += other_open_half_bond_map[stochastic_id]
             except KeyError:
                 self._open_half_bond_map[stochastic_id] = other_open_half_bond_map[stochastic_id]
+        return offset
 
     def get_open_half_bonds(self, sto_atom_id: int | tuple[int] | None, prefer_parent: bool = False) -> list[_HalfAtomBond]:
 
@@ -1409,7 +1420,7 @@ class _PartialAtomGraph:
                     self._open_half_bond_map[sto_atom_id] += [half_bond]
                 except KeyError:
                     self._open_half_bond_map[sto_atom_id] = [half_bond]
-            elif half_bond.exclusion_groups():
+            elif half_bond.exclusion_groups() or half_bond.ladder_groups():
                 self._entry_sites[node_idx] = half_bond
 
         # Initiate with first node
