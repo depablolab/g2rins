@@ -11,13 +11,17 @@ annotation of a compatible bond connector pair, terminal-descriptor edges
 annotated on the unit side. Phase 2 -- generation honors the EXCLUSION rule: a
 site consumed through an exclusion-typed channel blocks its group siblings, a
 site consumed through a plain channel removes their exclusion-typed channels
-(whatever mode fired the bond, at any level); LADDER stays gated.
+(whatever mode fired the bond, at any level). Phase 4 -- the LADDER rule: the
+first ladder-typed bond commits its group and the remaining members bond the fresh
+unit in the same step; a member consumed through any other channel strips the group's
+ladder channels from its siblings. Ladder-typed terminators stay gated.
 """
 
 import time
 import warnings
 
 import lark
+import networkx as nx
 import numpy as np
 import pytest
 from rdkit.Chem import Descriptors
@@ -590,7 +594,7 @@ def test_ladder_reference_string_encoding():
         ("[>[>1]]", "[<[<1]1]", "transition_weight", (0, 1, 1, 1)),
         ("[>[>2]]", "[<[<2]1]", "transition_weight", (0, 1, 1, 1)),
     }
-    with pytest.raises(NotImplementedError, match="LADDER"):
+    with pytest.raises(NotImplementedError, match="LADDER rule on a termination edge"):
         g2rins.EnsembleCreator(_generative_graph(_graph_creator(LADDER_REFERENCE_TEXT)))
 
 
@@ -611,11 +615,12 @@ def test_all_star_string_encoding():
 
 def _timeline(monkeypatch):
     """Record every realized bond (fresh unit's tag, consumed source site, consumed target site); a site is
-    (instance tag, exclusion groups held, channel group, channel rule). Unit tags are logged too: tag 1 opens a
+    (instance tag, exclusion groups held, channel group, channel rule, ladder groups held); a rung is logged like a bond. Unit tags are logged too: tag 1 opens a
     chain, a tag drawn again inside a chain is a checkpoint rollback that discarded the units from that tag on.
     The fragments the termination-mass estimate builds on a throwaway tracker draw tags as well; they are skipped."""
     log, observing = [], []
     next_tag, realize, observe = _ec._StochasticObjectTracker.next_unit_instance, _ec._PartialAtomGraph.realize_bond, _ec._PartialAtomGraph._observational_fragment
+    internal = _ec._PartialAtomGraph._realize_internal_bond
 
     def tag(self):
         value = next_tag(self)
@@ -631,16 +636,23 @@ def _timeline(monkeypatch):
             observing.pop()
 
     def site(half_bond, group, rule):
-        return None if half_bond is None else (half_bond.instance, frozenset(half_bond.exclusion_groups()), group, rule)
+        return None if half_bond is None else (half_bond.instance, frozenset(half_bond.exclusion_groups()), group, rule, frozenset(half_bond.ladder_groups()))
 
-    def bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr):
+    def bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr, rng):
         source = site(source_half_bond, fired_edge.get("source_group", -1), fired_edge.get("source_rule", 0))
         target = site(other._consumed_half_bond, fired_edge.get("target_group", -1), fired_edge.get("target_rule", 0))
         log.append(("bond", self.stochastic_tracker._unit_instances, source, target))
-        return realize(self, other, source_half_bond, fired_edge, other_idx, bond_attr)
+        return realize(self, other, source_half_bond, fired_edge, other_idx, bond_attr, rng)
+
+    def rung(self, member, partner, edge):
+        source = site(member, edge.get("source_group", -1), edge.get("source_rule", 0))
+        target = site(partner, edge.get("target_group", -1), edge.get("target_rule", 0))
+        log.append(("rung", self.stochastic_tracker._unit_instances, source, target))
+        return internal(self, member, partner, edge)
 
     monkeypatch.setattr(_ec._StochasticObjectTracker, "next_unit_instance", tag)
     monkeypatch.setattr(_ec._PartialAtomGraph, "realize_bond", bond)
+    monkeypatch.setattr(_ec._PartialAtomGraph, "_realize_internal_bond", rung)
     monkeypatch.setattr(_ec._PartialAtomGraph, "_observational_fragment", fragment)
     return log
 
@@ -667,7 +679,7 @@ def _rule_violations(bonds):
         for site in (source, target):
             if site is None or not site[1]:
                 continue
-            tag, groups, group, rule = site
+            tag, groups, group, rule, _ladder = site
             is_typed = rule == GroupRule.EXCLUSION and group in groups
             violations += sum(1 for g in groups if (tag, g) in engaged or (is_typed and (tag, g) in bystander))
             (engaged if is_typed else bystander).update((tag, g) for g in groups)
@@ -845,7 +857,7 @@ def test_entry_through_the_typed_channel_counts_as_a_typed_consumption(monkeypat
     assert len(chains) == 6
     for bonds in chains:
         grouped = [(side, site) for _kind, _tag, source, target in bonds for side, site in (("source", source), ("target", target)) if site is not None and site[1]]
-        assert len(grouped) == 1 and grouped[0][0] == "target" and grouped[0][1][1:] == (frozenset({1}), 1, GroupRule.EXCLUSION)
+        assert len(grouped) == 1 and grouped[0][0] == "target" and grouped[0][1][1:4] == (frozenset({1}), 1, GroupRule.EXCLUSION)
     assert sum(_rule_violations(bonds)[0] for bonds in chains) == 0
 
 
@@ -1035,3 +1047,103 @@ def test_all_rule_overshoot_counts_returned_chains_only(monkeypatch):
 
 def test_all_generation_is_seed_reproducible():
     assert list(_sample(ALL_TEXT, 4, seed=5, output_format="smiles")) == list(_sample(ALL_TEXT, 4, seed=5, output_format="smiles"))
+
+
+# -- Phase 4: generation under the LADDER rule ------------------------------------------
+
+# Regiospecific inner classes: every rung pairs class 1 with class 1 and class 2 with class 2.
+REGIO_LADDER_TEXT = "{[] [<[<1]2]OC(O[<[<2]2])CC(O[>[>1]1])O[>[>2]1]; C(O[>[>1]1])O[>[>2]1]; [<][H] []}|poisson(1000)|"
+# Three members per class on separate atoms: after the first bond two members face two free partners, so the
+# completion draws (three sites on one atom would give parallel bonds a simple graph cannot hold).
+THREE_RUNG_TEXT = "{[] [<[<]2]OC(O[<[<]2])(O[<[<]2])CC(O[>[>]1])(O[>[>]1])O[>[>]1]; C(O[>[>]1])(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
+COMPLETION_DRAW = "ladder completion partner selection"
+
+
+def _unit_anchors(ensemble):
+    """One template node per unit, as the chains carry it, to count unit instances in a chain."""
+    return {str(next(iter(unit["subgraph"].nodes))) for unit in ensemble.units.values()}
+
+
+def _ensemble(text, n_chains, seed=5):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format="mol_graph", ensemble_info=True, seed=seed)
+
+
+@pytest.mark.parametrize(
+    "text, n_chains, rungs_per_junction, mass_window",
+    [(LADDER_TEXT, 6, 2, (800, 1200)), (REGIO_LADDER_TEXT, 6, 2, (800, 1200)), (THREE_RUNG_TEXT, 4, 3, (800, 1200))],
+)
+def test_every_ladder_junction_closes_with_its_rungs(text, n_chains, rungs_per_junction, mass_window):
+    ensemble = _ensemble(text, n_chains)
+    anchors = _unit_anchors(ensemble)
+    assert len(ensemble.chains) == n_chains
+    for chain in ensemble.chains:
+        undirected = nx.Graph(chain)
+        units = sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] in anchors)
+        # Each junction is a cycle per rung beyond the first; a single-bonded junction closes none.
+        cycle_rank = undirected.number_of_edges() - undirected.number_of_nodes() + nx.number_connected_components(undirected)
+        assert units > 1 and cycle_rank == (units - 1) * (rungs_per_junction - 1)
+        assert mass_window[0] <= Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) <= mass_window[1]
+
+
+def _junction_records(ensemble, left, right):
+    return {tuple(record["labels"]): record["count"] for record in ensemble.bonds if record["labels"][0].startswith(left) and record["labels"][1].startswith(right)}
+
+
+@pytest.mark.parametrize("text, pairings", [(LADDER_TEXT, 4), (REGIO_LADDER_TEXT, 2)])
+def test_rungs_are_bond_records_of_their_own(text, pairings):
+    # Two-member classes: the first bond picks a pair and the rung takes the other; a degenerate class
+    # reaches every pairing over the chains, regiospecific classes only the declared ones.
+    ensemble = _ensemble(text, 12)
+    between_units = _junction_records(ensemble, "R0", "R0")
+    assert len(between_units) == pairings
+    assert sum(between_units.values()) == 2 * (ensemble.units["R0"]["count"] - 12)
+    assert sum(_junction_records(ensemble, "I0", "R0").values()) == 2 * 12
+
+
+def test_completion_draws_only_when_a_member_has_a_choice(monkeypatch):
+    contexts = []
+    choose = _ec._StochasticObjectTracker.choose
+
+    def recording(self, rng, n_candidates, weights, context):
+        contexts.append(context)
+        return choose(self, rng, n_candidates, weights, context)
+
+    monkeypatch.setattr(_ec._StochasticObjectTracker, "choose", recording)
+    assert _sample(LADDER_TEXT, 4) is not None and COMPLETION_DRAW not in contexts
+    contexts.clear()
+    assert _sample(THREE_RUNG_TEXT, 4) is not None and COMPLETION_DRAW in contexts
+
+
+def _ladder_strip_violations(bonds):
+    """Ladder-channel fires of a group after a member of it was consumed through another channel, and the rungs."""
+    stripped, violations, rungs = set(), 0, 0
+    for kind, _fresh_tag, source, target in bonds:
+        for side in (source, target):
+            if side is None:
+                continue
+            instance, _exclusion, group, rule, ladder = side
+            if rule == GroupRule.LADDER:
+                violations += (instance, group) in stripped
+                stripped.update((instance, held) for held in ladder if held != group)
+            else:
+                stripped.update((instance, held) for held in ladder)
+        rungs += kind == "rung"
+    return violations, rungs
+
+
+def test_plain_consumption_strips_the_ladder_group(monkeypatch):
+    log = _timeline(monkeypatch)
+    chains = _sample(DUAL_CHANNEL_TEXT, 8)
+    assert chains is not None and len(chains) == 8
+    per_chain = _surviving_bonds_per_chain(log)
+    results = [_ladder_strip_violations(bonds) for bonds in per_chain]
+    assert sum(violations for violations, _rungs in results) == 0
+    assert sum(rungs for _violations, rungs in results) > 0  # junctions where the ladder channel won
+    assert any(source is not None and source[3] == GroupRule.NONE for bonds in per_chain for _kind, _tag, source, _target in bonds)  # plain growth
+    assert any(target is None for bonds in per_chain for _kind, _tag, _source, target in bonds)  # caps
+
+
+def test_ladder_generation_is_seed_reproducible():
+    assert list(_sample(LADDER_TEXT, 4, seed=5, output_format="smiles")) == list(_sample(LADDER_TEXT, 4, seed=5, output_format="smiles"))
