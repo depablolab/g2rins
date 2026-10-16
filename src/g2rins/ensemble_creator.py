@@ -1217,13 +1217,15 @@ class _PartialAtomGraph:
             self._realize_internal_bond(member, partner, edge)
 
     def _realize_internal_bond(self, member, partner, edge):
-        """Bond two open sites of this molecule through ``edge``: both leave the pool and consume like any
-        fired site, then the bond is welded and the endpoints' hydrogens re-inferred."""
+        """Bond two open sites of this molecule through ``edge``: both leave the pool for good and consume like
+        any fired site, then the bond is welded and the endpoints' hydrogens re-inferred."""
         for site, group, rule in ((member, edge.get(_SOURCE_GROUP_NAME, -1), edge.get(_SOURCE_RULE_NAME, 0)), (partner, edge.get(_TARGET_GROUP_NAME, -1), edge.get(_TARGET_RULE_NAME, 0))):
             for bucket in self._open_half_bond_map.values():
                 if site in bucket:
                     bucket.remove(site)
             self._consume_site(site, group, rule, self._open_half_bond_map)
+            # A termination pass re-adds the transition sites it set aside: a rung must not be found live among them.
+            site.block()
         bond_attr = self.gen_edge_attr_to_bond_attr(edge)
         self.atom_graph.add_edge(member.atom_idx, partner.atom_idx, **bond_attr)
         self._apply_realized_bond(member.atom_idx, partner.atom_idx, bond_attr)
@@ -1660,20 +1662,25 @@ class _PartialAtomGraph:
                 # existing endpoint sheds and, for split-dummy connectors, by
                 # charging the attach order to the massless dummy instead of
                 # its real anchors (so their hydrogens stayed uncounted).
-                terminator_weight = self._fragment_gross_mw(terminator_atom_graph, node_id, attach_order)
                 if attach_order not in source_delta_by_order:
                     source_delta_by_order[attach_order] = self._source_attach_delta(termination_bond.atom_idx, attach_order)
                 group, rule = target_attributes[i].get(_SOURCE_GROUP_NAME, -1), target_attributes[i].get(_SOURCE_RULE_NAME, 0)
-                channels.append((group, rule, target_prob[i], terminator_weight + source_delta_by_order[attach_order]))
+                attachments, shed = {str(node_id): attach_order}, source_delta_by_order[attach_order]
+                if rule == GroupRule.LADDER:
+                    # A ladder cap takes the group's other members as rungs in the same step: their attaches to the
+                    # cap's other sites of the pair and the hydrogens they shed belong to this channel's price.
+                    shed += self._rung_attachments(termination_bond, group, target_attributes[i].get(_TARGET_GROUP_NAME, -1), gen_sto_id, terminator_atom_graph, attachments)
+                terminator_weight = self._fragment_gross_mw(terminator_atom_graph, attachments)
+                channels.append((group, rule, target_prob[i], terminator_weight + shed))
             return channels
 
         avg_termination_mw = 0
         clusters = {}
         for termination_bond in termination_bonds:
             channels = priced_channels(termination_bond)
-            groups = termination_bond.exclusion_groups()
+            groups = termination_bond.exclusion_groups() | termination_bond.ladder_groups()
             if groups:
-                # Grouped caps of one unit instance reach each other through the exclusion rule: priced as a set.
+                # Grouped caps of one unit instance reach each other through their rules: priced as a set.
                 clusters.setdefault(termination_bond.instance, []).append((termination_bond.weight, frozenset(groups), channels))
             else:
                 for _group, _rule, probability, mass in channels:
@@ -1687,8 +1694,10 @@ class _PartialAtomGraph:
         """Expected cap mass of the grouped termination sites of one unit instance, ``(weight, groups,
         channels)`` each, under the sequence terminate_graph realizes: a waiting member fires with
         probability proportional to its weight, draws among its live channels, and the rule reaches the
-        rest as realize_bond applies it (a typed channel drops the siblings holding its group; any
-        channel kills the consumed site's groups on them, whose menus renormalize)."""
+        rest as realize_bond applies it (a typed channel drops the siblings holding its group: blocked by
+        the exclusion rule, welded as rungs by the ladder completion with their ends priced into the
+        channel; any channel kills the consumed site's groups on them, the rungs' groups too, whose menus
+        renormalize)."""
 
         @functools.lru_cache(maxsize=None)
         def expect(remaining, dead):
@@ -1717,12 +1726,37 @@ class _PartialAtomGraph:
             for index, weight, groups, channels, probability_sum in live:
                 for group, rule, probability, mass in channels:
                     rest = tuple(other for other, _weight, _groups, _channels, _probability_sum in live if other != index)
-                    if rule == GroupRule.EXCLUSION:
-                        rest = tuple(other for other in rest if group not in members[other][1] - dead)
-                    expected += (weight / weight_sum) * (probability / probability_sum) * (mass + expect(rest, dead | groups))
+                    gone = groups
+                    if rule in (GroupRule.EXCLUSION, GroupRule.LADDER):
+                        taken = [other for other in rest if group in members[other][1] - dead]
+                        rest = tuple(other for other in rest if other not in taken)
+                        if rule == GroupRule.LADDER:
+                            gone = gone.union(*(members[other][1] for other in taken))
+                    expected += (weight / weight_sum) * (probability / probability_sum) * (mass + expect(rest, dead | gone))
             return expected
 
         return expect(tuple(range(len(members))), frozenset())
+
+    def _rung_attachments(self, fired, group, target_group, gen_sto_id, fragment, attachments):
+        """Extend ``attachments`` with the cap sites the other members of ``fired``'s ladder ``group`` weld rungs
+        to (one each, through this level's termination edges of the same group pair, first free site of the cap
+        fragment) and return the hydrogen mass those members shed."""
+        in_fragment = {data["origin_idx"] for _node, data in fragment.atom_graph.nodes(data=True)}
+        shed = 0.0
+        for bucket in self._open_half_bond_map.values():
+            for member in bucket:
+                if member is fired or member.instance != fired.instance or group not in member.ladder_groups():
+                    continue
+                edges, targets, _molar_amounts = member.get_mode_bonds(_TERMINATION_NAME)
+                for edge, target in zip(edges, targets):
+                    if str(target) not in in_fragment or str(target) in attachments or edge.get(_EDGE_STOCHASTIC_ID_NAME) != gen_sto_id:
+                        continue
+                    if (edge.get(_SOURCE_GROUP_NAME, -1), edge.get(_TARGET_GROUP_NAME, -1)) != (group, target_group):
+                        continue
+                    attachments[str(target)] = edge.get(_BOND_TYPE_NAME, 1)
+                    shed += self._source_attach_delta(member.atom_idx, edge.get(_BOND_TYPE_NAME, 1))
+                    break
+        return shed
 
     def _observational_fragment(self, source, static_graph, estimator_rng):
         """Build the static fragment that starts at ``source`` under a throwaway tracker, so an
@@ -1737,16 +1771,15 @@ class _PartialAtomGraph:
         fragment_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
         return _PartialAtomGraph(self.generative_graph, static_graph, source, stochastic_object_tracker, fragment_sto_atom_id, estimator_rng)
 
-    def _fragment_gross_mw(self, fragment, target_node, attach_order):
-        """Mass ``fragment`` adds when attached at ``target_node`` with a bond of ``attach_order``:
-        atoms plus inferred hydrogens, the attach order charged to the target's real anchors
-        (never to a massless split dummy). Placeholders carry no mass and no hydrogens."""
+    def _fragment_gross_mw(self, fragment, attachments):
+        """Mass ``fragment`` adds when attached at the template nodes of ``attachments`` (node id to
+        bond order): atoms plus inferred hydrogens, each attach order charged to its node's real
+        anchors (never to a massless split dummy). Placeholders carry no mass and no hydrogens."""
         extra_occupied = {}
         for frag_node, data in fragment.atom_graph.nodes(data=True):
-            if data["origin_idx"] == str(target_node):
+            if data["origin_idx"] in attachments:
                 for anchor in fragment._real_anchors(frag_node, exclude=None):
-                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
-                break
+                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attachments[data["origin_idx"]]
         gross = 0.0
         for frag_node, data in fragment.atom_graph.nodes(data=True):
             if _is_connector_placeholder(data):
@@ -2737,21 +2770,12 @@ class EnsembleCreator:
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
         # error but silently generate truncated, end-group-less molecules.
-        ladder_termination = False
         for u, v, edge_data in self._generative_graph.edges(data=True):
             if _EDGE_STOCHASTIC_ID_NAME not in edge_data:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
             # Sampling decides forced fires by the transition role; a graph written before the
             # field existed, or one that contradicts its own weights and stamps, is refused.
             _check_transition_role((u, v), edge_data)
-            if edge_data.get(_TERMINATION_NAME, 0) > 0 and GroupRule.LADDER in (edge_data.get(_SOURCE_RULE_NAME, 0), edge_data.get(_TARGET_RULE_NAME, 0)):
-                ladder_termination = True
-        if ladder_termination:
-            # Temporary gate: a ladder group completes on growth and transition bonds; completion on a
-            # termination bond (a ladder-typed terminator) lands in the next implementation phase.
-            raise NotImplementedError(
-                "This generative graph declares conditional connectivity with a LADDER rule on a termination edge; parsing, validation and the graph are supported, but generation with ladder-typed terminators lands in the next implementation phase."
-            )
 
         self._static_graph = self._create_static_graph(self.generative_graph)
         # A placeholder is one half of a split atom. Its sole static neighbor

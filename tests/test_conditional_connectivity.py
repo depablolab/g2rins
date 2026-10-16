@@ -14,7 +14,8 @@ site consumed through a plain channel removes their exclusion-typed channels
 (whatever mode fired the bond, at any level). Phase 4 -- the LADDER rule: the
 first ladder-typed bond commits its group and the remaining members bond the fresh
 unit in the same step; a member consumed through any other channel strips the group's
-ladder channels from its siblings. Ladder-typed terminators stay gated.
+ladder channels from its siblings; a ladder-typed terminator closes the last junction the
+same way and the termination estimate prices its cap once, rungs included.
 """
 
 import time
@@ -596,8 +597,6 @@ def test_ladder_reference_string_encoding():
         ("[>[>1]]", "[<[<1]1]", "transition_weight", (0, 1, 1, 1)),
         ("[>[>2]]", "[<[<2]1]", "transition_weight", (0, 1, 1, 1)),
     }
-    with pytest.raises(NotImplementedError, match="LADDER rule on a termination edge"):
-        g2rins.EnsembleCreator(_generative_graph(_graph_creator(LADDER_REFERENCE_TEXT)))
 
 
 def test_all_star_string_encoding():
@@ -887,6 +886,18 @@ def test_entry_through_the_typed_channel_counts_as_a_typed_consumption(monkeypat
             ],
             120.0,
         ),
+        # Ladder siblings: whichever fires takes the other as a rung, the channel's mass holding both ends already
+        ([(1.0, frozenset({1}), [(1, GroupRule.LADDER, 1.0, 44.0)])] * 2, 44.0),
+        # A rung-welded member also holding exclusion group 2 takes that group with it: the third site's typed channel
+        # dies and it caps plain; by hand (100 + 100 + 130) / 3 over the three first movers
+        (
+            [
+                (1.0, frozenset({1}), [(1, GroupRule.LADDER, 1.0, 80.0)]),
+                (1.0, frozenset({1, 2}), [(1, GroupRule.LADDER, 1.0, 80.0)]),
+                (1.0, frozenset({2}), [(2, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 20.0)]),
+            ],
+            110.0,
+        ),
     ],
 )
 def test_cluster_cap_estimate_follows_the_firing_sequence(members, expected):
@@ -904,14 +915,28 @@ def test_independent_cluster_members_are_priced_apart():
     assert time.perf_counter() - started < 5.0
 
 
-def _unit_termination_estimate(text):
-    """Termination-mass estimate of one freshly instantiated repeat unit of ``text``."""
+def _fresh_unit(text):
+    """One freshly instantiated repeat unit of ``text``, with its instance id, static graph and rng."""
     generative_graph = _generative_graph(_graph_creator(text))
     static_graph = _ec.EnsembleCreator._create_static_graph(generative_graph)
     tracker, rng = _ec._StochasticObjectTracker(generative_graph), np.random.default_rng(0)
     carbon = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
     unit, sto_atom_id = _instantiate(generative_graph, static_graph, tracker, carbon, rng)
+    return unit, sto_atom_id, static_graph, rng
+
+
+def _unit_termination_estimate(text):
+    """Termination-mass estimate of one freshly instantiated repeat unit of ``text``."""
+    unit, sto_atom_id, static_graph, rng = _fresh_unit(text)
     return unit.get_average_termination_mw(sto_atom_id, static_graph, rng)
+
+
+def _realized_cap_delta(text):
+    """Mass one freshly instantiated repeat unit of ``text`` gains when it terminates."""
+    unit, sto_atom_id, _static_graph, rng = _fresh_unit(text)
+    before = Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(unit.atom_graph))
+    unit.terminate_graph(sto_atom_id, rng)
+    return Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(unit.atom_graph)) - before
 
 
 # One repeat unit carrying ten exclusion groups, each a pair of sites with a typed and a plain cap channel.
@@ -1063,6 +1088,8 @@ COMPLETION_DRAW = "ladder completion partner selection"
 INCOMING_ONLY_LADDER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2]; [<][H] []}|uniform(400,400)|"
 # The second exit site may only pair with the first entry site; a first exit that fires and takes it leaves no partner.
 RESTRICTED_PARTNER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1|1 1 0 0|])O[>[>]1|1 0 0 0|]; C(O[>[>]1])O[>[>]1]; [<][H] []}|uniform(500,500)|"
+# A two-site ladder-typed cap: the first member to terminate draws it, the other welds the rung to its second site.
+LADDER_CAP_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<[<]]OCO[<[<]] []}|poisson(1000)|"
 
 
 def _unit_anchors(ensemble):
@@ -1189,3 +1216,30 @@ def test_member_without_a_free_partner_discards_the_attempt(monkeypatch):
     for chain in ensemble.chains:
         units = sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] in anchors)
         assert _cycle_rank(chain) == units - 1
+
+
+@pytest.mark.parametrize("text, n_chains, seed", [(LADDER_CAP_TEXT, 6, 5), (LADDER_REFERENCE_TEXT, 3, 1)])
+def test_ladder_typed_cap_closes_the_last_junction(text, n_chains, seed):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble = _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format="mol_graph", ensemble_info=True, seed=seed)
+    assert not any(issubclass(record.category, DiscardedSamplingPaths) for record in caught)
+    assert len(ensemble.chains) == n_chains
+    # One cap per chain, bonded twice: the chain start, every growth step and the cap each close with two rungs.
+    assert ensemble.units["T0"]["count"] == n_chains
+    assert sum(_junction_records(ensemble, "I0", "R0").values()) == 2 * n_chains
+    assert sum(_junction_records(ensemble, "R0", "R0").values()) == 2 * (ensemble.units["R0"]["count"] - n_chains)
+    assert sum(_junction_records(ensemble, "R0", "T0").values()) == 2 * n_chains
+    # Every chain's cycle rank is one per junction on top of the rings its units bring.
+    intrinsic = {str(next(iter(unit["subgraph"].nodes))): _cycle_rank(unit["subgraph"]) for unit in ensemble.units.values()}
+    for chain in ensemble.chains:
+        units = [data["origin_idx"] for _node, data in chain.nodes(data=True) if data["origin_idx"] in intrinsic]
+        assert _cycle_rank(chain) == len(units) - 1 + sum(intrinsic[anchor] for anchor in units)
+        assert Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) > 0
+
+
+@pytest.mark.parametrize("text", [LADDER_CAP_TEXT, LADDER_REFERENCE_TEXT])
+def test_ladder_cap_is_priced_once_with_its_rungs(text):
+    # The cap is the only terminator, so the expectation is the one mass termination realizes: the cap
+    # attached at both sites of the pair, every end shedding its hydrogen.
+    assert _unit_termination_estimate(text) == pytest.approx(_realized_cap_delta(text))
