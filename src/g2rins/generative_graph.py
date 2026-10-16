@@ -31,6 +31,7 @@ from .exception import (
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
     TooManyStochasticObjects,
+    UnsettledHardAllRule,
     UnsupportedBondDescriptor,
 )
 from .util import _determine_darkness_from_hex
@@ -370,6 +371,37 @@ def _verified_unit_texts(generative_graph, labels):
         if matches:
             verified[unit_id] = text
     return verified
+
+
+def _refuse_unsettled_hard_all(generative_graph, labels):
+    """Refuse a graph whose hard all-typed channels feed each other without end (``UnsettledHardAllRule``).
+
+    Units settle from the ones holding no hard all-typed growth or transition channel upward
+    (a forced exit never competes, a termination channel never forces): a unit settles once
+    every target unit of every such channel of its sites has settled; a unit left over would
+    grow every chain forever, whatever the weights.
+    """
+    from .bond import GroupRule  # bond imports this module
+
+    targets = {}
+    for u, v, d in generative_graph.edges(data=True):
+        if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.ALL_HARD and d.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT and (d[_PROPAGATION_NAME] > 0 or d[_TRANSITION_NAME] > 0):
+            targets.setdefault(labels.unit_id[u], set()).add(labels.unit_id[v])
+    settled = set(labels.unit_nodes) - set(targets)
+    while True:
+        settling = {unit for unit, units in targets.items() if unit not in settled and units <= settled}
+        if not settling:
+            break
+        settled |= settling
+    unsettled = [unit for unit in labels.unit_nodes if unit in targets and unit not in settled]
+    if not unsettled:
+        return
+    # Follow the first offender's unsettled targets until one repeats: the cycle its channels close.
+    cycle = [unsettled[0]]
+    while cycle.count(cycle[-1]) == 1:
+        cycle.append(min(unit for unit in targets[cycle[-1]] if unit not in settled))
+    texts = generative_graph.graph.get("unit_g2rins", {})
+    raise UnsettledHardAllRule(unsettled[0], texts.get(unsettled[0], ""), cycle, [texts.get(unit, "") for unit in cycle])
 
 
 def derive_unit_labels(generative_graph, node_sort_key=None):
@@ -1329,7 +1361,7 @@ class GraphCreator:
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
         - **{source_group_name}**, **{target_group_name}**: int Group id declared by the bond connector symbol of the unit the bond leaves from, respectively arrives at (conditional connectivity). -1 when that symbol declares no group.
-        - **{source_rule_name}**, **{target_rule_name}**: int Group rule of that symbol: 0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL (the ``GroupRule`` encoding, stable across versions). A bond across nesting levels passes through terminal bond connectors and the bond connectors that attach the nested stochastic object; those are plain, so the bond carries the rule of the unit it leaves or of the unit it reaches, and a bond ruled at both ends is refused (``GroupRulesOnBothPathEnds``, raised when the graph without bond connectors is built; the graph with bond connectors stays available). Static bonds and the terminal-bond-connector side of a stochastic object's entry or exit carry the sentinels -1 and 0. One bond per distinct group annotation of a compatible bond connector pair: a pair whose symbols match in two differently grouped ways yields two parallel bonds sharing that pair's weight.
+        - **{source_rule_name}**, **{target_rule_name}**: int Group rule of that symbol: 0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL_HARD, 4 ALL_SOFT (the ``GroupRule`` encoding, stable across versions). A bond across nesting levels passes through terminal bond connectors and the bond connectors that attach the nested stochastic object; those are plain, so the bond carries the rule of the unit it leaves or of the unit it reaches, and a bond ruled at both ends is refused (``GroupRulesOnBothPathEnds``, raised when the graph without bond connectors is built; the graph with bond connectors stays available). A hard all-typed channel whose target units never run out of hard all-typed channels of their own is refused the same way (``UnsettledHardAllRule``): the hard all rule would grow every chain forever. Static bonds and the terminal-bond-connector side of a stochastic object's entry or exit carry the sentinels -1 and 0. One bond per distinct group annotation of a compatible bond connector pair: a pair whose symbols match in two differently grouped ways yields two parallel bonds sharing that pair's weight.
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
@@ -1651,6 +1683,9 @@ class GraphCreator:
                 unit_g2rins[unit_id] = graph.nodes[n]["token_text"]
         generative_graph.graph["unit_g2rins"] = unit_g2rins
         generative_graph.graph["unit_node_ids"] = {unit_id: list(nodes) for unit_id, nodes in labels.unit_nodes.items()}
+
+        if not include_bond_connectors:
+            _refuse_unsettled_hard_all(generative_graph, labels)
 
         if return_extra_graph_info:
             return generative_graph, extra_graph_info

@@ -9,6 +9,7 @@ import numpy as np
 
 from .g2rins_molecule import G2rinsMolecule
 from .bond import (
+    ALL_RULES,
     BondConnector,
     GroupRule,
     TerminalBondConnector,
@@ -282,7 +283,8 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     if len(outers) > 1:
                         raise MixedOuterSymbolsInGroup(group_id, owner, self)
                     ladder_groups.append((owner, kind, group_id, members))
-                if len(members) == 1:
+                # A single all-typed site per unit is the grafting use: the warning would have nothing to say.
+                if len(members) == 1 and rule not in ALL_RULES:
                     warnings.warn(SingleMemberGroup(group_id, rule.name, owner), stacklevel=1)
 
         # A plain symbol beside an exclusion- or all-typed one with the same outer symbol and index
@@ -293,7 +295,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 if symbol.group_suffix is None:
                     plain_keys.setdefault(id(bc), set()).add((symbol.symbol_char, symbol.idx))
             for bc, symbol in symbols:
-                if symbol.group_rule in (GroupRule.EXCLUSION, GroupRule.ALL) and (symbol.symbol_char, symbol.idx) in plain_keys.get(id(bc), ()):
+                if (symbol.group_rule == GroupRule.EXCLUSION or symbol.group_rule in ALL_RULES) and (symbol.symbol_char, symbol.idx) in plain_keys.get(id(bc), ()):
                     warnings.warn(IndistinguishableSymbolsInSite(symbol, bc, owner), stacklevel=1)
 
         for i, (owner_a, kind_a, group_a, members_a) in enumerate(ladder_groups):
@@ -311,7 +313,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
         for _owner, kind, table, _symbols in scopes:
             for members in table.values():
                 for bc, symbol in members:
-                    if symbol.group_rule not in (GroupRule.EXCLUSION, GroupRule.ALL):
+                    if symbol.group_rule != GroupRule.EXCLUSION and symbol.group_rule not in ALL_RULES:
                         continue
                     for other_kind, other_bc, other in every_symbol:
                         if other.group_suffix is not None and can_bond(kind, bc, other_kind, other_bc) and symbol.is_compatible(other):

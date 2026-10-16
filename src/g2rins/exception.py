@@ -411,11 +411,12 @@ class UndershootSnapshotMissed(G2RINSWarning):
 
 
 class AllGroupOvershoot(G2RINSWarning):
-    """A stochastic object grew past its drawn target because sites of an all-group were still unfired.
+    """A stochastic object grew past its drawn target because hard all-typed sites were still unfired.
 
-    The all rule places every all-typed site of a unit instance before the object may stop, so a
-    target too small for the written architecture is exceeded, never cut. The sampler emits it once
-    per chain; ``create_ensemble`` folds those of the returned chains into one warning with the count.
+    The hard all rule places every hard all-typed site of a unit instance before the object may stop, so
+    a target too small for the written architecture is exceeded, never cut (a soft all-typed site yields
+    to the target instead). The sampler emits it once per chain; ``create_ensemble`` folds those of the
+    returned chains into one warning with the count.
     """
 
     def __init__(self, chain_count=1, chain_total=1):
@@ -426,8 +427,9 @@ class AllGroupOvershoot(G2RINSWarning):
     def __str__(self):
         return (
             f"In {self.chain_count} of {self.chain_total} chain(s) a stochastic object grew past its drawn "
-            "molecular weight target because sites of an all-group were still waiting to fire: the all rule "
-            "places them before the object may stop. Raise the target if the overshoot is unintended."
+            "molecular weight target because hard all-typed sites were still waiting to fire: the hard all rule "
+            "places them before the object may stop. Raise the target, or write `alls` for sites that may yield "
+            "to it, if the overshoot is unintended."
         )
 
 
@@ -713,7 +715,7 @@ class GroupPartnerNotPlain(ParsingError):
         partner = str(self.partner_symbol)
         if partner == str(self.symbol):
             partner = f"its own symbol {partner} on another site or instance of the unit"
-        return f"The {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {partner}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
+        return f"The {self.symbol.group_rule.label}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {partner}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
 
 
 class GroupRuleOnTerminalBondConnector(ParsingError):
@@ -755,7 +757,7 @@ class IndistinguishableSymbolsInSite(ParsingWarning):
         self.bond_connector = bond_connector
 
     def __str__(self):
-        return f"The bond connector {str(self.bond_connector)} in the unit {str(self.token)} lists the {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} beside a plain symbol with the same outer symbol and index; partners cannot tell the two apart, so bonds are drawn through either with equal odds."
+        return f"The bond connector {str(self.bond_connector)} in the unit {str(self.token)} lists the {self.symbol.group_rule.label}-typed symbol {str(self.symbol)} beside a plain symbol with the same outer symbol and index; partners cannot tell the two apart, so bonds are drawn through either with equal odds."
 
 
 class GroupRulesOnBothPathEnds(G2RINSError):
@@ -769,3 +771,30 @@ class GroupRulesOnBothPathEnds(G2RINSError):
         from .bond import GroupRule
 
         return f"The bond from the bond connector {self.source_bond_connector} to the bond connector {self.target_bond_connector} crosses a nesting level and both ends declare a group rule (group {self.source_values[0]} {GroupRule(self.source_values[1]).name} and group {self.target_values[0]} {GroupRule(self.target_values[1]).name}). Exclusion and all channels must point at plain bond connector symbols, so a bond connector path may carry a group rule at one end only."
+
+
+class UnsettledHardAllRule(G2RINSError):
+    """Hard all-typed channels that feed each other without end.
+
+    Raised when the graph without bond connectors is built. The hard all rule forbids a stochastic
+    object to stop while one of its unit instances holds an unfired hard all-typed site, so every
+    unit such a channel leads to must itself run out of hard all-typed sites: a unit holding no hard
+    all-typed growth or transition channel settles at once, a unit settles once every target of every
+    such channel of its sites has settled (forced exits never compete), and a unit left over would
+    grow every chain forever. Weights play no part: one non-settling target hangs the chain with
+    positive probability.
+    """
+
+    def __init__(self, unit_id, unit_text, cycle, cycle_texts):
+        self.unit_id = unit_id
+        self.unit_text = unit_text
+        self.cycle = list(cycle)
+        self.cycle_texts = list(cycle_texts)
+        super().__init__(self.unit_id, self.unit_text, self.cycle, self.cycle_texts)
+
+    def __str__(self):
+        chain = " -> ".join(f"{unit} {text}".rstrip() for unit, text in zip(self.cycle, self.cycle_texts))
+        return (
+            f"The hard all rule in the unit {self.unit_id} {self.unit_text} can never settle: its hard all-typed channels lead through units that hold hard all-typed channels of their own without end ({chain}), so every chain would grow forever. "
+            "Write `alls` for an all rule that yields to the molecular weight target, or point the hard channels at units without hard all-typed sites."
+        )

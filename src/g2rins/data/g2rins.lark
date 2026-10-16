@@ -67,8 +67,8 @@ bond_connector_symbol_idx: bond_connector_symbol INT?
 ?grouped_symbol: bond_connector_symbol_idx group_suffix?
 group_suffix: "[" _group_rule? "]" INT?
 _group_rule: bond_connector_symbol_idx | rule_keyword
-# future group-rule keywords join as alternatives here
-rule_keyword: "all"
+# the all rule always states its hardness; a bare `all` is not a keyword
+rule_keyword: "allh" | "alls"
 
 bond_connector_generation: "|" WS_INLINE* NUMBER WS_INLINE* "|"
   | "|" WS_INLINE* NUMBER  _number_list_repeat* WS_INLINE* "|"

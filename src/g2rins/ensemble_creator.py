@@ -20,7 +20,7 @@ import networkx as nx
 import numpy as np
 from rdkit import Chem, rdBase
 
-from .bond import GroupRule
+from .bond import ALL_RULES, GroupRule
 from .chem_resource import (
     atom_color_mapping,
     atom_name_mapping,
@@ -252,6 +252,8 @@ class _HalfAtomBond:
         self.node_idx: str = node_idx
         # Unit instance this site belongs to; group rules act on siblings sharing the tag.
         self.instance: int = instance
+        # All-generation of the unit: all-typed bonds (either flavour) crossed from the chain start to it.
+        self.generation: int = 0
         self.weight: float = graph.nodes[node_idx]["gen_weight"]
         self.molar_amounts: float = graph.nodes[node_idx]["unit_molar_amounts"]
         self.gen_hierarchy: int = graph.nodes[node_idx]["gen_hierarchy"]
@@ -351,10 +353,10 @@ class _HalfAtomBond:
         held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER}
         return held | {group for group, rule in self._entry_rules.items() if rule == GroupRule.LADDER}
 
-    def holds_rule(self, mode, rule, sto_gen_id):
-        """Whether a live ``mode`` channel of this site at level ``sto_gen_id`` carries the group rule ``rule`` (forced exits never compete)."""
+    def holds_rule(self, mode, rules, sto_gen_id):
+        """Whether a live ``mode`` channel of this site at level ``sto_gen_id`` carries one of the group rules ``rules`` (forced exits never compete)."""
         return any(
-            attrs.get(_SOURCE_RULE_NAME, 0) == rule and attrs.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attrs.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
+            attrs.get(_SOURCE_RULE_NAME, 0) in rules and attrs.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attrs.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
             for attrs in self._mode_attr_map.get(mode, [])
         )
 
@@ -1144,8 +1146,14 @@ class _PartialAtomGraph:
         transition, nested entry, forced exit, junction cap, global transition): the
         exclusion rule and the ladder strip read only the channel of ``fired_edge`` on
         each side, never the mode that fired it or the level it crosses. A ladder-typed
-        channel commits its group: the remaining members bond the fresh unit now.
+        channel commits its group: the remaining members bond the fresh unit now. The
+        fresh unit's all-generation is its source's, one deeper through an all-typed bond.
         """
+        generation = source_half_bond.generation + int(fired_edge.get(_SOURCE_RULE_NAME, 0) in ALL_RULES or fired_edge.get(_TARGET_RULE_NAME, 0) in ALL_RULES)
+        for sites in (*other._open_half_bond_map.values(), other._entry_sites.values(), (other._consumed_half_bond,)):
+            for site in sites:
+                if site is not None:
+                    site.generation = generation
         self._consume_sites(source_half_bond, fired_edge, other)
         offset = self.merge(other, source_half_bond.atom_idx, other_idx, bond_attr)
         if fired_edge.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and other._consumed_half_bond is not None:
@@ -1290,15 +1298,16 @@ class _PartialAtomGraph:
                 idx = parent_idx
         return idx, open_half_bonds
 
-    def all_tier(self, sto_atom_id, mode, sto_gen_id):
-        """The instance's own open sites still holding an ALL-typed ``mode`` channel at its level.
+    def all_tier(self, sto_atom_id, mode, sto_gen_id, rules=ALL_RULES):
+        """The instance's own open sites still holding an all-typed ``mode`` channel at its level.
 
-        The all rule: while any exists, that instance's ``mode`` draw is restricted to them and
-        the instance cannot stop, whatever its mass. Read from the pool the draw reads, the
-        instance's own bucket: an owner-level site never waits in a child's bucket, promotion
-        moves it with its rule.
+        The all rule: while any exists, that instance's ``mode`` draw is restricted to them,
+        lowest all-generation first, in both flavours; a hard one also keeps the instance from
+        stopping, whatever its mass, where a soft one yields to the target (``rules`` narrows
+        the flavour). Read from the pool the draw reads, the instance's own bucket: an
+        owner-level site never waits in a child's bucket, promotion moves it with its rule.
         """
-        return [half_bond for half_bond in self._open_half_bond_map.get(sto_atom_id, []) if half_bond.holds_rule(mode, GroupRule.ALL, sto_gen_id)]
+        return [half_bond for half_bond in self._open_half_bond_map.get(sto_atom_id, []) if half_bond.holds_rule(mode, rules, sto_gen_id)]
 
     def _apply_realized_bond(self, u_idx, v_idx, bond_attr):
         """A junction bond just became real: charge each endpoint's occupied
@@ -1532,10 +1541,11 @@ class _PartialAtomGraph:
             # remain in the bucket): report "no transition possible" instead of
             # crashing on an empty draw.
             return None, non_used_half_bonds
-        # The all rule: a site holding an ALL-typed transition at this level fires before any other.
-        tier = [half_bond for half_bond in filtered_half_bonds if half_bond.holds_rule(_TRANSITION_NAME, GroupRule.ALL, sto_gen_id)]
+        # The all rule: a site holding an all-typed transition at this level fires before any other, lowest all-generation first.
+        tier = [half_bond for half_bond in filtered_half_bonds if half_bond.holds_rule(_TRANSITION_NAME, ALL_RULES, sto_gen_id)]
         if tier:
-            filtered_half_bonds = tier
+            lowest = min(half_bond.generation for half_bond in tier)
+            filtered_half_bonds = [half_bond for half_bond in tier if half_bond.generation == lowest]
         if len(filtered_half_bonds) == 1:
             # Deterministic pick: skip the draw so it consumes no RNG state.
             chosen = filtered_half_bonds[0]
@@ -2387,11 +2397,14 @@ class _PartialAtomGraph:
     def propagate_graph(self, sto_atom_id, rng, prefer_parent_bonds):
 
         def pop_random_stochastic_bond():
-            # The all rule: sites still holding an ALL-typed growth channel are drawn before
-            # any other site of the pool; the tier is read before the prefer_parent filter.
+            # The all rule: sites still holding an all-typed growth channel are drawn before
+            # any other site of the pool, generation by generation (one weighted draw over the
+            # lowest all-generation present); the tier is read before the prefer_parent filter.
             tier = {id(half_bond) for half_bond in self.all_tier(sto_atom_id, _PROPAGATION_NAME, self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id])}
             if tier:
                 candidates = [(i, half_bond) for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id), strict=False) if id(half_bond) in tier]
+                lowest = min((half_bond.generation for _i, half_bond in candidates), default=0)
+                candidates = [(i, half_bond) for i, half_bond in candidates if half_bond.generation == lowest]
             else:
                 candidates = zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False)
             stochastic_idx = []
@@ -3574,7 +3587,7 @@ class EnsembleCreator:
         checkpoints = {}
         owner_epochs = {}
         forced_overshoot_no_boundary = set()
-        # Instances the all rule kept growing past their drawn target (reported once per chain).
+        # Instances the hard all rule kept growing past their drawn target (reported once per chain).
         all_group_overshoot = set()
         mutations = 0
 
@@ -3594,9 +3607,9 @@ class EnsembleCreator:
         avg_termination_cache = {}
 
         def _all_tier_open(graph, sto_atom_id):
-            """Whether ``sto_atom_id`` still holds an unfired ALL-typed site in ``graph``, growth or transition."""
+            """Whether ``sto_atom_id`` still holds an unfired HARD all-typed site in ``graph``, growth or transition (a soft one yields to the target)."""
             gen_id = graph.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
-            return any(graph.all_tier(sto_atom_id, mode, gen_id) for mode in (_PROPAGATION_NAME, _TRANSITION_NAME))
+            return any(graph.all_tier(sto_atom_id, mode, gen_id, rules=(GroupRule.ALL_HARD,)) for mode in (_PROPAGATION_NAME, _TRANSITION_NAME))
 
         def _projected_molw(tracker, sto_atom_id):
             """Tracked mass of sto_atom_id EXCLUDING its own termination caps
@@ -3856,8 +3869,8 @@ class EnsembleCreator:
                 avg_termination_cache[sto_atom_id] = avg_termination_weight
                 if proj_now[sto_atom_id] + avg_termination_weight >= expected_i:
                     if _all_tier_open(partial_atom_graph, sto_atom_id):
-                        # The all rule: an instance with an unfired ALL-typed site cannot
-                        # stop; it grows past its drawn target and the chain reports it.
+                        # The hard all rule: an instance with an unfired hard all-typed site
+                        # cannot stop; it grows past its drawn target and the chain reports it.
                         all_group_overshoot.add(sto_atom_id)
                         if _DECISION_TRACE is not None:
                             _DECISION_TRACE.append(
@@ -3894,8 +3907,8 @@ class EnsembleCreator:
                     if crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw and not snapshot_tracker.is_terminated(crossing_sto_atom_id):
                         under_caps_molw = snapshot_graph.get_average_termination_mw(crossing_sto_atom_id, self._static_graph, rng)
                         projected_under = _projected_molw(snapshot_tracker, crossing_sto_atom_id) + under_caps_molw
-                        # A checkpoint still holding an unfired ALL-typed site is no boundary:
-                        # restoring it would un-place a site the all rule forces.
+                        # A checkpoint still holding an unfired hard all-typed site is no boundary:
+                        # restoring it would un-place a site the hard all rule forces.
                         snapshot_valid = projected_under < expected_molw and not _all_tier_open(snapshot_graph, crossing_sto_atom_id)
                 if termination_flag == 0:
                     adopt_overshoot = True
