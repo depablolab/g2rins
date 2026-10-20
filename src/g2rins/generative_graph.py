@@ -26,6 +26,7 @@ from .chem_resource import (
     smi_bond_mapping,
 )
 from .exception import (
+    AllRuleOnTargetOnlySite,
     G2RINSWarning,
     GroupRulesOnBothPathEnds,
     IncompatibleBondTypeBondConnector,
@@ -373,35 +374,120 @@ def _verified_unit_texts(generative_graph, labels):
     return verified
 
 
-def _refuse_unsettled_hard_all(generative_graph, labels):
-    """Refuse a graph whose hard all-typed channels feed each other without end (``UnsettledHardAllRule``).
+def _static_units(generative_graph):
+    """Index of the unit every node belongs to: the maximal groups of nodes connected through static bonds."""
+    static = nx.Graph()
+    static.add_nodes_from(generative_graph.nodes())
+    static.add_edges_from((u, v) for u, v, data in generative_graph.edges(data=True) if is_static_edge(data))
+    return {node: index for index, component in enumerate(nx.connected_components(static)) for node in component}
 
-    Units settle from the ones holding no hard all-typed growth or transition channel upward
-    (a forced exit never competes, a termination channel never forces): a unit settles once
-    every target unit of every such channel of its sites has settled; a unit left over would
-    grow every chain forever, whatever the weights.
+
+def _unit_sites(generative_graph, unit_of):
+    """The sites of every unit: the nodes its non-static edges leave or enter."""
+    unit_sites = {}
+    for u, v, data in generative_graph.edges(data=True):
+        if not is_static_edge(data):
+            for node in (u, v):
+                unit_sites.setdefault(unit_of[node], set()).add(node)
+    return unit_sites
+
+
+def _reachable_states(generative_graph, unit_of, unit_sites, start_units):
+    """The (unit, entry site) states a chain can hold, from the units it may start in.
+
+    A chain starts with every site of its first unit open. A unit it enters holds every site but
+    the entry site open, that one spent by the bond that placed the unit (a site fires one bond),
+    and every channel of an open site, weights ignored, leads to the target unit entered through
+    the target site.
+    """
+    channels = {}
+    for u, v, data in generative_graph.edges(data=True):
+        if not is_static_edge(data):
+            channels.setdefault(u, set()).add(v)
+    states = {(unit, None) for unit in start_units}
+    queue = list(states)
+    while queue:
+        unit, entry = queue.pop()
+        for site in unit_sites.get(unit, set()) - {entry}:
+            for target in channels.get(site, ()):
+                state = (unit_of[target], target)
+                if state not in states:
+                    states.add(state)
+                    queue.append(state)
+    return states
+
+
+def _open_sites(states, unit_sites):
+    """The sites open in at least one state: the ones that can ever fire a bond."""
+    return {site for unit, entry in states for site in unit_sites.get(unit, set()) if site != entry}
+
+
+def _warn_target_only_all_sites(generative_graph, unit_of, openable, bond_connector_text, unit_text):
+    """An all-typed site that is never open is only ever a bond target: its rule never acts (``AllRuleOnTargetOnlySite``)."""
+    from .bond import ALL_RULES, GroupRule  # bond imports this module
+
+    reported = set()
+    for u, v, data in generative_graph.edges(data=True):
+        for node, rule in ((u, data.get(_SOURCE_RULE_NAME, 0)), (v, data.get(_TARGET_RULE_NAME, 0))):
+            if rule in ALL_RULES and node not in openable and node not in reported:
+                reported.add(node)
+                warnings.warn(AllRuleOnTargetOnlySite(bond_connector_text.get(node, ""), unit_text.get(unit_of[node], ""), GroupRule(rule).label), stacklevel=1)
+
+
+def _hard_all_cycle(generative_graph, unit_of, unit_sites, states):
+    """The units whose hard all-typed channels feed each other without end, as the closed cycle they form; empty when every state settles.
+
+    A state settles once every state its open hard all-typed growth or transition channels force
+    has settled (a forced exit never competes, a termination channel never forces), from the states
+    that force nothing upward; a state left over would grow every chain forever, whatever the weights.
     """
     from .bond import GroupRule  # bond imports this module
 
-    targets = {}
+    hard = {}
     for u, v, d in generative_graph.edges(data=True):
         if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.ALL_HARD and d.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT and (d[_PROPAGATION_NAME] > 0 or d[_TRANSITION_NAME] > 0):
-            targets.setdefault(labels.unit_id[u], set()).add(labels.unit_id[v])
-    settled = set(labels.unit_nodes) - set(targets)
+            hard.setdefault(u, set()).add(v)
+    forcing = {(unit, entry): {(unit_of[target], target) for site in unit_sites.get(unit, set()) - {entry} for target in hard.get(site, ())} for unit, entry in states}
+    settled = {state for state, forced in forcing.items() if not forced}
     while True:
-        settling = {unit for unit, units in targets.items() if unit not in settled and units <= settled}
+        settling = {state for state, forced in forcing.items() if state not in settled and forced <= settled}
         if not settling:
             break
         settled |= settling
-    unsettled = [unit for unit in labels.unit_nodes if unit in targets and unit not in settled]
+    unsettled = sorted(forcing.keys() - settled, key=str)
     if not unsettled:
-        return
-    # Follow the first offender's unsettled targets until one repeats: the cycle its channels close.
-    cycle = [unsettled[0]]
-    while cycle.count(cycle[-1]) == 1:
-        cycle.append(min(unit for unit in targets[cycle[-1]] if unit not in settled))
+        return []
+    # Follow the first offender's unsettled forced states until one repeats: the cycle the channels close.
+    walk = [unsettled[0]]
+    while walk.count(walk[-1]) == 1:
+        walk.append(min((state for state in forcing[walk[-1]] if state not in settled), key=str))
+    return [unit for unit, _entry in walk[walk.index(walk[-1]) :]]
+
+
+def _provenance_unit_texts(generative_graph, unit_of):
+    """The source text of every unit the graph's provenance records, by unit.
+
+    ``unit_g2rins`` is keyed like ``unit_node_ids``, which records the node membership each text
+    was composed against; a text counts only where those nodes are exactly one unit of the graph.
+    """
     texts = generative_graph.graph.get("unit_g2rins", {})
-    raise UnsettledHardAllRule(unsettled[0], texts.get(unsettled[0], ""), cycle, [texts.get(unit, "") for unit in cycle])
+    saved = generative_graph.graph.get("unit_node_ids", {})
+    if not isinstance(texts, dict) or not isinstance(saved, dict):
+        return {}
+    members = {}
+    for node, unit in unit_of.items():
+        members.setdefault(unit, set()).add(node)
+    unit_texts = {}
+    for key, nodes in saved.items():
+        try:
+            units = {unit_of[node] for node in nodes}
+            matches = len(units) == 1 and members[next(iter(units))] == set(nodes)
+        except (KeyError, TypeError):
+            # Optional provenance from an external graph may be malformed.
+            continue
+        if matches and isinstance(texts.get(key), str):
+            unit_texts[units.pop()] = texts[key]
+    return unit_texts
 
 
 def derive_unit_labels(generative_graph, node_sort_key=None):
@@ -1361,7 +1447,7 @@ class GraphCreator:
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
         - **{source_group_name}**, **{target_group_name}**: int Group id declared by the bond connector symbol of the unit the bond leaves from, respectively arrives at (conditional connectivity). -1 when that symbol declares no group.
-        - **{source_rule_name}**, **{target_rule_name}**: int Group rule of that symbol: 0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL_HARD, 4 ALL_SOFT (the ``GroupRule`` encoding, stable across versions). A bond across nesting levels passes through terminal bond connectors and the bond connectors that attach the nested stochastic object; those are plain, so the bond carries the rule of the unit it leaves or of the unit it reaches, and a bond ruled at both ends is refused (``GroupRulesOnBothPathEnds``, raised when the graph without bond connectors is built; the graph with bond connectors stays available). A hard all-typed channel whose target units never run out of hard all-typed channels of their own is refused the same way (``UnsettledHardAllRule``): the hard all rule would grow every chain forever. Static bonds and the terminal-bond-connector side of a stochastic object's entry or exit carry the sentinels -1 and 0. One bond per distinct group annotation of a compatible bond connector pair: a pair whose symbols match in two differently grouped ways yields two parallel bonds sharing that pair's weight.
+        - **{source_rule_name}**, **{target_rule_name}**: int Group rule of that symbol: 0 NONE, 1 LADDER, 2 EXCLUSION, 3 ALL_HARD, 4 ALL_SOFT (the ``GroupRule`` encoding, stable across versions). A bond across nesting levels passes through terminal bond connectors and the bond connectors that attach the nested stochastic object; those are plain, so the bond carries the rule of the unit it leaves or of the unit it reaches, and a bond ruled at both ends is refused (``GroupRulesOnBothPathEnds``, raised when the graph without bond connectors is built; the graph with bond connectors stays available). A hard all-typed channel whose target units never run out of hard all-typed channels of their own is refused the same way (``UnsettledHardAllRule``): the hard all rule would grow every chain forever; only sites that can ever be open count, and an all-typed site that is only ever a bond target warns instead (``AllRuleOnTargetOnlySite``), since the all rule acts on the bonds a site fires. Static bonds and the terminal-bond-connector side of a stochastic object's entry or exit carry the sentinels -1 and 0. One bond per distinct group annotation of a compatible bond connector pair: a pair whose symbols match in two differently grouped ways yields two parallel bonds sharing that pair's weight.
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
@@ -1685,7 +1771,21 @@ class GraphCreator:
         generative_graph.graph["unit_node_ids"] = {unit_id: list(nodes) for unit_id, nodes in labels.unit_nodes.items()}
 
         if not include_bond_connectors:
-            _refuse_unsettled_hard_all(generative_graph, labels)
+            # The all-rule checks read the structure alone: units from the static bonds, texts from the parser.
+            unit_of = _static_units(generative_graph)
+            unit_text = {}
+            for node, data in graph.nodes(data=True):
+                if "token_text" in data:
+                    unit_text.setdefault(unit_of[node], data["token_text"])
+            bond_connector_text = {node: str(self.g.nodes[bc]["obj"]) for node in generative_graph.nodes if node in self.g for _node, bc in self.g.out_edges(node) if bc in self._bc_idx_set}
+            unit_sites = _unit_sites(generative_graph, unit_of)
+            # A chain starts in an initiator's unit; a graph without initiators may start anywhere.
+            start_units = {unit_of[node] for node, data in generative_graph.nodes(data=True) if data["init_weight"] > 0} or set(unit_sites)
+            states = _reachable_states(generative_graph, unit_of, unit_sites, start_units)
+            _warn_target_only_all_sites(generative_graph, unit_of, _open_sites(states, unit_sites), bond_connector_text, unit_text)
+            cycle = _hard_all_cycle(generative_graph, unit_of, unit_sites, states)
+            if cycle:
+                raise UnsettledHardAllRule(unit_text.get(cycle[0], ""), [unit_text.get(unit, "") for unit in cycle])
 
         if return_extra_graph_info:
             return generative_graph, extra_graph_info

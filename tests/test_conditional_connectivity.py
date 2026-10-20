@@ -36,6 +36,7 @@ from g2rins import ensemble_creator as _ec
 from g2rins.bond import ALL_RULES
 from g2rins.exception import (
     AllGroupOvershoot,
+    AllRuleOnTargetOnlySite,
     DiscardedSamplingPaths,
     GroupPartnerNotPlain,
     GroupRuleOnNestedObjectBondConnector,
@@ -1271,6 +1272,13 @@ HARD_PENDANT_TEXT = "{[] [<]CC([>1[allh]1])[>], [<1]CCO[>]; C[>]; [<][H] []}|poi
 HARD_PENDANT_CHAIN_TEXT = "{[] [<]CC([>1[allh]1])[>], [<1]CC([>2[allh]2])O[>], [<2]C(=O)C[>1]; C[>]; [<][H] []}|poisson(300)|"
 # A plain-grown backbone whose every unit carries one soft pendant; the grafts are drawn at the outer level.
 SOFT_BACKBONE_TEXT = "{[] [<1]CCO[>1]; {[] [<]CC([>1[alls]1])[>]; C[>]; [<][H] [<1]}|uniform(300,300)|[>1]; [<1][H] []}|uniform(600,600)|"
+# An all-typed site that is only ever a bond target (the unit is entered through it alone): the rule never acts.
+TARGET_ONLY_ALL_TEXT = "{[] [<[allh]]CC[>]; C[>]; [<][H] []}|poisson(300)|"
+TARGET_ONLY_SOFT_CAP_TEXT = "{[] [<]CC[>]; C[>]; [<[alls]][H] []}|poisson(300)|"
+# The same unit with the hard site on the growth side: it opens on every placement and feeds the unit itself.
+HARD_GROWTH_TEXT = "{[] [<]CC[>[allh]]; C[>]; [<][H] []}|poisson(300)|"
+# A probe of the entry-site rule, not a chemistry example: the hard channel enters the fresh unit through the site that carries it, which spends it.
+SPENT_ENTRY_SITE_TEXT = "{[] [<]CC[<1,>1[allh]]; C[>]; [>][H], [>1][H] []}|uniform(40,40)|"
 
 
 def test_bare_all_is_not_a_keyword():
@@ -1293,15 +1301,15 @@ def test_soft_all_edge_annotations():
     assert all(_group_values(data) == (1, 4, -1, 0) and _mode(data) == "transition_weight" for data in annotated)
 
 
-@pytest.mark.parametrize("text", [HARD_DENDRIMER_TEXT, HARD_CYCLE_TEXT])
-def test_unsettled_hard_all_rule_is_refused_at_graph_build(text):
+@pytest.mark.parametrize("text, cycle_units", [(HARD_DENDRIMER_TEXT, 1), (HARD_CYCLE_TEXT, 2), (HARD_GROWTH_TEXT, 1)])
+def test_unsettled_hard_all_rule_is_refused_at_graph_build(text, cycle_units):
     graph_creator = _graph_creator(text)
     with pytest.raises(UnsettledHardAllRule) as info:
         _generative_graph(graph_creator)
     error = info.value
     # The cycle starts and ends on the same unit and passes through the offender.
-    assert error.cycle[0] == error.cycle[-1] and error.unit_id in error.cycle
-    assert len(set(error.cycle)) == (1 if text is HARD_DENDRIMER_TEXT else 2)
+    assert error.cycle[0] == error.cycle[-1] and error.unit_text in error.cycle
+    assert len(set(error.cycle)) == cycle_units
     assert error.unit_text and "allh" in error.unit_text and "`alls`" in str(error)
     with pytest.raises(UnsettledHardAllRule):
         graph_creator.get_ensemble_creator()
@@ -1309,9 +1317,26 @@ def test_unsettled_hard_all_rule_is_refused_at_graph_build(text):
     assert _generative_graph(graph_creator, include_bond_connectors=True).number_of_nodes() > 0
 
 
-@pytest.mark.parametrize("text", [ALL_TEXT, HARD_PENDANT_TEXT, HARD_PENDANT_CHAIN_TEXT, SOFT_DENDRIMER_TEXT])
+@pytest.mark.parametrize("text", [ALL_TEXT, HARD_PENDANT_TEXT, HARD_PENDANT_CHAIN_TEXT, SOFT_DENDRIMER_TEXT, TARGET_ONLY_ALL_TEXT, SPENT_ENTRY_SITE_TEXT])
 def test_settling_hard_channels_and_soft_rules_build(text):
     assert _generative_graph(_graph_creator(text)).number_of_nodes() > 0
+
+
+@pytest.mark.parametrize(
+    "text, bond_connector, unit, label",
+    [(TARGET_ONLY_ALL_TEXT, "[<[allh]]", "[<[allh]]CC[>]", "hard all"), (TARGET_ONLY_SOFT_CAP_TEXT, "[<[alls]]", "[<[alls]][H]", "soft all")],
+)
+def test_target_only_all_site_warns_and_samples_as_plain(text, bond_connector, unit, label):
+    graph_creator = _graph_creator(text)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        graph_creator.get_generative_graph()
+    reported = [record.message for record in caught if issubclass(record.category, AllRuleOnTargetOnlySite)]
+    assert [(message.bond_connector, str(message.token), message.rule_label) for message in reported] == [(bond_connector, unit, label)]
+    assert "never acts" in str(reported[0])
+    # The site never opens, so its channel never fires: the string samples exactly as its plain twin.
+    plain = text.replace("[allh]", "").replace("[alls]", "")
+    assert list(_sample(text, 6, seed=1, output_format="smiles")) == list(_sample(plain, 6, seed=1, output_format="smiles"))
 
 
 def test_hard_pendants_all_fire():
@@ -1410,3 +1435,28 @@ def test_soft_pendants_graft_across_the_backbone():
         patterns.append([any(heavy.nodes[other]["origin_idx"] in graft_origins for other in heavy.neighbors(node)) for node in carbons])
     assert all(len(pattern) >= 8 and 0 < sum(pattern) < len(pattern) for pattern in patterns), patterns
     assert any(pattern.index(False) < len(pattern) - 1 - pattern[::-1].index(True) for pattern in patterns), patterns
+
+
+def _unit_nodes(generative_graph, text):
+    """The nodes of the unit parsed from ``text``, through the graph's provenance record."""
+    unit_id = next(unit_id for unit_id, unit_text in generative_graph.graph["unit_g2rins"].items() if unit_text == text)
+    return generative_graph.graph["unit_node_ids"][unit_id]
+
+
+def test_hard_all_is_validated_for_the_sampled_source():
+    # A chain started in the unit opens its `<` site, which the initiator-started chains never open.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = _graph_creator(TARGET_ONLY_ALL_TEXT).get_ensemble_creator()
+    source = _unit_nodes(ensemble_creator.generative_graph, "[<[allh]]CC[>]")[0]
+    with pytest.raises(UnsettledHardAllRule) as info:
+        ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
+    assert (info.value.start_text, info.value.unit_text, info.value.cycle) == ("[<[allh]]CC[>]", "[<[allh]]CC[>]", ["[<[allh]]CC[>]"] * 2)
+    assert "A chain started in the unit [<[allh]]CC[>]" in str(info.value)
+    # A chain started in a unit whose hard channels settle samples as before.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = _graph_creator(HARD_PENDANT_TEXT).get_ensemble_creator()
+        source = _unit_nodes(ensemble_creator.generative_graph, "[<1]CCO[>]")[0]
+        chain = ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
+    assert chain.number_of_nodes() > 0

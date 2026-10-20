@@ -750,6 +750,27 @@ class SingleMemberGroup(ParsingWarning):
         return message + "."
 
 
+class AllRuleOnTargetOnlySite(ParsingWarning):
+    """An all-typed site that is only ever a bond target carries a rule that never acts.
+
+    The all rule acts on the bonds a site fires. A site is open to fire only when its unit was
+    entered through another of its sites, so a site that is never entered that way is only ever
+    the target of a bond, and its all rule, hard or soft, has nothing to act on. Raised when the
+    graph without bond connectors is built.
+    """
+
+    def __init__(self, bond_connector, unit_text, rule_label):
+        super().__init__(unit_text)
+        self.bond_connector = bond_connector
+        self.rule_label = rule_label
+
+    def __str__(self):
+        return (
+            f"The {self.rule_label}-typed bond connector {self.bond_connector} of the unit {str(self.token)} is only ever a bond target: its unit is never entered through another site, so the site is never open to fire, "
+            "and the all rule, which acts on the bonds a site fires, never acts here."
+        )
+
+
 class IndistinguishableSymbolsInSite(ParsingWarning):
     def __init__(self, symbol, bond_connector, owner):
         super().__init__(owner)
@@ -776,25 +797,30 @@ class GroupRulesOnBothPathEnds(G2RINSError):
 class UnsettledHardAllRule(G2RINSError):
     """Hard all-typed channels that feed each other without end.
 
-    Raised when the graph without bond connectors is built. The hard all rule forbids a stochastic
-    object to stop while one of its unit instances holds an unfired hard all-typed site, so every
-    unit such a channel leads to must itself run out of hard all-typed sites: a unit holding no hard
-    all-typed growth or transition channel settles at once, a unit settles once every target of every
-    such channel of its sites has settled (forced exits never compete), and a unit left over would
-    grow every chain forever. Weights play no part: one non-settling target hangs the chain with
-    positive probability.
+    Raised when the graph without bond connectors is built, for chains started in an initiator's
+    unit, and by ``sample_mol_graph`` for a source in any other unit (``start_text``), whose chains
+    open every site of that unit at once. The hard all rule forbids a stochastic object to stop
+    while one of its unit instances holds an unfired hard all-typed site, so every unit such a
+    channel leads to must itself run out of hard all-typed sites: a unit entered through one of its
+    sites holds the others open (the entry site is spent), it settles at once when none of them
+    carries a hard all-typed growth or transition channel (forced exits never compete), it settles
+    once every unit such a channel enters, through the site the channel points at, has settled, and
+    a unit left over would grow every chain forever. Weights play no part: one non-settling target
+    hangs the chain with positive probability.
     """
 
-    def __init__(self, unit_id, unit_text, cycle, cycle_texts):
-        self.unit_id = unit_id
+    def __init__(self, unit_text, cycle, start_text=None):
         self.unit_text = unit_text
         self.cycle = list(cycle)
-        self.cycle_texts = list(cycle_texts)
-        super().__init__(self.unit_id, self.unit_text, self.cycle, self.cycle_texts)
+        self.start_text = start_text
+        super().__init__(self.unit_text, self.cycle, self.start_text)
 
     def __str__(self):
-        chain = " -> ".join(f"{unit} {text}".rstrip() for unit, text in zip(self.cycle, self.cycle_texts))
+        chain = " -> ".join(self.cycle)
+        started = (
+            f" A chain started in the unit {self.start_text} opens every site of that unit, among them sites no chain started from an initiator ever opens." if self.start_text is not None else ""
+        )
         return (
-            f"The hard all rule in the unit {self.unit_id} {self.unit_text} can never settle: its hard all-typed channels lead through units that hold hard all-typed channels of their own without end ({chain}), so every chain would grow forever. "
+            f"The hard all rule in the unit {self.unit_text} can never settle: its hard all-typed channels lead through units that hold hard all-typed channels of their own without end ({chain}), so every chain would grow forever.{started} "
             "Write `alls` for an all rule that yields to the molecular weight target, or point the hard channels at units without hard all-typed sites."
         )

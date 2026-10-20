@@ -44,6 +44,7 @@ from .exception import (
     PossibleNonRepresentativePolymerChain,
     TooManyDiscardedChains,
     UndershootSnapshotMissed,
+    UnsettledHardAllRule,
     UnsupportedWildcardGeneration,
     UnvalidatedGenerationSource,
 )
@@ -66,9 +67,14 @@ from .generative_graph import (
     _atomic_number,
     _check_transition_role,
     _connector_placeholder_flag,
+    _hard_all_cycle,
     _is_connector_placeholder,
     _json_safe,
+    _provenance_unit_texts,
+    _reachable_states,
     _static_neighbors,
+    _static_units,
+    _unit_sites,
     _verified_unit_texts,
     derive_unit_labels,
     generative_graph_json_data,
@@ -2822,6 +2828,7 @@ class EnsembleCreator:
             self._provably_immediate_zero_components = frozenset()
             self._provably_zero_termination_states = frozenset()
         self._source_provably_dead_cache = {}
+        self._hard_all_source_cache = {}
 
         self._starting_node_idx, self._starting_node_weight = self._create_init_weights(self.generative_graph)
 
@@ -3454,6 +3461,25 @@ class EnsembleCreator:
     def generative_graph(self):
         return self._generative_graph.copy()
 
+    def _refuse_unsettled_hard_all_from(self, source):
+        """Refuse a source whose chains could never settle their hard all rule (``UnsettledHardAllRule``).
+
+        The graph build validates the hard all rule for chains started in an initiator's unit. A chain
+        started anywhere else opens every site of its first unit, among them sites no such chain ever
+        opens, so the settle check runs again from that unit; the verdict is kept per source.
+        """
+        cache = self._hard_all_source_cache
+        if source not in cache:
+            unit_of = _static_units(self._generative_graph)
+            unit_sites = _unit_sites(self._generative_graph, unit_of)
+            states = _reachable_states(self._generative_graph, unit_of, unit_sites, {unit_of[source]})
+            cycle = _hard_all_cycle(self._generative_graph, unit_of, unit_sites, states)
+            texts = _provenance_unit_texts(self._generative_graph, unit_of) if cycle else {}
+            cache[source] = (texts.get(unit_of[source], ""), [texts.get(unit, "") for unit in cycle])
+        start_text, cycle = cache[source]
+        if cycle:
+            raise UnsettledHardAllRule(cycle[0], cycle, start_text=start_text)
+
     def _get_random_start_node(self, rng, use_repeat_units_as_source=False):
         if use_repeat_units_as_source:
             candidates = self._repeat_unit_starting_node_idx
@@ -3516,6 +3542,9 @@ class EnsembleCreator:
 
         if source not in generative_graph.nodes():
             raise InvalidGenerationSource(source, generative_graph.nodes(), generative_graph)
+
+        if source not in self._starting_node_idx:
+            self._refuse_unsettled_hard_all_from(source)
 
         if not automatic_source:
             zero_support_is_unavoidable = self._source_is_provably_dead(source)
