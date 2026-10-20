@@ -78,6 +78,14 @@ ensemble = ensemble_creator.create_ensemble(100, output_format="smiles", ensembl
 
 `generative_graph` is the graph representation constructed from the encoded polymer. With `ensemble_info=True`, `ensemble` is an `EnsembleData` object: `ensemble.chains` contains the generated SMILES strings, while the remaining fields describe units, bonds, sequences, molecular weights, and distributions.
 
+When sequence metadata is retained, `ensemble.sequence_unit_ids` has the same
+chain/segment/unit shape as `ensemble.sequences`, but contains the exact sampled
+unit labels (`I0`, `R0`, `T0`, etc.) regardless of `output_format`. This sidecar
+also appears in fixed-size JSON exports. Growth segments are not independently
+initiated chains: do not infer unit roles from a segment's first position or
+attempt to recover ambiguous identities from fragment SMILES. Sequence retention
+disabled (or unavailable metadata) yields `sequence_unit_ids=None`.
+
 For experimental serial convergence topology retention, use
 `ensemble_creator.create_ensemble_until_converged(metadata=True, retain_bond_sequences=True)`;
 no record-count or byte-budget options are required. Each record's `occurrences`
@@ -87,6 +95,37 @@ edge list containing only type labels loses which instances connect and how
 branches are joined. Fixed-size topology export, exact topology counting,
 parallel execution, and checkpoint/resume remain unsupported. See the
 [changelog](CHANGELOG.md) for scope and limitations.
+
+For a sequence-like view without repeated trunks, add
+`bond_sequence_format="branches"`. `bond_sequences` contains a list of segments
+per chain, with singleton roots, e.g.
+`[["null.I0.null"], ["null.I0.1","1.R1.3","1.T1.null"], ["1.R1.2","1.R2.null"]]`.
+The aligned `bond_sequence_parents` entry is `[null,[0,0],[1,1]]`: each non-null
+pair references `[parent_segment, junction_position]`, both zero-based. The first
+token of that segment references the existing junction, not a new building-block
+copy. Thus the arm above starts at the `R1` in segment 1, position 1, via site 2.
+Only junction references repeat; every other occurrence is introduced once.
+`null` means a segment endpoint, not a chemically terminated or unreacted site.
+The earliest surviving occurrence ID is continued at a junction; other children
+start separate segments. This deterministic growth-order convention does not
+claim to chemically identify a backbone. Parent references preserve tree
+connectivity and occupied sites even with identical unit labels; bond categories
+and aromaticity still require `compact`. Cycles are rejected explicitly.
+The public `g2rins.render_bond_sequence_branches(topology)` returns
+`(segments, parents)` for existing compact records without resampling.
+
+For the older repeated root-to-leaf view, use `bond_sequence_format="paths"`. Each retained
+chain is a list of root-to-leaf paths, for example
+`[["null.I0.2", "1.R0.3", "1.T0.null"]]`. The token `1.R0.3` means entering
+unit `R0` through canonical pSMILES attachment site 1 and leaving through site 3.
+`null` marks a path endpoint, not an unreacted site. Shared trunks repeat across
+paths; occurrence identity and bond order/aromaticity are not encoded, so this
+view must not be used as an exact topology key. Cycles raise an explicit error;
+use `bond_sequence_format="compact"` (the Python API default) for lossless graphs.
+Rendering is post-retention and does not change sampling or coverage weights.
+The public `g2rins.render_bond_sequence_paths(topology, max_tokens=1_000_000)`
+also renders existing compact records offline. The token budget bounds repeated
+trunk expansion and raises explicitly rather than truncating output.
 
 Worked examples are in [`G2RINS_guide.ipynb`](G2RINS_guide.ipynb).
 

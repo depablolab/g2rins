@@ -617,9 +617,9 @@ def _validate_bond_sequence_exports(
     Compact topology retention and motif membership use the serial metadata
     path; exact whole-topology counting remains explicitly unsupported.
     """
-    if bond_sequence_format not in {"compact"}:
+    if bond_sequence_format not in {"compact", "paths", "branches"}:
         raise ValueError(
-            "bond_sequence_format must be 'compact'; other formats are not supported yet."
+            "bond_sequence_format must be 'compact', 'paths', or 'branches'."
         )
     if retain_motif_membership and not metadata:
         raise ValueError(
@@ -1557,7 +1557,10 @@ class EnsembleData:
     Full result of :meth:`EnsembleCreator.create_ensemble` with ``ensemble_info=True``.
 
     ``chains`` and ``sequences`` follow the requested ``output_format``; the
-    ensemble aggregates are template-level and format-independent. ``units``
+    optional ``sequence_unit_ids`` mirrors every chain/segment/unit position
+    using exact sampled unit labels, independently of output format. It is
+    unavailable when sequence metadata is not retained. The ensemble
+    aggregates are template-level and format-independent. ``units``
     maps each derived unit_id (see :func:`g2rins.derive_unit_labels`) to
     ``{"psmiles", "g2rins", "subgraph", "count"}``, where ``subgraph`` is a
     detached copy of the unit's static subgraph of the generative graph
@@ -1579,13 +1582,17 @@ class EnsembleData:
     mol_weights: dict
     distributions: dict
     molecular_weights: list = field(default_factory=list, kw_only=True)
+    # Same chain/segment/unit shape as sequences, independent of output_format.
+    sequence_unit_ids: list | None = field(default=None, kw_only=True)
     bond_sequence_metadata: dict | None = field(default=None, kw_only=True)
     bond_sequences: list | None = field(default=None, kw_only=True)
     bond_sequence_indices: list | None = field(default=None, kw_only=True)
     bond_sequence_weights: list | None = field(default=None, kw_only=True)
+    bond_sequence_parents: list | None = field(default=None, kw_only=True)
     bond_sequence_counts: dict | None = field(default=None, kw_only=True)
     chain_motif_index: dict | None = field(default=None, kw_only=True)
     motif_population_statistics: dict | None = field(default=None, kw_only=True)
+    next_neighbor_motif_statistics: dict | None = field(default=None, kw_only=True)
     building_block_statistics: dict | None = field(default=None, kw_only=True)
 
     def __eq__(self, other):
@@ -2285,6 +2292,7 @@ class _ChainRecord:
     distributions: dict | None
     molecular_weight: float | None
     legacy_units: dict | None = None
+    sequence_unit_ids: list | None = None
 
     def __getitem__(self, name):
         """Preserve the historical callback/test mapping interface."""
@@ -2358,6 +2366,12 @@ def _bond_records(bond_counts, origin_endpoint, origin_node=None):
 
 def _merge_ensemble_data(target, batch):
     """Merge a batch into cumulative :class:`EnsembleData` in place."""
+    if target.sequence_unit_ids is not None and batch.sequence_unit_ids is not None:
+        target.sequence_unit_ids.extend(batch.sequence_unit_ids)
+    elif not target.chains and batch.sequence_unit_ids is not None:
+        target.sequence_unit_ids = deepcopy(batch.sequence_unit_ids)
+    else:
+        target.sequence_unit_ids = None
     target.chains.extend(batch.chains)
     target.sequences.extend(batch.sequences)
     target.molecular_weights.extend(batch.molecular_weights)
@@ -2589,12 +2603,21 @@ def _convert_chain(
         molecule = mol_graph
 
     converted_sequences = None
+    sequence_unit_ids = None
     if metadata_mode >= _MetadataLevel.COMPACT_SEQUENCES and include_sequences:
         sequences = (
             sample.legacy_sequences
             if sample.legacy_sequences is not None
             else sample.metadata.materialize_sequences()
         )
+        # Preserve sampled identities before conversion discards origin IDs.
+        # These are growth segments, not independent initiator-rooted chains.
+        sequence_unit_ids = [
+            [sample.metadata.occurrences[index].unit_id for index in segment]
+            for segment in sample.metadata.sequences
+        ]
+        if [len(segment) for segment in sequence_unit_ids] != [len(segment) for segment in sequences]:
+            raise RuntimeError("Sequence unit identities do not align with sampled segments")
         # Units are static-connected fragments with dangling inter-unit
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
@@ -2629,6 +2652,7 @@ def _convert_chain(
         distributions=distributions,
         molecular_weight=molecular_weight,
         legacy_units=legacy_units,
+        sequence_unit_ids=sequence_unit_ids,
     )
 
 
@@ -7146,6 +7170,12 @@ class EnsembleCreator:
                 )
             ),
             sequences=sequences,
+            sequence_unit_ids=(
+                [record.sequence_unit_ids for record in records]
+                if all(isinstance(record, _ChainRecord) and record.sequence_unit_ids is not None
+                       for record in records)
+                else None
+            ),
             mol_weights=mol_weight_lists,
             distributions=ensemble_distributions,
             molecular_weights=molecular_weights,
@@ -7505,6 +7535,7 @@ class EnsembleCreator:
                 "mol_weights": mol_weight_lists,
                 "distributions": ensemble_distributions,
                 "sequences": [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
+                "sequence_unit_ids": ensemble_data.sequence_unit_ids,
             }, "$['ensemble']")
             if retain_motif_membership:
                 json_data["ensemble"]["chain_motif_index"] = ensemble_data.chain_motif_index
@@ -7606,6 +7637,17 @@ class EnsembleCreator:
         record-count or byte budgets. Existing sampling and retention settings
         control how many chains are kept. Record-local occurrence IDs reference
         individual copies; building-block type labels remain unchanged.
+        ``bond_sequence_format='compact'`` (default) preserves exact topology.
+        ``'branches'`` uses sequence-like segments without repeated trunks,
+        and ``bond_sequence_parents`` identifies the existing junction at the
+        start of every non-root segment. Roots are singleton segments. Both
+        segment and position indices are zero-based. Connectivity/site identity
+        is preserved; bond order/aromaticity is not encoded.
+        ``'paths'`` renders each retained chain as root-to-leaf lists of
+        ``incoming.unit.outgoing`` tokens, with ``null`` at path endpoints.
+        Shared trunks repeat; occurrence identity and bond categories are not
+        encoded. Cycles require compact format. Rendering is limited to one
+        million tokens per chain; use compact format for larger path views.
 
         ``building_block_statistics=True`` independently aggregates rooted
         covalent neighborhoods and directed site-pair counts over all accepted
@@ -7736,6 +7778,12 @@ class EnsembleCreator:
         retained_motif_by_index = {} if retain_motif_membership else None
         aggregate_motif_occurrences = Counter() if retain_motif_membership else None
         aggregate_motif_presence = Counter() if retain_motif_membership else None
+        if retain_motif_membership:
+            from .neighbor_motifs import CenteredMotifStatistics
+
+            centered_motif_statistics = CenteredMotifStatistics()
+        else:
+            centered_motif_statistics = None
         block_statistics = _BuildingBlockStatistics() if building_block_statistics else None
         if checkpoint is None:
             aggregate_unit_counts = Counter()
@@ -7921,12 +7969,18 @@ class EnsembleCreator:
                     metadata_record = sample.metadata
                     molecular_weight = deferred.molecular_weight
                     occurrence_view = None
-                    if retain_bond_sequences or (building_block_statistics and not worker_block_statistics):
+                    if retain_bond_sequences or retain_motif_membership or (building_block_statistics and not worker_block_statistics):
                         occurrence_view = _build_occurrence_adjacency(
                             metadata_record,
                             sample.graph,
                             preserve_self_edges=True,
                         )
+                    if centered_motif_statistics is not None:
+                        centered_motif_statistics.update(_compact_bond_sequence_record(
+                            metadata_record, sample.graph,
+                            unit_info=self._canonical_unit_info,
+                            occurrence_view=occurrence_view,
+                        ))
                     if building_block_statistics:
                         if worker_block_statistics:
                             block_statistics.merge(chain_result["building_block_statistics"])
@@ -8326,6 +8380,7 @@ class EnsembleCreator:
         retained_bond_sequence_payloads = []
         retained_bond_sequence_indices = []
         retained_bond_sequence_weights = None
+        retained_bond_sequence_parents = None
         bond_sequence_metadata = None
         if retain_bond_sequences and metadata:
             retention = "all"
@@ -8368,6 +8423,24 @@ class EnsembleCreator:
                 unit_info=self._canonical_unit_info,
                 model_identity=self._generative_graph.graph.get("g2rins_string", ""),
             )
+            if bond_sequence_format == "paths":
+                from .bond_sequences import bond_sequence_path_metadata, render_bond_sequence_paths
+
+                retained_bond_sequence_payloads = [
+                    render_bond_sequence_paths(payload)
+                    for payload in retained_bond_sequence_payloads
+                ]
+                bond_sequence_metadata = bond_sequence_path_metadata(bond_sequence_metadata)
+            elif bond_sequence_format == "branches":
+                from .bond_sequences import bond_sequence_branch_metadata, render_bond_sequence_branches
+
+                branch_records = [
+                    render_bond_sequence_branches(payload)
+                    for payload in retained_bond_sequence_payloads
+                ]
+                retained_bond_sequence_payloads = [segments for segments, _ in branch_records]
+                retained_bond_sequence_parents = [parents for _, parents in branch_records]
+                bond_sequence_metadata = bond_sequence_branch_metadata(bond_sequence_metadata)
         retained_mol_weights = {}
         if metadata:
             for record in retained:
@@ -8397,6 +8470,12 @@ class EnsembleCreator:
                 else []
             ),
             sequences=sequences,
+            sequence_unit_ids=(
+                [record.sequence_unit_ids for record in retained]
+                if retain_sequences and metadata
+                and all(record.sequence_unit_ids is not None for record in retained)
+                else None
+            ),
             mol_weights=retained_mol_weights if metadata else {},
             distributions=aggregate_distributions if metadata else {},
             molecular_weights=masses,
@@ -8404,9 +8483,12 @@ class EnsembleCreator:
             bond_sequences=retained_bond_sequence_payloads if retain_bond_sequences else None,
             bond_sequence_indices=retained_bond_sequence_indices if retain_bond_sequences else None,
             bond_sequence_weights=retained_bond_sequence_weights if retain_bond_sequences else None,
+            bond_sequence_parents=retained_bond_sequence_parents,
             bond_sequence_counts=None,
             chain_motif_index=chain_motif_index if retain_motif_membership else None,
             motif_population_statistics=motif_population_statistics if retain_motif_membership else None,
+            next_neighbor_motif_statistics=(centered_motif_statistics.finalize()
+                                            if centered_motif_statistics is not None else None),
             building_block_statistics=block_statistics.finalize() if building_block_statistics else None,
             converged=converged,
             n_batches=batch_index,

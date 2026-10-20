@@ -51,6 +51,7 @@ from .distribution import (
     Uniform,
 )
 from .convergence import ConvergenceTracker
+from .bond_sequences import render_bond_sequence_branches, render_bond_sequence_paths
 from .exception import TopologyBudgetExceeded
 from .ensemble_creator import (
     ConvergedEnsembleData,
@@ -88,6 +89,8 @@ from .transformer import G2RINSTransformer, get_global_transformer
 from .util import camel_to_snake, get_global_rng, snake_to_camel
 
 __all__ = [
+    "render_bond_sequence_branches",
+    "render_bond_sequence_paths",
     "__version__",
     "version_tuple",
     "Atom",
