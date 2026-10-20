@@ -50,7 +50,14 @@ from .distribution import (
     StochasticDistribution,
     Uniform,
 )
-from .ensemble_creator import EnsembleCreator
+from .convergence import ConvergenceTracker
+from .exception import TopologyBudgetExceeded
+from .ensemble_creator import (
+    ConvergedEnsembleData,
+    ConvergenceCheckpoint,
+    EnsembleCreator,
+    EnsembleData,
+)
 from .g2rins_molecule import DotGeneration, DotSystemSize, G2rins, G2rinsMolecule
 from .generative_graph import (
     GraphCreator,
@@ -142,4 +149,9 @@ __all__ = [
     "mark_legacy_connector_placeholders",
     "GraphCreator",
     "EnsembleCreator",
+    "EnsembleData",
+    "ConvergedEnsembleData",
+    "ConvergenceCheckpoint",
+    "ConvergenceTracker",
+    "TopologyBudgetExceeded",
 ]

@@ -45,6 +45,9 @@ _STATIC_NAME = "static"
 _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
+_ATOM_CHIRAL_TOKEN_NAME = "atom_chiral_token"
+_BOND_SYMBOL_RAW_NAME = "bond_symbol_raw"
+_DOUBLE_BOND_STEREO_DEFINED_NAME = "double_bond_stereo_defined"
 _CONNECTOR_PLACEHOLDER_NAME = "is_connector_placeholder"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 10
@@ -58,6 +61,42 @@ def is_static_edge(edge_data):
         if attr in edge_data:
             weight += edge_data[attr]
     return not weight > 0
+
+
+def _mark_defined_double_bond_stereochemistry(generative_graph):
+    """Mark double bonds whose written directional context fully defines E/Z."""
+    def directional_token_sets(atom_idx, partner_idx):
+        tokens_by_bond = {}
+
+        def add_token(other_idx, edge_data):
+            if other_idx == partner_idx or edge_data.get(_BOND_TYPE_NAME, 1) != 1:
+                return
+            token = edge_data.get(_BOND_SYMBOL_RAW_NAME)
+            if token in {"/", "\\"}:
+                tokens_by_bond.setdefault(frozenset((atom_idx, other_idx)), set()).add(token)
+
+        for _u_idx, v_idx, _key, edge_data in generative_graph.out_edges(
+            atom_idx, keys=True, data=True
+        ):
+            add_token(v_idx, edge_data)
+        for u_idx, _v_idx, _key, edge_data in generative_graph.in_edges(
+            atom_idx, keys=True, data=True
+        ):
+            add_token(u_idx, edge_data)
+        return tokens_by_bond
+
+    for u_idx, v_idx, edge_data in generative_graph.edges(data=True):
+        if edge_data.get(_BOND_TYPE_NAME, 1) != 2:
+            continue
+        left_tokens = list(directional_token_sets(u_idx, v_idx).values())
+        right_tokens = list(directional_token_sets(v_idx, u_idx).values())
+        is_defined = (
+            len(left_tokens) == 1
+            and len(right_tokens) == 1
+            and all(len(tokens) == 1 for tokens in left_tokens + right_tokens)
+        )
+        if is_defined:
+            edge_data[_DOUBLE_BOND_STEREO_DEFINED_NAME] = True
 
 
 _DERIVED_NODE_FIELDS = ("unit_id", "bond_id")
@@ -1447,6 +1486,13 @@ class GraphCreator:
                         num_explicit_h = h_count.num
                 except AttributeError:
                     num_explicit_h = -1
+            atom_chiral_token = None
+            try:
+                chiral = obj.chiral
+                if chiral is not None:
+                    atom_chiral_token = str(chiral)
+            except AttributeError:
+                pass
 
             if "stochastic_obj" not in data or data["stochastic_obj"].stochastic_generation is None:
                 stochastic_id = -1
@@ -1483,24 +1529,24 @@ class GraphCreator:
                         current_stochastic_obj = current_stochastic_obj.stochastic_parent
                         depth_idx += 1
 
-            generative_graph.add_node(
-                node,
-                **{
-                    "atomic_num": atomic_num,
-                    _CONNECTOR_PLACEHOLDER_NAME: data.get(_CONNECTOR_PLACEHOLDER_NAME, False),
-                    _AROMATIC_NAME: aromatic,
-                    "charge": charge,
-                    "num_explicit_h": int(num_explicit_h),
-                    "molecular_weight_distribution": MW_distribution_array,
-                    "mol_molecular_weight": mol_molecular_weight,
-                    "total_molecular_weight": total_molecular_weight,
-                    "unit_molar_amounts": molar_amount,
-                    "init_weight": float(init_weight),
-                    "gen_weight": float(gen_weight),
-                    "gen_hierarchy": 0,
-                    "stochastic_id_tree": stochastic_id_tree,
-                },
-            )
+            node_attributes = {
+                "atomic_num": atomic_num,
+                _CONNECTOR_PLACEHOLDER_NAME: data.get(_CONNECTOR_PLACEHOLDER_NAME, False),
+                _AROMATIC_NAME: aromatic,
+                "charge": charge,
+                "num_explicit_h": int(num_explicit_h),
+                "molecular_weight_distribution": MW_distribution_array,
+                "mol_molecular_weight": mol_molecular_weight,
+                "total_molecular_weight": total_molecular_weight,
+                "unit_molar_amounts": molar_amount,
+                "init_weight": float(init_weight),
+                "gen_weight": float(gen_weight),
+                "gen_hierarchy": 0,
+                "stochastic_id_tree": stochastic_id_tree,
+            }
+            if atom_chiral_token is not None:
+                node_attributes[_ATOM_CHIRAL_TOKEN_NAME] = atom_chiral_token
+            generative_graph.add_node(node, **node_attributes)
 
         for u, v, _k, d in graph.edges(keys=True, data=True):
 
@@ -1511,12 +1557,17 @@ class GraphCreator:
             d.setdefault(_EDGE_STOCHASTIC_ID_NAME, -2)  # -2 = unassigned; real ids start at 0, -1 is the global level
 
             if _BOND_TYPE_NAME in d:
-                d[_BOND_TYPE_NAME] = smi_bond_mapping.get(str(d[_BOND_TYPE_NAME]), 1)
+                bond_symbol_raw = str(d[_BOND_TYPE_NAME])
+                if bond_symbol_raw in ("/", "\\"):
+                    d[_BOND_SYMBOL_RAW_NAME] = bond_symbol_raw
+                d[_BOND_TYPE_NAME] = smi_bond_mapping.get(bond_symbol_raw, 1)
             else:
                 d[_BOND_TYPE_NAME] = 1
             d.setdefault(_AROMATIC_NAME, False)
 
             generative_graph.add_edge(u, v, **d)
+
+        _mark_defined_double_bond_stereochemistry(generative_graph)
 
         if not include_bond_connectors:
             for node in generative_graph.nodes():

@@ -96,6 +96,28 @@ class GenerationError(G2RINSError):
     pass
 
 
+class WorkerProcessFailure(GenerationError):
+    """A process worker repeatedly died before its chain result was returned."""
+
+    def __init__(self, restart_count, native_state=None):
+        self.restart_count = restart_count
+        self.native_state = native_state
+
+    def __str__(self):
+        detail = ""
+        if self.native_state:
+            detail = (
+                f" Last native state: chain={self.native_state.get('chain_index')},"
+                f" stage={self.native_state.get('native_stage')},"
+                f" atoms={self.native_state.get('atom_count')},"
+                f" bonds={self.native_state.get('bond_count')}."
+            )
+        return (
+            f"The sampling process pool failed after {self.restart_count} restart(s)."
+            f"{detail}"
+        )
+
+
 class UnsupportedBondDescriptor(G2RINSError):
     """A descriptor embedded between atoms cannot identify a single bond site."""
 
@@ -129,6 +151,26 @@ class UnsupportedWildcardGeneration(GenerationError):
             "Parsing and graph export remain supported. "
             f"node_id={self.node_id!r}, unit_id={self.unit_id!r}, unit_text={self.unit_text!r}."
         )
+
+
+class TopologyBudgetExceeded(ValueError, G2RINSError):
+    """Raised when a topology or path-statistics budget is exceeded."""
+
+    def __init__(self, limit_name, limit_value, actual_value=None):
+        self.limit_name = limit_name
+        self.limit_value = limit_value
+        self.actual_value = actual_value
+        super().__init__(limit_name, limit_value, actual_value)
+
+    def __str__(self):
+        summary = (
+            f"Budget exceeded for {self.limit_name!r} "
+            f"(limit={self.limit_value!r}"
+        )
+        if self.actual_value is not None:
+            summary += f", actual={self.actual_value!r}"
+        summary += ")"
+        return summary
 
 
 class InvalidUnitPSmiles(GenerationError):
@@ -453,13 +495,20 @@ class InvalidGenerationSource(G2RINSError):
 class NoValidGenerationSource(G2RINSError):
     """Automatic source selection has no candidate with positive weight."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, use_repeat_units_as_source=False):
+        self.use_repeat_units_as_source = bool(use_repeat_units_as_source)
+        super().__init__(self.use_repeat_units_as_source)
 
     def __str__(self):
+        mode = "repeat-unit" if self.use_repeat_units_as_source else "default"
+        reason = (
+            " and without a declared initiator no repeat-unit bond connector does either"
+            if not self.use_repeat_units_as_source
+            else ""
+        )
         return (
-            "No valid automatic generation source is available: no initiation route carries weight, and without a declared "
-            "initiator no repeat-unit bond connector does either. Supply an explicit valid source or revise the G2RINS initiation paths."
+            f"No valid automatic generation source is available in {mode} source mode: no initiation route carries weight{reason}. "
+            "Supply an explicit valid source or revise the G2RINS initiation paths."
         )
 
 
