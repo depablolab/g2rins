@@ -96,6 +96,19 @@ branches are joined. Fixed-size topology export, exact topology counting,
 parallel execution, and checkpoint/resume remain unsupported. See the
 [changelog](CHANGELOG.md) for scope and limitations.
 
+New topology exports declare `hydrogen_termination="implicit/v1"`. Explicit
+ordinary hydrogen-only terminal units are omitted from the representation,
+matching assumed valence hydrogen, before retained topology and all-accepted
+centered next-neighbor motif statistics are produced. Compact, branches and
+paths therefore agree for the same realized chemistry regardless of whether
+H termination was specified. Isotopic/charged H, non-H end groups, hydrogen
+initiators/repeat units, isolated H and H-H molecules remain explicit. Sampling,
+SMILES, masses, legacy sequences, and raw unit/contact statistics are unchanged;
+their explicit-H counts need not match normalized topology/motif totals.
+Historical records without this policy are not automatically rewritten. The
+offline renderers below render their supplied topology as-is, since they do
+not receive canonical unit chemistry.
+
 For a sequence-like view without repeated trunks, add
 `bond_sequence_format="branches"`. `bond_sequences` contains a list of segments
 per chain, with singleton roots, e.g.

@@ -98,9 +98,10 @@ def centered_motif_rows(record):
 class CenteredMotifStatistics:
     """Exact occurrence counts and at-least-once incidence per accepted chain."""
 
-    def __init__(self):
+    def __init__(self, *, hydrogen_termination=None):
         self.accepted_count = 0
         self.rows = {}
+        self.hydrogen_termination = hydrogen_termination
 
     def update(self, record, weight=1):
         seen = set()
@@ -119,6 +120,8 @@ class CenteredMotifStatistics:
     def finalize(self):
         return {
             "schema": "centered-motif-population/v1",
+            **({"hydrogen_termination": self.hydrogen_termination}
+               if self.hydrogen_termination is not None else {}),
             "accepted_count": self.accepted_count,
             "rows": [json.loads(json.dumps(self.rows[key])) for key in sorted(self.rows)],
         }

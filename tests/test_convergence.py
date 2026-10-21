@@ -810,8 +810,11 @@ def test_native_branched_topology_matches_independent_phantom_oracle(monkeypatch
         unit_info=creator._canonical_unit_info,
     )
     assert set(record) == {"schema", "occurrences", "edges", "components"}
-    assert record["edges"] == expected_rows
-    assert record["components"] == [{"root": 0, "occurrence_ids": [0, 1, 2, 3, 4, 5]}]
+    # The atom-level oracle stays explicit; only the terminal T0 at ID 5 is
+    # projected out of structural exports. The hydrogen initiator I0 survives.
+    assert sample.metadata.occurrences[5].unit_id == "T0"
+    assert record["edges"] == [row for row in expected_rows if 5 not in (row[0], row[2])]
+    assert record["components"] == [{"root": 0, "occurrence_ids": [0, 1, 2, 3, 4]}]
     envelope = ensemble_creator_module._bond_sequence_export_metadata(
         [record],
         retention="all",
@@ -899,12 +902,13 @@ def test_native_intrinsic_ring_stays_inside_cyclic_unit_topology():
         sample.graph,
         unit_info=creator._canonical_unit_info,
     )
-    assert record["edges"] == expected_rows
+    assert sample.metadata.occurrences[2].unit_id == "T0"
+    assert record["edges"] == expected_rows[:1]
     assert all(left != right for left, _left_site, right, *_rest in record["edges"])
     repeat_unit = Chem.MolFromSmiles(creator._canonical_unit_info["R0"]["psmiles"])
     assert repeat_unit is not None
     assert repeat_unit.GetRingInfo().NumRings() == 1
-    assert record["components"] == [{"root": 0, "occurrence_ids": [0, 1, 2]}]
+    assert record["components"] == [{"root": 0, "occurrence_ids": [0, 1]}]
 
 
 def test_native_counterion_association_is_not_a_covalent_export_edge():
@@ -938,10 +942,9 @@ def test_native_counterion_association_is_not_a_covalent_export_edge():
         sample.graph,
         unit_info=creator._canonical_unit_info,
     )
-    assert record["occurrences"] == [[0, "I0"], [1, "R0"], [2, "T0"]]
+    assert record["occurrences"] == [[0, "I0"], [1, "R0"]]
     assert record["edges"] == [
         [0, "1", 1, "1", "1", False],
-        [1, "2", 2, "1", "1", False],
     ]
     assert all(row[4] != "0" for row in record["edges"])
 

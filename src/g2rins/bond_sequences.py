@@ -3,6 +3,91 @@
 
 """User-facing attachment-site sequences derived from finalized unit topology."""
 
+from functools import lru_cache
+
+
+HYDROGEN_TERMINATION_POLICY = "implicit/v1"
+
+
+@lru_cache(maxsize=4096)
+def _is_plain_hydrogen_cap(psmiles):
+    """Recognize only a neutral, non-isotopic H bonded to one mapped port."""
+    if not isinstance(psmiles, str) or not psmiles:
+        return False
+    from rdkit import Chem
+
+    parameters = Chem.SmilesParserParams()
+    parameters.removeHs = False
+    mol = Chem.MolFromSmiles(psmiles, parameters)
+    if mol is None or mol.GetNumAtoms() != 2 or mol.GetNumBonds() != 1:
+        return False
+    atoms = list(mol.GetAtoms())
+    return (
+        sorted(atom.GetAtomicNum() for atom in atoms) == [0, 1]
+        and all(atom.GetIsotope() == 0 and atom.GetFormalCharge() == 0
+                and atom.GetNumRadicalElectrons() == 0 for atom in atoms)
+        and any(atom.GetAtomicNum() == 0 and atom.GetAtomMapNum() > 0 for atom in atoms)
+        and mol.GetBondWithIdx(0).GetBondType() == Chem.BondType.SINGLE
+    )
+
+
+def normalize_hydrogen_termini(topology, unit_info):
+    """Project explicit ordinary H termini to implicit valence hydrogen.
+
+    Only singly bonded, degree-one T units with canonical H-only chemistry
+    are omitted. Isotopic/charged hydrogen, initiators, repeat units, isolated
+    hydrogen and H-H molecules remain explicit. This never changes sampling,
+    atom graphs, unit/contact counts or molecular weights. Surviving occurrence
+    IDs are compacted without changing growth order; existing roots survive.
+    """
+    units = dict(topology["occurrences"])
+    hydrogen_units = {
+        unit for unit in set(units.values())
+        if _is_plain_hydrogen_cap(unit_info.get(unit, {}).get("psmiles"))
+    }
+    candidates = {oid for oid, unit in units.items()
+                  if unit.startswith("T") and unit in hydrogen_units}
+    if not candidates:
+        return topology
+    adjacency = {oid: [] for oid in candidates}
+    for edge in topology["edges"]:
+        left, _ls, right, _rs, _bond, _aromatic = edge
+        if left in adjacency:
+            adjacency[left].append((right, edge))
+        if right in adjacency:
+            adjacency[right].append((left, edge))
+    removed = {
+        oid for oid, neighbors in adjacency.items()
+        if len(neighbors) == 1
+        and units[neighbors[0][0]] not in hydrogen_units
+        and neighbors[0][1][4:] == ["1", False]
+    }
+    if not removed:
+        return topology
+    surviving = [(oid, unit) for oid, unit in topology["occurrences"] if oid not in removed]
+    remap = {oid: index for index, (oid, _unit) in enumerate(surviving)}
+    edges = [
+        [remap[left], ls, remap[right], rs, bond, aromatic]
+        for left, ls, right, rs, bond, aromatic in topology["edges"]
+        if left not in removed and right not in removed
+    ]
+    components = []
+    for component in topology["components"]:
+        members = [oid for oid in component["occurrence_ids"] if oid not in removed]
+        if members:
+            root = component["root"]
+            if root in removed:
+                root = min(members)
+            components.append({"root": remap[root],
+                               "occurrence_ids": sorted(remap[oid] for oid in members)})
+    components.sort(key=lambda component: component["root"])
+    return {
+        "schema": topology["schema"],
+        "occurrences": [[index, unit] for index, (_oid, unit) in enumerate(surviving)],
+        "edges": edges,
+        "components": components,
+    }
+
 
 def _validate_token_budget(max_tokens):
     if isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0:

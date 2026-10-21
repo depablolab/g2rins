@@ -1860,12 +1860,14 @@ def _compact_bond_sequence_record(
         })
     components.sort(key=lambda item: item["root"])
 
-    return {
+    from .bond_sequences import normalize_hydrogen_termini
+
+    return normalize_hydrogen_termini({
         "schema": "bond-sequence-topology/v1",
         "occurrences": occurrence_rows,
         "edges": edge_rows,
         "components": components,
-    }
+    }, unit_info)
 
 
 def _bond_sequence_export_metadata(
@@ -1923,10 +1925,13 @@ def _bond_sequence_export_metadata(
             for key, info in sorted((unit_info or {}).items())
         },
     }
+    from .bond_sequences import HYDROGEN_TERMINATION_POLICY
+
     return {
         "schema": "bond-sequence-topology/v1",
         "format": "compact",
         "root_policy": "surviving-growth-root/v1",
+        "hydrogen_termination": HYDROGEN_TERMINATION_POLICY,
         "model_fingerprint": hashlib.sha256(
             _canonical_bond_sequence_json_bytes(model_fingerprint_payload)
         ).hexdigest(),
@@ -7781,7 +7786,11 @@ class EnsembleCreator:
         if retain_motif_membership:
             from .neighbor_motifs import CenteredMotifStatistics
 
-            centered_motif_statistics = CenteredMotifStatistics()
+            from .bond_sequences import HYDROGEN_TERMINATION_POLICY
+
+            centered_motif_statistics = CenteredMotifStatistics(
+                hydrogen_termination=HYDROGEN_TERMINATION_POLICY,
+            )
         else:
             centered_motif_statistics = None
         block_statistics = _BuildingBlockStatistics() if building_block_statistics else None

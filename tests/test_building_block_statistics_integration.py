@@ -5,11 +5,13 @@
 
 import json
 from collections import Counter, defaultdict
+from unittest.mock import patch
 
 import pytest
 from rdkit import Chem
 
 import g2rins
+import g2rins.bond_sequences as bond_sequences
 import g2rins.ensemble_creator as module
 from benchmarks.cases import CASES
 from tests.test_convergence import FAST_SMI
@@ -27,6 +29,22 @@ CONVERGENCE = {
 
 def _creator(source=FAST_SMI):
     return g2rins.G2rins.make(source).get_graph_creator().get_ensemble_creator()
+
+
+def _reference(source=FAST_SMI, **options):
+    """Capture pre-projection rows: raw statistics deliberately retain H caps."""
+    raw_records = []
+    normalize = bond_sequences.normalize_hydrogen_termini
+
+    def capture(record, unit_info):
+        raw_records.append(record)
+        return normalize(record, unit_info)
+
+    with patch.object(bond_sequences, "normalize_hydrogen_termini", capture):
+        result = _creator(source).create_ensemble_until_converged(**options)
+    result._raw_bond_sequences = raw_records
+    assert len(raw_records) == len(result.bond_sequences)
+    return result
 
 
 def _unexpected(*_args, **_kwargs):
@@ -190,11 +208,11 @@ def test_fixed_outputs_and_json_only_add_statistics(source, output_format, tmp_p
     assert baseline.building_block_statistics is None
     assert module._metadata_equal(_ordinary_fields(enabled), _ordinary_fields(baseline))
     assert module._metadata_equal(json_only, enabled.chains)
-    reference = _creator(source).create_ensemble_until_converged(
+    reference = _reference(source,
         batch_size=2, max_samples=2, window=10, seed=7,
         output_format=output_format, retain_bond_sequences=True,
     )
-    assert enabled.building_block_statistics == _bond_record_oracle(reference.bond_sequences)
+    assert enabled.building_block_statistics == _bond_record_oracle(reference._raw_bond_sequences)
     assert _chemistry(enabled.chains) == _chemistry(reference.chains)
     payloads = [json.loads(path.read_text()) for path in paths]
     assert "building_block_statistics" not in payloads[0]["ensemble"]
@@ -214,7 +232,7 @@ def test_fixed_outputs_and_json_only_add_statistics(source, output_format, tmp_p
 def test_native_counts_match_independent_retained_record_oracle(source, output_format):
     options = {**CONVERGENCE, "output_format": output_format, "retain_bond_sequences": True}
     # Two fresh parses must preserve native labels, not parser UUID identities.
-    reference = _creator(source).create_ensemble_until_converged(**options)
+    reference = _reference(source, **options)
     creator = _creator(source)
     baseline = creator.create_ensemble_until_converged(**options)
     enabled = creator.create_ensemble_until_converged(
@@ -222,7 +240,7 @@ def test_native_counts_match_independent_retained_record_oracle(source, output_f
     )
     assert module._metadata_equal(_ordinary_fields(enabled), _ordinary_fields(baseline))
     assert len(reference.bond_sequences) == 4
-    expected = _bond_record_oracle(reference.bond_sequences)
+    expected = _bond_record_oracle(reference._raw_bond_sequences)
     assert enabled.building_block_statistics == expected
     assert enabled.bond_sequences == reference.bond_sequences
     assert _chemistry(enabled.chains) == _chemistry(reference.chains)
@@ -243,7 +261,7 @@ def test_native_counts_match_independent_retained_record_oracle(source, output_f
     pytest.param({"representative_distance": 100.0}, 1, id="representative-cover"),
 ])
 def test_selection_never_reweights_or_truncates_population(source, selection, retained):
-    reference = _creator(source).create_ensemble_until_converged(
+    reference = _reference(source,
         retain_bond_sequences=True, **CONVERGENCE,
     )
     creator = _creator(source)
@@ -255,7 +273,7 @@ def test_selection_never_reweights_or_truncates_population(source, selection, re
     assert module._metadata_equal(_ordinary_fields(enabled), _ordinary_fields(baseline))
     assert enabled.convergence_trace == reference.convergence_trace
     assert enabled.convergence_trace[-1]["n_samples"] == 4
-    assert enabled.building_block_statistics == _bond_record_oracle(reference.bond_sequences)
+    assert enabled.building_block_statistics == _bond_record_oracle(reference._raw_bond_sequences)
     _assert_population(
         enabled.building_block_statistics, 4,
         {unit: info["count"] for unit, info in reference.units.items()},
@@ -266,7 +284,7 @@ def test_selection_never_reweights_or_truncates_population(source, selection, re
 
 @pytest.mark.parametrize("source", SOURCES)
 def test_statistics_only_avoids_paths_and_retained_materialization(source, monkeypatch):
-    reference = _creator(source).create_ensemble_until_converged(
+    reference = _reference(source,
         retain_bond_sequences=True, **CONVERGENCE,
     )
     creator = _creator(source)
@@ -288,13 +306,17 @@ def test_statistics_only_avoids_paths_and_retained_materialization(source, monke
     assert result.chains == result.sequences == result.molecular_weights == []
     assert result.units == {} and result.bonds == []
     assert result.bond_sequences is None and result.chain_motif_index is None
-    assert result.building_block_statistics == _bond_record_oracle(reference.bond_sequences)
+    assert result.building_block_statistics == _bond_record_oracle(reference._raw_bond_sequences)
     assert result.convergence_trace == reference.convergence_trace
 
 
 @pytest.mark.parametrize("source", SOURCES)
 @pytest.mark.parametrize("api", ["fixed", "convergence"])
 def test_combined_flags_share_one_occurrence_view_per_sample(source, api, monkeypatch):
+    reference = (
+        _reference(source, retain_bond_sequences=True, **CONVERGENCE)
+        if api == "convergence" else None
+    )
     creator = _creator(source)
     original = module._build_occurrence_adjacency
     calls = []
@@ -316,7 +338,7 @@ def test_combined_flags_share_one_occurrence_view_per_sample(source, api, monkey
             **CONVERGENCE,
         )
         assert len(result.bond_sequences) == 4
-        assert result.building_block_statistics == _bond_record_oracle(result.bond_sequences)
+        assert result.building_block_statistics == _bond_record_oracle(reference._raw_bond_sequences)
     assert calls == [True] * 4
     assert result.chain_motif_index["accepted_count"] == 4
     assert len(result.chain_motif_index["rows"]) == 4
@@ -348,7 +370,7 @@ def test_disabled_never_constructs_accumulator(api, output_format, flag, monkeyp
 
 
 def test_fixed_statistics_count_only_the_accepted_prefix(monkeypatch):
-    reference = _creator().create_ensemble_until_converged(
+    reference = _reference(
         batch_size=2, max_samples=2, window=10, seed=7,
         retain_bond_sequences=True,
     )
@@ -369,7 +391,7 @@ def test_fixed_statistics_count_only_the_accepted_prefix(monkeypatch):
             2, ensemble_info=True, seed=7, building_block_statistics=True,
         )
     assert len(result.chains) == 1
-    assert result.building_block_statistics == _bond_record_oracle(reference.bond_sequences[:1])
+    assert result.building_block_statistics == _bond_record_oracle(reference._raw_bond_sequences[:1])
     _assert_population(
         result.building_block_statistics, 1,
         {unit: info["count"] for unit, info in result.units.items()},
