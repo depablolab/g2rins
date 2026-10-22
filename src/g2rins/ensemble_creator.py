@@ -20,7 +20,7 @@ import networkx as nx
 import numpy as np
 from rdkit import Chem, rdBase
 
-from .bond import GroupRule
+from .bond import ALL_RULES, GroupRule
 from .chem_resource import (
     atom_color_mapping,
     atom_name_mapping,
@@ -29,6 +29,7 @@ from .chem_resource import (
 )
 from .distribution import StochasticDistribution
 from .exception import (
+    AllGroupOvershoot,
     AllZeroSamplingWeights,
     DeadSamplingPath,
     DiscardedSamplingPaths,
@@ -38,11 +39,13 @@ from .exception import (
     IncompleteStochasticGeneration,
     InvalidGenerationSource,
     InvalidUnitPSmiles,
+    LadderMemberWithoutPartner,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
     RepeatUnitInitiation,
     TooManyDiscardedChains,
     UndershootSnapshotMissed,
+    UnsettledHardAllRule,
     UnsupportedWildcardGeneration,
     UnvalidatedGenerationSource,
 )
@@ -65,9 +68,14 @@ from .generative_graph import (
     _atomic_number,
     _check_transition_role,
     _connector_placeholder_flag,
+    _hard_all_cycle,
     _is_connector_placeholder,
     _json_safe,
+    _provenance_unit_texts,
+    _reachable_states,
     _static_neighbors,
+    _static_units,
+    _unit_sites,
     _verified_unit_texts,
     derive_unit_labels,
     generative_graph_json_data,
@@ -251,6 +259,8 @@ class _HalfAtomBond:
         self.node_idx: str = node_idx
         # Unit instance this site belongs to; group rules act on siblings sharing the tag.
         self.instance: int = instance
+        # All-generation of the unit: all-typed bonds (either flavour) crossed from the chain start to it.
+        self.generation: int = 0
         self.weight: float = graph.nodes[node_idx]["gen_weight"]
         self.molar_amounts: float = graph.nodes[node_idx]["unit_molar_amounts"]
         self.gen_hierarchy: int = graph.nodes[node_idx]["gen_hierarchy"]
@@ -261,8 +271,9 @@ class _HalfAtomBond:
         self._mode_attr_map = {}
         self._mode_target_map = {}
         self._mode_target_molar_amounts_map = {}
-        # Exclusion channels read off the incoming edges: an entry-only site holds them with no outgoing edge.
-        self._entry_groups = {d.get(_TARGET_GROUP_NAME, -1) for _u, _v, d in graph.in_edges(node_idx, data=True) if not d["static"] and d.get(_TARGET_RULE_NAME, 0) == GroupRule.EXCLUSION}
+        # Grouped channels read off the incoming edges, by group: an entry-only site holds them with no outgoing edge.
+        entering = [d for _u, _v, d in graph.in_edges(node_idx, data=True) if not d["static"]]
+        self._entry_rules = {d.get(_TARGET_GROUP_NAME, -1): d.get(_TARGET_RULE_NAME, 0) for d in entering if d.get(_TARGET_RULE_NAME, 0) in (GroupRule.EXCLUSION, GroupRule.LADDER)}
 
         self._special_target = None
         special_target_list = []
@@ -342,11 +353,23 @@ class _HalfAtomBond:
     def exclusion_groups(self):
         """Group ids of the EXCLUSION channels this site still holds, derived from its live edges on either side."""
         held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.EXCLUSION}
-        return held | self._entry_groups
+        return held | {group for group, rule in self._entry_rules.items() if rule == GroupRule.EXCLUSION}
+
+    def ladder_groups(self):
+        """Group ids of the LADDER channels this site still holds, derived from its live edges on either side."""
+        held = {attrs.get(_SOURCE_GROUP_NAME, -1) for attr_list in self._mode_attr_map.values() for attrs in attr_list if attrs.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER}
+        return held | {group for group, rule in self._entry_rules.items() if rule == GroupRule.LADDER}
+
+    def holds_rule(self, mode, rules, sto_gen_id):
+        """Whether a live ``mode`` channel of this site at level ``sto_gen_id`` carries one of the group rules ``rules`` (forced exits never compete)."""
+        return any(
+            attrs.get(_SOURCE_RULE_NAME, 0) in rules and attrs.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attrs.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
+            for attrs in self._mode_attr_map.get(mode, [])
+        )
 
     def drop_edges(self, keep):
         """Drop the channels whose group id fails ``keep`` on either side, menus kept aligned; a dropped forced entry is forgotten."""
-        self._entry_groups = {group for group in self._entry_groups if keep(group)}
+        self._entry_rules = {group: rule for group, rule in self._entry_rules.items() if keep(group)}
         for mode in list(self._mode_attr_map):
             attr_list = self._mode_attr_map[mode]
             kept = [i for i, attrs in enumerate(attr_list) if keep(attrs.get(_SOURCE_GROUP_NAME, -1))]
@@ -1051,11 +1074,14 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
         first_cause = None
         deferred_warnings = []
         record = None
+        all_group_overshoot = False
         while True:
             sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(atom_graph, collect_info, termination_flag, rng)
             deferred_warnings.extend(attempt_warnings)
             if sample is not None:
                 record = _convert_chain(sample, molecule_format, collect_info)
+                # A discarded attempt's overshoot died with it: only the kept attempt counts.
+                all_group_overshoot = any(issubclass(caught.category, AllGroupOvershoot) for caught in attempt_warnings)
                 break
             discards += 1
             reasons.update(attempt_reasons)
@@ -1070,6 +1096,7 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
                 "discards": discards,
                 "reasons": tuple(reasons.items()),
                 "first_cause": first_cause,
+                "all_group_overshoot": all_group_overshoot,
                 "warnings": [_portable_warning(caught) for caught in deferred_warnings],
             }
         )
@@ -1119,61 +1146,121 @@ class _PartialAtomGraph:
             setattr(new_graph, key, copy.deepcopy(value, memo))
         return new_graph
 
-    def realize_bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr):
-        """Apply the group rules the fired edge triggers, then weld ``other`` on with ``merge``.
+    def realize_bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr, rng):
+        """Apply the group rules the fired edge triggers, weld ``other`` on with ``merge``, complete a ladder.
 
         Every bond the sampler realizes passes through here (growth, termination,
         transition, nested entry, forced exit, junction cap, global transition): the
-        exclusion rule reads only the channel of ``fired_edge`` on each side, never the
-        mode that fired it or the level it crosses.
+        exclusion rule and the ladder strip read only the channel of ``fired_edge`` on
+        each side, never the mode that fired it or the level it crosses. A ladder-typed
+        channel commits its group: the remaining members bond the fresh unit now. The
+        fresh unit's all-generation is its source's, one deeper through an all-typed bond.
         """
+        generation = source_half_bond.generation + int(fired_edge.get(_SOURCE_RULE_NAME, 0) in ALL_RULES or fired_edge.get(_TARGET_RULE_NAME, 0) in ALL_RULES)
+        for sites in (*other._open_half_bond_map.values(), other._entry_sites.values(), (other._consumed_half_bond,)):
+            for site in sites:
+                if site is not None:
+                    site.generation = generation
         self._consume_sites(source_half_bond, fired_edge, other)
-        self.merge(other, source_half_bond.atom_idx, other_idx, bond_attr)
+        offset = self.merge(other, source_half_bond.atom_idx, other_idx, bond_attr)
+        if fired_edge.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and other._consumed_half_bond is not None:
+            self._complete_ladder(source_half_bond, fired_edge, other, offset, rng)
 
     def _consume_sites(self, source_half_bond, fired_edge, other):
-        """Exclusion rule for the two sites ``fired_edge`` consumes: one in this molecule, one in the fresh unit.
+        """Group rules for the two sites ``fired_edge`` consumes: one in this molecule, one in the fresh unit."""
+        self._consume_site(source_half_bond, fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_SOURCE_RULE_NAME, 0), self._open_half_bond_map)
+        self._consume_site(other._consumed_half_bond, fired_edge.get(_TARGET_GROUP_NAME, -1), fired_edge.get(_TARGET_RULE_NAME, 0), other._open_half_bond_map)
 
-        Through an exclusion-typed channel the group's other sites of that unit instance
-        are blocked; through any other channel they lose their exclusion-typed channels
-        and keep the plain ones. Membership is read from the sites' live edges on either
+    @staticmethod
+    def _consume_site(consumed, group, rule, pool):
+        """Group rules for one consumed site, applied to its instance siblings in ``pool`` (``group``, ``rule`` = its channel).
+
+        Exclusion: through an exclusion-typed channel the group's other sites are blocked; through any
+        other channel they lose their exclusion-typed channels and keep the plain ones. Ladder: a group
+        whose member went through anything but its own ladder channel can never close, so its ladder
+        channels leave the siblings (the strip). Membership is read from the sites' live edges on either
         side, so a killed channel drops its site from the group with no bookkeeping.
         """
-        sides = (
-            (source_half_bond, fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_SOURCE_RULE_NAME, 0), self._open_half_bond_map),
-            (other._consumed_half_bond, fired_edge.get(_TARGET_GROUP_NAME, -1), fired_edge.get(_TARGET_RULE_NAME, 0), other._open_half_bond_map),
-        )
-        for consumed, group, rule, pool in sides:
-            if consumed is None:
-                continue
-            groups = consumed.exclusion_groups()
-            if not groups:
-                continue
-            for bucket in pool.values():
-                for sibling in bucket:
-                    if sibling is consumed or sibling.instance != consumed.instance:
-                        continue
-                    if rule == GroupRule.EXCLUSION and group in sibling.exclusion_groups():
-                        sibling.block()
-                    else:
-                        sibling.drop_edges(lambda group, dead=groups: group not in dead)
-                bucket[:] = [sibling for sibling in bucket if sibling.has_any_bonds()]
+        if consumed is None:
+            return
+        dead = consumed.exclusion_groups() | (consumed.ladder_groups() - ({group} if rule == GroupRule.LADDER else set()))
+        if not dead:
+            return
+        for bucket in pool.values():
+            for sibling in bucket:
+                if sibling is consumed or sibling.instance != consumed.instance:
+                    continue
+                if rule == GroupRule.EXCLUSION and group in sibling.exclusion_groups():
+                    sibling.block()
+                else:
+                    sibling.drop_edges(lambda group, dead=dead: group not in dead)
+            bucket[:] = [sibling for sibling in bucket if sibling.has_any_bonds()]
+
+    def _complete_ladder(self, source_half_bond, fired_edge, other, offset, rng):
+        """The ladder rule: the fired member committed its group, so every other member of the source
+        instance bonds a site of the fresh unit ``other`` (merged at atom ``offset``) in this same step,
+        through the edges of the same group pair (the inner classes are in the edge set). Members go in
+        template order; one with a single free partner takes it without touching the random stream, one
+        with several draws by the weight of its live edge to each (a member's edges need not sit in the
+        mode that fired: an initiator's other sites reach the repeat units through growth edges once the
+        chain started). A member whose partners were all taken ends the attempt: the junction cannot close."""
+        source_group, target_group = fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_TARGET_GROUP_NAME, -1)
+        members = [site for bucket in self._open_half_bond_map.values() for site in bucket if site.instance == source_half_bond.instance and source_group in site.ladder_groups()]
+        fresh_instance = other._consumed_half_bond.instance
+        free = {site.node_idx: site for bucket in self._open_half_bond_map.values() for site in bucket if site.instance == fresh_instance}
+        # The fresh unit's entry-only sites never join the pool; they are partners all the same, at their merged atom indices.
+        for site in other._entry_sites.values():
+            if site is not other._consumed_half_bond:
+                free[site.node_idx] = copy.copy(site)
+                free[site.node_idx].atom_idx += offset
+        rungs = []
+        for member in members:
+            candidates = {}
+            for mode in _NON_STATIC_ATTR:
+                edges, targets, _molar_amounts = member.get_mode_bonds(mode)
+                for edge, target in zip(edges, targets):
+                    if target in free and edge.get(_SOURCE_GROUP_NAME, -1) == source_group and edge.get(_TARGET_GROUP_NAME, -1) == target_group:
+                        candidates.setdefault(target, (edge, edge[mode]))
+            if not candidates:
+                raise LadderMemberWithoutPartner("ladder completion", source_group)
+            options = list(candidates.values())
+            chosen = 0 if len(options) == 1 else self.stochastic_tracker.choose(rng, len(options), [weight for _edge, weight in options], "ladder completion partner selection")
+            edge, partner = options[chosen][0], free[list(candidates)[chosen]]
+            del free[partner.node_idx]
+            rungs.append((member, partner, edge))
+        for member, partner, edge in rungs:
+            self._realize_internal_bond(member, partner, edge)
+
+    def _realize_internal_bond(self, member, partner, edge):
+        """Bond two open sites of this molecule through ``edge``: both leave the pool for good and consume like
+        any fired site, then the bond is welded and the endpoints' hydrogens re-inferred."""
+        for site, group, rule in ((member, edge.get(_SOURCE_GROUP_NAME, -1), edge.get(_SOURCE_RULE_NAME, 0)), (partner, edge.get(_TARGET_GROUP_NAME, -1), edge.get(_TARGET_RULE_NAME, 0))):
+            for bucket in self._open_half_bond_map.values():
+                if site in bucket:
+                    bucket.remove(site)
+            self._consume_site(site, group, rule, self._open_half_bond_map)
+            # A termination pass re-adds the transition sites it set aside: a rung must not be found live among them.
+            site.block()
+        bond_attr = self.gen_edge_attr_to_bond_attr(edge)
+        self.atom_graph.add_edge(member.atom_idx, partner.atom_idx, **bond_attr)
+        self._apply_realized_bond(member.atom_idx, partner.atom_idx, bond_attr)
 
     def merge(self, other, self_idx, other_idx, bond_attr):
-        # Bonds are realized through realize_bond (group rules first); merge only welds.
-        # relabel other idx
-        remapping_dict = {idx: idx + self._atom_id for idx in other.atom_graph.nodes}
+        """Weld ``other`` on (bonds are realized through realize_bond, group rules first); returns the offset its atoms were relabeled by."""
+        offset = self._atom_id
+        remapping_dict = {idx: idx + offset for idx in other.atom_graph.nodes}
         other_graph = nx.relabel_nodes(other.atom_graph, remapping_dict, copy=True)
         other_open_half_bond_map = {}
         for stochastic_id in other._open_half_bond_map:
             for half_bond in other._open_half_bond_map[stochastic_id]:
                 new_half_bond = copy.copy(half_bond)
-                new_half_bond.atom_idx += self._atom_id
+                new_half_bond.atom_idx += offset
                 try:
                     other_open_half_bond_map[stochastic_id] += [new_half_bond]
                 except KeyError:
                     other_open_half_bond_map[stochastic_id] = [new_half_bond]
 
-        other_idx += self._atom_id
+        other_idx += offset
 
         # Now we can do the actual merging
         self._atom_id += other._atom_id
@@ -1189,6 +1276,7 @@ class _PartialAtomGraph:
                 self._open_half_bond_map[stochastic_id] += other_open_half_bond_map[stochastic_id]
             except KeyError:
                 self._open_half_bond_map[stochastic_id] = other_open_half_bond_map[stochastic_id]
+        return offset
 
     def get_open_half_bonds(self, sto_atom_id: int | tuple[int] | None, prefer_parent: bool = False) -> list[_HalfAtomBond]:
 
@@ -1216,6 +1304,17 @@ class _PartialAtomGraph:
                 open_half_bonds = parent_bonds
                 idx = parent_idx
         return idx, open_half_bonds
+
+    def all_tier(self, sto_atom_id, mode, sto_gen_id, rules=ALL_RULES):
+        """The instance's own open sites still holding an all-typed ``mode`` channel at its level.
+
+        The all rule: while any exists, that instance's ``mode`` draw is restricted to them,
+        lowest all-generation first, in both flavours; a hard one also keeps the instance from
+        stopping, whatever its mass, where a soft one yields to the target (``rules`` narrows
+        the flavour). Read from the pool the draw reads, the instance's own bucket: an
+        owner-level site never waits in a child's bucket, promotion moves it with its rule.
+        """
+        return [half_bond for half_bond in self._open_half_bond_map.get(sto_atom_id, []) if half_bond.holds_rule(mode, rules, sto_gen_id)]
 
     def _apply_realized_bond(self, u_idx, v_idx, bond_attr):
         """A junction bond just became real: charge each endpoint's occupied
@@ -1339,7 +1438,7 @@ class _PartialAtomGraph:
                     self._open_half_bond_map[sto_atom_id] += [half_bond]
                 except KeyError:
                     self._open_half_bond_map[sto_atom_id] = [half_bond]
-            elif half_bond.exclusion_groups():
+            elif half_bond.exclusion_groups() or half_bond.ladder_groups():
                 self._entry_sites[node_idx] = half_bond
 
         # Initiate with first node
@@ -1449,6 +1548,11 @@ class _PartialAtomGraph:
             # remain in the bucket): report "no transition possible" instead of
             # crashing on an empty draw.
             return None, non_used_half_bonds
+        # The all rule: a site holding an all-typed transition at this level fires before any other, lowest all-generation first.
+        tier = [half_bond for half_bond in filtered_half_bonds if half_bond.holds_rule(_TRANSITION_NAME, ALL_RULES, sto_gen_id)]
+        if tier:
+            lowest = min(half_bond.generation for half_bond in tier)
+            filtered_half_bonds = [half_bond for half_bond in tier if half_bond.generation == lowest]
         if len(filtered_half_bonds) == 1:
             # Deterministic pick: skip the draw so it consumes no RNG state.
             chosen = filtered_half_bonds[0]
@@ -1575,20 +1679,25 @@ class _PartialAtomGraph:
                 # existing endpoint sheds and, for split-dummy connectors, by
                 # charging the attach order to the massless dummy instead of
                 # its real anchors (so their hydrogens stayed uncounted).
-                terminator_weight = self._fragment_gross_mw(terminator_atom_graph, node_id, attach_order)
                 if attach_order not in source_delta_by_order:
                     source_delta_by_order[attach_order] = self._source_attach_delta(termination_bond.atom_idx, attach_order)
                 group, rule = target_attributes[i].get(_SOURCE_GROUP_NAME, -1), target_attributes[i].get(_SOURCE_RULE_NAME, 0)
-                channels.append((group, rule, target_prob[i], terminator_weight + source_delta_by_order[attach_order]))
+                attachments, shed = {str(node_id): attach_order}, source_delta_by_order[attach_order]
+                if rule == GroupRule.LADDER:
+                    # A ladder cap takes the group's other members as rungs in the same step: their attaches to the
+                    # cap's other sites of the pair and the hydrogens they shed belong to this channel's price.
+                    shed += self._rung_attachments(termination_bond, group, target_attributes[i].get(_TARGET_GROUP_NAME, -1), gen_sto_id, terminator_atom_graph, attachments)
+                terminator_weight = self._fragment_gross_mw(terminator_atom_graph, attachments)
+                channels.append((group, rule, target_prob[i], terminator_weight + shed))
             return channels
 
         avg_termination_mw = 0
         clusters = {}
         for termination_bond in termination_bonds:
             channels = priced_channels(termination_bond)
-            groups = termination_bond.exclusion_groups()
+            groups = termination_bond.exclusion_groups() | termination_bond.ladder_groups()
             if groups:
-                # Grouped caps of one unit instance reach each other through the exclusion rule: priced as a set.
+                # Grouped caps of one unit instance reach each other through their rules: priced as a set.
                 clusters.setdefault(termination_bond.instance, []).append((termination_bond.weight, frozenset(groups), channels))
             else:
                 for _group, _rule, probability, mass in channels:
@@ -1602,8 +1711,10 @@ class _PartialAtomGraph:
         """Expected cap mass of the grouped termination sites of one unit instance, ``(weight, groups,
         channels)`` each, under the sequence terminate_graph realizes: a waiting member fires with
         probability proportional to its weight, draws among its live channels, and the rule reaches the
-        rest as realize_bond applies it (a typed channel drops the siblings holding its group; any
-        channel kills the consumed site's groups on them, whose menus renormalize)."""
+        rest as realize_bond applies it (a typed channel drops the siblings holding its group: blocked by
+        the exclusion rule, welded as rungs by the ladder completion with their ends priced into the
+        channel; any channel kills the consumed site's groups on them, the rungs' groups too, whose menus
+        renormalize)."""
 
         @functools.lru_cache(maxsize=None)
         def expect(remaining, dead):
@@ -1614,19 +1725,55 @@ class _PartialAtomGraph:
                 probability_sum = sum(probability for _group, _rule, probability, _mass in channels)
                 if probability_sum > 0:
                     live.append((index, weight, groups - dead, channels, probability_sum))
+            # Members that share no live group never reach each other, and the weighted race keeps
+            # the relative firing order inside each connected set: price the sets alone and add them
+            # up, else n independent pairs cost 4**n joint states.
+            sets = []
+            for entry in live:
+                joined = [group_set for group_set in sets if group_set[0] & entry[2]]
+                for group_set in joined:
+                    sets.remove(group_set)
+                sets.append((entry[2].union(*(group_set[0] for group_set in joined)), [member for group_set in joined for member in group_set[1]] + [entry]))
+            if len(sets) > 1:
+                return sum(expect(tuple(index for index, _weight, _groups, _channels, _probability_sum in entries), dead) for _groups, entries in sets)
             weight_sum = sum(weight for _index, weight, _groups, _channels, _probability_sum in live)
             if weight_sum <= 0:
                 return 0.0
             expected = 0.0
             for index, weight, groups, channels, probability_sum in live:
                 for group, rule, probability, mass in channels:
-                    rest = tuple(other for other in remaining if other != index)
-                    if rule == GroupRule.EXCLUSION:
-                        rest = tuple(other for other in rest if group not in members[other][1] - dead)
-                    expected += (weight / weight_sum) * (probability / probability_sum) * (mass + expect(rest, dead | groups))
+                    rest = tuple(other for other, _weight, _groups, _channels, _probability_sum in live if other != index)
+                    gone = groups
+                    if rule in (GroupRule.EXCLUSION, GroupRule.LADDER):
+                        taken = [other for other in rest if group in members[other][1] - dead]
+                        rest = tuple(other for other in rest if other not in taken)
+                        if rule == GroupRule.LADDER:
+                            gone = gone.union(*(members[other][1] for other in taken))
+                    expected += (weight / weight_sum) * (probability / probability_sum) * (mass + expect(rest, dead | gone))
             return expected
 
         return expect(tuple(range(len(members))), frozenset())
+
+    def _rung_attachments(self, fired, group, target_group, gen_sto_id, fragment, attachments):
+        """Extend ``attachments`` with the cap sites the other members of ``fired``'s ladder ``group`` weld rungs
+        to (one each, through this level's termination edges of the same group pair, first free site of the cap
+        fragment) and return the hydrogen mass those members shed."""
+        in_fragment = {data["origin_idx"] for _node, data in fragment.atom_graph.nodes(data=True)}
+        shed = 0.0
+        for bucket in self._open_half_bond_map.values():
+            for member in bucket:
+                if member is fired or member.instance != fired.instance or group not in member.ladder_groups():
+                    continue
+                edges, targets, _molar_amounts = member.get_mode_bonds(_TERMINATION_NAME)
+                for edge, target in zip(edges, targets):
+                    if str(target) not in in_fragment or str(target) in attachments or edge.get(_EDGE_STOCHASTIC_ID_NAME) != gen_sto_id:
+                        continue
+                    if (edge.get(_SOURCE_GROUP_NAME, -1), edge.get(_TARGET_GROUP_NAME, -1)) != (group, target_group):
+                        continue
+                    attachments[str(target)] = edge.get(_BOND_TYPE_NAME, 1)
+                    shed += self._source_attach_delta(member.atom_idx, edge.get(_BOND_TYPE_NAME, 1))
+                    break
+        return shed
 
     def _observational_fragment(self, source, static_graph, estimator_rng):
         """Build the static fragment that starts at ``source`` under a throwaway tracker, so an
@@ -1641,16 +1788,15 @@ class _PartialAtomGraph:
         fragment_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
         return _PartialAtomGraph(self.generative_graph, static_graph, source, stochastic_object_tracker, fragment_sto_atom_id, estimator_rng)
 
-    def _fragment_gross_mw(self, fragment, target_node, attach_order):
-        """Mass ``fragment`` adds when attached at ``target_node`` with a bond of ``attach_order``:
-        atoms plus inferred hydrogens, the attach order charged to the target's real anchors
-        (never to a massless split dummy). Placeholders carry no mass and no hydrogens."""
+    def _fragment_gross_mw(self, fragment, attachments):
+        """Mass ``fragment`` adds when attached at the template nodes of ``attachments`` (node id to
+        bond order): atoms plus inferred hydrogens, each attach order charged to its node's real
+        anchors (never to a massless split dummy). Placeholders carry no mass and no hydrogens."""
         extra_occupied = {}
         for frag_node, data in fragment.atom_graph.nodes(data=True):
-            if data["origin_idx"] == str(target_node):
+            if data["origin_idx"] in attachments:
                 for anchor in fragment._real_anchors(frag_node, exclude=None):
-                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
-                break
+                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attachments[data["origin_idx"]]
         gross = 0.0
         for frag_node, data in fragment.atom_graph.nodes(data=True):
             if _is_connector_placeholder(data):
@@ -1773,7 +1919,7 @@ class _PartialAtomGraph:
             other_partial_graph = _PartialAtomGraph(terminated_graph.generative_graph, terminated_graph.static_graph, selected_target, self.stochastic_tracker, sto_atom_id, rng)
             other_half_bond_atom_idx = other_partial_graph.pop_target_open_half_bond(sto_atom_id, selected_target)
             pre_merge_watermark = terminated_graph._atom_id
-            terminated_graph.realize_bond(other_partial_graph, termination_bond, target_attributes[selected_target_idx], other_half_bond_atom_idx, selected_attr)
+            terminated_graph.realize_bond(other_partial_graph, termination_bond, target_attributes[selected_target_idx], other_half_bond_atom_idx, selected_attr, rng)
             last_unit = terminated_graph.add_new_unit_and_bond(pre_merge_watermark)
             terminated_graph.add_unit_to_sequence(last_unit)
 
@@ -1847,7 +1993,7 @@ class _PartialAtomGraph:
                 other_partial_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, selected_target, self.stochastic_tracker, level_sto_atom_id, rng)
                 other_half_bond_atom_idx = other_partial_graph.pop_target_open_half_bond(level_sto_atom_id, selected_target)
                 pre_merge_watermark = self._atom_id
-                self.realize_bond(other_partial_graph, half_bond, target_attributes[selected_target_idx], other_half_bond_atom_idx, selected_attr)
+                self.realize_bond(other_partial_graph, half_bond, target_attributes[selected_target_idx], other_half_bond_atom_idx, selected_attr, rng)
                 last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
                 self.add_unit_to_sequence(last_unit)
                 bucket.remove(half_bond)
@@ -1927,7 +2073,7 @@ class _PartialAtomGraph:
         )
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.realize_bond(other_graph, half_bond, target_attr[chosen], other_half_bond_atom_idx, selected_attr)
+        self.realize_bond(other_graph, half_bond, target_attr[chosen], other_half_bond_atom_idx, selected_attr, rng)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -2248,7 +2394,7 @@ class _PartialAtomGraph:
 
         other_target_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.realize_bond(other_graph, transition_bond, target_attr[target_id], other_target_idx, selected_attr)
+        self.realize_bond(other_graph, transition_bond, target_attr[target_id], other_target_idx, selected_attr, rng)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -2258,10 +2404,19 @@ class _PartialAtomGraph:
     def propagate_graph(self, sto_atom_id, rng, prefer_parent_bonds):
 
         def pop_random_stochastic_bond():
-            # Find a transition bond
+            # The all rule: sites still holding an all-typed growth channel are drawn before
+            # any other site of the pool, generation by generation (one weighted draw over the
+            # lowest all-generation present); the tier is read before the prefer_parent filter.
+            tier = {id(half_bond) for half_bond in self.all_tier(sto_atom_id, _PROPAGATION_NAME, self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id])}
+            if tier:
+                candidates = [(i, half_bond) for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id), strict=False) if id(half_bond) in tier]
+                lowest = min((half_bond.generation for _i, half_bond in candidates), default=0)
+                candidates = [(i, half_bond) for i, half_bond in candidates if half_bond.generation == lowest]
+            else:
+                candidates = zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False)
             stochastic_idx = []
             propagation_weight = []
-            for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False):
+            for i, half_bond in candidates:
                 if half_bond.propagation_suitable:
                     # TODO carefully check if stochastic bonds have the right weight here!
                     propagation_weight += [half_bond.weight]
@@ -2318,7 +2473,7 @@ class _PartialAtomGraph:
 
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.realize_bond(other_graph, stochastic_bond, target_attr[target_id], other_half_bond_atom_idx, selected_attr)
+        self.realize_bond(other_graph, stochastic_bond, target_attr[target_id], other_half_bond_atom_idx, selected_attr, rng)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -2370,7 +2525,7 @@ class _PartialAtomGraph:
             other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
 
             pre_merge_watermark = self._atom_id
-            self.realize_bond(other_graph, nested_transition_bond, selected_edge_attr, other_half_bond_atom_idx, selected_attr)
+            self.realize_bond(other_graph, nested_transition_bond, selected_edge_attr, other_half_bond_atom_idx, selected_attr, rng)
             last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
             self.add_unit_to_sequence(last_unit)
             self.nested_transition(new_sto_atom_id, rng)
@@ -2455,7 +2610,7 @@ class _PartialAtomGraph:
         other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, target_idx, tracker, target_sto_atom_id, rng)
         other_target_idx = other_graph.pop_target_open_half_bond(target_sto_atom_id, target_idx)
         pre_merge_watermark = self._atom_id
-        self.realize_bond(other_graph, half_bond, all_attr[chosen], other_target_idx, selected_attr)
+        self.realize_bond(other_graph, half_bond, all_attr[chosen], other_target_idx, selected_attr, rng)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(target_sto_atom_id, rng)
@@ -2473,18 +2628,12 @@ class _PartialAtomGraph:
         # quadratic in chain length); the extra .copy() detaches the subgraph
         # view before deepcopy so the template graph is not dragged along.
         added_atom_graph = deepcopy(current_atom_graph.subgraph(new_nodes).copy())
-        # A merge fires exactly one half-bond, so at most one edge crosses the
-        # watermark; if that invariant ever breaks, this keeps only the last.
-        edge_to_add = None
+        # Every edge crossing the watermark joins the new unit to the molecule: the fired bond,
+        # plus one per rung when a ladder group completed.
         for u, v in current_atom_graph.edges():
             if v >= pre_merge_watermark > u:
                 edge_to_add = current_atom_graph.nodes[u]["origin_idx"], current_atom_graph.nodes[v]["origin_idx"]
-
-        if edge_to_add is not None:
-            if edge_to_add in self.bonds_idx:
-                self.bonds_idx[edge_to_add] += 1
-            else:
-                self.bonds_idx[edge_to_add] = 1
+                self.bonds_idx[edge_to_add] = self.bonds_idx.get(edge_to_add, 0) + 1
 
         if added_atom_graph.number_of_nodes() > 0:
             old_unit = None
@@ -2641,21 +2790,12 @@ class EnsembleCreator:
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
         # error but silently generate truncated, end-group-less molecules.
-        group_rules = set()
         for u, v, edge_data in self._generative_graph.edges(data=True):
             if _EDGE_STOCHASTIC_ID_NAME not in edge_data:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
             # Sampling decides forced fires by the transition role; a graph written before the
             # field existed, or one that contradicts its own weights and stamps, is refused.
             _check_transition_role((u, v), edge_data)
-            for key in (_SOURCE_RULE_NAME, _TARGET_RULE_NAME):
-                if edge_data.get(key, 0):
-                    group_rules.add(GroupRule(edge_data[key]).name)
-        if group_rules - {GroupRule.EXCLUSION.name}:
-            # Temporary gate: sampling honors EXCLUSION; LADDER and ALL land in later phases.
-            raise NotImplementedError(
-                f"This generative graph declares conditional connectivity (group rules: {', '.join(sorted(group_rules))}); parsing, validation and the graph are supported, but generation for the rules other than EXCLUSION lands in a later implementation phase."
-            )
 
         self._static_graph = self._create_static_graph(self.generative_graph)
         # A placeholder is one half of a split atom. Its sole static neighbor
@@ -2689,6 +2829,7 @@ class EnsembleCreator:
             self._provably_immediate_zero_components = frozenset()
             self._provably_zero_termination_states = frozenset()
         self._source_provably_dead_cache = {}
+        self._hard_all_source_cache = {}
 
         # Without a declared initiator, chains start at repeat units.  An
         # initiator whose every route carries zero weight still declares one:
@@ -3326,6 +3467,25 @@ class EnsembleCreator:
     def generative_graph(self):
         return self._generative_graph.copy()
 
+    def _refuse_unsettled_hard_all_from(self, source):
+        """Refuse a source whose chains could never settle their hard all rule (``UnsettledHardAllRule``).
+
+        The graph build validates the hard all rule for chains started in an initiator's unit. A chain
+        started anywhere else opens every site of its first unit, among them sites no such chain ever
+        opens, so the settle check runs again from that unit; the verdict is kept per source.
+        """
+        cache = self._hard_all_source_cache
+        if source not in cache:
+            unit_of = _static_units(self._generative_graph)
+            unit_sites = _unit_sites(self._generative_graph, unit_of)
+            states = _reachable_states(self._generative_graph, unit_of, unit_sites, {unit_of[source]})
+            cycle = _hard_all_cycle(self._generative_graph, unit_of, unit_sites, states)
+            texts = _provenance_unit_texts(self._generative_graph, unit_of) if cycle else {}
+            cache[source] = (texts.get(unit_of[source], ""), [texts.get(unit, "") for unit in cycle])
+        start_text, cycle = cache[source]
+        if cycle:
+            raise UnsettledHardAllRule(cycle[0], cycle, start_text=start_text)
+
     def _get_random_start_node(self, rng):
         if not self._starting_node_idx:
             raise NoValidGenerationSource()
@@ -3380,6 +3540,9 @@ class EnsembleCreator:
 
         if source not in generative_graph.nodes():
             raise InvalidGenerationSource(source, generative_graph.nodes(), generative_graph)
+
+        if source not in self._starting_node_idx:
+            self._refuse_unsettled_hard_all_from(source)
 
         if not automatic_source:
             zero_support_is_unavoidable = self._source_is_provably_dead(source)
@@ -3453,6 +3616,8 @@ class EnsembleCreator:
         checkpoints = {}
         owner_epochs = {}
         forced_overshoot_no_boundary = set()
+        # Instances the hard all rule kept growing past their drawn target (reported once per chain).
+        all_group_overshoot = set()
         mutations = 0
 
         def _commit_mutation():
@@ -3469,6 +3634,11 @@ class EnsembleCreator:
         gain_floor = {}
         last_checked_proj = {}
         avg_termination_cache = {}
+
+        def _all_tier_open(graph, sto_atom_id):
+            """Whether ``sto_atom_id`` still holds an unfired HARD all-typed site in ``graph``, growth or transition (a soft one yields to the target)."""
+            gen_id = graph.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+            return any(graph.all_tier(sto_atom_id, mode, gen_id, rules=(GroupRule.ALL_HARD,)) for mode in (_PROPAGATION_NAME, _TRANSITION_NAME))
 
         def _projected_molw(tracker, sto_atom_id):
             """Tracked mass of sto_atom_id EXCLUDING its own termination caps
@@ -3511,6 +3681,7 @@ class EnsembleCreator:
                 "avg_termination_cache": dict(avg_termination_cache),
                 "owner_epochs": dict(owner_epochs),
                 "forced_overshoot_no_boundary": set(forced_overshoot_no_boundary),
+                "all_group_overshoot": set(all_group_overshoot),
                 "checkpoints": {owner: checkpoint for owner, checkpoint in checkpoints.items() if owner in compatible_ancestors},
                 "owner": checkpoint_owner,
                 "epoch": owner_epochs.get(checkpoint_owner, 0),
@@ -3726,6 +3897,21 @@ class EnsembleCreator:
                 avg_termination_weight = partial_atom_graph.get_average_termination_mw(sto_atom_id, self._static_graph, rng)
                 avg_termination_cache[sto_atom_id] = avg_termination_weight
                 if proj_now[sto_atom_id] + avg_termination_weight >= expected_i:
+                    if _all_tier_open(partial_atom_graph, sto_atom_id):
+                        # The hard all rule: an instance with an unfired hard all-typed site
+                        # cannot stop; it grows past its drawn target and the chain reports it.
+                        all_group_overshoot.add(sto_atom_id)
+                        if _DECISION_TRACE is not None:
+                            _DECISION_TRACE.append(
+                                {
+                                    "kind": "all_tier_blocked",
+                                    "id": sto_atom_id,
+                                    "gen": tracker._stochastic_atom_id_to_gen_id[sto_atom_id],
+                                    "expected": expected_i,
+                                    "proj_over": proj_now[sto_atom_id] + avg_termination_weight,
+                                }
+                            )
+                        continue
                     crossing_sto_atom_id = sto_atom_id
                     crossing_projected = proj_now[sto_atom_id] + avg_termination_weight
                     break
@@ -3750,7 +3936,9 @@ class EnsembleCreator:
                     if crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw and not snapshot_tracker.is_terminated(crossing_sto_atom_id):
                         under_caps_molw = snapshot_graph.get_average_termination_mw(crossing_sto_atom_id, self._static_graph, rng)
                         projected_under = _projected_molw(snapshot_tracker, crossing_sto_atom_id) + under_caps_molw
-                        snapshot_valid = projected_under < expected_molw
+                        # A checkpoint still holding an unfired hard all-typed site is no boundary:
+                        # restoring it would un-place a site the hard all rule forces.
+                        snapshot_valid = projected_under < expected_molw and not _all_tier_open(snapshot_graph, crossing_sto_atom_id)
                 if termination_flag == 0:
                     adopt_overshoot = True
                 elif not snapshot_valid:
@@ -3810,6 +3998,7 @@ class EnsembleCreator:
                     avg_termination_cache = dict(checkpoint["avg_termination_cache"])
                     owner_epochs = dict(checkpoint["owner_epochs"])
                     forced_overshoot_no_boundary = set(checkpoint["forced_overshoot_no_boundary"])
+                    all_group_overshoot = set(checkpoint["all_group_overshoot"])
                     restored_tracker = partial_atom_graph.stochastic_tracker
                     restored_live = set(restored_tracker.get_unterminated_sto_atom_ids())
                     checkpoints = {owner: prior for owner, prior in checkpoint["checkpoints"].items() if (owner in restored_live and prior["epoch"] + 1 == owner_epochs.get(owner, 0))}
@@ -4000,6 +4189,11 @@ class EnsembleCreator:
         # ancestor can compensate; warning at the provisional crossing made
         # correctly undershooting final chains look like failures.
         final_tracker = partial_atom_graph.stochastic_tracker
+        if any(
+            sto_atom_id in final_tracker._sto_atom_id_actual_molw and final_tracker._sto_atom_id_actual_molw[sto_atom_id] > final_tracker._sto_atom_id_expected_molw[sto_atom_id] + 1e-9
+            for sto_atom_id in all_group_overshoot
+        ):
+            warnings.warn(AllGroupOvershoot(), stacklevel=1)
         if termination_flag == 1:
             for sto_atom_id in sorted(forced_overshoot_no_boundary):
                 if (
@@ -4222,6 +4416,8 @@ class EnsembleCreator:
         total_discards = 0
         discard_reasons = Counter()
         first_discard_cause = None
+        # Returned chains the all rule grew past a drawn target: one aggregate warning per ensemble.
+        all_group_overshoot_chains = 0
 
         if parallel and n_workers > 1:
             # One independent stream per CHAIN INDEX (not per worker): the
@@ -4240,8 +4436,10 @@ class EnsembleCreator:
 
             records = []
             for chain_result in chain_results:
+                all_group_overshoot_chains += chain_result["all_group_overshoot"]
                 for message, category, filename, lineno in chain_result["warnings"]:
-                    warnings.warn_explicit(message, category, filename, lineno)
+                    if not issubclass(category, AllGroupOvershoot):
+                        warnings.warn_explicit(message, category, filename, lineno)
                 total_discards += chain_result["discards"]
                 discard_reasons.update(dict(chain_result["reasons"]))
                 if chain_result["record"] is not None:
@@ -4278,7 +4476,8 @@ class EnsembleCreator:
                 rng = chain_rngs[len(records)] if chain_rngs is not None else None
                 sample, attempt_reasons, discard_cause, deferred_warnings = _attempt_chain(self, collect_info, termination_flag, rng)
                 for caught in deferred_warnings:
-                    warnings.warn_explicit(caught.message, caught.category, caught.filename, caught.lineno)
+                    if not issubclass(caught.category, AllGroupOvershoot):
+                        warnings.warn_explicit(caught.message, caught.category, caught.filename, caught.lineno)
                 if sample is None:
                     consecutive_discards += 1
                     total_discards += 1
@@ -4305,6 +4504,8 @@ class EnsembleCreator:
                     continue
                 consecutive_discards = 0
                 first_discard_cause = None
+                # A discarded attempt's overshoot died with it: only the kept attempt counts.
+                all_group_overshoot_chains += any(issubclass(caught.category, AllGroupOvershoot) for caught in deferred_warnings)
                 records.append(_convert_chain(sample, molecule_format, collect_info))
 
         if total_discards:
@@ -4312,6 +4513,8 @@ class EnsembleCreator:
                 DiscardedSamplingPaths(total_discards, tuple(discard_reasons.items())),
                 stacklevel=2,
             )
+        if all_group_overshoot_chains:
+            warnings.warn(AllGroupOvershoot(all_group_overshoot_chains, len(records)), stacklevel=2)
 
         list_of_molecules = [record["molecule"] for record in records]
 

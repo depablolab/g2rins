@@ -21,7 +21,18 @@ class GroupRule(IntEnum):
     NONE = 0
     LADDER = 1
     EXCLUSION = 2
-    ALL = 3
+    # The all rule in its two flavours: hard wins over the molecular weight target, soft yields to it.
+    ALL_HARD = 3
+    ALL_SOFT = 4
+
+    @property
+    def label(self):
+        """The rule's name in diagnostics (``plain``, ``ladder``, ``exclusion``, ``hard all``, ``soft all``)."""
+        return {GroupRule.NONE: "plain", GroupRule.ALL_HARD: "hard all", GroupRule.ALL_SOFT: "soft all"}.get(self, self.name.lower())
+
+
+# Both flavours of the all rule, as the draws read them (edge attributes hold plain ints).
+ALL_RULES = frozenset((GroupRule.ALL_HARD, GroupRule.ALL_SOFT))
 
 
 class BondSymbol(G2rinsBase):
@@ -169,8 +180,8 @@ class BondConnectorSymbolIdx(BondConnectorSymbol):
 
 
 class RuleKeyword(G2rinsBase):
-    # Future group-rule keywords register here alongside the grammar rule alternatives.
-    _KEYWORD_RULES = {"all": GroupRule.ALL}
+    # Group-rule keywords register here alongside the grammar rule alternatives.
+    _KEYWORD_RULES = {"allh": GroupRule.ALL_HARD, "alls": GroupRule.ALL_SOFT}
 
     def __init__(self, children):
         super().__init__(children)

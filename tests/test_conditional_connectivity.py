@@ -11,12 +11,21 @@ annotation of a compatible bond connector pair, terminal-descriptor edges
 annotated on the unit side. Phase 2 -- generation honors the EXCLUSION rule: a
 site consumed through an exclusion-typed channel blocks its group siblings, a
 site consumed through a plain channel removes their exclusion-typed channels
-(whatever mode fired the bond, at any level); LADDER and ALL stay gated.
+(whatever mode fired the bond, at any level). Phase 4 -- the LADDER rule: the
+first ladder-typed bond commits its group and the remaining members bond the fresh
+unit in the same step; a member consumed through any other channel strips the group's
+ladder channels from its siblings; a ladder-typed terminator closes the last junction the
+same way and the termination estimate prices its cap once, rungs included. Phase 5 -- the
+two flavours of the ALL rule: all-typed sites are drawn before any other growth, lowest
+all-generation first; a hard site (``allh``) keeps the object from stopping, a soft one
+(``alls``) yields to the molecular weight target; hard channels that never settle are refused.
 """
 
+import time
 import warnings
 
 import lark
+import networkx as nx
 import numpy as np
 import pytest
 from rdkit.Chem import Descriptors
@@ -24,17 +33,24 @@ from rdkit.Chem import Descriptors
 import g2rins
 from g2rins import GroupRule
 from g2rins import ensemble_creator as _ec
+from g2rins.bond import ALL_RULES
 from g2rins.exception import (
+    AllGroupOvershoot,
+    AllRuleOnTargetOnlySite,
+    DiscardedSamplingPaths,
     GroupPartnerNotPlain,
     GroupRuleOnNestedObjectBondConnector,
     GroupRuleOnTerminalBondConnector,
     GroupRulesOnBothPathEnds,
     IncompatibleGroupPair,
     IndistinguishableSymbolsInSite,
+    LadderMemberWithoutChannel,
+    LadderMemberWithoutPartner,
     MixedOuterSymbolsInGroup,
     MixedRulesInGroup,
     RepeatedGroupInSite,
     SingleMemberGroup,
+    UnsettledHardAllRule,
 )
 
 GROUP_KEYS = ("source_group", "source_rule", "target_group", "target_rule")
@@ -45,8 +61,9 @@ ROUND_TRIP_CASES = [
     "[$[$1]1]",
     "[<1[<1]1]",
     "[>, >1[]1]",
-    "[>[all]1]",
-    "[>[all]]",
+    "[>[allh]1]",
+    "[>[allh]]",
+    "[>[alls]1]",
     "[<1, <[$]2]",
     "[$[<]1, $[>]2]",
     "[<1[<1]1|2.0|]",
@@ -74,8 +91,8 @@ def test_legacy_ladder_fragments_parse(text):
 
 
 def test_implicit_group_zero_is_omitted():
-    bond_connector = g2rins.SimpleBondConnector.make("[>[all]0]")
-    assert str(bond_connector) == "[>[all]]"
+    bond_connector = g2rins.SimpleBondConnector.make("[>[allh]0]")
+    assert str(bond_connector) == "[>[allh]]"
 
 
 def test_terminal_bond_connector_parses_group_suffix():
@@ -88,9 +105,13 @@ def test_terminal_bond_connector_parses_group_suffix():
 
 
 def test_suffix_semantics():
-    (symbol,) = g2rins.SimpleBondConnector.make("[>2[all]3]").symbol
+    (symbol,) = g2rins.SimpleBondConnector.make("[>2[allh]3]").symbol
     assert symbol.idx == 2
-    assert symbol.group_rule == GroupRule.ALL
+    assert symbol.group_rule == GroupRule.ALL_HARD
+    assert symbol.group_suffix.group_id == 3
+
+    (symbol,) = g2rins.SimpleBondConnector.make("[>2[alls]3]").symbol
+    assert symbol.group_rule == GroupRule.ALL_SOFT
     assert symbol.group_suffix.group_id == 3
 
     (symbol,) = g2rins.SimpleBondConnector.make("[<1[<4]5]").symbol
@@ -110,7 +131,8 @@ def test_rule_enum_values_stable():
     assert GroupRule.NONE == 0
     assert GroupRule.LADDER == 1
     assert GroupRule.EXCLUSION == 2
-    assert GroupRule.ALL == 3
+    assert GroupRule.ALL_HARD == 3
+    assert GroupRule.ALL_SOFT == 4
 
 
 def _single_symbol(text):
@@ -129,7 +151,7 @@ def test_ladder_rigidity():
 
 def test_nonladder_rules_pair_with_plain():
     assert _single_symbol("[>1[]1]").is_compatible(_single_symbol("[<1]"))
-    assert _single_symbol("[>[all]1]").is_compatible(_single_symbol("[<]"))
+    assert _single_symbol("[>[allh]1]").is_compatible(_single_symbol("[<]"))
 
 
 def test_group_edge_attrs_one_entry_per_distinct_symbol_pair():
@@ -144,7 +166,7 @@ def test_group_edge_attrs_one_entry_per_distinct_symbol_pair():
 
 VALIDATION_ERROR_CASES = [
     pytest.param(
-        "{[] [<]C([>1[all]1])C([>2[]1])C[>]; ; [H][<] []}",
+        "{[] [<]C([>1[allh]1])C([>2[]1])C[>]; ; [H][<] []}",
         MixedRulesInGroup,
         id="mixed-rules-in-group",
     ),
@@ -154,7 +176,7 @@ VALIDATION_ERROR_CASES = [
         id="mixed-outer-symbols-in-group",
     ),
     pytest.param(
-        "{[] [<]C(C[>1[]1, >2[all]1])C[>]; ; [H][<] []}",
+        "{[] [<]C(C[>1[]1, >2[allh]1])C[>]; ; [H][<] []}",
         RepeatedGroupInSite,
         id="repeated-group-in-site",
     ),
@@ -188,7 +210,7 @@ VALIDATION_ERROR_CASES = [
         id="exclusion-self-pair-not-plain",
     ),
     pytest.param(
-        "{[] [<]C([<[all]1])C([<[all]1])C[>], [<]C([>[all]2])C([>[all]2])C[>]; ; [H][<] []}",
+        "{[] [<]C([<[allh]1])C([<[allh]1])C[>], [<]C([>[allh]2])C([>[allh]2])C[>]; ; [H][<] []}",
         GroupPartnerNotPlain,
         id="all-partner-not-plain",
     ),
@@ -223,7 +245,7 @@ VALIDATION_ERROR_CASES = [
     pytest.param(
         # Formerly the multilevel fixture: group 2 sits on the two bond connectors
         # that attach the nested object, interior to every bond connector path.
-        "{[] [<[all]2]{[>] [<[all]1]CC(C[<[all]1])O[>]; ; [<]F [<]}|poisson(100)|[>[all]2]; [<][H]; [<][H] []}|poisson(400)|",
+        "{[] [<[allh]2]{[>] [<[allh]1]CC(C[<[allh]1])O[>]; ; [<]F [<]}|poisson(100)|[>[allh]2]; [<][H]; [<][H] []}|poisson(400)|",
         GroupRuleOnNestedObjectBondConnector,
         id="group-rule-on-nested-object-bond-connector-all",
     ),
@@ -245,7 +267,7 @@ END_GROUP_ONLY_PAIR_CASES = [
     # Initiators never bond to initiators and terminators never to terminators, and an
     # initiator that a repeat unit takes never reaches the terminators either, so
     # group-typed symbols that conjugate only across such pairs have no partner to check.
-    pytest.param("{[] [$]CC[$]; C([$[all]1])([$[all]1])([$[all]1]); [$][H] []}|poisson(300)|", id="dollar-star-all-initiator"),
+    pytest.param("{[] [$]CC[$]; C([$[allh]1])([$[allh]1])([$[allh]1]); [$][H] []}|poisson(300)|", id="dollar-star-all-initiator"),
     pytest.param("{[] [$]CC[$]; C([$[]1])([$[]1]); [$][H] []}|poisson(300)|", id="dollar-exclusion-initiator"),
     pytest.param("{[] [$]CC[$]; C[$]; [$[]1][H], [$[]1]F []}|poisson(300)|", id="dollar-exclusion-terminators"),
     pytest.param("{[] [<]CC[>]; C([>[>]1])([>[>]1]), C([>[>]1])([>[>]1])([>[>]1]); [H][<] []}|poisson(300)|", id="ladder-groups-on-two-initiators"),
@@ -262,12 +284,12 @@ def test_end_group_only_pairs_are_not_partners(text):
 
 
 def test_dollar_star_all_initiator_encoding():
-    text = "{[] [$]CC[$]; C([$[all]1])([$[all]1])([$[all]1]); [$][H] []}|poisson(300)|"
+    text = "{[] [$]CC[$]; C([$[allh]1])([$[allh]1])([$[allh]1]); [$][H] []}|poisson(300)|"
     _assert_no_diagnostics(text)
     annotated = [edge for edge in _bond_connector_edges(text) if edge[3] != SENTINEL]
     # Three initiator sites x the two sites of the repeat unit, all through the all-group.
     assert len(annotated) == 6
-    assert all(edge == ("[$[all]1]", "[$]", "transition_weight", (1, 3, -1, 0)) for edge in annotated)
+    assert all(edge == ("[$[allh]1]", "[$]", "transition_weight", (1, 3, -1, 0)) for edge in annotated)
 
 
 def test_connected_initiator_never_reaches_typed_terminators():
@@ -321,7 +343,7 @@ def test_ladder_only_chain_ends_raise_no_diagnostics():
 
 
 INDISTINGUISHABLE_CASES = [
-    pytest.param("{[<] [<]CC([>,>[all]1])C([>,>[all]1])[>]; ; [H][<] [<]}|poisson(200)|", id="plain-beside-all"),
+    pytest.param("{[<] [<]CC([>,>[allh]1])C([>,>[allh]1])[>]; ; [H][<] [<]}|poisson(200)|", id="plain-beside-all"),
     pytest.param("{[] [<]CC([>,>[]1])C([>,>[]1])[>]; C[>]; [H][<] []}|poisson(200)|", id="plain-beside-exclusion"),
 ]
 
@@ -348,7 +370,7 @@ SINGLE_CAP_SITE_TEXT = "{[] [<]CC([>1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600
 LADDER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
 DUAL_CHANNEL_TEXT = "{[] [<1,<[<]2]OC(O[<1,<[<]2])CC(O[>1,>[>]1])O[>1,>[>]1]; C(O[>1,>[>]1])O[>1,>[>]1]; [<1][H] []}|poisson(1000)|"
 DUAL_CHANNEL_SWAPPED_TEXT = "{[] [<[<]2,<1]OC(O[<[<]2,<1])CC(O[>[>]1,>1])O[>[>]1,>1]; C(O[>[>]1,>1])O[>[>]1,>1]; [<1][H] []}|poisson(1000)|"
-ALL_TEXT = "{[] [<]CCO[>]; C(O[>[all]1])(CO[>[all]1])(CO[>[all]1]); [H][<] []}|poisson(300)|"
+ALL_TEXT = "{[] [<]CCO[>]; C(O[>[allh]1])(CO[>[allh]1])(CO[>[allh]1]); [H][<] []}|poisson(300)|"
 
 
 def _graph_creator(text):
@@ -563,7 +585,7 @@ def test_consumers_read_absent_group_keys_as_sentinels():
 # inner classes, ladder-typed initiator and terminator with implicit group 0.
 LADDER_REFERENCE_TEXT = "{[] [>[>1]2]C(C(OC([>[>2]2])=O)=C1)=CC2=C1C([<[<2]1])=C([<[<1]1])C(O2)=O; O=C([>[>2]])OC1=C([>[>1]])C=C2C(CC(O2)=O)=C1; O=C(C([<[<1]])=C1[<[<2]])OC2=C1C=C3C(CC(O3)=O)=C2 []}|gauss(5000,1000)|"
 # Three-site initiator whose sites must all initiate before propagation (implicit group 0).
-ALL_STAR_TEXT = "{[] [<]C(C)C(=O)O[>], [<]CC(=O)O[>]; [>[all]]OCC(O[>[all]])CO[>[all]]; [<][H] []}|schulz_zimm(1800, 1200)|"
+ALL_STAR_TEXT = "{[] [<]C(C)C(=O)O[>], [<]CC(=O)O[>]; [>[allh]]OCC(O[>[allh]])CO[>[allh]]; [<][H] []}|schulz_zimm(1800, 1200)|"
 
 
 def _assert_no_diagnostics(text):
@@ -588,8 +610,6 @@ def test_ladder_reference_string_encoding():
         ("[>[>1]]", "[<[<1]1]", "transition_weight", (0, 1, 1, 1)),
         ("[>[>2]]", "[<[<2]1]", "transition_weight", (0, 1, 1, 1)),
     }
-    with pytest.raises(NotImplementedError, match="LADDER"):
-        g2rins.EnsembleCreator(_generative_graph(_graph_creator(LADDER_REFERENCE_TEXT)))
 
 
 def test_all_star_string_encoding():
@@ -599,9 +619,9 @@ def test_all_star_string_encoding():
     annotated = [edge for edge in edges if edge[3] != SENTINEL]
     # Three initiator sites x two repeat units, all transitions through the all-group.
     assert len(annotated) == 6
-    assert all(edge == ("[>[all]]", "[<]", "transition_weight", (0, 3, -1, 0)) for edge in annotated)
-    with pytest.raises(NotImplementedError, match="ALL"):
-        g2rins.EnsembleCreator(_generative_graph(_graph_creator(ALL_STAR_TEXT)))
+    assert all(edge == ("[>[allh]]", "[<]", "transition_weight", (0, 3, -1, 0)) for edge in annotated)
+    # ALL is no longer gated: the creator builds; sampling is pinned by the phase-3 tests.
+    g2rins.EnsembleCreator(_generative_graph(_graph_creator(ALL_STAR_TEXT)))
 
 
 # -- Phase 2: generation under the EXCLUSION rule --------------------------------------
@@ -609,11 +629,12 @@ def test_all_star_string_encoding():
 
 def _timeline(monkeypatch):
     """Record every realized bond (fresh unit's tag, consumed source site, consumed target site); a site is
-    (instance tag, exclusion groups held, channel group, channel rule). Unit tags are logged too: tag 1 opens a
+    (instance tag, exclusion groups held, channel group, channel rule, ladder groups held); a rung is logged like a bond. Unit tags are logged too: tag 1 opens a
     chain, a tag drawn again inside a chain is a checkpoint rollback that discarded the units from that tag on.
     The fragments the termination-mass estimate builds on a throwaway tracker draw tags as well; they are skipped."""
     log, observing = [], []
     next_tag, realize, observe = _ec._StochasticObjectTracker.next_unit_instance, _ec._PartialAtomGraph.realize_bond, _ec._PartialAtomGraph._observational_fragment
+    internal = _ec._PartialAtomGraph._realize_internal_bond
 
     def tag(self):
         value = next_tag(self)
@@ -629,16 +650,23 @@ def _timeline(monkeypatch):
             observing.pop()
 
     def site(half_bond, group, rule):
-        return None if half_bond is None else (half_bond.instance, frozenset(half_bond.exclusion_groups()), group, rule)
+        return None if half_bond is None else (half_bond.instance, frozenset(half_bond.exclusion_groups()), group, rule, frozenset(half_bond.ladder_groups()))
 
-    def bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr):
+    def bond(self, other, source_half_bond, fired_edge, other_idx, bond_attr, rng):
         source = site(source_half_bond, fired_edge.get("source_group", -1), fired_edge.get("source_rule", 0))
         target = site(other._consumed_half_bond, fired_edge.get("target_group", -1), fired_edge.get("target_rule", 0))
         log.append(("bond", self.stochastic_tracker._unit_instances, source, target))
-        return realize(self, other, source_half_bond, fired_edge, other_idx, bond_attr)
+        return realize(self, other, source_half_bond, fired_edge, other_idx, bond_attr, rng)
+
+    def rung(self, member, partner, edge):
+        source = site(member, edge.get("source_group", -1), edge.get("source_rule", 0))
+        target = site(partner, edge.get("target_group", -1), edge.get("target_rule", 0))
+        log.append(("rung", self.stochastic_tracker._unit_instances, source, target))
+        return internal(self, member, partner, edge)
 
     monkeypatch.setattr(_ec._StochasticObjectTracker, "next_unit_instance", tag)
     monkeypatch.setattr(_ec._PartialAtomGraph, "realize_bond", bond)
+    monkeypatch.setattr(_ec._PartialAtomGraph, "_realize_internal_bond", rung)
     monkeypatch.setattr(_ec._PartialAtomGraph, "_observational_fragment", fragment)
     return log
 
@@ -665,7 +693,7 @@ def _rule_violations(bonds):
         for site in (source, target):
             if site is None or not site[1]:
                 continue
-            tag, groups, group, rule = site
+            tag, groups, group, rule, _ladder = site
             is_typed = rule == GroupRule.EXCLUSION and group in groups
             violations += sum(1 for g in groups if (tag, g) in engaged or (is_typed and (tag, g) in bystander))
             (engaged if is_typed else bystander).update((tag, g) for g in groups)
@@ -843,7 +871,7 @@ def test_entry_through_the_typed_channel_counts_as_a_typed_consumption(monkeypat
     assert len(chains) == 6
     for bonds in chains:
         grouped = [(side, site) for _kind, _tag, source, target in bonds for side, site in (("source", source), ("target", target)) if site is not None and site[1]]
-        assert len(grouped) == 1 and grouped[0][0] == "target" and grouped[0][1][1:] == (frozenset({1}), 1, GroupRule.EXCLUSION)
+        assert len(grouped) == 1 and grouped[0][0] == "target" and grouped[0][1][1:4] == (frozenset({1}), 1, GroupRule.EXCLUSION)
     assert sum(_rule_violations(bonds)[0] for bonds in chains) == 0
 
 
@@ -871,20 +899,70 @@ def test_entry_through_the_typed_channel_counts_as_a_typed_consumption(monkeypat
             ],
             120.0,
         ),
+        # Ladder siblings: whichever fires takes the other as a rung, the channel's mass holding both ends already
+        ([(1.0, frozenset({1}), [(1, GroupRule.LADDER, 1.0, 44.0)])] * 2, 44.0),
+        # A rung-welded member also holding exclusion group 2 takes that group with it: the third site's typed channel
+        # dies and it caps plain; by hand (100 + 100 + 130) / 3 over the three first movers
+        (
+            [
+                (1.0, frozenset({1}), [(1, GroupRule.LADDER, 1.0, 80.0)]),
+                (1.0, frozenset({1, 2}), [(1, GroupRule.LADDER, 1.0, 80.0)]),
+                (1.0, frozenset({2}), [(2, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 20.0)]),
+            ],
+            110.0,
+        ),
     ],
 )
 def test_cluster_cap_estimate_follows_the_firing_sequence(members, expected):
     assert _ec._PartialAtomGraph._expected_cluster_cap_mw(members) == pytest.approx(expected)
 
 
-def _unit_termination_estimate(text):
-    """Termination-mass estimate of one freshly instantiated repeat unit of ``text``."""
+def test_independent_cluster_members_are_priced_apart():
+    # Ten pairs of typed-plus-plain siblings in one unit instance never reach each other: the estimate
+    # is ten times the pair's, and the recursion prices the pairs apart instead of enumerating their
+    # 4**10 joint states (over a minute before the split).
+    pair = [(1.0, frozenset({1}), [(1, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 19.0)])] * 2
+    members = [(1.0, frozenset({group}), [(group, GroupRule.EXCLUSION, 0.5, 80.0), (-1, GroupRule.NONE, 0.5, 19.0)]) for group in range(1, 11) for _ in range(2)]
+    started = time.perf_counter()
+    assert _ec._PartialAtomGraph._expected_cluster_cap_mw(members) == pytest.approx(10 * _ec._PartialAtomGraph._expected_cluster_cap_mw(pair))
+    assert time.perf_counter() - started < 5.0
+
+
+def _fresh_unit(text):
+    """One freshly instantiated repeat unit of ``text``, with its instance id, static graph and rng."""
     generative_graph = _generative_graph(_graph_creator(text))
     static_graph = _ec.EnsembleCreator._create_static_graph(generative_graph)
     tracker, rng = _ec._StochasticObjectTracker(generative_graph), np.random.default_rng(0)
     carbon = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
     unit, sto_atom_id = _instantiate(generative_graph, static_graph, tracker, carbon, rng)
+    return unit, sto_atom_id, static_graph, rng
+
+
+def _unit_termination_estimate(text):
+    """Termination-mass estimate of one freshly instantiated repeat unit of ``text``."""
+    unit, sto_atom_id, static_graph, rng = _fresh_unit(text)
     return unit.get_average_termination_mw(sto_atom_id, static_graph, rng)
+
+
+def _realized_cap_delta(text):
+    """Mass one freshly instantiated repeat unit of ``text`` gains when it terminates."""
+    unit, sto_atom_id, _static_graph, rng = _fresh_unit(text)
+    before = Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(unit.atom_graph))
+    unit.terminate_graph(sto_atom_id, rng)
+    return Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(unit.atom_graph)) - before
+
+
+# One repeat unit carrying ten exclusion groups, each a pair of sites with a typed and a plain cap channel.
+TEN_GROUP_UNIT_TEXT = (
+    "{[] [<]C([>1[]1,>2])([>1[]1,>2])C([>1[]2,>2])([>1[]2,>2])C([>1[]3,>2])([>1[]3,>2])C([>1[]4,>2])([>1[]4,>2])C([>1[]5,>2])([>1[]5,>2])"
+    "C([>1[]6,>2])([>1[]6,>2])C([>1[]7,>2])([>1[]7,>2])C([>1[]8,>2])([>1[]8,>2])C([>1[]9,>2])([>1[]9,>2])C([>1[]10,>2])([>1[]10,>2])[>]; O[>]; [<][H], [<1]Br, [<2]F []}|poisson(3000)|"
+)
+ONE_GROUP_UNIT_TEXT = "{[] [<]C([>1[]1,>2])([>1[]1,>2])[>]; O[>]; [<][H], [<1]Br, [<2]F []}|poisson(3000)|"
+
+
+def test_ten_independent_groups_price_as_ten_pairs():
+    ten, one = _unit_termination_estimate(TEN_GROUP_UNIT_TEXT), _unit_termination_estimate(ONE_GROUP_UNIT_TEXT)
+    assert one > 0 and ten == pytest.approx(10 * one)
 
 
 def test_typed_sibling_caps_are_priced_as_one_cap():
@@ -900,3 +978,520 @@ def test_typed_sibling_caps_keep_the_number_average_on_target():
         chains = _sample(text, 40, seed=1)
         number_average = np.mean([Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) for chain in chains])
         assert abs(number_average - 600) / 600 < 0.1, f"Mn {number_average:.0f} vs target 600 for {text}"
+
+
+# -- Phase 3: generation under the ALL rule ---------------------------------------------
+
+# Two all-typed initiator sites beside a plain one: the plain site waits, at the opening move too.
+MIXED_ALL_TEXT = "{[] [<]CCO[>]; C(O[>[allh]1])(CO[>[allh]1])(CO[>]); [H][<] []}|poisson(300)|"
+# Target below the initiator plus one unit per all-typed site: every chain must overshoot.
+SMALL_TARGET_ALL_TEXT = "{[] [<]CCO[>]; C(O[>[allh]1])(CO[>[allh]1])(CO[>[allh]1]); [H][<] []}|poisson(120)|"
+# A nested initiator whose all-group overshoots its own target, beside a plain one; the second repeat unit's exit
+# only matches a terminator, so the enclosing object sometimes ends below target and that attempt is discarded.
+NESTED_OVERSHOOT_DISCARD_TEXT = "{[] [<]CC[>]|0.95|, [<]CC[>1]|0.05|; {[] [<]CCO[>]; C(O[>[allh]])CO[>[allh]]; [<][H] [<]}|uniform(80,80)|[>], C[>]; [<][H], [<1][H] []}|uniform(300,300)|"
+
+
+def _all_rule_violations(bonds):
+    """Bonds fired from a plain source channel before the chain's last bond fired from an all-typed one: the
+    all rule places every all-typed site before any other growth, so none may occur."""
+    rules = [source[3] for _kind, _fresh_tag, source, _target in bonds if source is not None]
+    last_all = max((i for i, rule in enumerate(rules) if rule in ALL_RULES), default=-1)
+    return sum(1 for rule in rules[:last_all] if rule not in ALL_RULES), last_all >= 0
+
+
+@pytest.mark.parametrize("text, n_chains", [(ALL_TEXT, 12), (ALL_STAR_TEXT, 4), (MIXED_ALL_TEXT, 12), (SMALL_TARGET_ALL_TEXT, 12)])
+def test_all_typed_sites_fire_before_any_other_growth(monkeypatch, text, n_chains):
+    log = _timeline(monkeypatch)
+    chains = _sample(text, n_chains)
+    assert chains is not None and len(chains) == n_chains
+    results = [_all_rule_violations(bonds) for bonds in _surviving_bonds_per_chain(log)]
+    assert len(results) == n_chains
+    assert sum(violations for violations, _fired in results) == 0
+    assert all(fired for _violations, fired in results)
+
+
+def _all_typed_oxygen_origins(generative_graph):
+    return {
+        str(node)
+        for node, data in generative_graph.nodes(data=True)
+        if data["atomic_num"] == 8 and any(edge.get("source_rule", 0) in ALL_RULES for site in _site_nodes(generative_graph, node) for _u, _v, edge in generative_graph.out_edges(site, data=True))
+    }
+
+
+def _chains_with_every_all_typed_site_used(generative_graph, chains):
+    origins = _all_typed_oxygen_origins(generative_graph)
+    assert len(origins) == 3
+    return sum(1 for chain in chains if sum(1 for node, data in chain.nodes(data=True) if data["origin_idx"] in origins and chain.degree(node) == 2) == 3)
+
+
+@pytest.mark.parametrize("text, n_chains", [(ALL_TEXT, 8), (ALL_STAR_TEXT, 3)])
+def test_every_all_typed_site_is_used_in_the_output(text, n_chains):
+    graph_creator = _graph_creator(text)
+    generative_graph = _generative_graph(graph_creator)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(n_chains, output_format="mol_graph", seed=7)
+    assert _chains_with_every_all_typed_site_used(generative_graph, chains) == n_chains
+
+
+@pytest.mark.parametrize("termination_flag", [None, 1])
+def test_all_rule_overshoots_a_small_target_and_warns_once(termination_flag):
+    graph_creator = _graph_creator(SMALL_TARGET_ALL_TEXT)
+    generative_graph = _generative_graph(graph_creator)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(6, output_format="mol_graph", termination_flag=termination_flag, seed=3)
+    assert _chains_with_every_all_typed_site_used(generative_graph, chains) == 6
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert len(reported) == 1
+    assert (reported[0].chain_count, reported[0].chain_total) == (6, 6)
+
+
+def test_all_rule_warning_is_aggregated_on_the_parallel_path():
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parallel = _graph_creator(SMALL_TARGET_ALL_TEXT).get_ensemble_creator().create_ensemble(4, output_format="smiles", parallel=True, n_workers=2, seed=3)
+    serial = _sample(SMALL_TARGET_ALL_TEXT, 4, seed=3, output_format="smiles")
+    assert list(parallel) == list(serial)
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert len(reported) == 1 and (reported[0].chain_count, reported[0].chain_total) == (4, 4)
+
+
+def test_all_rule_overshoot_counts_returned_chains_only(monkeypatch):
+    attempts = []
+    attempt_chain = _ec._attempt_chain
+
+    def recording(*args):
+        result = attempt_chain(*args)
+        attempts.append((result[0] is not None, any(issubclass(caught.category, AllGroupOvershoot) for caught in result[3])))
+        return result
+
+    monkeypatch.setattr(_ec, "_attempt_chain", recording)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        serial = _graph_creator(NESTED_OVERSHOOT_DISCARD_TEXT).get_ensemble_creator().create_ensemble(8, output_format="smiles", seed=1)
+    # At least one discarded attempt overshot: that is what the count must leave out.
+    assert sum(1 for accepted, overshoot in attempts if not accepted and overshoot) >= 1
+    expected = sum(1 for accepted, overshoot in attempts if accepted and overshoot)
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert [(message.chain_count, message.chain_total) for message in reported] == [(expected, 8)]
+    # The workers run the unpatched attempt helper; same seed, same chains, same count.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        parallel = _graph_creator(NESTED_OVERSHOOT_DISCARD_TEXT).get_ensemble_creator().create_ensemble(8, output_format="smiles", parallel=True, n_workers=2, seed=1)
+    assert list(parallel) == list(serial)
+    reported = [record.message for record in caught if issubclass(record.category, AllGroupOvershoot)]
+    assert [(message.chain_count, message.chain_total) for message in reported] == [(expected, 8)]
+
+
+def test_all_generation_is_seed_reproducible():
+    assert list(_sample(ALL_TEXT, 4, seed=5, output_format="smiles")) == list(_sample(ALL_TEXT, 4, seed=5, output_format="smiles"))
+
+
+# -- Phase 4: generation under the LADDER rule ------------------------------------------
+
+# Regiospecific inner classes: every rung pairs class 1 with class 1 and class 2 with class 2.
+REGIO_LADDER_TEXT = "{[] [<[<1]2]OC(O[<[<2]2])CC(O[>[>1]1])O[>[>2]1]; C(O[>[>1]1])O[>[>2]1]; [<][H] []}|poisson(1000)|"
+# Three members per class on separate atoms: after the first bond two members face two free partners, so the
+# completion draws (three sites on one atom would give parallel bonds a simple graph cannot hold).
+THREE_RUNG_TEXT = "{[] [<[<]2]OC(O[<[<]2])(O[<[<]2])CC(O[>[>]1])(O[>[>]1])O[>[>]1]; C(O[>[>]1])(O[>[>]1])O[>[>]1]; [<][H] []}|poisson(1000)|"
+COMPLETION_DRAW = "ladder completion partner selection"
+# Ladder sites whose partners all sit on the initiator only receive bonds: no outgoing edge, never in the pool.
+INCOMING_ONLY_LADDER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2]; [<][H] []}|uniform(400,400)|"
+# The second exit site may only pair with the first entry site; a first exit that fires and takes it leaves no partner.
+RESTRICTED_PARTNER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1|1 1 0 0|])O[>[>]1|1 0 0 0|]; C(O[>[>]1])O[>[>]1]; [<][H] []}|uniform(500,500)|"
+# A two-site ladder-typed cap: the first member to terminate draws it, the other welds the rung to its second site.
+LADDER_CAP_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<[<]]OCO[<[<]] []}|poisson(1000)|"
+# A weight list that leaves the `>2` member no channel while its sibling fires: no junction fired from that side could close.
+ZERO_WEIGHT_MEMBER_TEXT = (
+    "{[] [<[<1]2|0 0 1 1|]OC(O[<[<2]2|0 0 1 1|])CC(O[>[>1]1])O[>[>2]1|0 0 0 0|]; C(O[>[>1]1])O[>[>2]1], C(O[<[<1]2|0 0 1 1|])O[<[<2]2|0 0 1 1|]; [<1,<2,>1,>2][H] []}|uniform(500,500)|"
+)
+# Both members without a channel: the group never fires toward the repeat unit, so nothing is broken.
+INERT_GROUP_TEXT = (
+    "{[] [<[<1]2|0 0 1 1|]OC(O[<[<2]2|0 0 1 1|])CC(O[>[>1]1|0 0 0 0|])O[>[>2]1|0 0 0 0|]; C(O[>[>1]1])O[>[>2]1], C(O[<[<1]2|0 0 1 1|])O[<[<2]2|0 0 1 1|]; [<1,<2,>1,>2][H] []}|uniform(500,500)|"
+)
+# An initiator member nothing targets holds no edge at all once its weight list is zero: only its declaration tells it is a member.
+ZERO_WEIGHT_INITIATOR_MEMBER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2|0 0|]; [<][H] []}|uniform(300,300)|"
+
+
+def _unit_anchors(ensemble):
+    """One template node per unit, as the chains carry it, to count unit instances in a chain."""
+    return {str(next(iter(unit["subgraph"].nodes))) for unit in ensemble.units.values()}
+
+
+def _ensemble(text, n_chains, seed=5):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format="mol_graph", ensemble_info=True, seed=seed)
+
+
+@pytest.mark.parametrize(
+    "text, n_chains, rungs_per_junction, mass_window",
+    [(LADDER_TEXT, 6, 2, (800, 1200)), (REGIO_LADDER_TEXT, 6, 2, (800, 1200)), (THREE_RUNG_TEXT, 4, 3, (800, 1200))],
+)
+def test_every_ladder_junction_closes_with_its_rungs(text, n_chains, rungs_per_junction, mass_window):
+    ensemble = _ensemble(text, n_chains)
+    anchors = _unit_anchors(ensemble)
+    assert len(ensemble.chains) == n_chains
+    for chain in ensemble.chains:
+        undirected = nx.Graph(chain)
+        units = sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] in anchors)
+        # Each junction is a cycle per rung beyond the first; a single-bonded junction closes none.
+        cycle_rank = undirected.number_of_edges() - undirected.number_of_nodes() + nx.number_connected_components(undirected)
+        assert units > 1 and cycle_rank == (units - 1) * (rungs_per_junction - 1)
+        assert mass_window[0] <= Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) <= mass_window[1]
+
+
+def _junction_records(ensemble, left, right):
+    return {tuple(record["labels"]): record["count"] for record in ensemble.bonds if record["labels"][0].startswith(left) and record["labels"][1].startswith(right)}
+
+
+@pytest.mark.parametrize("text, pairings", [(LADDER_TEXT, 4), (REGIO_LADDER_TEXT, 2)])
+def test_rungs_are_bond_records_of_their_own(text, pairings):
+    # Two-member classes: the first bond picks a pair and the rung takes the other; a degenerate class
+    # reaches every pairing over the chains, regiospecific classes only the declared ones.
+    ensemble = _ensemble(text, 12)
+    between_units = _junction_records(ensemble, "R0", "R0")
+    assert len(between_units) == pairings
+    assert sum(between_units.values()) == 2 * (ensemble.units["R0"]["count"] - 12)
+    assert sum(_junction_records(ensemble, "I0", "R0").values()) == 2 * 12
+
+
+def test_completion_draws_only_when_a_member_has_a_choice(monkeypatch):
+    contexts = []
+    choose = _ec._StochasticObjectTracker.choose
+
+    def recording(self, rng, n_candidates, weights, context):
+        contexts.append(context)
+        return choose(self, rng, n_candidates, weights, context)
+
+    monkeypatch.setattr(_ec._StochasticObjectTracker, "choose", recording)
+    assert _sample(LADDER_TEXT, 4) is not None and COMPLETION_DRAW not in contexts
+    contexts.clear()
+    assert _sample(THREE_RUNG_TEXT, 4) is not None and COMPLETION_DRAW in contexts
+
+
+def _ladder_strip_violations(bonds):
+    """Ladder-channel fires of a group after a member of it was consumed through another channel, and the rungs."""
+    stripped, violations, rungs = set(), 0, 0
+    for kind, _fresh_tag, source, target in bonds:
+        for side in (source, target):
+            if side is None:
+                continue
+            instance, _exclusion, group, rule, ladder = side
+            if rule == GroupRule.LADDER:
+                violations += (instance, group) in stripped
+                stripped.update((instance, held) for held in ladder if held != group)
+            else:
+                stripped.update((instance, held) for held in ladder)
+        rungs += kind == "rung"
+    return violations, rungs
+
+
+def test_plain_consumption_strips_the_ladder_group(monkeypatch):
+    log = _timeline(monkeypatch)
+    chains = _sample(DUAL_CHANNEL_TEXT, 8)
+    assert chains is not None and len(chains) == 8
+    per_chain = _surviving_bonds_per_chain(log)
+    results = [_ladder_strip_violations(bonds) for bonds in per_chain]
+    assert sum(violations for violations, _rungs in results) == 0
+    assert sum(rungs for _violations, rungs in results) > 0  # junctions where the ladder channel won
+    assert any(source is not None and source[3] == GroupRule.NONE for bonds in per_chain for _kind, _tag, source, _target in bonds)  # plain growth
+    assert any(target is None for bonds in per_chain for _kind, _tag, _source, target in bonds)  # caps
+
+
+def test_ladder_generation_is_seed_reproducible():
+    assert list(_sample(LADDER_TEXT, 4, seed=5, output_format="smiles")) == list(_sample(LADDER_TEXT, 4, seed=5, output_format="smiles"))
+
+
+def _cycle_rank(chain):
+    undirected = nx.Graph(chain)
+    return undirected.number_of_edges() - undirected.number_of_nodes() + nx.number_connected_components(undirected)
+
+
+def test_incoming_only_ladder_sites_close_the_junction():
+    # The initiator's two-rung junction closes one ring per chain; the rest of the chain is linear.
+    ensemble = _ensemble(INCOMING_ONLY_LADDER_TEXT, 6)
+    assert [_cycle_rank(chain) for chain in ensemble.chains] == [1] * 6
+    assert sum(_junction_records(ensemble, "I0", "L0").values()) == 2 * 6
+
+
+def test_member_without_a_free_partner_discards_the_attempt(monkeypatch):
+    causes = []
+    attempt_chain = _ec._attempt_chain
+
+    def recording(*args):
+        result = attempt_chain(*args)
+        causes.append(result[2])
+        return result
+
+    monkeypatch.setattr(_ec, "_attempt_chain", recording)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble = _graph_creator(RESTRICTED_PARTNER_TEXT).get_ensemble_creator().create_ensemble(6, output_format="mol_graph", ensemble_info=True, seed=7)
+    rejected = [cause for cause in causes if isinstance(cause, LadderMemberWithoutPartner)]
+    assert rejected and all(cause.group == 1 for cause in rejected)
+    reported = [record.message for record in caught if issubclass(record.category, DiscardedSamplingPaths)]
+    assert len(reported) == 1 and dict(reported[0].reasons)["LadderMemberWithoutPartner"] == len(rejected)
+    # Every returned chain closes all of its junctions.
+    anchors = _unit_anchors(ensemble)
+    for chain in ensemble.chains:
+        units = sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] in anchors)
+        assert _cycle_rank(chain) == units - 1
+
+
+@pytest.mark.parametrize("text, n_chains, seed", [(LADDER_CAP_TEXT, 6, 5), (LADDER_REFERENCE_TEXT, 3, 1)])
+def test_ladder_typed_cap_closes_the_last_junction(text, n_chains, seed):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble = _graph_creator(text).get_ensemble_creator().create_ensemble(n_chains, output_format="mol_graph", ensemble_info=True, seed=seed)
+    assert not any(issubclass(record.category, DiscardedSamplingPaths) for record in caught)
+    assert len(ensemble.chains) == n_chains
+    # One cap per chain, bonded twice: the chain start, every growth step and the cap each close with two rungs.
+    assert ensemble.units["T0"]["count"] == n_chains
+    assert sum(_junction_records(ensemble, "I0", "R0").values()) == 2 * n_chains
+    assert sum(_junction_records(ensemble, "R0", "R0").values()) == 2 * (ensemble.units["R0"]["count"] - n_chains)
+    assert sum(_junction_records(ensemble, "R0", "T0").values()) == 2 * n_chains
+    # Every chain's cycle rank is one per junction on top of the rings its units bring.
+    intrinsic = {str(next(iter(unit["subgraph"].nodes))): _cycle_rank(unit["subgraph"]) for unit in ensemble.units.values()}
+    for chain in ensemble.chains:
+        units = [data["origin_idx"] for _node, data in chain.nodes(data=True) if data["origin_idx"] in intrinsic]
+        assert _cycle_rank(chain) == len(units) - 1 + sum(intrinsic[anchor] for anchor in units)
+        assert Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) > 0
+
+
+@pytest.mark.parametrize("text", [LADDER_CAP_TEXT, LADDER_REFERENCE_TEXT])
+def test_ladder_cap_is_priced_once_with_its_rungs(text):
+    # The cap is the only terminator, so the expectation is the one mass termination realizes: the cap
+    # attached at both sites of the pair, every end shedding its hydrogen.
+    assert _unit_termination_estimate(text) == pytest.approx(_realized_cap_delta(text))
+
+
+# -- Phase 5: the two flavours of the ALL rule ----------------------------------------
+
+# The same star with soft sites: the target wins as soon as it is reached, the other sites close plain.
+SMALL_TARGET_SOFT_TEXT = "{[] [<]CCO[>]; C(O[>[alls]1])(CO[>[alls]1])(CO[>[alls]1]); [H][<] []}|poisson(120)|"
+# Two soft initiator sites beside a plain one: the plain site still waits for the tier.
+MIXED_SOFT_TEXT = "{[] [<]CCO[>]; C(O[>[alls]1])(CO[>[alls]1])(CO[>]); [H][<] []}|poisson(300)|"
+# A unit whose two soft sites point back at itself: under the hard rule it could never settle.
+SOFT_DENDRIMER_TEXT = "{[] [<]CCN([>[alls]])([>[alls]]); C[>]; [<][H] []}|poisson(200)|"
+HARD_DENDRIMER_TEXT = "{[] [<]CCN([>[allh]])([>[allh]]); C[>]; [<][H] []}|poisson(200)|"
+# Two units whose hard sites feed each other: a two-unit cycle.
+HARD_CYCLE_TEXT = "{[] [<]CC([>1[allh]])[>], [<1]CC([>[allh]])O[>1]; C[>]; [<][H], [<1][H] []}|poisson(300)|"
+# A hard pendant into a plain unit, and a hard pendant into a unit whose own hard pendant leads into a plain one: both settle.
+HARD_PENDANT_TEXT = "{[] [<]CC([>1[allh]1])[>], [<1]CCO[>]; C[>]; [<][H] []}|poisson(300)|"
+HARD_PENDANT_CHAIN_TEXT = "{[] [<]CC([>1[allh]1])[>], [<1]CC([>2[allh]2])O[>], [<2]C(=O)C[>1]; C[>]; [<][H] []}|poisson(300)|"
+# A plain-grown backbone whose every unit carries one soft pendant; the grafts are drawn at the outer level.
+SOFT_BACKBONE_TEXT = "{[] [<1]CCO[>1]; {[] [<]CC([>1[alls]1])[>]; C[>]; [<][H] [<1]}|uniform(300,300)|[>1]; [<1][H] []}|uniform(600,600)|"
+# An all-typed site that is only ever a bond target (the unit is entered through it alone): the rule never acts.
+TARGET_ONLY_ALL_TEXT = "{[] [<[allh]]CC[>]; C[>]; [<][H] []}|poisson(300)|"
+TARGET_ONLY_SOFT_CAP_TEXT = "{[] [<]CC[>]; C[>]; [<[alls]][H] []}|poisson(300)|"
+# The same unit with the hard site on the growth side: it opens on every placement and feeds the unit itself.
+HARD_GROWTH_TEXT = "{[] [<]CC[>[allh]]; C[>]; [<][H] []}|poisson(300)|"
+# A probe of the entry-site rule, not a chemistry example: the hard channel enters the fresh unit through the site that carries it, which spends it.
+SPENT_ENTRY_SITE_TEXT = "{[] [<]CC[<1,>1[allh]]; C[>]; [>][H], [>1][H] []}|uniform(40,40)|"
+
+
+def test_bare_all_is_not_a_keyword():
+    with pytest.raises(lark.exceptions.UnexpectedInput):
+        g2rins.SimpleBondConnector.make("[>[all]]")
+
+
+@pytest.mark.parametrize("text", ["{[] [<]CC([>1[alls]1])[>]; C[>]; [<][H], [<1][H] []}|poisson(100)|", "{[] [<]CC([>1[allh]1])[>]; C[>]; [<][H], [<1][H] []}|poisson(100)|"])
+def test_single_member_group_is_silent_for_the_all_rules(text):
+    # One all-typed site per unit is the grafting use of the rule; the exclusion twin still warns.
+    _assert_no_diagnostics(text)
+    with pytest.warns(SingleMemberGroup):
+        g2rins.StochasticObject.make(text.replace("[alls]", "[]").replace("[allh]", "[]"))
+
+
+def test_soft_all_edge_annotations():
+    generative_graph = _generative_graph(_graph_creator(SMALL_TARGET_SOFT_TEXT))
+    annotated = [data for _u, _v, data in generative_graph.edges(data=True) if _group_values(data) != SENTINEL]
+    assert len(annotated) == 3
+    assert all(_group_values(data) == (1, 4, -1, 0) and _mode(data) == "transition_weight" for data in annotated)
+
+
+@pytest.mark.parametrize("text, cycle_units", [(HARD_DENDRIMER_TEXT, 1), (HARD_CYCLE_TEXT, 2), (HARD_GROWTH_TEXT, 1)])
+def test_unsettled_hard_all_rule_is_refused_at_graph_build(text, cycle_units):
+    graph_creator = _graph_creator(text)
+    with pytest.raises(UnsettledHardAllRule) as info:
+        _generative_graph(graph_creator)
+    error = info.value
+    # The cycle starts and ends on the same unit and passes through the offender.
+    assert error.cycle[0] == error.cycle[-1] and error.unit_text in error.cycle
+    assert len(set(error.cycle)) == cycle_units
+    assert error.unit_text and "allh" in error.unit_text and "`alls`" in str(error)
+    with pytest.raises(UnsettledHardAllRule):
+        graph_creator.get_ensemble_creator()
+    # The graph with bond connectors stays available, as for a bond ruled at both ends.
+    assert _generative_graph(graph_creator, include_bond_connectors=True).number_of_nodes() > 0
+
+
+@pytest.mark.parametrize("text", [ALL_TEXT, HARD_PENDANT_TEXT, HARD_PENDANT_CHAIN_TEXT, SOFT_DENDRIMER_TEXT, TARGET_ONLY_ALL_TEXT, SPENT_ENTRY_SITE_TEXT])
+def test_settling_hard_channels_and_soft_rules_build(text):
+    assert _generative_graph(_graph_creator(text)).number_of_nodes() > 0
+
+
+@pytest.mark.parametrize(
+    "text, bond_connector, unit, label",
+    [(TARGET_ONLY_ALL_TEXT, "[<[allh]]", "[<[allh]]CC[>]", "hard all"), (TARGET_ONLY_SOFT_CAP_TEXT, "[<[alls]]", "[<[alls]][H]", "soft all")],
+)
+def test_target_only_all_site_warns_and_samples_as_plain(text, bond_connector, unit, label):
+    graph_creator = _graph_creator(text)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        graph_creator.get_generative_graph()
+    reported = [record.message for record in caught if issubclass(record.category, AllRuleOnTargetOnlySite)]
+    assert [(message.bond_connector, str(message.token), message.rule_label) for message in reported] == [(bond_connector, unit, label)]
+    assert "never acts" in str(reported[0])
+    # The site never opens, so its channel never fires: the string samples exactly as its plain twin.
+    plain = text.replace("[allh]", "").replace("[alls]", "")
+    assert list(_sample(text, 6, seed=1, output_format="smiles")) == list(_sample(plain, 6, seed=1, output_format="smiles"))
+
+
+def test_hard_pendants_all_fire():
+    # The object cannot stop while a hard pendant is open: every backbone unit carries its graft.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble = _graph_creator(HARD_PENDANT_TEXT).get_ensemble_creator().create_ensemble(6, output_format="mol_graph", ensemble_info=True, seed=1)
+    assert not any(issubclass(record.category, DiscardedSamplingPaths) for record in caught)
+    backbone = next(key for key, unit in ensemble.units.items() if "allh" in unit["g2rins"])
+    graft = next(key for key, unit in ensemble.units.items() if unit["g2rins"].replace(" ", "") == "[<1]CCO[>]")
+    # Bonds into the graft unit's entry site (its exit site continues the backbone and does not count).
+    grafts = sum(record["count"] for record in ensemble.bonds if f"{graft}.1" in record["labels"] and any(label.startswith(backbone) for label in record["labels"]))
+    assert grafts == ensemble.units[backbone]["count"] > 0
+
+
+@pytest.mark.parametrize("text, n_chains", [(MIXED_SOFT_TEXT, 12), (SMALL_TARGET_SOFT_TEXT, 12)])
+def test_soft_all_typed_sites_fire_before_any_other_growth(monkeypatch, text, n_chains):
+    log = _timeline(monkeypatch)
+    chains = _sample(text, n_chains)
+    assert chains is not None and len(chains) == n_chains
+    results = [_all_rule_violations(bonds) for bonds in _surviving_bonds_per_chain(log)]
+    assert len(results) == n_chains
+    assert sum(violations for violations, _fired in results) == 0
+    assert all(fired for _violations, fired in results)
+
+
+def test_soft_all_yields_to_the_target():
+    # The hard twin of this string overshoots every chain and warns; the soft one stops at the first arm.
+    graph_creator = _graph_creator(SMALL_TARGET_SOFT_TEXT)
+    generative_graph = _generative_graph(graph_creator)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(12, output_format="mol_graph", seed=3)
+    assert not any(issubclass(record.category, AllGroupOvershoot) for record in caught)
+    origins = _all_typed_oxygen_origins(generative_graph)
+    used = [sum(1 for node, data in chain.nodes(data=True) if data["origin_idx"] in origins and chain.degree(node) == 2) for chain in chains]
+    assert used == [1] * 12
+    # Initiator plus one repeat unit; the two unfired sites closed with hydrogen.
+    assert all(abs(Descriptors.MolWt(g2rins.mol_graph_to_rdkit_mol(chain)) - 136.15) < 0.5 for chain in chains)
+
+
+def _nitrogen_generations(chain):
+    """Units per all-generation of a CCN dendrimer chain rooted at the initiator carbon."""
+    heavy = chain.subgraph([node for node, data in chain.nodes(data=True) if data["atomic_num"] > 1])
+    (root,) = [node for node, data in heavy.nodes(data=True) if data["atomic_num"] == 6 and heavy.degree(node) == 1]
+    distance = nx.single_source_shortest_path_length(heavy, root)
+    levels = {}
+    for node, data in heavy.nodes(data=True):
+        if data["atomic_num"] == 7:
+            levels[(distance[node] - 3) // 3] = levels.get((distance[node] - 3) // 3, 0) + 1
+    return [levels.get(generation, 0) for generation in range(max(levels) + 1)]
+
+
+def test_soft_dendrimer_fills_generation_by_generation():
+    # The tier draws the lowest all-generation first: every generation but the last is complete.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        chains = _graph_creator(SOFT_DENDRIMER_TEXT).get_ensemble_creator().create_ensemble(20, output_format="mol_graph", seed=1)
+    assert not any(issubclass(record.category, (AllGroupOvershoot, DiscardedSamplingPaths)) for record in caught)
+    profiles = [_nitrogen_generations(chain) for chain in chains]
+    assert all(profile[:-1] == [2**generation for generation in range(len(profile) - 1)] for profile in profiles)
+    assert any(len(profile) >= 3 for profile in profiles)
+
+
+def test_soft_pendants_graft_across_the_backbone():
+    # Plain-grown backbone units share all-generation 0, so the pendants are one weighted draw: the grafts
+    # are not placed from the backbone start on, and the budget runs out before the tier, so no graft grows.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        graph_creator = _graph_creator(SOFT_BACKBONE_TEXT)
+        generative_graph = _generative_graph(graph_creator)
+        ensemble = graph_creator.get_ensemble_creator().create_ensemble(10, output_format="mol_graph", ensemble_info=True, seed=1)
+    assert not any(issubclass(record.category, (AllGroupOvershoot, DiscardedSamplingPaths)) for record in caught)
+    backbone = next(key for key, unit in ensemble.units.items() if "alls" in unit["g2rins"])
+    graft = next(key for key, unit in ensemble.units.items() if unit["g2rins"].replace(" ", "") == "[<1]CCO[>1]")
+    start = next(key for key, unit in ensemble.units.items() if unit["g2rins"].replace(" ", "") == "C[>]")
+    graft_bonds = [record for record in ensemble.bonds if {label.split(".")[0] for label in record["labels"]} == {backbone, graft}]
+    assert len(graft_bonds) == 1 and not any({label.split(".")[0] for label in record["labels"]} == {graft} for record in ensemble.bonds)
+    site = next(node for node, label in zip(graft_bonds[0]["nodes"], graft_bonds[0]["labels"]) if label.startswith(backbone))
+    if generative_graph.nodes[site]["atomic_num"] == 0:
+        # The pendant site is a connector placeholder split off its carbon; the chains hold the carbon.
+        (site,) = {
+            u if v == site else v
+            for u, v, data in list(generative_graph.in_edges(site, data=True)) + list(generative_graph.out_edges(site, data=True))
+            if data.get("static") and generative_graph.nodes[u if v == site else v]["atomic_num"] > 0
+        }
+    pendant_carbon = str(site)
+    graft_origins = {str(node) for node in ensemble.units[graft]["subgraph"].nodes}
+    root_origins = {str(node) for node in ensemble.units[start]["subgraph"].nodes}
+    patterns = []
+    for chain in ensemble.chains:
+        heavy = chain.subgraph([node for node, data in chain.nodes(data=True) if data["atomic_num"] > 1])
+        root = next(node for node, data in heavy.nodes(data=True) if data["origin_idx"] in root_origins)
+        distance = nx.single_source_shortest_path_length(heavy, root)
+        carbons = sorted((node for node, data in heavy.nodes(data=True) if data["origin_idx"] == pendant_carbon), key=distance.get)
+        patterns.append([any(heavy.nodes[other]["origin_idx"] in graft_origins for other in heavy.neighbors(node)) for node in carbons])
+    assert all(len(pattern) >= 8 and 0 < sum(pattern) < len(pattern) for pattern in patterns), patterns
+    assert any(pattern.index(False) < len(pattern) - 1 - pattern[::-1].index(True) for pattern in patterns), patterns
+
+
+def _unit_nodes(generative_graph, text):
+    """The nodes of the unit parsed from ``text``, through the graph's provenance record."""
+    unit_id = next(unit_id for unit_id, unit_text in generative_graph.graph["unit_g2rins"].items() if unit_text == text)
+    return generative_graph.graph["unit_node_ids"][unit_id]
+
+
+def test_hard_all_is_validated_for_the_sampled_source():
+    # A chain started in the unit opens its `<` site, which the initiator-started chains never open.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = _graph_creator(TARGET_ONLY_ALL_TEXT).get_ensemble_creator()
+    source = _unit_nodes(ensemble_creator.generative_graph, "[<[allh]]CC[>]")[0]
+    with pytest.raises(UnsettledHardAllRule) as info:
+        ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
+    assert (info.value.start_text, info.value.unit_text, info.value.cycle) == ("[<[allh]]CC[>]", "[<[allh]]CC[>]", ["[<[allh]]CC[>]"] * 2)
+    assert "A chain started in the unit [<[allh]]CC[>]" in str(info.value)
+    # A chain started in a unit whose hard channels settle samples as before.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = _graph_creator(HARD_PENDANT_TEXT).get_ensemble_creator()
+        source = _unit_nodes(ensemble_creator.generative_graph, "[<1]CCO[>]")[0]
+        chain = ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
+    assert chain.number_of_nodes() > 0
+
+
+@pytest.mark.parametrize(
+    "text, bond_connector, unit_start, partner_start",
+    [
+        (ZERO_WEIGHT_MEMBER_TEXT, "[>[>2]1|0.0 0.0 0.0 0.0|]", "[<[<1]2|", "[<[<1]2|"),
+        (ZERO_WEIGHT_INITIATOR_MEMBER_TEXT, "[>[>]2|0.0 0.0|]", "C(O[>[>]2])", "[<[<]1]OC("),
+    ],
+)
+def test_ladder_member_without_channel_is_refused_at_graph_build(text, bond_connector, unit_start, partner_start):
+    graph_creator = _graph_creator(text)
+    with pytest.raises(LadderMemberWithoutChannel) as info:
+        _generative_graph(graph_creator)
+    error = info.value
+    assert error.bond_connector == bond_connector
+    assert error.unit_text.startswith(unit_start) and error.partner_text.startswith(partner_start)
+    assert "same group pair" in str(error)
+    with pytest.raises(LadderMemberWithoutChannel):
+        graph_creator.get_ensemble_creator()
+    # The graph with bond connectors stays available, as for a bond ruled at both ends.
+    assert _generative_graph(graph_creator, include_bond_connectors=True).number_of_nodes() > 0
+    # A group none of whose members fires toward the unit is inert, not broken, and a restricted partner list is still a channel.
+    for text in (INERT_GROUP_TEXT, RESTRICTED_PARTNER_TEXT):
+        assert _generative_graph(_graph_creator(text)).number_of_nodes() > 0

@@ -40,6 +40,7 @@ def test_parser_and_descriptor_diagnostics_preserve_context(diagnostic, copy_met
             1.0,
             2.0,
         ),
+        g2rins.exception.LadderMemberWithoutPartner("ladder completion", 1),
         g2rins.exception.DiscardedSamplingPaths(
             3,
             (("DeadSamplingPath", 2), ("EmptyTruncatedDistributionSupport", 1)),

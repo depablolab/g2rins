@@ -522,6 +522,29 @@ class UndershootSnapshotMissed(G2RINSWarning):
         return f"{self._MESSAGE} Token: {self.token}"
 
 
+class AllGroupOvershoot(G2RINSWarning):
+    """A stochastic object grew past its drawn target because hard all-typed sites were still unfired.
+
+    The hard all rule places every hard all-typed site of a unit instance before the object may stop, so
+    a target too small for the written architecture is exceeded, never cut (a soft all-typed site yields
+    to the target instead). The sampler emits it once per chain; ``create_ensemble`` folds those of the
+    returned chains into one warning with the count.
+    """
+
+    def __init__(self, chain_count=1, chain_total=1):
+        self.chain_count = int(chain_count)
+        self.chain_total = int(chain_total)
+        Warning.__init__(self, self.chain_count, self.chain_total)
+
+    def __str__(self):
+        return (
+            f"In {self.chain_count} of {self.chain_total} chain(s) a stochastic object grew past its drawn "
+            "molecular weight target because hard all-typed sites were still waiting to fire: the hard all rule "
+            "places them before the object may stop. Raise the target, or write `alls` for sites that may yield "
+            "to it, if the overshoot is unintended."
+        )
+
+
 class ForcedOvershootNoBoundary(G2RINSWarning):
     """A final explicit undershoot remained impossible because no valid
     owner-level boundary existed below the target.
@@ -596,6 +619,26 @@ class EmptyTruncatedDistributionSupport(DeadSamplingPath):
             f"The truncated sampling interval [{self.lower:g}, {self.upper:g}] of '{self.context}' "
             "contains no probability mass; the requested bounds exclude the distribution's support "
             "(e.g. a nested target distribution lying above the remaining parent budget)."
+        )
+
+
+class LadderMemberWithoutPartner(DeadSamplingPath):
+    """A site of a committed ladder group found no free partner in the fresh unit.
+
+    The bond that committed the group, or an earlier rung of the same junction,
+    took every partner the site's edges allow (bond weights can leave it one),
+    so the junction cannot close. Chain-local: another draw pairs the members
+    differently, so create_ensemble counts the attempt as a discard and retries.
+    """
+
+    def __init__(self, context, group):
+        self.group = group
+        super().__init__(context, group)
+
+    def __str__(self):
+        return (
+            f"A site of ladder group {self.group} found no free partner in the unit its group bonded during '{self.context}': "
+            "the bond that committed the group or an earlier rung took every partner its edges allow, so the junction cannot close."
         )
 
 
@@ -784,7 +827,7 @@ class GroupPartnerNotPlain(ParsingError):
         partner = str(self.partner_symbol)
         if partner == str(self.symbol):
             partner = f"its own symbol {partner} on another site or instance of the unit"
-        return f"The {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {partner}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
+        return f"The {self.symbol.group_rule.label}-typed symbol {str(self.symbol)} in the stochastic object {str(self.stochastic_obj)} is compatible with {partner}, which also carries a group suffix. Exclusion and all channels must point at plain bond connector symbols."
 
 
 class GroupRuleOnTerminalBondConnector(ParsingError):
@@ -819,6 +862,27 @@ class SingleMemberGroup(ParsingWarning):
         return message + "."
 
 
+class AllRuleOnTargetOnlySite(ParsingWarning):
+    """An all-typed site that is only ever a bond target carries a rule that never acts.
+
+    The all rule acts on the bonds a site fires. A site is open to fire only when its unit was
+    entered through another of its sites, so a site that is never entered that way is only ever
+    the target of a bond, and its all rule, hard or soft, has nothing to act on. Raised when the
+    graph without bond connectors is built.
+    """
+
+    def __init__(self, bond_connector, unit_text, rule_label):
+        super().__init__(unit_text)
+        self.bond_connector = bond_connector
+        self.rule_label = rule_label
+
+    def __str__(self):
+        return (
+            f"The {self.rule_label}-typed bond connector {self.bond_connector} of the unit {str(self.token)} is only ever a bond target: its unit is never entered through another site, so the site is never open to fire, "
+            "and the all rule, which acts on the bonds a site fires, never acts here."
+        )
+
+
 class IndistinguishableSymbolsInSite(ParsingWarning):
     def __init__(self, symbol, bond_connector, owner):
         super().__init__(owner)
@@ -826,7 +890,7 @@ class IndistinguishableSymbolsInSite(ParsingWarning):
         self.bond_connector = bond_connector
 
     def __str__(self):
-        return f"The bond connector {str(self.bond_connector)} in the unit {str(self.token)} lists the {self.symbol.group_rule.name.lower()}-typed symbol {str(self.symbol)} beside a plain symbol with the same outer symbol and index; partners cannot tell the two apart, so bonds are drawn through either with equal odds."
+        return f"The bond connector {str(self.bond_connector)} in the unit {str(self.token)} lists the {self.symbol.group_rule.label}-typed symbol {str(self.symbol)} beside a plain symbol with the same outer symbol and index; partners cannot tell the two apart, so bonds are drawn through either with equal odds."
 
 
 class GroupRulesOnBothPathEnds(G2RINSError):
@@ -840,3 +904,57 @@ class GroupRulesOnBothPathEnds(G2RINSError):
         from .bond import GroupRule
 
         return f"The bond from the bond connector {self.source_bond_connector} to the bond connector {self.target_bond_connector} crosses a nesting level and both ends declare a group rule (group {self.source_values[0]} {GroupRule(self.source_values[1]).name} and group {self.target_values[0]} {GroupRule(self.target_values[1]).name}). Exclusion and all channels must point at plain bond connector symbols, so a bond connector path may carry a group rule at one end only."
+
+
+class LadderMemberWithoutChannel(G2RINSError):
+    """A ladder group member with no channel toward a unit another member of its group fires toward.
+
+    Raised when the graph without bond connectors is built. A ladder junction bonds every member
+    of the group to the fresh unit through the same group pair, each through a channel of its own,
+    so a member whose bond weights leave it none toward that unit would leave every junction its
+    group fires toward that unit open.
+    """
+
+    def __init__(self, bond_connector, unit_text, partner_text):
+        self.bond_connector = bond_connector
+        self.unit_text = unit_text
+        self.partner_text = partner_text
+        super().__init__(self.bond_connector, self.unit_text, self.partner_text)
+
+    def __str__(self):
+        return (
+            f"The ladder-typed bond connector {self.bond_connector} of the unit {self.unit_text} has no channel to the unit {self.partner_text}, which another member of its group fires toward: a ladder junction bonds every member of the group to the fresh unit through the same group pair, so no junction fired toward that unit could ever close. "
+            "Give the member a weight for a partner in that unit, or take it out of the group."
+        )
+
+
+class UnsettledHardAllRule(G2RINSError):
+    """Hard all-typed channels that feed each other without end.
+
+    Raised when the graph without bond connectors is built, for chains started in an initiator's
+    unit, and by ``sample_mol_graph`` for a source in any other unit (``start_text``), whose chains
+    open every site of that unit at once. The hard all rule forbids a stochastic object to stop
+    while one of its unit instances holds an unfired hard all-typed site, so every unit such a
+    channel leads to must itself run out of hard all-typed sites: a unit entered through one of its
+    sites holds the others open (the entry site is spent), it settles at once when none of them
+    carries a hard all-typed growth or transition channel (forced exits never compete), it settles
+    once every unit such a channel enters, through the site the channel points at, has settled, and
+    a unit left over would grow every chain forever. Weights play no part: one non-settling target
+    hangs the chain with positive probability.
+    """
+
+    def __init__(self, unit_text, cycle, start_text=None):
+        self.unit_text = unit_text
+        self.cycle = list(cycle)
+        self.start_text = start_text
+        super().__init__(self.unit_text, self.cycle, self.start_text)
+
+    def __str__(self):
+        chain = " -> ".join(self.cycle)
+        started = (
+            f" A chain started in the unit {self.start_text} opens every site of that unit, among them sites no chain started from an initiator ever opens." if self.start_text is not None else ""
+        )
+        return (
+            f"The hard all rule in the unit {self.unit_text} can never settle: its hard all-typed channels lead through units that hold hard all-typed channels of their own without end ({chain}), so every chain would grow forever.{started} "
+            "Write `alls` for an all rule that yields to the molecular weight target, or point the hard channels at units without hard all-typed sites."
+        )
