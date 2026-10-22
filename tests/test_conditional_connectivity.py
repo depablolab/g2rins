@@ -1461,7 +1461,7 @@ def test_hard_all_is_validated_for_the_sampled_source():
         ensemble_creator = _graph_creator(TARGET_ONLY_ALL_TEXT).get_ensemble_creator()
     source = _unit_nodes(ensemble_creator.generative_graph, "[<[allh]]CC[>]")[0]
     with pytest.raises(UnsettledHardAllRule) as info:
-        ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
+        ensemble_creator.sample_mol_graph(source=source, rng=np.random.default_rng(1))
     assert (info.value.start_text, info.value.unit_text, info.value.cycle) == ("[<[allh]]CC[>]", "[<[allh]]CC[>]", ["[<[allh]]CC[>]"] * 2)
     assert "A chain started in the unit [<[allh]]CC[>]" in str(info.value)
     # A chain started in a unit whose hard channels settle samples as before.
@@ -1469,7 +1469,7 @@ def test_hard_all_is_validated_for_the_sampled_source():
         warnings.simplefilter("ignore")
         ensemble_creator = _graph_creator(HARD_PENDANT_TEXT).get_ensemble_creator()
         source = _unit_nodes(ensemble_creator.generative_graph, "[<1]CCO[>]")[0]
-        chain = ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
+        chain = ensemble_creator.sample_mol_graph(source=source, rng=np.random.default_rng(1))
     assert chain.number_of_nodes() > 0
 
 
