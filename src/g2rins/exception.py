@@ -794,6 +794,28 @@ class GroupRulesOnBothPathEnds(G2RINSError):
         return f"The bond from the bond connector {self.source_bond_connector} to the bond connector {self.target_bond_connector} crosses a nesting level and both ends declare a group rule (group {self.source_values[0]} {GroupRule(self.source_values[1]).name} and group {self.target_values[0]} {GroupRule(self.target_values[1]).name}). Exclusion and all channels must point at plain bond connector symbols, so a bond connector path may carry a group rule at one end only."
 
 
+class LadderMemberWithoutChannel(G2RINSError):
+    """A ladder group member with no channel toward a unit another member of its group fires toward.
+
+    Raised when the graph without bond connectors is built. A ladder junction bonds every member
+    of the group to the fresh unit through the same group pair, each through a channel of its own,
+    so a member whose bond weights leave it none toward that unit would leave every junction its
+    group fires toward that unit open.
+    """
+
+    def __init__(self, bond_connector, unit_text, partner_text):
+        self.bond_connector = bond_connector
+        self.unit_text = unit_text
+        self.partner_text = partner_text
+        super().__init__(self.bond_connector, self.unit_text, self.partner_text)
+
+    def __str__(self):
+        return (
+            f"The ladder-typed bond connector {self.bond_connector} of the unit {self.unit_text} has no channel to the unit {self.partner_text}, which another member of its group fires toward: a ladder junction bonds every member of the group to the fresh unit through the same group pair, so no junction fired toward that unit could ever close. "
+            "Give the member a weight for a partner in that unit, or take it out of the group."
+        )
+
+
 class UnsettledHardAllRule(G2RINSError):
     """Hard all-typed channels that feed each other without end.
 

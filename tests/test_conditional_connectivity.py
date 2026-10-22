@@ -44,6 +44,7 @@ from g2rins.exception import (
     GroupRulesOnBothPathEnds,
     IncompatibleGroupPair,
     IndistinguishableSymbolsInSite,
+    LadderMemberWithoutChannel,
     LadderMemberWithoutPartner,
     MixedOuterSymbolsInGroup,
     MixedRulesInGroup,
@@ -1101,6 +1102,16 @@ INCOMING_ONLY_LADDER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])
 RESTRICTED_PARTNER_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1|1 1 0 0|])O[>[>]1|1 0 0 0|]; C(O[>[>]1])O[>[>]1]; [<][H] []}|uniform(500,500)|"
 # A two-site ladder-typed cap: the first member to terminate draws it, the other welds the rung to its second site.
 LADDER_CAP_TEXT = "{[] [<[<]2]OC(O[<[<]2])CC(O[>[>]1])O[>[>]1]; C(O[>[>]1])O[>[>]1]; [<[<]]OCO[<[<]] []}|poisson(1000)|"
+# A weight list that leaves the `>2` member no channel while its sibling fires: no junction fired from that side could close.
+ZERO_WEIGHT_MEMBER_TEXT = (
+    "{[] [<[<1]2|0 0 1 1|]OC(O[<[<2]2|0 0 1 1|])CC(O[>[>1]1])O[>[>2]1|0 0 0 0|]; C(O[>[>1]1])O[>[>2]1], C(O[<[<1]2|0 0 1 1|])O[<[<2]2|0 0 1 1|]; [<1,<2,>1,>2][H] []}|uniform(500,500)|"
+)
+# Both members without a channel: the group never fires toward the repeat unit, so nothing is broken.
+INERT_GROUP_TEXT = (
+    "{[] [<[<1]2|0 0 1 1|]OC(O[<[<2]2|0 0 1 1|])CC(O[>[>1]1|0 0 0 0|])O[>[>2]1|0 0 0 0|]; C(O[>[>1]1])O[>[>2]1], C(O[<[<1]2|0 0 1 1|])O[<[<2]2|0 0 1 1|]; [<1,<2,>1,>2][H] []}|uniform(500,500)|"
+)
+# An initiator member nothing targets holds no edge at all once its weight list is zero: only its declaration tells it is a member.
+ZERO_WEIGHT_INITIATOR_MEMBER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2|0 0|]; [<][H] []}|uniform(300,300)|"
 
 
 def _unit_anchors(ensemble):
@@ -1460,3 +1471,27 @@ def test_hard_all_is_validated_for_the_sampled_source():
         source = _unit_nodes(ensemble_creator.generative_graph, "[<1]CCO[>]")[0]
         chain = ensemble_creator.sample_mol_graph(source=source, use_repeat_units_as_source=True, rng=np.random.default_rng(1))
     assert chain.number_of_nodes() > 0
+
+
+@pytest.mark.parametrize(
+    "text, bond_connector, unit_start, partner_start",
+    [
+        (ZERO_WEIGHT_MEMBER_TEXT, "[>[>2]1|0.0 0.0 0.0 0.0|]", "[<[<1]2|", "[<[<1]2|"),
+        (ZERO_WEIGHT_INITIATOR_MEMBER_TEXT, "[>[>]2|0.0 0.0|]", "C(O[>[>]2])", "[<[<]1]OC("),
+    ],
+)
+def test_ladder_member_without_channel_is_refused_at_graph_build(text, bond_connector, unit_start, partner_start):
+    graph_creator = _graph_creator(text)
+    with pytest.raises(LadderMemberWithoutChannel) as info:
+        _generative_graph(graph_creator)
+    error = info.value
+    assert error.bond_connector == bond_connector
+    assert error.unit_text.startswith(unit_start) and error.partner_text.startswith(partner_start)
+    assert "same group pair" in str(error)
+    with pytest.raises(LadderMemberWithoutChannel):
+        graph_creator.get_ensemble_creator()
+    # The graph with bond connectors stays available, as for a bond ruled at both ends.
+    assert _generative_graph(graph_creator, include_bond_connectors=True).number_of_nodes() > 0
+    # A group none of whose members fires toward the unit is inert, not broken, and a restricted partner list is still a channel.
+    for text in (INERT_GROUP_TEXT, RESTRICTED_PARTNER_TEXT):
+        assert _generative_graph(_graph_creator(text)).number_of_nodes() > 0

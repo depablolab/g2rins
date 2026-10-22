@@ -31,6 +31,7 @@ from .exception import (
     GroupRulesOnBothPathEnds,
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
+    LadderMemberWithoutChannel,
     TooManyStochasticObjects,
     UnsettledHardAllRule,
     UnsupportedBondDescriptor,
@@ -432,6 +433,30 @@ def _warn_target_only_all_sites(generative_graph, unit_of, openable, bond_connec
             if rule in ALL_RULES and node not in openable and node not in reported:
                 reported.add(node)
                 warnings.warn(AllRuleOnTargetOnlySite(bond_connector_text.get(node, ""), unit_text.get(unit_of[node], ""), GroupRule(rule).label), stacklevel=1)
+
+
+def _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connector_groups, bond_connector_text, unit_text):
+    """Refuse a ladder group one of whose members has no channel toward a unit another member fires toward (``LadderMemberWithoutChannel``).
+
+    A ladder junction bonds every member of the group to the fresh unit through the same group
+    pair, each through a channel of its own in whatever mode it sits, so a member left without one
+    toward that unit, which bond weights can bring about, would leave every junction its group
+    fires toward that unit open. The members are the ones the bond connectors declare: a member
+    whose weights leave it no edge at all, as an initiator member nothing targets, is one too.
+    """
+    from .bond import GroupRule  # bond imports this module
+
+    members, firing = {}, {}
+    for node, groups in bond_connector_groups.items():
+        for group, rule in groups:
+            if rule == GroupRule.LADDER:
+                members.setdefault((unit_of[node], group), set()).add(node)
+    for u, v, d in generative_graph.edges(data=True):
+        if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and any(d[mode] > 0 for mode in _NON_STATIC_ATTR):
+            firing.setdefault((unit_of[u], d.get(_SOURCE_GROUP_NAME, -1), unit_of[v], d.get(_TARGET_GROUP_NAME, -1)), set()).add(u)
+    for (unit, group, partner, _partner_group), sources in sorted(firing.items(), key=str):
+        for node in sorted(members[(unit, group)] - sources, key=str):
+            raise LadderMemberWithoutChannel(bond_connector_text.get(node, ""), unit_text.get(unit, ""), unit_text.get(partner, ""))
 
 
 def _hard_all_cycle(generative_graph, unit_of, unit_sites, states):
@@ -1777,12 +1802,16 @@ class GraphCreator:
             for node, data in graph.nodes(data=True):
                 if "token_text" in data:
                     unit_text.setdefault(unit_of[node], data["token_text"])
-            bond_connector_text = {node: str(self.g.nodes[bc]["obj"]) for node in generative_graph.nodes if node in self.g for _node, bc in self.g.out_edges(node) if bc in self._bc_idx_set}
+            bond_connectors = {node: [self.g.nodes[bc]["obj"] for _node, bc in self.g.out_edges(node) if bc in self._bc_idx_set] for node in generative_graph.nodes if node in self.g}
+            bond_connector_text = {node: str(bcs[-1]) for node, bcs in bond_connectors.items() if bcs}
+            # (group, rule) per declared symbol: a member keeps its group without any edge.
+            bond_connector_groups = {node: [symbol.group_edge_values for bc in bcs for symbol in bc.symbol or []] for node, bcs in bond_connectors.items()}
             unit_sites = _unit_sites(generative_graph, unit_of)
             # A chain starts in an initiator's unit; a graph without initiators may start anywhere.
             start_units = {unit_of[node] for node, data in generative_graph.nodes(data=True) if data["init_weight"] > 0} or set(unit_sites)
             states = _reachable_states(generative_graph, unit_of, unit_sites, start_units)
             _warn_target_only_all_sites(generative_graph, unit_of, _open_sites(states, unit_sites), bond_connector_text, unit_text)
+            _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connector_groups, bond_connector_text, unit_text)
             cycle = _hard_all_cycle(generative_graph, unit_of, unit_sites, states)
             if cycle:
                 raise UnsettledHardAllRule(unit_text.get(cycle[0], ""), [unit_text.get(unit, "") for unit in cycle])
