@@ -33,6 +33,7 @@ from .exception import (
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
     InheritedTermination,
+    LadderGroupOnOneAtom,
     LadderMemberWithoutChannel,
     MismatchedBondConnectorLists,
     MissingTermination,
@@ -440,14 +441,39 @@ def _warn_target_only_all_sites(generative_graph, unit_of, openable, bond_connec
                 warnings.warn(AllRuleOnTargetOnlySite(bond_connector_text.get(node, ""), unit_text.get(unit_of[node], ""), GroupRule(rule).label), stacklevel=1)
 
 
+def _refuse_ladder_group_on_one_atom(generative_graph, bond_connectors, unit_of, unit_text):
+    """Refuse a ladder group two of whose bond connectors sit on the same atom (``LadderGroupOnOneAtom``).
+
+    A junction fired by such a group bonds the atom twice, and two rungs between the same two
+    atoms collapse into one bond of the output molecule. A split atom carries each of its bond
+    connectors on a placeholder of its own, so the groups are read on the atom the placeholders share.
+    """
+    from .bond import GroupRule  # bond imports this module
+
+    seen = {}
+    for node, bcs in bond_connectors.items():
+        atom = next(iter(_static_neighbors(generative_graph, node)), node) if _is_connector_placeholder(generative_graph.nodes[node]) else node
+        groups = seen.setdefault(atom, {})
+        for bc in bcs:
+            for symbol in bc.symbol or []:
+                group, rule = symbol.group_edge_values
+                if rule != GroupRule.LADDER:
+                    continue
+                if group in groups:
+                    raise LadderGroupOnOneAtom(group, [str(groups[group]), str(bc)], unit_text.get(unit_of[node], ""))
+                groups[group] = bc
+
+
 def _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connector_groups, bond_connector_text, unit_text):
     """Refuse a ladder group one of whose members has no channel toward a unit another member fires toward (``LadderMemberWithoutChannel``).
 
     A ladder junction bonds every member of the group to the fresh unit through the same group
     pair, each through a channel of its own in whatever mode it sits, so a member left without one
     toward that unit, which bond weights can bring about, would leave every junction its group
-    fires toward that unit open. The members are the ones the bond connectors declare: a member
-    whose weights leave it no edge at all, as an initiator member nothing targets, is one too.
+    fires toward that unit open. A member fires through an edge with weight from a site with weight:
+    a scalar zero weight keeps the edges and takes the site out of every draw. The members are the
+    ones the bond connectors declare: a member whose weights leave it no edge at all, as an initiator
+    member nothing targets, is one too.
     """
     from .bond import GroupRule  # bond imports this module
 
@@ -457,7 +483,7 @@ def _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connec
             if rule == GroupRule.LADDER:
                 members.setdefault((unit_of[node], group), set()).add(node)
     for u, v, d in generative_graph.edges(data=True):
-        if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and any(d[mode] > 0 for mode in _NON_STATIC_ATTR):
+        if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and generative_graph.nodes[u]["gen_weight"] > 0 and any(d[mode] > 0 for mode in _NON_STATIC_ATTR):
             firing.setdefault((unit_of[u], d.get(_SOURCE_GROUP_NAME, -1), unit_of[v], d.get(_TARGET_GROUP_NAME, -1)), set()).add(u)
     for (unit, group, partner, _partner_group), sources in sorted(firing.items(), key=str):
         for node in sorted(members[(unit, group)] - sources, key=str):
@@ -1988,6 +2014,7 @@ class GraphCreator:
             start_units = {unit_of[node] for node, data in generative_graph.nodes(data=True) if data["init_weight"] > 0} or set(unit_sites)
             states = _reachable_states(generative_graph, unit_of, unit_sites, start_units)
             _warn_target_only_all_sites(generative_graph, unit_of, _open_sites(states, unit_sites), bond_connector_text, unit_text)
+            _refuse_ladder_group_on_one_atom(generative_graph, bond_connectors, unit_of, unit_text)
             _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connector_groups, bond_connector_text, unit_text)
             cycle = _hard_all_cycle(generative_graph, unit_of, unit_sites, states)
             if cycle:

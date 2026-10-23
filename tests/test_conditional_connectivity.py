@@ -44,6 +44,7 @@ from g2rins.exception import (
     GroupRulesOnBothPathEnds,
     IncompatibleGroupPair,
     IndistinguishableSymbolsInSite,
+    LadderGroupOnOneAtom,
     LadderMemberWithoutChannel,
     LadderMemberWithoutPartner,
     MixedOuterSymbolsInGroup,
@@ -364,6 +365,18 @@ EXIT_INTO_ENCLOSING_TEXT = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F 
 NESTED_BLOCK_TEXT = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
 # The typed site [<1[]1] is only ever entered (no outgoing edge): the group rule must still see it when the chain starts there.
 ENTRY_ONLY_SITE_TEXT = "{[] [<1[]1]C([>2[]1])[>], [<]CC[>]; O[>1]; [<][H], [<2]F []}|poisson(100)|"
+# A nested object splits the unit in two static fragments: the sites around it are one exclusion group all the same,
+# through one object, two objects joined directly, and an inner object that ends the middle unit.
+SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(700,700)|"
+JOINED_OBJECTS_SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|{[>] [<]OO[>];; [<]}|uniform(64,64)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(800,800)|"
+TWO_LEVEL_SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]C{[>] [<]CC[>];; [<]}|uniform(56,56)|[>];; [<]}|uniform(170,170)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(900,900)|"
+# The object ends the unit: its exit opens the next unit, whose site is a group of its own.
+OBJECT_ENDS_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|[>]; C[>]; [<][H], [<1]Br []}|uniform(700,700)|"
+# The chain enters the unit through a group member before the object; the group's other member sits in the text after it.
+# Typed entry: that member is blocked (no Br). Plain entry through the same site: it loses the typed channel and keeps the plain one (F).
+TYPED_ENTRY_TAIL_TEXT = "{[] [>1[]1]C{[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>2[]1])[>], [<]CC[>]; C[<1]; [<][H], [<2]Br []}|uniform(300,300)|"
+PLAIN_ENTRY_TAIL_TEXT = "{[] [>1[]1,>3]C{[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>2[]1,>4])[>], [<]CC[>]; C[<3]; [<][H], [<1]Cl, [<2]Br, [<4]F []}|uniform(300,300)|"
+TYPED_ENTRY_TAIL_WITH_PLAIN_CAP_TEXT = "{[] [>1[]1,>3]C{[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>2[]1,>4])[>], [<]CC[>]; C[<1]; [<][H], [<3]Cl, [<2]Br, [<4]F []}|uniform(300,300)|"
 # Two typed sibling cap sites per unit realize one cap; the one-site string is the reference for the mass they add.
 TYPED_SIBLING_CAPS_TEXT = "{[] [<]CC([>1[]1])([>1[]1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
 SINGLE_CAP_SITE_TEXT = "{[] [<]CC([>1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
@@ -708,7 +721,8 @@ def _sample(text, n_chains, seed=7, output_format="mol_graph"):
 
 
 @pytest.mark.parametrize(
-    "text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12), (MULTILEVEL_EXCLUSION_TEXT, 6)]
+    "text, n_chains",
+    [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12), (MULTILEVEL_EXCLUSION_TEXT, 6), (SPLIT_UNIT_TEXT, 6)],
 )
 def test_sampling_obeys_the_channel_rule_at_every_level(monkeypatch, text, n_chains):
     # Same-level growth and caps, exits through terminal bond connectors into the
@@ -785,6 +799,39 @@ def test_exclusion_sites_follow_the_channel_rule_in_the_output():
 
 def test_exclusion_generation_is_seed_reproducible():
     assert list(_sample(EXCLUSION_TEXT, 6, seed=11, output_format="smiles")) == list(_sample(EXCLUSION_TEXT, 6, seed=11, output_format="smiles"))
+
+
+@pytest.mark.parametrize("text", [SPLIT_UNIT_TEXT, JOINED_OBJECTS_SPLIT_UNIT_TEXT, TWO_LEVEL_SPLIT_UNIT_TEXT, OBJECT_ENDS_UNIT_TEXT])
+def test_sites_around_a_nested_object_form_one_group(text):
+    # The text after the object is built by the object's forced exit, as a fragment of its own:
+    # it takes the tag of the unit that entered the object, so the typed cap on one of the two
+    # sites blocks the other and every enclosing unit ends with exactly one. A unit the object
+    # ends is followed by a fresh unit, whose site is a group of its own.
+    graph_creator = _graph_creator(text)
+    generative_graph = _generative_graph(graph_creator)
+    first_oxygen = str(min(str(node) for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 8 and data["stochastic_id_tree"][0] == 0))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(12, output_format="mol_graph", seed=1)
+    units = [sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] == first_oxygen) for chain in chains]
+    caps = [sum(1 for _node, data in chain.nodes(data=True) if data["atomic_num"] == 35) for chain in chains]
+    assert max(units) >= 2
+    assert caps == units
+
+
+@pytest.mark.parametrize(
+    "text, caps_per_chain",
+    [(TYPED_ENTRY_TAIL_TEXT, {35: 0}), (PLAIN_ENTRY_TAIL_TEXT, {35: 0, 9: 1, 17: 0}), (TYPED_ENTRY_TAIL_WITH_PLAIN_CAP_TEXT, {35: 0, 9: 0, 17: 0})],
+)
+def test_a_group_consumed_before_the_object_rules_the_text_after_it(text, caps_per_chain):
+    # The entry consumed the group before the object's exit placed the text after it: the kill is
+    # recorded under the unit's tag and replayed on that text's sites, so a typed entry blocks the
+    # member there and a plain entry leaves it its plain channel only.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = _graph_creator(text).get_ensemble_creator().create_ensemble(6, output_format="mol_graph", seed=2)
+    for atomic_num, count in caps_per_chain.items():
+        assert [sum(1 for _node, data in chain.nodes(data=True) if data["atomic_num"] == atomic_num) for chain in chains] == [count] * 6
 
 
 def _instantiate(generative_graph, static_graph, tracker, source_node, rng):
@@ -1112,6 +1159,12 @@ INERT_GROUP_TEXT = (
 )
 # An initiator member nothing targets holds no edge at all once its weight list is zero: only its declaration tells it is a member.
 ZERO_WEIGHT_INITIATOR_MEMBER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2|0 0|]; [<][H] []}|uniform(300,300)|"
+# A scalar zero weight keeps the member's edges (a weight list zeroes them) but takes the site out of every draw: no channel either.
+SCALAR_ZERO_MEMBER_TEXT = "{[] [<[<1]1]OC(O[<[<2]1])CC[>], [<]CC[>]; C(O[>[>1]2])O[>[>2]2|0|]; [<][H] []}|uniform(300,300)|"
+# Two members of one ladder group on the same atom: a junction bonds that atom twice. In the second string every unit
+# shares an atom, so each junction's two rungs join the same two atoms and the output molecule keeps one bond of each.
+SHARED_ATOM_LADDER_TEXT = "{[] [<[<]2]C([<[<]2])CC([>[>]1])O[>[>]1]; C([>[>]1])C[>[>]1]; [<[<]]CC[<[<]] []}|uniform(100,100)|"
+SHARED_ATOM_LADDER_ALL_UNITS_TEXT = "{[] [<[<]2]C([<[<]2])CC([>[>]1])[>[>]1]; C([>[>]1])[>[>]1]; [<[<]]C[<[<]] []}|uniform(100,100)|"
 
 
 def _unit_anchors(ensemble):
@@ -1478,6 +1531,7 @@ def test_hard_all_is_validated_for_the_sampled_source():
     [
         (ZERO_WEIGHT_MEMBER_TEXT, "[>[>2]1|0.0 0.0 0.0 0.0|]", "[<[<1]2|", "[<[<1]2|"),
         (ZERO_WEIGHT_INITIATOR_MEMBER_TEXT, "[>[>]2|0.0 0.0|]", "C(O[>[>]2])", "[<[<]1]OC("),
+        (SCALAR_ZERO_MEMBER_TEXT, "[>[>2]2|0.0|]", "C(O[>[>1]2])", "[<[<1]1]OC("),
     ],
 )
 def test_ladder_member_without_channel_is_refused_at_graph_build(text, bond_connector, unit_start, partner_start):
@@ -1495,3 +1549,18 @@ def test_ladder_member_without_channel_is_refused_at_graph_build(text, bond_conn
     # A group none of whose members fires toward the unit is inert, not broken, and a restricted partner list is still a channel.
     for text in (INERT_GROUP_TEXT, RESTRICTED_PARTNER_TEXT):
         assert _generative_graph(_graph_creator(text)).number_of_nodes() > 0
+
+
+@pytest.mark.parametrize("text", [SHARED_ATOM_LADDER_TEXT, SHARED_ATOM_LADDER_ALL_UNITS_TEXT])
+def test_ladder_group_on_one_atom_is_refused_at_graph_build(text):
+    graph_creator = _graph_creator(text)
+    with pytest.raises(LadderGroupOnOneAtom) as info:
+        _generative_graph(graph_creator)
+    error = info.value
+    assert len(error.bond_connectors) == 2 and "same atom" in str(error)
+    if text is SHARED_ATOM_LADDER_TEXT:
+        assert error.group_id == 2 and error.bond_connectors == ["[<[<]2]", "[<[<]2]"] and error.unit_text.startswith("[<[<]2]C(")
+    with pytest.raises(LadderGroupOnOneAtom):
+        graph_creator.get_ensemble_creator()
+    # The graph with bond connectors stays available, as for a bond ruled at both ends.
+    assert _generative_graph(graph_creator, include_bond_connectors=True).number_of_nodes() > 0
