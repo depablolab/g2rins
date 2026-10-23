@@ -422,6 +422,8 @@ class _StochasticObjectTracker:
         self._parent_molw = {}
         # Unit-instance tags for group-rule dispatch; deep-copied with snapshots, so a rollback replays them.
         self._unit_instances = 0
+        # Nested object instance -> (tag, level) of the site that entered it: the text after the object continues that site's unit.
+        self.entering_site = {}
 
         for _node_idx, data in generative_graph.nodes(data=True):
             for index, _stochastic_vector in enumerate(data["molecular_weight_distribution"]):
@@ -478,7 +480,8 @@ class _StochasticObjectTracker:
         return rng.choice(n_candidates, p=probabilities)
 
     def next_unit_instance(self):
-        """Tag of the unit instance being instantiated: monotone, one per add_static_sub_graph call."""
+        """Tag of the unit instance being instantiated: monotone, one per add_static_sub_graph call. The text after a
+        nested object takes the tag of the unit that entered the object instead (``_fire_forced_exit``)."""
         self._unit_instances += 1
         return self._unit_instances
 
@@ -2519,6 +2522,9 @@ class _PartialAtomGraph:
                     selected_target_sto_parent_id = self.generative_graph.nodes[selected_target_idx]["stochastic_id_tree"][1:]
                     new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
 
+            if new_sto_atom_id != sto_atom_id:
+                # The entering unit continues after the object (first entry wins when a live instance is joined).
+                self.stochastic_tracker.entering_site.setdefault(new_sto_atom_id, (nested_transition_bond.instance, self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]))
             other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, selected_target_idx, self.stochastic_tracker, new_sto_atom_id, rng)
 
             other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
@@ -2577,6 +2583,7 @@ class _PartialAtomGraph:
         tracker = self.stochastic_tracker
         target_tree = self.generative_graph.nodes[target_idx]["stochastic_id_tree"]
         target_gen_id = target_tree[0]
+        entering = tracker.entering_site.get(sto_atom_id)
 
         # The instance that receives the fragment and its mass. A literal tail belongs to
         # the finalized instance's own ancestor at the target's level, parked or not, taken
@@ -2598,6 +2605,8 @@ class _PartialAtomGraph:
             for gen_id in [gen_id for gen_id in reversed(target_tree) if gen_id >= 0 and gen_id not in shared_gen_ids]:
                 parent_expected_molw = tracker._sto_atom_id_expected_molw.get(chain[-1]) if chain else None
                 new_sto_atom_id = tracker.register_new_atom_instance(gen_id, sto_atom_id, parent_expected_molw, False)
+                if entering is not None:
+                    tracker.entering_site.setdefault(new_sto_atom_id, entering)  # a joined object keeps the enclosing unit
                 if chain:
                     tracker.parent_map[new_sto_atom_id] = list(chain)
                 chain.append(new_sto_atom_id)
@@ -2607,6 +2616,12 @@ class _PartialAtomGraph:
 
         self._open_half_bond_map[bucket_id].remove(half_bond)
         other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, target_idx, tracker, target_sto_atom_id, rng)
+        if entering is not None and target_gen_id == entering[1]:
+            # A tail at the entering site's level is that site's own unit: its sites take the unit's tag, so the
+            # group rules and the cap estimate pair them with the sites placed before the object.
+            for sites in (*other_graph._open_half_bond_map.values(), other_graph._entry_sites.values()):
+                for site in sites:
+                    site.instance = entering[0]
         other_target_idx = other_graph.pop_target_open_half_bond(target_sto_atom_id, target_idx)
         pre_merge_watermark = self._atom_id
         self.realize_bond(other_graph, half_bond, all_attr[chosen], other_target_idx, selected_attr, rng)

@@ -364,6 +364,13 @@ EXIT_INTO_ENCLOSING_TEXT = "{[] [<]{[>] [<]CC([>,>1[]1])C([>,>1[]1])[>]; ; [<]F 
 NESTED_BLOCK_TEXT = "{[] [<]CC(C)O[>]; {[] [>,>1[]]N([>,>1[]])CCN([>,>1[]1])([>,>1[]1]), [<1]C(=O)CCCC(=O)[<1]; O[>1], [H][<]; [>1]O [<]}|gauss(4000,500)|[>]; [<][H] []}|gauss(5400,1000)|"
 # The typed site [<1[]1] is only ever entered (no outgoing edge): the group rule must still see it when the chain starts there.
 ENTRY_ONLY_SITE_TEXT = "{[] [<1[]1]C([>2[]1])[>], [<]CC[>]; O[>1]; [<][H], [<2]F []}|poisson(100)|"
+# A nested object splits the unit in two static fragments: the sites around it are one exclusion group all the same,
+# through one object, two objects joined directly, and an inner object that ends the middle unit.
+SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(700,700)|"
+JOINED_OBJECTS_SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|{[>] [<]OO[>];; [<]}|uniform(64,64)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(800,800)|"
+TWO_LEVEL_SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]C{[>] [<]CC[>];; [<]}|uniform(56,56)|[>];; [<]}|uniform(170,170)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(900,900)|"
+# The object ends the unit: its exit opens the next unit, whose site is a group of its own.
+OBJECT_ENDS_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|[>]; C[>]; [<][H], [<1]Br []}|uniform(700,700)|"
 # Two typed sibling cap sites per unit realize one cap; the one-site string is the reference for the mass they add.
 TYPED_SIBLING_CAPS_TEXT = "{[] [<]CC([>1[]1])([>1[]1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
 SINGLE_CAP_SITE_TEXT = "{[] [<]CC([>1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
@@ -708,7 +715,8 @@ def _sample(text, n_chains, seed=7, output_format="mol_graph"):
 
 
 @pytest.mark.parametrize(
-    "text, n_chains", [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12), (MULTILEVEL_EXCLUSION_TEXT, 6)]
+    "text, n_chains",
+    [(EXCLUSION_TEXT, 12), (EMBEDDED_EXIT_TEXT, 12), (EXIT_INTO_ENCLOSING_TEXT, 12), (NESTED_BLOCK_TEXT, 8), (ENTRY_ONLY_SITE_TEXT, 12), (MULTILEVEL_EXCLUSION_TEXT, 6), (SPLIT_UNIT_TEXT, 6)],
 )
 def test_sampling_obeys_the_channel_rule_at_every_level(monkeypatch, text, n_chains):
     # Same-level growth and caps, exits through terminal bond connectors into the
@@ -785,6 +793,24 @@ def test_exclusion_sites_follow_the_channel_rule_in_the_output():
 
 def test_exclusion_generation_is_seed_reproducible():
     assert list(_sample(EXCLUSION_TEXT, 6, seed=11, output_format="smiles")) == list(_sample(EXCLUSION_TEXT, 6, seed=11, output_format="smiles"))
+
+
+@pytest.mark.parametrize("text", [SPLIT_UNIT_TEXT, JOINED_OBJECTS_SPLIT_UNIT_TEXT, TWO_LEVEL_SPLIT_UNIT_TEXT, OBJECT_ENDS_UNIT_TEXT])
+def test_sites_around_a_nested_object_form_one_group(text):
+    # The text after the object is built by the object's forced exit, as a fragment of its own:
+    # it takes the tag of the unit that entered the object, so the typed cap on one of the two
+    # sites blocks the other and every enclosing unit ends with exactly one. A unit the object
+    # ends is followed by a fresh unit, whose site is a group of its own.
+    graph_creator = _graph_creator(text)
+    generative_graph = _generative_graph(graph_creator)
+    first_oxygen = str(min(str(node) for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 8 and data["stochastic_id_tree"][0] == 0))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = graph_creator.get_ensemble_creator().create_ensemble(12, output_format="mol_graph", seed=1)
+    units = [sum(1 for _node, data in chain.nodes(data=True) if data["origin_idx"] == first_oxygen) for chain in chains]
+    caps = [sum(1 for _node, data in chain.nodes(data=True) if data["atomic_num"] == 35) for chain in chains]
+    assert max(units) >= 2
+    assert caps == units
 
 
 def _instantiate(generative_graph, static_graph, tracker, source_node, rng):
