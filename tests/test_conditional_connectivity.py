@@ -371,6 +371,11 @@ JOINED_OBJECTS_SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform
 TWO_LEVEL_SPLIT_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]C{[>] [<]CC[>];; [<]}|uniform(56,56)|[>];; [<]}|uniform(170,170)|C(O[>1[]1])[>]; C[>]; [<][H], [<1]Br []}|uniform(900,900)|"
 # The object ends the unit: its exit opens the next unit, whose site is a group of its own.
 OBJECT_ENDS_UNIT_TEXT = "{[] [<]C(O[>1[]1]){[>] [<]CC[>];; [<]}|uniform(56,56)|[>]; C[>]; [<][H], [<1]Br []}|uniform(700,700)|"
+# The chain enters the unit through a group member before the object; the group's other member sits in the text after it.
+# Typed entry: that member is blocked (no Br). Plain entry through the same site: it loses the typed channel and keeps the plain one (F).
+TYPED_ENTRY_TAIL_TEXT = "{[] [>1[]1]C{[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>2[]1])[>], [<]CC[>]; C[<1]; [<][H], [<2]Br []}|uniform(300,300)|"
+PLAIN_ENTRY_TAIL_TEXT = "{[] [>1[]1,>3]C{[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>2[]1,>4])[>], [<]CC[>]; C[<3]; [<][H], [<1]Cl, [<2]Br, [<4]F []}|uniform(300,300)|"
+TYPED_ENTRY_TAIL_WITH_PLAIN_CAP_TEXT = "{[] [>1[]1,>3]C{[>] [<]CC[>];; [<]}|uniform(56,56)|C(O[>2[]1,>4])[>], [<]CC[>]; C[<1]; [<][H], [<3]Cl, [<2]Br, [<4]F []}|uniform(300,300)|"
 # Two typed sibling cap sites per unit realize one cap; the one-site string is the reference for the mass they add.
 TYPED_SIBLING_CAPS_TEXT = "{[] [<]CC([>1[]1])([>1[]1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
 SINGLE_CAP_SITE_TEXT = "{[] [<]CC([>1])[>]; O[>]; [<][H], [<1]Br []}|poisson(600)|"
@@ -813,6 +818,21 @@ def test_sites_around_a_nested_object_form_one_group(text):
     assert caps == units
 
 
+@pytest.mark.parametrize(
+    "text, caps_per_chain",
+    [(TYPED_ENTRY_TAIL_TEXT, {35: 0}), (PLAIN_ENTRY_TAIL_TEXT, {35: 0, 9: 1, 17: 0}), (TYPED_ENTRY_TAIL_WITH_PLAIN_CAP_TEXT, {35: 0, 9: 0, 17: 0})],
+)
+def test_a_group_consumed_before_the_object_rules_the_text_after_it(text, caps_per_chain):
+    # The entry consumed the group before the object's exit placed the text after it: the kill is
+    # recorded under the unit's tag and replayed on that text's sites, so a typed entry blocks the
+    # member there and a plain entry leaves it its plain channel only.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = _graph_creator(text).get_ensemble_creator().create_ensemble(6, output_format="mol_graph", seed=2)
+    for atomic_num, count in caps_per_chain.items():
+        assert [sum(1 for _node, data in chain.nodes(data=True) if data["atomic_num"] == atomic_num) for chain in chains] == [count] * 6
+
+
 def _instantiate(generative_graph, static_graph, tracker, source_node, rng):
     """A fresh unit containing ``source_node``, registered as its own instance."""
     tree = list(generative_graph.nodes[source_node]["stochastic_id_tree"])
@@ -1138,6 +1158,8 @@ INERT_GROUP_TEXT = (
 )
 # An initiator member nothing targets holds no edge at all once its weight list is zero: only its declaration tells it is a member.
 ZERO_WEIGHT_INITIATOR_MEMBER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2|0 0|]; [<][H] []}|uniform(300,300)|"
+# A scalar zero weight keeps the member's edges (a weight list zeroes them) but takes the site out of every draw: no channel either.
+SCALAR_ZERO_MEMBER_TEXT = "{[] [<[<1]1]OC(O[<[<2]1])CC[>], [<]CC[>]; C(O[>[>1]2])O[>[>2]2|0|]; [<][H] []}|uniform(300,300)|"
 
 
 def _unit_anchors(ensemble):
@@ -1504,6 +1526,7 @@ def test_hard_all_is_validated_for_the_sampled_source():
     [
         (ZERO_WEIGHT_MEMBER_TEXT, "[>[>2]1|0.0 0.0 0.0 0.0|]", "[<[<1]2|", "[<[<1]2|"),
         (ZERO_WEIGHT_INITIATOR_MEMBER_TEXT, "[>[>]2|0.0 0.0|]", "C(O[>[>]2])", "[<[<]1]OC("),
+        (SCALAR_ZERO_MEMBER_TEXT, "[>[>2]2|0.0|]", "C(O[>[>1]2])", "[<[<1]1]OC("),
     ],
 )
 def test_ladder_member_without_channel_is_refused_at_graph_build(text, bond_connector, unit_start, partner_start):

@@ -441,8 +441,10 @@ def _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connec
     A ladder junction bonds every member of the group to the fresh unit through the same group
     pair, each through a channel of its own in whatever mode it sits, so a member left without one
     toward that unit, which bond weights can bring about, would leave every junction its group
-    fires toward that unit open. The members are the ones the bond connectors declare: a member
-    whose weights leave it no edge at all, as an initiator member nothing targets, is one too.
+    fires toward that unit open. A member fires through an edge with weight from a site with weight:
+    a scalar zero weight keeps the edges and takes the site out of every draw. The members are the
+    ones the bond connectors declare: a member whose weights leave it no edge at all, as an initiator
+    member nothing targets, is one too.
     """
     from .bond import GroupRule  # bond imports this module
 
@@ -452,7 +454,7 @@ def _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connec
             if rule == GroupRule.LADDER:
                 members.setdefault((unit_of[node], group), set()).add(node)
     for u, v, d in generative_graph.edges(data=True):
-        if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and any(d[mode] > 0 for mode in _NON_STATIC_ATTR):
+        if d.get(_SOURCE_RULE_NAME, 0) == GroupRule.LADDER and generative_graph.nodes[u]["gen_weight"] > 0 and any(d[mode] > 0 for mode in _NON_STATIC_ATTR):
             firing.setdefault((unit_of[u], d.get(_SOURCE_GROUP_NAME, -1), unit_of[v], d.get(_TARGET_GROUP_NAME, -1)), set()).add(u)
     for (unit, group, partner, _partner_group), sources in sorted(firing.items(), key=str):
         for node in sorted(members[(unit, group)] - sources, key=str):

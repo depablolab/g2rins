@@ -795,12 +795,12 @@ class GroupRulesOnBothPathEnds(G2RINSError):
 
 
 class LadderMemberWithoutChannel(G2RINSError):
-    """A ladder group member with no channel toward a unit another member of its group fires toward.
+    """A ladder group member that never fires toward a unit another member of its group fires toward.
 
     Raised when the graph without bond connectors is built. A ladder junction bonds every member
     of the group to the fresh unit through the same group pair, each through a channel of its own,
-    so a member whose bond weights leave it none toward that unit would leave every junction its
-    group fires toward that unit open.
+    so a member whose weight or weight list leaves it none toward that unit would leave every
+    junction its group fires toward that unit open.
     """
 
     def __init__(self, bond_connector, unit_text, partner_text):
@@ -811,8 +811,8 @@ class LadderMemberWithoutChannel(G2RINSError):
 
     def __str__(self):
         return (
-            f"The ladder-typed bond connector {self.bond_connector} of the unit {self.unit_text} has no channel to the unit {self.partner_text}, which another member of its group fires toward: a ladder junction bonds every member of the group to the fresh unit through the same group pair, so no junction fired toward that unit could ever close. "
-            "Give the member a weight for a partner in that unit, or take it out of the group."
+            f"The ladder-typed bond connector {self.bond_connector} of the unit {self.unit_text} never fires toward the unit {self.partner_text}, which another member of its group fires toward: its weight or its weight list leaves it no channel there, and a ladder junction bonds every member of the group to the fresh unit through the same group pair, so no junction fired toward that unit could ever close. "
+            "Give the member a weight and a partner weight in that unit, or take it out of the group."
         )
 
 

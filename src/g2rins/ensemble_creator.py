@@ -424,6 +424,8 @@ class _StochasticObjectTracker:
         self._unit_instances = 0
         # Nested object instance -> (tag, level) of the site that entered it: the text after the object continues that site's unit.
         self.entering_site = {}
+        # Unit instance tag -> the grouped consumptions it saw, replayed on the text a nested object's exit places after it.
+        self.consumed_groups = {}
 
         for _node_idx, data in generative_graph.nodes(data=True):
             for index, _stochastic_vector in enumerate(data["molecular_weight_distribution"]):
@@ -1173,24 +1175,31 @@ class _PartialAtomGraph:
         self._consume_site(source_half_bond, fired_edge.get(_SOURCE_GROUP_NAME, -1), fired_edge.get(_SOURCE_RULE_NAME, 0), self._open_half_bond_map)
         self._consume_site(other._consumed_half_bond, fired_edge.get(_TARGET_GROUP_NAME, -1), fired_edge.get(_TARGET_RULE_NAME, 0), other._open_half_bond_map)
 
-    @staticmethod
-    def _consume_site(consumed, group, rule, pool):
+    def _consume_site(self, consumed, group, rule, pool):
         """Group rules for one consumed site, applied to its instance siblings in ``pool`` (``group``, ``rule`` = its channel).
 
         Exclusion: through an exclusion-typed channel the group's other sites are blocked; through any
         other channel they lose their exclusion-typed channels and keep the plain ones. Ladder: a group
         whose member went through anything but its own ladder channel can never close, so its ladder
         channels leave the siblings (the strip). Membership is read from the sites' live edges on either
-        side, so a killed channel drops its site from the group with no bookkeeping.
+        side, so a killed channel drops its site from the group with no bookkeeping. The kill is recorded
+        under the instance's tag: the text after a stochastic object embedded in the unit is placed later,
+        under the same tag, and receives it then (``_fire_forced_exit``).
         """
         if consumed is None:
             return
         dead = consumed.exclusion_groups() | (consumed.ladder_groups() - ({group} if rule == GroupRule.LADDER else set()))
         if not dead:
             return
+        self.stochastic_tracker.consumed_groups.setdefault(consumed.instance, []).append((group, rule, dead))
+        self._apply_kill(consumed.instance, group, rule, dead, pool, consumed)
+
+    @staticmethod
+    def _apply_kill(instance, group, rule, dead, pool, consumed=None):
+        """One recorded consumption applied to the sites of ``instance`` in ``pool`` (``consumed`` itself is left alone)."""
         for bucket in pool.values():
             for sibling in bucket:
-                if sibling is consumed or sibling.instance != consumed.instance:
+                if sibling is consumed or sibling.instance != instance:
                     continue
                 if rule == GroupRule.EXCLUSION and group in sibling.exclusion_groups():
                     sibling.block()
@@ -2622,6 +2631,9 @@ class _PartialAtomGraph:
             for sites in (*other_graph._open_half_bond_map.values(), other_graph._entry_sites.values()):
                 for site in sites:
                     site.instance = entering[0]
+            # The sites placed before the object may have consumed a group already: those kills reach the tail now.
+            for group, rule, dead in tracker.consumed_groups.get(entering[0], []):
+                self._apply_kill(entering[0], group, rule, dead, other_graph._open_half_bond_map)
         other_target_idx = other_graph.pop_target_open_half_bond(target_sto_atom_id, target_idx)
         pre_merge_watermark = self._atom_id
         self.realize_bond(other_graph, half_bond, all_attr[chosen], other_target_idx, selected_attr, rng)
