@@ -44,6 +44,7 @@ from g2rins.exception import (
     GroupRulesOnBothPathEnds,
     IncompatibleGroupPair,
     IndistinguishableSymbolsInSite,
+    LadderGroupOnOneAtom,
     LadderMemberWithoutChannel,
     LadderMemberWithoutPartner,
     MixedOuterSymbolsInGroup,
@@ -1160,6 +1161,10 @@ INERT_GROUP_TEXT = (
 ZERO_WEIGHT_INITIATOR_MEMBER_TEXT = "{[] [<[<]1]OC(O[<[<]1])CC[>], [<]CC[>]; C(O[>[>]2])O[>[>]2|0 0|]; [<][H] []}|uniform(300,300)|"
 # A scalar zero weight keeps the member's edges (a weight list zeroes them) but takes the site out of every draw: no channel either.
 SCALAR_ZERO_MEMBER_TEXT = "{[] [<[<1]1]OC(O[<[<2]1])CC[>], [<]CC[>]; C(O[>[>1]2])O[>[>2]2|0|]; [<][H] []}|uniform(300,300)|"
+# Two members of one ladder group on the same atom: a junction bonds that atom twice. In the second string every unit
+# shares an atom, so each junction's two rungs join the same two atoms and the output molecule keeps one bond of each.
+SHARED_ATOM_LADDER_TEXT = "{[] [<[<]2]C([<[<]2])CC([>[>]1])O[>[>]1]; C([>[>]1])C[>[>]1]; [<[<]]CC[<[<]] []}|uniform(100,100)|"
+SHARED_ATOM_LADDER_ALL_UNITS_TEXT = "{[] [<[<]2]C([<[<]2])CC([>[>]1])[>[>]1]; C([>[>]1])[>[>]1]; [<[<]]C[<[<]] []}|uniform(100,100)|"
 
 
 def _unit_anchors(ensemble):
@@ -1544,3 +1549,18 @@ def test_ladder_member_without_channel_is_refused_at_graph_build(text, bond_conn
     # A group none of whose members fires toward the unit is inert, not broken, and a restricted partner list is still a channel.
     for text in (INERT_GROUP_TEXT, RESTRICTED_PARTNER_TEXT):
         assert _generative_graph(_graph_creator(text)).number_of_nodes() > 0
+
+
+@pytest.mark.parametrize("text", [SHARED_ATOM_LADDER_TEXT, SHARED_ATOM_LADDER_ALL_UNITS_TEXT])
+def test_ladder_group_on_one_atom_is_refused_at_graph_build(text):
+    graph_creator = _graph_creator(text)
+    with pytest.raises(LadderGroupOnOneAtom) as info:
+        _generative_graph(graph_creator)
+    error = info.value
+    assert len(error.bond_connectors) == 2 and "same atom" in str(error)
+    if text is SHARED_ATOM_LADDER_TEXT:
+        assert error.group_id == 2 and error.bond_connectors == ["[<[<]2]", "[<[<]2]"] and error.unit_text.startswith("[<[<]2]C(")
+    with pytest.raises(LadderGroupOnOneAtom):
+        graph_creator.get_ensemble_creator()
+    # The graph with bond connectors stays available, as for a bond ruled at both ends.
+    assert _generative_graph(graph_creator, include_bond_connectors=True).number_of_nodes() > 0

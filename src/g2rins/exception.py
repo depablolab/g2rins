@@ -816,6 +816,26 @@ class LadderMemberWithoutChannel(G2RINSError):
         )
 
 
+class LadderGroupOnOneAtom(G2RINSError):
+    """Two bond connectors of one ladder group on the same atom.
+
+    Raised when the graph without bond connectors is built. A junction fired by the group bonds
+    that atom twice, and two rungs between the same two atoms collapse into one bond.
+    """
+
+    def __init__(self, group_id, bond_connectors, unit_text):
+        self.group_id = group_id
+        self.bond_connectors = bond_connectors
+        self.unit_text = unit_text
+        super().__init__(self.group_id, self.bond_connectors, self.unit_text)
+
+    def __str__(self):
+        return (
+            f"The ladder group {self.group_id} of the unit {self.unit_text} puts two of its bond connectors, {' and '.join(self.bond_connectors)}, on the same atom: a junction fired by that group bonds the atom twice, and two rungs between the same two atoms collapse into one bond. "
+            "Give every member of a ladder group an atom of its own."
+        )
+
+
 class UnsettledHardAllRule(G2RINSError):
     """Hard all-typed channels that feed each other without end.
 

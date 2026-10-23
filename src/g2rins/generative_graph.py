@@ -31,6 +31,7 @@ from .exception import (
     GroupRulesOnBothPathEnds,
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
+    LadderGroupOnOneAtom,
     LadderMemberWithoutChannel,
     TooManyStochasticObjects,
     UnsettledHardAllRule,
@@ -433,6 +434,29 @@ def _warn_target_only_all_sites(generative_graph, unit_of, openable, bond_connec
             if rule in ALL_RULES and node not in openable and node not in reported:
                 reported.add(node)
                 warnings.warn(AllRuleOnTargetOnlySite(bond_connector_text.get(node, ""), unit_text.get(unit_of[node], ""), GroupRule(rule).label), stacklevel=1)
+
+
+def _refuse_ladder_group_on_one_atom(generative_graph, bond_connectors, unit_of, unit_text):
+    """Refuse a ladder group two of whose bond connectors sit on the same atom (``LadderGroupOnOneAtom``).
+
+    A junction fired by such a group bonds the atom twice, and two rungs between the same two
+    atoms collapse into one bond of the output molecule. A split atom carries each of its bond
+    connectors on a placeholder of its own, so the groups are read on the atom the placeholders share.
+    """
+    from .bond import GroupRule  # bond imports this module
+
+    seen = {}
+    for node, bcs in bond_connectors.items():
+        atom = next(iter(_static_neighbors(generative_graph, node)), node) if _is_connector_placeholder(generative_graph.nodes[node]) else node
+        groups = seen.setdefault(atom, {})
+        for bc in bcs:
+            for symbol in bc.symbol or []:
+                group, rule = symbol.group_edge_values
+                if rule != GroupRule.LADDER:
+                    continue
+                if group in groups:
+                    raise LadderGroupOnOneAtom(group, [str(groups[group]), str(bc)], unit_text.get(unit_of[node], ""))
+                groups[group] = bc
 
 
 def _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connector_groups, bond_connector_text, unit_text):
@@ -1813,6 +1837,7 @@ class GraphCreator:
             start_units = {unit_of[node] for node, data in generative_graph.nodes(data=True) if data["init_weight"] > 0} or set(unit_sites)
             states = _reachable_states(generative_graph, unit_of, unit_sites, start_units)
             _warn_target_only_all_sites(generative_graph, unit_of, _open_sites(states, unit_sites), bond_connector_text, unit_text)
+            _refuse_ladder_group_on_one_atom(generative_graph, bond_connectors, unit_of, unit_text)
             _refuse_ladder_member_without_channel(generative_graph, unit_of, bond_connector_groups, bond_connector_text, unit_text)
             cycle = _hard_all_cycle(generative_graph, unit_of, unit_sites, states)
             if cycle:
