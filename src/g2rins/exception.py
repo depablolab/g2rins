@@ -345,18 +345,27 @@ class ShadowedTerminationDeclaration(TerminationDeclarationWarning):
 
 
 class InheritedTermination(TerminationDeclarationWarning):
-    def __init__(self, unit_label, unit_text, terminators, controlling_level):
+    def __init__(self, unit_label, unit_text, terminators, declared_level, firing_level):
         super().__init__(unit_label, unit_text)
         self.terminators = tuple(terminators)
-        self.controlling_level = controlling_level
+        self.declared_level = declared_level
+        self.firing_level = firing_level
 
     def __str__(self):
-        return (
+        inherited = (
             f"{self._site()} has no terminator declared in its own stochastic object, so it is capped by "
-            f"{', '.join(self.terminators)}, declared in the enclosing stochastic object {self.controlling_level}. "
-            "That object decides when the site is capped and carries the cap's molecular weight, which models a "
-            "later step of the generation. Declare a terminator with a matching bond descriptor in the unit's own "
-            "stochastic object to cap the site in the step that grows it."
+            f"{', '.join(self.terminators)}, declared in the enclosing stochastic object {self.declared_level}. "
+        )
+        if self.firing_level == self.declared_level:
+            return inherited + (
+                "That object decides when the site is capped and carries the cap's molecular weight, which models a "
+                "later step of the generation. Declare a terminator with a matching bond descriptor in the unit's own "
+                "stochastic object to cap the site in the step that grows it."
+            )
+        return inherited + (
+            f"Stochastic object {self.firing_level}, which owns the site's bond descriptor, fires the cap when it "
+            "finishes and carries the cap's molecular weight. Declare a terminator with a matching bond descriptor in "
+            "that object to state the cap where the site is."
         )
 
 

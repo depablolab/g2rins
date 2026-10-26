@@ -221,6 +221,13 @@ TERMINATION_DECLARATION_CASES = [
         g2rins.exception.MissingTermination,
         id="missing",
     ),
+    pytest.param(
+        # The inner [>2] sites have no growth partner at the enclosing level, so
+        # the inner object owns them and fires the enclosing object's [<2]Br.
+        "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; {[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; [<2]Br []}|poisson(2000)|",
+        g2rins.exception.InheritedTermination,
+        id="inherited-fired-by-the-owner",
+    ),
 ]
 
 
@@ -228,6 +235,29 @@ TERMINATION_DECLARATION_CASES = [
 def test_warn_termination_declaration(smi, category):
     with pytest.warns(category):
         g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+
+
+@pytest.mark.parametrize(
+    ("smi", "declared_level", "firing_level", "phrase"),
+    [
+        # The block ends also exit to the enclosing object, which therefore fires the cap it declares.
+        ("{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|", 0, 0, "That object decides when the site is capped"),
+        # The inner object owns the sites, so it fires the cap the enclosing object declares and carries its mass.
+        (TERMINATION_DECLARATION_CASES[-1].values[0], 0, 1, "Stochastic object 1, which owns the site's bond descriptor, fires the cap"),
+    ],
+)
+def test_inherited_termination_names_the_object_that_fires_the_cap(smi, declared_level, firing_level, phrase):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    inherited = [w.message for w in caught if isinstance(w.message, g2rins.exception.InheritedTermination)]
+    assert inherited, "no InheritedTermination warning"
+    for warning in inherited:
+        assert (warning.declared_level, warning.firing_level) == (declared_level, firing_level)
+        assert phrase in str(warning)
+    # The warning's firing object is the one stamped on the surviving cap edges.
+    terminators = {node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] in (17, 35)}
+    assert {data["stochastic_id"] for _u, v, data in generative_graph.edges(data=True) if v in terminators and data["termination_weight"] > 0} == {firing_level}
 
 
 @pytest.mark.parametrize(

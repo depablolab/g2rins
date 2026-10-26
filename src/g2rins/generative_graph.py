@@ -661,7 +661,7 @@ def _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, resolut
         if 0 < resolution.rank < depth:
             emit(
                 ("inherited", label, tuple(terminators)),
-                InheritedTermination(label, text, terminators, resolution.declared_level),
+                InheritedTermination(label, text, terminators, resolution.declared_level, resolution.firing_level),
             )
         elif resolution.rank == 0 and resolution.firing_level != resolution.declared_level:
             emit(
