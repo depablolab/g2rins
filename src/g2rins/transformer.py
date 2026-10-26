@@ -46,6 +46,7 @@ _GLOBAL_TRANSFORMER: None | G2RINSTransformer = None
 
 
 def get_global_transformer():
+    """Create once, importing the package lazily so its AST classes are available."""
     global _GLOBAL_TRANSFORMER
     if _GLOBAL_TRANSFORMER is None:
         import g2rins

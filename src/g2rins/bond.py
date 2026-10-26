@@ -69,7 +69,8 @@ class BondConnectorSymbol(G2rinsBase):
     def generate_string(self, extension):
         return str(self._children[0])
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
 
@@ -90,7 +91,8 @@ class BondConnectorSymbolIdx(BondConnectorSymbol):
             string += str(self.idx)
         return string
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
     def is_compatible(self, other):
@@ -147,7 +149,8 @@ class BondConnectorGeneration(G2rinsBase):
             return string
         return ""
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
 
@@ -168,7 +171,8 @@ class InnerBondConnector(G2rinsBase):
         string += self._generation.generate_string(extension)
         return string
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
     @property
@@ -240,7 +244,8 @@ class SimpleBondConnector(BondConnector):
     def generate_string(self, extension):
         return "[" + self._inner_bond_connector.generate_string(extension) + "]"
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return self._inner_bond_connector.generable
 
     @property
@@ -270,7 +275,8 @@ class TerminalBondConnectorList(G2rinsBase):
         string = "|".join(terminal_bond_connector.generate_string(extension) for terminal_bond_connector in self.terminal_bond_connectors)
         return string
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
 
@@ -284,7 +290,8 @@ class BondConnectorList(G2rinsBase, GenerationBase):
         string = "|".join(bond_connector.generate_string(extension) for bond_connector in self._bond_connector_list)
         return string
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
     def _generate_partial_graph(self) -> _PartialGraph:
@@ -333,7 +340,8 @@ class TerminalBondConnector(BondConnector):
         except AttributeError:
             return "[]"
 
-    def generable(self):
+    @property
+    def generable(self) -> bool:
         return True
 
     @property

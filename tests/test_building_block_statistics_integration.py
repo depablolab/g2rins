@@ -10,25 +10,12 @@ from unittest.mock import patch
 import pytest
 from rdkit import Chem
 
-import g2rins
 import g2rins.bond_sequences as bond_sequences
 import g2rins.ensemble_creator as module
 from benchmarks.cases import CASES
-from tests.test_convergence import FAST_SMI
-
-
-SOURCES = [
-    pytest.param(FAST_SMI, id="fast-linear"),
-    pytest.param(CASES["branched"].g2rins, id="branched"),
-]
-CONVERGENCE = {
-    "batch_size": 2, "max_samples": 4, "window": 10,
-    "output_format": "smiles", "seed": 7,
-}
-
-
-def _creator(source=FAST_SMI):
-    return g2rins.G2rins.make(source).get_graph_creator().get_ensemble_creator()
+from tests._support import (
+    CONVERGENCE, FAST_SMI, SOURCES, _bond_record_oracle, _creator, _ordinary_fields,
+)
 
 
 def _reference(source=FAST_SMI, **options):
@@ -51,15 +38,6 @@ def _unexpected(*_args, **_kwargs):
     pytest.fail("unexpected statistics, retention, path enumeration, or scheduler work")
 
 
-def _ordinary_fields(result):
-    # Compare everything else, including sequences, masses, path statistics,
-    # convergence settings/trace, and the existing optional analytics fields.
-    return {
-        name: value for name, value in vars(result).items()
-        if name != "building_block_statistics"
-    }
-
-
 def _chemistry(chains):
     """Compare fresh creators chemically, never by parser UUID/origin nodes."""
     result = []
@@ -71,97 +49,6 @@ def _chemistry(chains):
         assert molecule is not None
         result.append(Chem.MolToSmiles(molecule, canonical=True))
     return result
-
-
-def _bond_record_oracle(records):
-    """Reconstruct root groups and directed endpoints from retained wire rows.
-
-    This deliberately does not call the statistics accumulator, occurrence-view
-    builder, or path-motif helpers. Occurrence IDs group neighbors within one
-    chain only; stable native unit labels are used unchanged in aggregate keys.
-    """
-    units, unit_presence = Counter(), Counter()
-    stars, star_presence = Counter(), Counter()
-    endpoints, endpoint_presence = Counter(), Counter()
-    for record in records:
-        labels = dict(record["occurrences"])
-        local_units = Counter(labels.values())
-        local_stars, local_endpoints = Counter(), Counter()
-        for root, root_label in labels.items():
-            groups = defaultdict(list)
-            for left, left_site, right, right_site, bond, aromatic in record["edges"]:
-                if bond == "0":
-                    continue
-                # Independent endpoint tests also preserve both self-link arms.
-                if left == root:
-                    groups[right].append((left_site, right_site, bond, aromatic))
-                if right == root:
-                    groups[left].append((right_site, left_site, bond, aromatic))
-            signature = tuple(sorted(
-                (labels[neighbor], neighbor == root, tuple(sorted(arms)))
-                for neighbor, arms in groups.items()
-            ))
-            local_stars[root_label, signature] += 1
-            for neighbor, arms in groups.items():
-                for source_site, target_site, bond, aromatic in arms:
-                    local_endpoints[
-                        root_label, source_site, labels[neighbor], target_site,
-                        bond, aromatic,
-                    ] += 1
-        units.update(local_units)
-        unit_presence.update(local_units.keys())
-        stars.update(local_stars)
-        star_presence.update(local_stars.keys())
-        endpoints.update(local_endpoints)
-        endpoint_presence.update(local_endpoints.keys())
-
-    occupied = Counter()
-    for (source, site, *_rest), count in endpoints.items():
-        occupied[source, site] += count
-    return {
-        "schema": "building-block-statistics/v1",
-        "population": "all-accepted-samples",
-        "accepted_count": len(records),
-        "neighborhood_definition": "root-incident-covalent-multistar/v1",
-        "probability_definition": "conditional-on-occupied-source-site-endpoints",
-        "building_blocks": [
-            {"unit_id": unit, "occurrence_count": count,
-             "chain_presence_count": unit_presence[unit]}
-            for unit, count in sorted(units.items())
-        ],
-        "neighborhoods": [
-            {
-                "motif_id": f"bbn:{ordinal}", "center_unit": center,
-                "neighbors": [
-                    {
-                        "unit_id": unit, "is_center": is_center,
-                        "connections": [
-                            {"source_site": source, "target_site": target,
-                             "bond_type": bond, "aromatic": aromatic}
-                            for source, target, bond, aromatic in arms
-                        ],
-                    }
-                    for unit, is_center, arms in groups
-                ],
-                "occurrence_count": count,
-                "chain_presence_count": star_presence[center, groups],
-            }
-            for ordinal, ((center, groups), count) in enumerate(sorted(stars.items()), 1)
-        ],
-        "site_connections": [
-            {
-                "source_unit": source, "source_site": source_site,
-                "target_unit": target, "target_site": target_site,
-                "bond_type": bond, "aromatic": aromatic,
-                "endpoint_count": count,
-                "chain_presence_count": endpoint_presence[key],
-                "occupied_endpoint_count": occupied[source, source_site],
-                "probability": count / occupied[source, source_site],
-            }
-            for key, count in sorted(endpoints.items())
-            for source, source_site, target, target_site, bond, aromatic in [key]
-        ],
-    }
 
 
 def _assert_population(statistics, accepted_count, unit_counts):

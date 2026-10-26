@@ -1,9 +1,3 @@
-# Uncomment if needed
-# [tool.pytest.ini_options]
-# testpaths = [
-#     "tests",
-# ]
-
 [build-system]
 requires = ["setuptools>=80", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
@@ -31,6 +25,7 @@ readme = "README.md"
 
 [project.optional-dependencies]
 test = ["pytest"]
+notebook = ["matplotlib", "ipython", "pydot"]
 
 [project.urls]
 Homepage = "https://github.com/depablolab/g2rins"

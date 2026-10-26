@@ -41,6 +41,16 @@ Available cases cover small and large linear chains, branching, nested stochasti
 
 Exact stochastic rounding is the default. Compare forced boundaries explicitly with `--termination overshoot` or `--termination undershoot`. Wall-clock results are descriptive, not absolute CI limits; automated performance gates should compare relative medians on the same machine.
 
+## Guarded metadata-copy runtime review
+
+The [October 26 report](GRAPH_COPY_2026-10-26.md) compares legacy deep copying
+with order-preserving guarded prototype copying, using alternating fresh-process
+pairs. Sampling and public fixed-size API timings are separate; disabled/counts
+paths do not perform the optimized copying. Reproduce with
+[benchmark_graph_copy.py](benchmark_graph_copy.py), selecting `--workflow sample`
+or `--workflow fixed`, repeated `--case` options, `--runs 5`, and `--warmups 1`.
+Use new output paths rather than overwriting the recorded evidence.
+
 ## Compare a source tree with the original checkout
 
 `compare_versions` runs the common public `create_ensemble()` API against two
@@ -147,6 +157,13 @@ submodule import paths, source-tree hashes, and source revisions are recorded;
 identical baseline/current hashes are rejected. A different hash alone does not
 prove pre-feature provenance: that remains the caller's responsibility. No
 historical source is searched for or reconstructed by the harness.
+
+RSS unit conversion is shared through [_common.py](_common.py), which imports
+no G2RINS code and does not affect source routing. It uses Unix `resource` or
+the Windows peak-working-set API without adding dependencies. New feature-benchmark source
+identities include `benchmark_common_sha256` alongside the existing harness
+and case hashes. JSON normalization and digest policies remain local to each
+harness; historical reports and archives are not rewritten.
 
 The JSON reports paired historical-disabled overhead separately from current
 on/off overhead. Default diagnostic thresholds are 1% disabled versus baseline

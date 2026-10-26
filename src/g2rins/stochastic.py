@@ -233,12 +233,8 @@ class StochasticObject(G2rinsBase, GenerationBase):
             full_idx,
             attr_name=_PROPAGATION_NAME,
             ignore_bond_probabilities=False,
-            prints=False,
         ):
             non_connected_bc = []
-            if prints:
-                print("first index is: ", first_idx)
-                print("target index is: ", second_idx)
             for bc_idx_a in first_idx:
                 obj_a = graph.nodes[bc_idx_a]["obj"]
                 if obj_a.bond_probabilities is not None and not ignore_bond_probabilities:
@@ -249,17 +245,11 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     probabilities = [graph.nodes[bc_idx_b]["obj"].weight for bc_idx_b in second_idx]
                 probabilities = np.asarray(probabilities)
                 # Set weights to zero if bond are incompatible, note different lengths from above.
-                if prints:
-                    print("before checking compatibility, probabilities are ", probabilities)
                 for i in range(len(probabilities)):
                     bc_idx_b = full_idx[i]
                     obj_b = graph.nodes[bc_idx_b]["obj"]
-                    if prints:
-                        print("target node is: ", graph.nodes[bc_idx_b])
                     if not obj_a.is_compatible(obj_b):
                         probabilities[i] = 0
-                if prints:
-                    print("after checking compatibility, probabilities are ", probabilities)
                 # Normalizing probabilities
                 if probabilities.sum() > 0:
                     probabilities /= probabilities.sum()
@@ -268,8 +258,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     if prob > 0:
                         bc_idx_b = full_idx[i]
                         graph.add_edge(bc_idx_a, bc_idx_b, **dict([(attr_name, prob)]))
-                if prints:
-                    print("At the end, probabilities are: ", probabilities)
                 if sum(probabilities) == 0:
                     non_connected_bc.append(bc_idx_a)
             return graph, non_connected_bc
@@ -284,7 +272,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 attr_name=_PROPAGATION_NAME,
             )
 
-        def connect_monomers_to_terminators(graph, mono_idx_pos, end_idx_pos):
+        def connect_monomers_to_terminators(graph, mono_idx_pos, terminator_idx_pos):
             result = _connect(
                 graph,
                 mono_idx_pos,
@@ -303,7 +291,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 mono_idx_pos,
                 ignore_bond_probabilities=False,
                 attr_name=_TRANSITION_NAME,
-                prints=False,
             )
 
         def connect_initiators_to_terminators(graph, initiator_idx_pos, terminator_idx_pos):
@@ -314,7 +301,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 terminator_idx_pos,
                 ignore_bond_probabilities=True,
                 attr_name=_TERMINATION_NAME,
-                prints=False,
             )
 
         # Build graph without any connections between bond connectors.
@@ -337,24 +323,17 @@ class StochasticObject(G2rinsBase, GenerationBase):
                         node_data["token_text"] = residue_text
 
         # Add molar amount information
-        for i, subgraph in enumerate(repeat_subgraphs):
-            for node, data in subgraph.g.nodes(data=True):
-                if "molar_amount" in data:
-                    data["molar_amount"][id(self)] = self._repeat_residues[i].molar_amount
-                else:
-                    data["molar_amount"] = {id(self): self._repeat_residues[i].molar_amount}
-        for i, subgraph in enumerate(initiator_subgraphs):
-            for node, data in subgraph.g.nodes(data=True):
-                if "molar_amount" in data:
-                    data["molar_amount"][id(self)] = self._initiation_residues[i].molar_amount
-                else:
-                    data["molar_amount"] = {id(self): self._initiation_residues[i].molar_amount}
-        for i, subgraph in enumerate(terminator_subgraphs):
-            for node, data in subgraph.g.nodes(data=True):
-                if "molar_amount" in data:
-                    data["molar_amount"][id(self)] = self._termination_residues[i].molar_amount
-                else:
-                    data["molar_amount"] = {id(self): self._termination_residues[i].molar_amount}
+        def stamp_molar_amounts(subgraphs, residues):
+            for i, subgraph in enumerate(subgraphs):
+                for node, data in subgraph.g.nodes(data=True):
+                    if "molar_amount" in data:
+                        data["molar_amount"][id(self)] = residues[i].molar_amount
+                    else:
+                        data["molar_amount"] = {id(self): residues[i].molar_amount}
+
+        stamp_molar_amounts(repeat_subgraphs, self._repeat_residues)
+        stamp_molar_amounts(initiator_subgraphs, self._initiation_residues)
+        stamp_molar_amounts(terminator_subgraphs, self._termination_residues)
         partial_graph = _PartialGraph(None)
         copy_of_initiator_subgraphs = copy.deepcopy(initiator_subgraphs)
 

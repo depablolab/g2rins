@@ -14,8 +14,8 @@ import pytest
 
 import g2rins.ensemble_creator as module
 from g2rins._building_block_statistics import _BuildingBlockStatistics
-from tests.test_building_block_statistics_integration import (
-    CONVERGENCE, SOURCES, _bond_record_oracle, _creator, _ordinary_fields,
+from tests._support import (
+    CONVERGENCE, FAST_SMI, SOURCES, _bond_record_oracle, _creator, _ordinary_fields,
 )
 
 
@@ -111,7 +111,9 @@ def test_real_parallel_matches_serial_counts_and_parallel_disabled_fields(
     {"reservoir_size": 0}, {"reservoir_size": 1}, {"representative_distance": 100.0},
 ])
 def test_parallel_selection_counts_all_accepted_not_just_retained(selection):
-    creator = _creator()
+    # The independent topology oracle needs all raw occurrences. Ordinary H
+    # caps are intentionally omitted from topology, but remain in raw counts.
+    creator = _creator(FAST_SMI.replace("[<][H]", "[<]C"))
     reference = creator.create_ensemble_until_converged(retain_bond_sequences=True, **CONVERGENCE)
     result = creator.create_ensemble_until_converged(
         parallel=True, n_workers=2, building_block_statistics=True,

@@ -30,8 +30,13 @@ jobs:
       - name: pip install g2rins Python package
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          python -m pip install jupytext ipython jupyter
-          python -m pip install .
+          python -m pip install jupytext jupyter
+          python -m pip install ".[test,notebook]"
+
+      - name: Test notebook helper contracts
+        env:
+          MPLBACKEND: Agg
+        run: python -m pytest tests/test_guide_helpers.py -q
 
       - name: Create test with Jupytext
         shell: bash -l {0}

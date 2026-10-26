@@ -2,10 +2,7 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
 
-"""Main entry point for the generation of SMILES string ensembles.
-
-This function serves as a convenience entry point.
-"""
+"""Informational command-line entry point for G2RINS license and version details."""
 
 import argparse
 import sys
@@ -39,14 +36,11 @@ SHORT_LICENSE_TEXT += "under certain conditions; type `license' for details.\n"
 
 
 def main(argv):
-    """
-    Main entry point function for the generation of SMILES string ensembles.
-    Pass '--help' for more options.
-    """
+    """Print the license notice and dispatch license, version, or help requests."""
 
     print(SHORT_LICENSE_TEXT)
     main_parser = argparse.ArgumentParser(
-        description="G2RINS -- generation of molecular ensembles from a G2RINS string.",
+        description="G2RINS -- license and version information.",
         prog="g2rins",
     )
     main_parser.add_argument("--version", "-v", action="version", version="%(prog)s " + g2rins.__version__)

@@ -466,6 +466,392 @@ def mol_graph_to_rdkit_mol(
     return mol
 
 
+def _is_ring_label_overflow(exc):
+    # RDKit can surface this condition as ValueError or RuntimeError
+    # depending on version/build bindings; only match the known message.
+    if not isinstance(exc, (ValueError, RuntimeError)):
+        return False
+    return "rings open at once" in str(exc).lower()
+
+
+def _direct_smiles_with_extended_ring_labels(mol):
+    """Write a stereo-aware molecule without RDKit's finite open-ring pool."""
+    from rdkit import Chem
+
+    prefer_direct = (
+        mol.HasProp(_PREFER_DIRECT_SMILES_PROPERTY)
+        and mol.GetBoolProp(_PREFER_DIRECT_SMILES_PROPERTY)
+    )
+    tetrahedral_tags = {
+        Chem.rdchem.ChiralType.CHI_UNSPECIFIED,
+        Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
+        Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW,
+    }
+    if any(
+        atom.GetChiralTag() not in tetrahedral_tags
+        for atom in mol.GetAtoms()
+    ):
+        return None
+    supported_bond_stereo = {
+        Chem.rdchem.BondStereo.STEREONONE,
+        Chem.rdchem.BondStereo.STEREOZ,
+        Chem.rdchem.BondStereo.STEREOE,
+        Chem.rdchem.BondStereo.STEREOCIS,
+        Chem.rdchem.BondStereo.STEREOTRANS,
+    }
+    supported_bond_directions = {
+        Chem.rdchem.BondDir.NONE,
+        Chem.rdchem.BondDir.ENDUPRIGHT,
+        Chem.rdchem.BondDir.ENDDOWNRIGHT,
+    }
+    if any(
+        bond.GetStereo() not in supported_bond_stereo
+        or bond.GetBondDir() not in supported_bond_directions
+        for bond in mol.GetBonds()
+    ):
+        return None
+
+    supported_bond_symbols = {
+        Chem.rdchem.BondType.DOUBLE: "=",
+        Chem.rdchem.BondType.TRIPLE: "#",
+        Chem.rdchem.BondType.AROMATIC: "",
+        Chem.rdchem.BondType.QUADRUPLE: "$",
+    }
+
+    def bond_symbol(bond, from_atom_idx=None):
+        direction = bond.GetBondDir()
+        if direction != Chem.rdchem.BondDir.NONE:
+            symbol = "/" if direction == Chem.rdchem.BondDir.ENDUPRIGHT else "\\"
+            if from_atom_idx is not None and bond.GetBeginAtomIdx() != from_atom_idx:
+                symbol = "\\" if symbol == "/" else "/"
+            return symbol
+        bond_type = bond.GetBondType()
+        if bond_type == Chem.rdchem.BondType.SINGLE:
+            # An omitted bond between aromatic atoms would become aromatic
+            # on reparse (for example, the central bond in biphenyl).
+            if (
+                bond.GetBeginAtom().GetIsAromatic()
+                and bond.GetEndAtom().GetIsAromatic()
+            ):
+                return "-"
+            return ""
+        return supported_bond_symbols.get(bond_type)
+
+    if any(bond_symbol(bond) is None for bond in mol.GetBonds()):
+        return None
+
+    n_atoms = mol.GetNumAtoms()
+    adjacency = [
+        [neighbor.GetIdx() for neighbor in mol.GetAtomWithIdx(atom_idx).GetNeighbors()]
+        for atom_idx in range(n_atoms)
+    ]
+    seen = set()
+    parent = {}
+    children = [[] for _ in range(n_atoms)]
+    traversal = []
+    component_roots = []
+    for component_root in range(n_atoms):
+        if component_root in seen:
+            continue
+        component_roots.append(component_root)
+        seen.add(component_root)
+        traversal.append(component_root)
+        stack = [(component_root, iter(adjacency[component_root]))]
+        while stack:
+            atom_idx, neighbors = stack[-1]
+            try:
+                neighbor_idx = next(neighbors)
+            except StopIteration:
+                stack.pop()
+                continue
+            if neighbor_idx in seen:
+                continue
+            seen.add(neighbor_idx)
+            parent[neighbor_idx] = atom_idx
+            children[atom_idx].append(neighbor_idx)
+            traversal.append(neighbor_idx)
+            stack.append((neighbor_idx, iter(adjacency[neighbor_idx])))
+
+    tree_edges = {
+        (min(atom_idx, parent_idx), max(atom_idx, parent_idx))
+        for atom_idx, parent_idx in parent.items()
+    }
+    traversal_position = {
+        atom_idx: position for position, atom_idx in enumerate(traversal)
+    }
+    ring_annotations = [[] for _ in range(n_atoms)]
+    ring_neighbors = [[] for _ in range(n_atoms)]
+
+    def ring_label(number):
+        if number < 10:
+            return str(number)
+        if number < 100:
+            return f"%{number}"
+        return f"%({number})"
+
+    ring_number = 0
+    for bond in mol.GetBonds():
+        begin = bond.GetBeginAtomIdx()
+        end = bond.GetEndAtomIdx()
+        edge = (min(begin, end), max(begin, end))
+        if edge in tree_edges:
+            continue
+        ring_number += 1
+        if traversal_position[begin] < traversal_position[end]:
+            first, second = begin, end
+        else:
+            first, second = end, begin
+        label = ring_label(ring_number)
+        ring_annotations[first].append(bond_symbol(bond, first) + label)
+        ring_annotations[second].append(label)
+        ring_neighbors[first].append(second)
+        ring_neighbors[second].append(first)
+
+    atom_token_cache = {}
+    chiral_atom_token_cache = {}
+
+    def atom_token(atom_idx):
+        atom = mol.GetAtomWithIdx(atom_idx)
+        chiral_tag = atom.GetChiralTag()
+        if chiral_tag != Chem.rdchem.ChiralType.CHI_UNSPECIFIED:
+            old_neighbors = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
+            emitted_neighbors = []
+            if atom_idx in parent:
+                emitted_neighbors.append(parent[atom_idx])
+            emitted_neighbors.extend(ring_neighbors[atom_idx])
+            emitted_neighbors.extend(children[atom_idx])
+            if set(old_neighbors) != set(emitted_neighbors):
+                return None
+            old_positions = {
+                neighbor_idx: position
+                for position, neighbor_idx in enumerate(old_neighbors)
+            }
+            permutation = [old_positions[neighbor_idx] for neighbor_idx in emitted_neighbors]
+            inversions = sum(
+                left > right
+                for index, left in enumerate(permutation)
+                for right in permutation[index + 1 :]
+            )
+            # For a component-root center with a bracket hydrogen, SMILES
+            # treats that virtual neighbor as preceding all written bonds;
+            # RDKit's stored tag orders it after the explicit neighbors.
+            if (
+                atom_idx not in parent
+                and atom.GetDegree() == 3
+                and atom.GetNumExplicitHs() + atom.GetNumImplicitHs() == 1
+            ):
+                inversions += 1
+            marker = (
+                "@@"
+                if chiral_tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW
+                else "@"
+            )
+            if inversions % 2:
+                marker = "@" if marker == "@@" else "@@"
+            original_marker = (
+                "@@"
+                if chiral_tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW
+                else "@"
+            )
+            key = (
+                atom.GetAtomicNum(),
+                atom.GetIsAromatic(),
+                atom.GetIsotope(),
+                atom.GetFormalCharge(),
+                atom.GetNumExplicitHs(),
+                atom.GetNumImplicitHs(),
+                atom.GetNoImplicit(),
+                atom.GetNumRadicalElectrons(),
+                atom.GetAtomMapNum(),
+                original_marker,
+                marker,
+            )
+            token = chiral_atom_token_cache.get(key)
+            if token is None:
+                token = atom.GetSmarts().replace(
+                    original_marker,
+                    marker,
+                    1,
+                )
+                chiral_atom_token_cache[key] = token
+            return token
+        key = (
+            atom.GetAtomicNum(),
+            atom.GetIsAromatic(),
+            atom.GetIsotope(),
+            atom.GetFormalCharge(),
+            atom.GetNumExplicitHs(),
+            atom.GetNumImplicitHs(),
+            atom.GetNoImplicit(),
+            atom.GetNumRadicalElectrons(),
+            atom.GetAtomMapNum(),
+        )
+        token = atom_token_cache.get(key)
+        if token is None:
+            # On the huge-ring fast path, MolFragmentToSmiles can invoke
+            # the same expensive ring machinery that this writer avoids.
+            # GetSmarts emits the same atom token for the supported atom
+            # features (including aromatic [nH], charge, isotope, and map).
+            if prefer_direct:
+                token = atom.GetSmarts()
+            else:
+                token = Chem.MolFragmentToSmiles(
+                    mol,
+                    atomsToUse=[atom_idx],
+                    canonical=False,
+                )
+            atom_token_cache[key] = token
+        return token
+
+    output = []
+    for component_index, component_root in enumerate(component_roots):
+        if component_index:
+            output.append(".")
+        events = [("node", component_root)]
+        while events:
+            event, value = events.pop()
+            if event == "text":
+                output.append(value)
+                continue
+            atom_idx = value
+            output.append(atom_token(atom_idx))
+            output.extend(ring_annotations[atom_idx])
+            atom_children = children[atom_idx]
+            if not atom_children:
+                continue
+            continuation = atom_children[-1]
+            events.append(("node", continuation))
+            events.append(
+                (
+                    "text",
+                    bond_symbol(
+                        mol.GetBondBetweenAtoms(atom_idx, continuation),
+                        atom_idx,
+                    ),
+                )
+            )
+            for branch in reversed(atom_children[:-1]):
+                events.append(("text", ")"))
+                events.append(("node", branch))
+                events.append(
+                    (
+                        "text",
+                        bond_symbol(
+                            mol.GetBondBetweenAtoms(atom_idx, branch),
+                            atom_idx,
+                        ),
+                    )
+                )
+                events.append(("text", "("))
+    return "".join(output)
+
+
+def _smiles_fallback_roots(n_atoms):
+    """Return the historical, stable and deduplicated root search order."""
+    roots = [0, 1, 2, 10]
+    if n_atoms > 1:
+        roots.extend([
+            n_atoms // 8, n_atoms // 4, n_atoms // 2,
+            (3 * n_atoms) // 4, (7 * n_atoms) // 8, n_atoms - 1,
+        ])
+    return list(dict.fromkeys(root for root in roots if 0 <= root < n_atoms))
+
+
+def _rooted_smiles(mol, roots):
+    """Try original-order roots, recovering only from known ring overflow."""
+    from rdkit import Chem
+
+    for root in roots:
+        try:
+            return Chem.MolToSmiles(mol, canonical=False, rootedAtAtom=root)
+        except Exception as exc:
+            if not _is_ring_label_overflow(exc):
+                raise
+    return None
+
+
+def _seeded_randomized_smiles(mol):
+    """Try independently seeded traversals under the process-global RNG lock."""
+    from rdkit import Chem, rdBase
+
+    # A positive MolToRandomSmilesVect randomSeed does not reset RDKit's global
+    # generator after its first construction. Explicitly reseed every attempt.
+    with _RANDOM_SMILES_LOCK:
+        for seed in range(1, _RANDOM_SMILES_ATTEMPTS + 1):
+            rdBase.SeedRandomNumberGenerator(seed)
+            try:
+                return Chem.MolToRandomSmilesVect(mol, 1, randomSeed=0)[0]
+            except Exception as exc:
+                if not _is_ring_label_overflow(exc):
+                    raise
+    return None
+
+
+def _breadth_first_smiles(mol):
+    """Repair atom order with reverse-neighbor BFS first, across components."""
+    from rdkit import Chem
+
+    n_atoms = mol.GetNumAtoms()
+    for reverse_neighbors in (True, False):
+        order = []
+        seen = set()
+        for component_root in range(n_atoms):
+            if component_root in seen:
+                continue
+            seen.add(component_root)
+            queue = deque([component_root])
+            while queue:
+                atom_idx = queue.popleft()
+                order.append(atom_idx)
+                neighbors = sorted(
+                    (neighbor.GetIdx() for neighbor in mol.GetAtomWithIdx(atom_idx).GetNeighbors()),
+                    reverse=reverse_neighbors,
+                )
+                for neighbor_idx in neighbors:
+                    if neighbor_idx not in seen:
+                        seen.add(neighbor_idx)
+                        queue.append(neighbor_idx)
+        renumbered = Chem.RenumberAtoms(mol, order)
+        try:
+            return Chem.MolToSmiles(renumbered, canonical=False, rootedAtAtom=0)
+        except Exception as exc:
+            if not _is_ring_label_overflow(exc):
+                raise
+    return None
+
+
+def _recover_smiles_ring_overflow(mol):
+    """Coordinate the existing bounded repairs in their original order."""
+    from rdkit import Chem
+
+    # Avoid extra native traversals when extended labels support this molecule.
+    direct = _direct_smiles_with_extended_ring_labels(mol)
+    if direct is not None:
+        return direct
+    n_atoms = mol.GetNumAtoms()
+    roots = _smiles_fallback_roots(n_atoms)
+    # Root zero is cheap for ordinary molecules. For huge molecules, repair
+    # the pathological order first rather than exhausting the same pool again.
+    initial_roots = roots[:1] if n_atoms < _BIG_STACK_ATOM_THRESHOLD else []
+    rooted = _rooted_smiles(mol, initial_roots)
+    if rooted is not None:
+        return rooted
+    # Failed BFS traversals are costly on huge molecules; random repair stays
+    # ahead of BFS there, and is never added to the small-molecule policy.
+    if n_atoms >= _BIG_STACK_ATOM_THRESHOLD:
+        randomized = _seeded_randomized_smiles(mol)
+        if randomized is not None:
+            return randomized
+    reordered = _breadth_first_smiles(mol)
+    if reordered is not None:
+        return reordered
+    rooted = _rooted_smiles(mol, roots[len(initial_roots):])
+    if rooted is not None:
+        return rooted
+    # Preserve the final native call and its exception if every repair fails.
+    return Chem.MolToSmiles(mol, canonical=False)
+
+
 def rdkit_mol_to_smiles(
     mol,
     native_stage_callback=None,
@@ -485,7 +871,7 @@ def rdkit_mol_to_smiles(
     and a stereo-aware writer using extended ring labels; the resulting SMILES
     is non-canonical but represents the same molecule.
     """
-    from rdkit import Chem, rdBase
+    from rdkit import Chem
 
     supported_policies = {"auto", "canonical", "fast"}
     if smiles_policy not in supported_policies:
@@ -497,282 +883,6 @@ def rdkit_mol_to_smiles(
     if native_stage_callback is not None:
         native_stage_callback("smiles")
 
-    def _is_ring_label_overflow(exc):
-        # RDKit can surface this condition as ValueError or RuntimeError
-        # depending on version/build bindings; only match the known message.
-        if not isinstance(exc, (ValueError, RuntimeError)):
-            return False
-        return "rings open at once" in str(exc).lower()
-
-    def _direct_smiles_with_extended_ring_labels():
-        """Write a stereo-aware molecule without RDKit's finite open-ring pool."""
-        prefer_direct = (
-            mol.HasProp(_PREFER_DIRECT_SMILES_PROPERTY)
-            and mol.GetBoolProp(_PREFER_DIRECT_SMILES_PROPERTY)
-        )
-        tetrahedral_tags = {
-            Chem.rdchem.ChiralType.CHI_UNSPECIFIED,
-            Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW,
-            Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CCW,
-        }
-        if any(
-            atom.GetChiralTag() not in tetrahedral_tags
-            for atom in mol.GetAtoms()
-        ):
-            return None
-        supported_bond_stereo = {
-            Chem.rdchem.BondStereo.STEREONONE,
-            Chem.rdchem.BondStereo.STEREOZ,
-            Chem.rdchem.BondStereo.STEREOE,
-            Chem.rdchem.BondStereo.STEREOCIS,
-            Chem.rdchem.BondStereo.STEREOTRANS,
-        }
-        supported_bond_directions = {
-            Chem.rdchem.BondDir.NONE,
-            Chem.rdchem.BondDir.ENDUPRIGHT,
-            Chem.rdchem.BondDir.ENDDOWNRIGHT,
-        }
-        if any(
-            bond.GetStereo() not in supported_bond_stereo
-            or bond.GetBondDir() not in supported_bond_directions
-            for bond in mol.GetBonds()
-        ):
-            return None
-
-        supported_bond_symbols = {
-            Chem.rdchem.BondType.DOUBLE: "=",
-            Chem.rdchem.BondType.TRIPLE: "#",
-            Chem.rdchem.BondType.AROMATIC: "",
-            Chem.rdchem.BondType.QUADRUPLE: "$",
-        }
-
-        def bond_symbol(bond, from_atom_idx=None):
-            direction = bond.GetBondDir()
-            if direction != Chem.rdchem.BondDir.NONE:
-                symbol = "/" if direction == Chem.rdchem.BondDir.ENDUPRIGHT else "\\"
-                if from_atom_idx is not None and bond.GetBeginAtomIdx() != from_atom_idx:
-                    symbol = "\\" if symbol == "/" else "/"
-                return symbol
-            bond_type = bond.GetBondType()
-            if bond_type == Chem.rdchem.BondType.SINGLE:
-                # An omitted bond between aromatic atoms would become aromatic
-                # on reparse (for example, the central bond in biphenyl).
-                if (
-                    bond.GetBeginAtom().GetIsAromatic()
-                    and bond.GetEndAtom().GetIsAromatic()
-                ):
-                    return "-"
-                return ""
-            return supported_bond_symbols.get(bond_type)
-
-        if any(bond_symbol(bond) is None for bond in mol.GetBonds()):
-            return None
-
-        n_atoms = mol.GetNumAtoms()
-        adjacency = [
-            [neighbor.GetIdx() for neighbor in mol.GetAtomWithIdx(atom_idx).GetNeighbors()]
-            for atom_idx in range(n_atoms)
-        ]
-        seen = set()
-        parent = {}
-        children = [[] for _ in range(n_atoms)]
-        traversal = []
-        component_roots = []
-        for component_root in range(n_atoms):
-            if component_root in seen:
-                continue
-            component_roots.append(component_root)
-            seen.add(component_root)
-            traversal.append(component_root)
-            stack = [(component_root, iter(adjacency[component_root]))]
-            while stack:
-                atom_idx, neighbors = stack[-1]
-                try:
-                    neighbor_idx = next(neighbors)
-                except StopIteration:
-                    stack.pop()
-                    continue
-                if neighbor_idx in seen:
-                    continue
-                seen.add(neighbor_idx)
-                parent[neighbor_idx] = atom_idx
-                children[atom_idx].append(neighbor_idx)
-                traversal.append(neighbor_idx)
-                stack.append((neighbor_idx, iter(adjacency[neighbor_idx])))
-
-        tree_edges = {
-            (min(atom_idx, parent_idx), max(atom_idx, parent_idx))
-            for atom_idx, parent_idx in parent.items()
-        }
-        traversal_position = {
-            atom_idx: position for position, atom_idx in enumerate(traversal)
-        }
-        ring_annotations = [[] for _ in range(n_atoms)]
-        ring_neighbors = [[] for _ in range(n_atoms)]
-
-        def ring_label(number):
-            if number < 10:
-                return str(number)
-            if number < 100:
-                return f"%{number}"
-            return f"%({number})"
-
-        ring_number = 0
-        for bond in mol.GetBonds():
-            begin = bond.GetBeginAtomIdx()
-            end = bond.GetEndAtomIdx()
-            edge = (min(begin, end), max(begin, end))
-            if edge in tree_edges:
-                continue
-            ring_number += 1
-            if traversal_position[begin] < traversal_position[end]:
-                first, second = begin, end
-            else:
-                first, second = end, begin
-            label = ring_label(ring_number)
-            ring_annotations[first].append(bond_symbol(bond, first) + label)
-            ring_annotations[second].append(label)
-            ring_neighbors[first].append(second)
-            ring_neighbors[second].append(first)
-
-        atom_token_cache = {}
-        chiral_atom_token_cache = {}
-
-        def atom_token(atom_idx):
-            atom = mol.GetAtomWithIdx(atom_idx)
-            chiral_tag = atom.GetChiralTag()
-            if chiral_tag != Chem.rdchem.ChiralType.CHI_UNSPECIFIED:
-                old_neighbors = [neighbor.GetIdx() for neighbor in atom.GetNeighbors()]
-                emitted_neighbors = []
-                if atom_idx in parent:
-                    emitted_neighbors.append(parent[atom_idx])
-                emitted_neighbors.extend(ring_neighbors[atom_idx])
-                emitted_neighbors.extend(children[atom_idx])
-                if set(old_neighbors) != set(emitted_neighbors):
-                    return None
-                old_positions = {
-                    neighbor_idx: position
-                    for position, neighbor_idx in enumerate(old_neighbors)
-                }
-                permutation = [old_positions[neighbor_idx] for neighbor_idx in emitted_neighbors]
-                inversions = sum(
-                    left > right
-                    for index, left in enumerate(permutation)
-                    for right in permutation[index + 1 :]
-                )
-                # For a component-root center with a bracket hydrogen, SMILES
-                # treats that virtual neighbor as preceding all written bonds;
-                # RDKit's stored tag orders it after the explicit neighbors.
-                if (
-                    atom_idx not in parent
-                    and atom.GetDegree() == 3
-                    and atom.GetNumExplicitHs() + atom.GetNumImplicitHs() == 1
-                ):
-                    inversions += 1
-                marker = (
-                    "@@"
-                    if chiral_tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW
-                    else "@"
-                )
-                if inversions % 2:
-                    marker = "@" if marker == "@@" else "@@"
-                original_marker = (
-                    "@@"
-                    if chiral_tag == Chem.rdchem.ChiralType.CHI_TETRAHEDRAL_CW
-                    else "@"
-                )
-                key = (
-                    atom.GetAtomicNum(),
-                    atom.GetIsAromatic(),
-                    atom.GetIsotope(),
-                    atom.GetFormalCharge(),
-                    atom.GetNumExplicitHs(),
-                    atom.GetNumImplicitHs(),
-                    atom.GetNoImplicit(),
-                    atom.GetNumRadicalElectrons(),
-                    atom.GetAtomMapNum(),
-                    original_marker,
-                    marker,
-                )
-                token = chiral_atom_token_cache.get(key)
-                if token is None:
-                    token = atom.GetSmarts().replace(
-                        original_marker,
-                        marker,
-                        1,
-                    )
-                    chiral_atom_token_cache[key] = token
-                return token
-            key = (
-                atom.GetAtomicNum(),
-                atom.GetIsAromatic(),
-                atom.GetIsotope(),
-                atom.GetFormalCharge(),
-                atom.GetNumExplicitHs(),
-                atom.GetNumImplicitHs(),
-                atom.GetNoImplicit(),
-                atom.GetNumRadicalElectrons(),
-                atom.GetAtomMapNum(),
-            )
-            token = atom_token_cache.get(key)
-            if token is None:
-                # On the huge-ring fast path, MolFragmentToSmiles can invoke
-                # the same expensive ring machinery that this writer avoids.
-                # GetSmarts emits the same atom token for the supported atom
-                # features (including aromatic [nH], charge, isotope, and map).
-                if prefer_direct:
-                    token = atom.GetSmarts()
-                else:
-                    token = Chem.MolFragmentToSmiles(
-                        mol,
-                        atomsToUse=[atom_idx],
-                        canonical=False,
-                    )
-                atom_token_cache[key] = token
-            return token
-
-        output = []
-        for component_index, component_root in enumerate(component_roots):
-            if component_index:
-                output.append(".")
-            events = [("node", component_root)]
-            while events:
-                event, value = events.pop()
-                if event == "text":
-                    output.append(value)
-                    continue
-                atom_idx = value
-                output.append(atom_token(atom_idx))
-                output.extend(ring_annotations[atom_idx])
-                atom_children = children[atom_idx]
-                if not atom_children:
-                    continue
-                continuation = atom_children[-1]
-                events.append(("node", continuation))
-                events.append(
-                    (
-                        "text",
-                        bond_symbol(
-                            mol.GetBondBetweenAtoms(atom_idx, continuation),
-                            atom_idx,
-                        ),
-                    )
-                )
-                for branch in reversed(atom_children[:-1]):
-                    events.append(("text", ")"))
-                    events.append(("node", branch))
-                    events.append(
-                        (
-                            "text",
-                            bond_symbol(
-                                mol.GetBondBetweenAtoms(atom_idx, branch),
-                                atom_idx,
-                            ),
-                        )
-                    )
-                    events.append(("text", "("))
-        return "".join(output)
-
     def serialize():
         if smiles_policy == "canonical":
             return Chem.MolToSmiles(mol)
@@ -780,7 +890,7 @@ def rdkit_mol_to_smiles(
             mol.HasProp(_PREFER_DIRECT_SMILES_PROPERTY)
             and mol.GetBoolProp(_PREFER_DIRECT_SMILES_PROPERTY)
         ):
-            direct = _direct_smiles_with_extended_ring_labels()
+            direct = _direct_smiles_with_extended_ring_labels(mol)
             if direct is not None:
                 return direct
         try:
@@ -790,129 +900,7 @@ def rdkit_mol_to_smiles(
         except Exception as exc:
             if not _is_ring_label_overflow(exc):
                 raise
-
-            # Once canonical traversal has exhausted RDKit's finite ring-label
-            # pool, prefer the deterministic extended-label writer. It avoids
-            # up to sixteen additional native traversals before the same
-            # fallback, while retaining the slower RDKit repairs for features
-            # the direct writer does not support.
-            direct = _direct_smiles_with_extended_ring_labels()
-            if direct is not None:
-                return direct
-
-            n_atoms = mol.GetNumAtoms()
-            roots = [0, 1, 2, 10]
-            if n_atoms > 1:
-                roots.extend(
-                    [
-                        n_atoms // 8,
-                        n_atoms // 4,
-                        n_atoms // 2,
-                        (3 * n_atoms) // 4,
-                        (7 * n_atoms) // 8,
-                        n_atoms - 1,
-                    ]
-                )
-            roots = [root for root in dict.fromkeys(root for root in roots if 0 <= root < n_atoms)]
-
-            # Root zero is the cheapest compatibility fallback for ordinary
-            # molecules. On large molecules, repair the pathological atom
-            # ordering first: another original-order traversal can be very slow
-            # before exhausting the same ring-label pool.
-            initial_roots = roots[:1] if n_atoms < _BIG_STACK_ATOM_THRESHOLD else []
-            for root in initial_roots:
-                try:
-                    return Chem.MolToSmiles(mol, canonical=False, rootedAtAtom=root)
-                except Exception as root_exc:
-                    if not _is_ring_label_overflow(root_exc):
-                        raise
-
-            def seeded_randomized_smiles():
-                # RDKit's randomized traversal can avoid pathological spanning
-                # trees that no fixed atom ordering repairs. Passing a positive
-                # ``randomSeed`` to MolToRandomSmilesVect does not reset RDKit's
-                # process-global generator after its first construction. Reset
-                # it explicitly so every attempt is an independent, reproducible
-                # traversal rather than merely the next state of one stream.
-                with _RANDOM_SMILES_LOCK:
-                    for seed in range(1, _RANDOM_SMILES_ATTEMPTS + 1):
-                        rdBase.SeedRandomNumberGenerator(seed)
-                        try:
-                            return Chem.MolToRandomSmilesVect(
-                                mol,
-                                1,
-                                randomSeed=0,
-                            )[0]
-                        except Exception as random_exc:
-                            if not _is_ring_label_overflow(random_exc):
-                                raise
-                return None
-
-            # Failed breadth-first traversals are disproportionately costly on
-            # these large molecules. For unsupported direct-writer features,
-            # prefer the bounded randomized repair; deterministic BFS remains
-            # available if every randomized traversal still overflows.
-            if n_atoms >= _BIG_STACK_ATOM_THRESHOLD:
-                randomized = seeded_randomized_smiles()
-                if randomized is not None:
-                    return randomized
-
-            # ``canonical=False`` still follows the molecule's atom ordering.
-            # Incrementally assembled cyclic polymers can have an ordering that
-            # leaves more than RDKit's finite ring-label pool open at once for
-            # every root. Renumber atoms breadth-first so neighboring rings are
-            # emitted close together. Reverse-neighbor BFS is first because it
-            # keeps newly added cyclic repeats locally contiguous in the
-            # reported long benzimidazole chain.
-            for reverse_neighbors in (True, False):
-                order = []
-                seen = set()
-                for component_root in range(n_atoms):
-                    if component_root in seen:
-                        continue
-                    seen.add(component_root)
-                    queue = deque([component_root])
-                    while queue:
-                        atom_idx = queue.popleft()
-                        order.append(atom_idx)
-                        neighbors = sorted(
-                            (
-                                neighbor.GetIdx()
-                                for neighbor in mol.GetAtomWithIdx(atom_idx).GetNeighbors()
-                            ),
-                            reverse=reverse_neighbors,
-                        )
-                        for neighbor_idx in neighbors:
-                            if neighbor_idx not in seen:
-                                seen.add(neighbor_idx)
-                                queue.append(neighbor_idx)
-
-                renumbered = Chem.RenumberAtoms(mol, order)
-                try:
-                    return Chem.MolToSmiles(
-                        renumbered,
-                        canonical=False,
-                        rootedAtAtom=0,
-                    )
-                except Exception as reordered_exc:
-                    if not _is_ring_label_overflow(reordered_exc):
-                        raise
-
-            # Retain the broader root search for unusual molecules where the
-            # original ordering is useful but the preceding deterministic
-            # traversals still exceed the ring-label pool.
-            for root in roots[len(initial_roots):]:
-                try:
-                    return Chem.MolToSmiles(
-                        mol,
-                        canonical=False,
-                        rootedAtAtom=root,
-                    )
-                except Exception as root_exc:
-                    if not _is_ring_label_overflow(root_exc):
-                        raise
-
-            return Chem.MolToSmiles(mol, canonical=False)
+            return _recover_smiles_ring_overflow(mol)
 
     if mol.GetNumAtoms() < _BIG_STACK_ATOM_THRESHOLD:
         return serialize()
