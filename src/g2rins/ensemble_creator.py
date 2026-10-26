@@ -159,6 +159,11 @@ def _molar_at(molar_amounts, sto_gen_id):
         return 1.0
 
 
+def _declared_molar(generative_graph, target_idx, molar_amounts):
+    """A terminator's molar amount is the one declared beside it, at its own object, whichever object fires the cap."""
+    return _molar_at(molar_amounts, generative_graph.nodes[target_idx]["stochastic_id_tree"][0])
+
+
 def _level_target_weights(generative_graph, target_idx, edge_weights, molar_amounts, sto_gen_id):
     """Weights that draw one target among ``target_idx`` level by level from ``sto_gen_id``.
 
@@ -1465,7 +1470,7 @@ class _PartialAtomGraph:
             target_attributes = [all_attributes[i] for i in level_indices]
             target_ids = [all_ids[i] for i in level_indices]
             all_molar_amounts = [all_molar[i] for i in level_indices]
-            molar_amounts = [molar_amount[gen_sto_id] for molar_amount in all_molar_amounts]
+            molar_amounts = [_declared_molar(self.generative_graph, target, molar_amount) for target, molar_amount in zip(target_ids, all_molar_amounts, strict=True)]
             target_weight = np.asarray([attr[_TERMINATION_NAME] for attr in target_attributes])
             target_molar_amount = np.asarray(molar_amounts)
             target_weight *= target_molar_amount
@@ -1620,7 +1625,7 @@ class _PartialAtomGraph:
             all_target_molar_amounts = [all_molar[i] for i in level_indices]
 
             target_weight = np.asarray([attr[_TERMINATION_NAME] for attr in target_attributes])
-            target_molar_amounts = [molar_amounts[gen_sto_id] for molar_amounts in all_target_molar_amounts]
+            target_molar_amounts = [_declared_molar(self.generative_graph, target, molar_amounts) for target, molar_amounts in zip(target_ids, all_target_molar_amounts, strict=True)]
             target_amounts = np.asarray(target_molar_amounts)
             target_weight *= target_amounts
             selected_target_idx = self.stochastic_tracker.choose(
@@ -1696,7 +1701,7 @@ class _PartialAtomGraph:
                     continue
                 target_attributes = [all_attributes[i] for i in level_indices]
                 target_ids = [all_ids[i] for i in level_indices]
-                target_molar_amounts = [all_molar[i][gen_sto_id] for i in level_indices]
+                target_molar_amounts = [_declared_molar(self.generative_graph, all_ids[i], all_molar[i]) for i in level_indices]
 
                 target_weight = np.asarray([attr[_TERMINATION_NAME] for attr in target_attributes])
                 target_weight = target_weight * np.asarray(target_molar_amounts)
@@ -2801,7 +2806,7 @@ class EnsembleCreator:
                         malformed = True
                         break
                     try:
-                        molar_amount = graph.nodes[target]["unit_molar_amounts"][level]
+                        molar_amount = graph.nodes[target]["unit_molar_amounts"][graph.nodes[target]["stochastic_id_tree"][0]]
                         effective_weight = float(termination_weight * molar_amount)
                     except (KeyError, IndexError, TypeError, ValueError):
                         unknown_levels.add(level)

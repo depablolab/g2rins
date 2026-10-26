@@ -2283,6 +2283,28 @@ def test_nested_initiator_block_ends_inherit_outer_terminator():
         assert chlorine_count == 2, f"seed {seed}: both block ends grew but {chlorine_count} Cl cap(s) landed"
 
 
+def test_a_cap_fired_by_an_enclosing_object_keeps_its_declared_molar_amount():
+    """A terminator declared inside a nested object but fired by the enclosing
+    object (the site's bond descriptor belongs to the enclosing object) keeps
+    the molar amount declared beside it. The resolution re-stamps the cap edge
+    to the firing object, and the draw used to read the amount at that object,
+    where the terminator is not declared and the amount is the 1.0 default: a
+    cap declared with amount 0 fired as often as its sibling."""
+    smi = "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0|, [<1]F|1| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    chlorines = fluorines = 0
+    for seed in range(1, 13):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        chlorines += _count_atoms(mol_graph, 17)
+        fluorines += _count_atoms(mol_graph, 9)
+    assert chlorines == 0, f"a cap declared with molar amount 0 fired {chlorines} time(s)"
+    assert fluorines >= 1, "the sibling cap declared with molar amount 1 never fired"
+
+
 def test_negative_target_draw_still_terminates():
     """A high-dispersity gauss target can draw negative; storing that draw like
     the negative no-target sentinel disables crossing checks and grows forever.

@@ -582,8 +582,9 @@ def _resolve_termination_levels(generative_graph):
     its own object terminated, so a terminator declared beside it would never
     fire. The surviving edges are re-stamped to the owning object, which both
     the terminate pass and the average-cap estimate read, so the same cap is
-    priced and delivered. Runs before weight normalization so the survivors
-    renormalize among themselves.
+    priced and delivered; the cap keeps the molar amount declared beside it,
+    read at its own object by whichever object fires it. Runs before weight
+    normalization so the survivors renormalize among themselves.
     """
     resolutions = []
     for node in generative_graph.nodes():
