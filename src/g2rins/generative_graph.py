@@ -682,13 +682,18 @@ def _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, resolut
         # sites are the origin of the growth (their capping is a separate
         # design question), a transition INTO a nested object written in the
         # unit's own text is realized with the unit, a transition into a
-        # terminator unit is a written endcap, and -1 marks cross-family
-        # arms, whose consumption is decided elsewhere.
+        # terminator unit is a written endcap, a forced exit fires on every
+        # instance when the outermost object it leaves finalizes, and -1
+        # marks cross-family arms, whose consumption is decided elsewhere.
         if not label.startswith(("R", "L")):
             continue
         stochastic_id_tree = generative_graph.nodes[node]["stochastic_id_tree"]
         if any(
-            data[_TRANSITION_NAME] > 0 and data[_EDGE_STOCHASTIC_ID_NAME] >= 0 and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree and not unit_id_map.get(target, "").startswith("T")
+            data[_TRANSITION_NAME] > 0
+            and data[_EDGE_STOCHASTIC_ID_NAME] >= 0
+            and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree
+            and data[_TRANSITION_ROLE_NAME] != TransitionRole.FORCED_EXIT
+            and not unit_id_map.get(target, "").startswith("T")
             for _source, target, data in generative_graph.out_edges(node, data=True)
         ):
             emit(("missing", label), MissingTermination(label, unit_g2rins.get(label, "")))

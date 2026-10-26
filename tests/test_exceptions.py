@@ -271,6 +271,9 @@ def test_inherited_termination_names_the_object_that_fires_the_cap(smi, declared
         # unit, never left open, so no warning.
         "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|[H])C({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])C[>]; [<][H]; [>][H] []}|poisson(400)|",
         "{[] [<]CC({[<] [<]NN({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])[>];; [>]}|poisson(200)|[H])CC[>]; [<][H]; []}|poisson(800)|",
+        # Two nested objects joined directly: the join is a forced exit, delivered on every
+        # instance of the first object, so its sites are never left open.
+        "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|",
     ],
 )
 def test_terminator_declared_beside_its_unit_is_silent(smi):
