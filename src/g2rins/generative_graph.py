@@ -77,11 +77,14 @@ class TransitionRole(IntEnum):
 def is_static_edge(edge_data):
     if _STATIC_NAME in edge_data:
         return edge_data[_STATIC_NAME]
-    weight = 0
-    for attr in _NON_STATIC_ATTR:
-        if attr in edge_data:
-            weight += edge_data[attr]
-    return not weight > 0
+    # An edge carrying a weight key is non-static whatever its value, so a terminator's declared 0 is not mirrored as a static bond.
+    return not any(attr in edge_data for attr in _NON_STATIC_ATTR)
+
+
+def _is_termination_edge(edge_data):
+    """A termination edge of the generative graph, including one kept at
+    weight 0 for a terminator declared with bond weight 0."""
+    return not edge_data.get(_STATIC_NAME, False) and edge_data.get(_PROPAGATION_NAME, 0) == 0 and edge_data.get(_TRANSITION_NAME, 0) == 0
 
 
 _DERIVED_NODE_FIELDS = ("unit_id", "bond_id")
@@ -578,9 +581,11 @@ def _resolve_termination_levels(generative_graph):
     outward through the terminal bond connector path. The farther edges are
     removed rather than left to compete in the terminate draw, because a
     generative graph should carry no edge that can never fire. A terminator
-    declared with molar amount 0 never fires either, so it neither caps nor
-    shadows: its edges are removed the same way once the site has a live
-    declaration, and a site with none keeps them for the zero-support checks.
+    declared with molar amount 0 or with bond weight 0 never fires either, so
+    it neither caps nor shadows: its edges are removed the same way once the
+    site has a live declaration, and a site with none keeps them, at their
+    zero weight, so generation reports the site as dead instead of leaving it
+    uncapped as if no terminator were written.
 
     Firing level: a site is capped when the object owning its bond descriptor
     finishes, which need not be the object that declared the terminator. A
@@ -617,11 +622,11 @@ def _resolve_termination_levels(generative_graph):
                     growth_levels.add(level)
             elif data[_PROPAGATION_NAME] > 0:
                 growth_levels.add(level)
-            elif data[_TERMINATION_NAME] > 0:
+            elif _is_termination_edge(data):
                 entry = (_declaration_rank(stochastic_id_tree, level), level, target, key)
                 target_data = generative_graph.nodes[target]
-                # The amount declared beside the terminator, at its own object: zero means the cap never fires.
-                if target_data["unit_molar_amounts"][target_data["stochastic_id_tree"][0]] == 0:
+                # A bond weight of 0, or a molar amount of 0 declared beside the terminator at its own object: the cap never fires.
+                if data[_TERMINATION_NAME] == 0 or target_data["unit_molar_amounts"][target_data["stochastic_id_tree"][0]] == 0:
                     never_firing.append(entry)
                 else:
                     terminations.append(entry)
@@ -1193,12 +1198,12 @@ class GraphCreator:
                         else:
                             data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
 
-                    non_static_weights = [d[attr] if attr in d else 0 for attr in non_static_attribute_list]
-                    if max(non_static_weights) > 0:
-                        for attr, w in zip(non_static_attribute_list, non_static_weights):
-                            if w > 0:
-                                current_type = attr
-                                weight *= w
+                    # A hop is typed by the weight it carries, even a terminator's declared weight 0.
+                    non_static_present = [attr for attr in non_static_attribute_list if attr in d]
+                    if non_static_present:
+                        for attr in non_static_present:
+                            current_type = attr
+                            weight *= d[attr]
                     else:
                         current_type = _STATIC_NAME
 
@@ -1329,7 +1334,8 @@ class GraphCreator:
                             if self.init_weight is None:
                                 weight_type = _PROPAGATION_NAME
 
-                if weight > 0:
+                if weight > 0 or weight_type == _TERMINATION_NAME:
+                    # A terminator declared with bond weight 0 keeps its termination edge at weight 0, so the site is declared rather than uncapped.
                     data[weight_type] = weight
 
                 return weight, data
@@ -1360,7 +1366,7 @@ class GraphCreator:
                     self.only_bond_connectors
                     and self.contains_bc(bc_idx)
                     and (self.combined_attr is not None)
-                    and (self.weight > 0)
+                    and (self.weight > 0 or _TERMINATION_NAME in self.combined_attr)
                     # and self.num_stochastic_transitions < 3
                 )
 
@@ -1509,7 +1515,7 @@ class GraphCreator:
 
         - **{static_name}**: bool indicating static edges, that are always present.
         - **{propagation_name}**: float Propagation probability. If bond connectors are connecting between monomer repeat units inside stochastic objects, this indicates the probability \in [0, 1].
-        - **{termination_name}**: float Termination Probabilities. If bond connectors terminate with end-groups after the molecular weight is reached, this is the probability \in [0, 1].
+        - **{termination_name}**: float Termination Probabilities. If bond connectors terminate with end-groups after the molecular weight is reached, this is the probability \in [0, 1]. A terminator declared with bond weight 0 keeps its edge at 0, so a site whose every declared terminator is 0 is distinguishable from one with no terminator.
         - **{transition_name}**: float Transition Probabilities. If transitioning between stochastic objects, this is the probability to take.
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
         - **{transition_role_name}**: int Role of the bond (the ``TransitionRole`` encoding, stable across versions, present on every edge): 0 not a transition; 1 stochastic -- mediated by a bond connector of the managing stochastic object, competes as a weighted option at that level; 2 forced entry -- into a nested stochastic object with no parent bond connector on the path; 3 forced exit -- out of a nested stochastic object through its terminal bond connector with no bond connector of an enclosing object on the path, fires when the instance owning the source finalizes; 4 global -- stochastic id -1. The graph with bond connectors carries 0 on every edge, its transitions are not contracted.
@@ -1715,7 +1721,7 @@ class GraphCreator:
                         else:
                             d[_EDGE_STOCHASTIC_ID_NAME] = -1
                             d[_TRANSITION_ROLE_NAME] = int(TransitionRole.GLOBAL)
-                    elif d.get(_TERMINATION_NAME, 0) > 0:
+                    elif _is_termination_edge(d):
                         # Termination edges: stochastic_id = target node's SO.
                         # A node in an inner SO may have terminators at multiple SO levels;
                         # the target terminator's SO determines which cascade level it belongs to.

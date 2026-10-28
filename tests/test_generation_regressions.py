@@ -2353,10 +2353,10 @@ def test_a_cap_fired_by_an_enclosing_object_keeps_its_declared_molar_amount():
 def test_a_zero_amount_declaration_neither_caps_nor_shadows():
     """A terminator declared with molar amount 0 never fires, so it is no
     declaration for the resolution: it neither caps the site nor shadows a
-    farther live cap, as the zero-weight spelling on its bond connector, which
-    creates no edge, never did. Ranked as the nearest declaration it kept the
-    site while the outer [<1]I was removed as shadowed, and every chain died
-    in the termination estimate."""
+    farther live cap, as the zero-weight spelling on its bond connector never
+    did. Ranked as the nearest declaration it kept the site while the outer
+    [<1]I was removed as shadowed, and every chain died in the termination
+    estimate."""
     smi = "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -2367,6 +2367,107 @@ def test_a_zero_amount_declaration_neither_caps_nor_shadows():
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
         assert _count_atoms(mol_graph, 17) == 0, f"seed {seed}: the zero-amount chlorine capped a site"
         assert _count_atoms(mol_graph, 53) >= 1, f"seed {seed}: no iodine cap delivered"
+
+
+# The same declarations with the terminator's 0 written as a molar amount and as a bond weight.
+ZERO_TERMINATOR_SPELLINGS = [
+    pytest.param(
+        "C{[>][<]CC[>];;[<][H]|0| []}|uniform(80,80)|",
+        "C{[>][<]CC[>];;[<|0|][H] []}|uniform(80,80)|",
+        id="lone-cap",
+    ),
+    pytest.param(
+        "{[] [<]CC[>]; C[>]; [<][H]|0|, [<]Br []}|poisson(100)|",
+        "{[] [<]CC[>]; C[>]; [<|0|][H], [<]Br []}|poisson(100)|",
+        id="live-sibling",
+    ),
+    pytest.param(
+        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; [<1][H]|0|, [<2][H] []}|uniform(80,80)|",
+        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; [<1|0|][H], [<2][H] []}|uniform(80,80)|",
+        id="dead-source-alternative",
+    ),
+    pytest.param(
+        "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)",
+        "C(O{[>1][<1]CC[>2];;[<2|0|][H] []}|uniform(80,80)|)(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)",
+        id="dead-arm",
+    ),
+    pytest.param(
+        "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|",
+        "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1|0|]Cl [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|",
+        id="zero-beside-a-live-outer-cap",
+    ),
+    pytest.param(
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1]F|0| []}|poisson(400)|",
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1|0|]F []}|poisson(400)|",
+        id="lone-cap-of-a-nested-side-site",
+    ),
+]
+
+
+@pytest.mark.parametrize(("by_amount", "by_weight"), ZERO_TERMINATOR_SPELLINGS)
+def test_a_zero_weight_terminator_is_declared_like_a_zero_amount_one(by_amount, by_weight):
+    """A terminator's 0 means the same whether written as its molar amount or
+    as its bond weight: beside a live cap it is ignored, and as the only cap of
+    a site it leaves the site declared but dead. The bond-weight spelling used
+    to create no edge at all, so a site capped by nothing else ended uncapped
+    and silent where the molar spelling failed."""
+    from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
+
+    def outcome(smi):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+            try:
+                return ensemble_creator.create_ensemble(3, output_format="smiles", seed=1, max_number_of_discarded_chains=2)
+            except (AllZeroSamplingWeights, DeadSamplingPath) as error:
+                return (type(error), type(error.__cause__))
+
+    assert outcome(by_weight) == outcome(by_amount)
+
+
+@pytest.mark.parametrize("smi", ["C{[>][<]CC[>];;[<][H]|0| []}|uniform(80,80)|", "C{[>][<]CC[>];;[<|0|][H] []}|uniform(80,80)|"], ids=["amount", "weight"])
+def test_a_lone_zero_terminator_fails_fast_in_either_spelling(smi):
+    """The only cap of the only site is declared with 0, so every chain reaches
+    an all-zero termination draw: the proof sees the zero-weight edge and the
+    first chain fails fatally instead of burning retries."""
+    from g2rins.exception import AllZeroSamplingWeights
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(AllZeroSamplingWeights, match="termination MW estimate"):
+            ensemble_creator.create_ensemble(n_samples=1, max_number_of_discarded_chains=3)
+
+
+@pytest.mark.parametrize(
+    "smi",
+    [
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1]F|0| []}|poisson(400)|",
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1|0|]F []}|poisson(400)|",
+    ],
+    ids=["amount", "weight"],
+)
+def test_a_site_whose_only_cap_is_zero_is_a_dead_sampling_path(smi):
+    """The [>1] side sites of the nested unit are capped by [<1]F alone,
+    declared with 0, so a chain that grew the nested object meets an all-zero
+    termination draw when the enclosing object finishes. The bond-weight
+    spelling used to drop the terminator and leave those sites silently
+    unused. A chain of CC units alone can complete, so the path is retryable
+    rather than fatal."""
+    from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(DeadSamplingPath) as caught:
+            ensemble_creator.create_ensemble(1, output_format="smiles", seed=0, max_number_of_discarded_chains=1)
+    assert isinstance(caught.value.__cause__, AllZeroSamplingWeights)
 
 
 def test_an_inherited_cap_fired_by_its_owner_counts_toward_that_objects_target():

@@ -60,6 +60,7 @@ from .generative_graph import (
     _check_transition_role,
     _connector_placeholder_flag,
     _is_connector_placeholder,
+    _is_termination_edge,
     _json_safe,
     _static_neighbors,
     _verified_unit_texts,
@@ -267,7 +268,8 @@ class _HalfAtomBond:
         for u, v, d in graph.out_edges(node_idx, data=True):
             if not d["static"]:
                 for k in _NON_STATIC_ATTR:
-                    if d[k] > 0:
+                    # A terminator declared with weight 0 stays a candidate, so the all-zero draw is reported rather than skipped.
+                    if d[k] > 0 or (k == _TERMINATION_NAME and _is_termination_edge(d)):
                         try:
                             self._mode_attr_map[k] += [d]
                         except KeyError:
@@ -2798,7 +2800,7 @@ class EnsembleCreator:
                         break
                     if transition_weight > 0:
                         has_transition = True
-                    if termination_weight <= 0:
+                    if termination_weight <= 0 and not _is_termination_edge(data):
                         continue
 
                     level = data.get(_EDGE_STOCHASTIC_ID_NAME)

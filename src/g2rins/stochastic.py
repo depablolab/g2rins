@@ -288,9 +288,10 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     probabilities /= probabilities.sum()
                 # Assign bond attribute (stochastic, transition or termination)
                 for i, prob in enumerate(probabilities):
-                    if prob > 0:
-                        bc_idx_b = full_idx[i]
-                        graph.add_edge(bc_idx_a, bc_idx_b, **dict([(attr_name, prob)]))
+                    bc_idx_b = full_idx[i]
+                    # A terminator declared with bond weight 0 keeps its edge at weight 0: the site is declared, not uncapped.
+                    if prob > 0 or (attr_name == _TERMINATION_NAME and obj_a.is_compatible(graph.nodes[bc_idx_b]["obj"])):
+                        graph.add_edge(bc_idx_a, bc_idx_b, **{attr_name: float(prob)})
                 if prints:
                     print("At the end, probabilities are: ", probabilities)
                 if sum(probabilities) == 0:
@@ -554,8 +555,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
         # means a deliberately closed '[]' object (whose missing-terminator
         # case NoExplicitTermination covers). A declared exit that generation
         # cannot reach is caught by the StochasticMissingPath check below.
-
-
 
         # To successfully generate molecules, there needs to be path from each entry point (left half bonds)
         # to at least one end, right half bonds
