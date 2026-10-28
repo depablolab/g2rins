@@ -260,6 +260,21 @@ def test_inherited_termination_names_the_object_that_fires_the_cap(smi, declared
     assert {data["stochastic_id"] for _u, v, data in generative_graph.edges(data=True) if v in terminators and data["termination_weight"] > 0} == {firing_level}
 
 
+def test_zero_amount_declaration_neither_caps_nor_shadows():
+    """A terminator declared with molar amount 0 is no declaration for the
+    resolution: the site inherits the live outer cap instead, nothing is
+    reported as shadowed, and the zero-amount cap keeps no edge."""
+    smi = "{[] [<]CC[>], [<]{[>] [<]NN[>];; [<]Cl|0| [<]}|poisson(100)|[>]; [>]I; [<]Br []}|poisson(400)|"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    assert not any(isinstance(w.message, g2rins.exception.ShadowedTerminationDeclaration) for w in caught)
+    inherited = [w.message for w in caught if isinstance(w.message, g2rins.exception.InheritedTermination)]
+    assert inherited and all(warning.terminators == ("[<]Br",) for warning in inherited)
+    chlorine = {node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 17}
+    assert chlorine and not any(v in chlorine and data["termination_weight"] > 0 for _u, v, data in generative_graph.edges(data=True))
+
+
 @pytest.mark.parametrize(
     "smi",
     [

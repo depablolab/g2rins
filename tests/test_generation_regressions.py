@@ -2305,6 +2305,25 @@ def test_a_cap_fired_by_an_enclosing_object_keeps_its_declared_molar_amount():
     assert fluorines >= 1, "the sibling cap declared with molar amount 1 never fired"
 
 
+def test_a_zero_amount_declaration_neither_caps_nor_shadows():
+    """A terminator declared with molar amount 0 never fires, so it is no
+    declaration for the resolution: it neither caps the site nor shadows a
+    farther live cap, as the zero-weight spelling on its bond connector, which
+    creates no edge, never did. Ranked as the nearest declaration it kept the
+    site while the outer [<1]I was removed as shadowed, and every chain died
+    in the termination estimate."""
+    smi = "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(1, 7):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        assert _count_atoms(mol_graph, 17) == 0, f"seed {seed}: the zero-amount chlorine capped a site"
+        assert _count_atoms(mol_graph, 53) >= 1, f"seed {seed}: no iodine cap delivered"
+
+
 def test_negative_target_draw_still_terminates():
     """A high-dispersity gauss target can draw negative; storing that draw like
     the negative no-target sentinel disables crossing checks and grows forever.

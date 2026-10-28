@@ -574,7 +574,10 @@ def _resolve_termination_levels(generative_graph):
     declared in the site's own stochastic object is wired over one reached
     outward through the terminal bond connector path. The farther edges are
     removed rather than left to compete in the terminate draw, because a
-    generative graph should carry no edge that can never fire.
+    generative graph should carry no edge that can never fire. A terminator
+    declared with molar amount 0 never fires either, so it neither caps nor
+    shadows: its edges are removed the same way once the site has a live
+    declaration, and a site with none keeps them for the zero-support checks.
 
     Firing level: a site is capped when the object owning its bond descriptor
     finishes, which need not be the object that declared the terminator. A
@@ -590,20 +593,30 @@ def _resolve_termination_levels(generative_graph):
     for node in generative_graph.nodes():
         stochastic_id_tree = generative_graph.nodes[node]["stochastic_id_tree"]
         terminations = []
+        never_firing = []
         growth_levels = set()
         for _source, target, key, data in generative_graph.out_edges(node, keys=True, data=True):
             level = data[_EDGE_STOCHASTIC_ID_NAME]
             if data[_TRANSITION_NAME] > 0 or data[_PROPAGATION_NAME] > 0:
                 growth_levels.add(level)
             elif data[_TERMINATION_NAME] > 0:
-                terminations.append((_declaration_rank(stochastic_id_tree, level), level, target, key))
+                entry = (_declaration_rank(stochastic_id_tree, level), level, target, key)
+                target_data = generative_graph.nodes[target]
+                # The amount declared beside the terminator, at its own object: zero means the cap never fires.
+                if target_data["unit_molar_amounts"][target_data["stochastic_id_tree"][0]] == 0:
+                    never_firing.append(entry)
+                else:
+                    terminations.append(entry)
+        if not terminations:
+            # Only never-firing declarations: resolved as declared, so the zero-support checks see the site.
+            terminations, never_firing = never_firing, []
         if not terminations:
             continue
 
         kept_rank = min(rank for rank, _level, _target, _key in terminations)
         kept = [entry for entry in terminations if entry[0] == kept_rank]
         shadowed = [entry for entry in terminations if entry[0] != kept_rank]
-        for _rank, _level, target, key in shadowed:
+        for _rank, _level, target, key in shadowed + never_firing:
             generative_graph.remove_edge(node, target, key)
 
         declared_level = kept[0][1]
