@@ -60,6 +60,7 @@ from .generative_graph import (
     _check_transition_role,
     _connector_placeholder_flag,
     _is_connector_placeholder,
+    _is_termination_edge,
     _json_safe,
     _static_neighbors,
     _verified_unit_texts,
@@ -157,6 +158,11 @@ def _molar_at(molar_amounts, sto_gen_id):
         return float(molar_amounts[sto_gen_id])
     except (IndexError, KeyError, TypeError):
         return 1.0
+
+
+def _declared_molar(generative_graph, target_idx, molar_amounts):
+    """A terminator's molar amount is the one declared beside it, at its own object, whichever object fires the cap."""
+    return _molar_at(molar_amounts, generative_graph.nodes[target_idx]["stochastic_id_tree"][0])
 
 
 def _level_target_weights(generative_graph, target_idx, edge_weights, molar_amounts, sto_gen_id):
@@ -262,7 +268,8 @@ class _HalfAtomBond:
         for u, v, d in graph.out_edges(node_idx, data=True):
             if not d["static"]:
                 for k in _NON_STATIC_ATTR:
-                    if d[k] > 0:
+                    # A terminator declared with weight 0 stays a candidate, so the all-zero draw is reported rather than skipped.
+                    if d[k] > 0 or (k == _TERMINATION_NAME and _is_termination_edge(d)):
                         try:
                             self._mode_attr_map[k] += [d]
                         except KeyError:
@@ -1465,7 +1472,7 @@ class _PartialAtomGraph:
             target_attributes = [all_attributes[i] for i in level_indices]
             target_ids = [all_ids[i] for i in level_indices]
             all_molar_amounts = [all_molar[i] for i in level_indices]
-            molar_amounts = [molar_amount[gen_sto_id] for molar_amount in all_molar_amounts]
+            molar_amounts = [_declared_molar(self.generative_graph, target, molar_amount) for target, molar_amount in zip(target_ids, all_molar_amounts, strict=True)]
             target_weight = np.asarray([attr[_TERMINATION_NAME] for attr in target_attributes])
             target_molar_amount = np.asarray(molar_amounts)
             target_weight *= target_molar_amount
@@ -1620,7 +1627,7 @@ class _PartialAtomGraph:
             all_target_molar_amounts = [all_molar[i] for i in level_indices]
 
             target_weight = np.asarray([attr[_TERMINATION_NAME] for attr in target_attributes])
-            target_molar_amounts = [molar_amounts[gen_sto_id] for molar_amounts in all_target_molar_amounts]
+            target_molar_amounts = [_declared_molar(self.generative_graph, target, molar_amounts) for target, molar_amounts in zip(target_ids, all_target_molar_amounts, strict=True)]
             target_amounts = np.asarray(target_molar_amounts)
             target_weight *= target_amounts
             selected_target_idx = self.stochastic_tracker.choose(
@@ -1696,7 +1703,7 @@ class _PartialAtomGraph:
                     continue
                 target_attributes = [all_attributes[i] for i in level_indices]
                 target_ids = [all_ids[i] for i in level_indices]
-                target_molar_amounts = [all_molar[i][gen_sto_id] for i in level_indices]
+                target_molar_amounts = [_declared_molar(self.generative_graph, all_ids[i], all_molar[i]) for i in level_indices]
 
                 target_weight = np.asarray([attr[_TERMINATION_NAME] for attr in target_attributes])
                 target_weight = target_weight * np.asarray(target_molar_amounts)
@@ -2793,7 +2800,7 @@ class EnsembleCreator:
                         break
                     if transition_weight > 0:
                         has_transition = True
-                    if termination_weight <= 0:
+                    if termination_weight <= 0 and not _is_termination_edge(data):
                         continue
 
                     level = data.get(_EDGE_STOCHASTIC_ID_NAME)
@@ -2801,7 +2808,7 @@ class EnsembleCreator:
                         malformed = True
                         break
                     try:
-                        molar_amount = graph.nodes[target]["unit_molar_amounts"][level]
+                        molar_amount = graph.nodes[target]["unit_molar_amounts"][graph.nodes[target]["stochastic_id_tree"][0]]
                         effective_weight = float(termination_weight * molar_amount)
                     except (KeyError, IndexError, TypeError, ValueError):
                         unknown_levels.add(level)

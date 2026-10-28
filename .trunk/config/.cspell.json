@@ -248,6 +248,12 @@
     "deques",
     "setrecursionlimit",
     "goldens",
-    "ddof"
+    "ddof",
+    "endcap",
+    "renormalize",
+    "unwired",
+    "fluorines",
+    "OCCO",
+    "allclose"
   ]
 }

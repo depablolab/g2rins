@@ -26,9 +26,14 @@ from .chem_resource import (
     smi_bond_mapping,
 )
 from .exception import (
+    ForeignControlledTermination,
     G2RINSWarning,
     IncompatibleBondTypeBondConnector,
     IncompatibleGenerativeGraphSchema,
+    InheritedTermination,
+    MissingTermination,
+    ShadowedTerminationDeclaration,
+    TerminatorOnForcedExitSite,
     TooManyStochasticObjects,
     UnsupportedBondDescriptor,
 )
@@ -72,11 +77,14 @@ class TransitionRole(IntEnum):
 def is_static_edge(edge_data):
     if _STATIC_NAME in edge_data:
         return edge_data[_STATIC_NAME]
-    weight = 0
-    for attr in _NON_STATIC_ATTR:
-        if attr in edge_data:
-            weight += edge_data[attr]
-    return not weight > 0
+    # An edge carrying a weight key is non-static whatever its value, so a terminator's declared 0 is not mirrored as a static bond.
+    return not any(attr in edge_data for attr in _NON_STATIC_ATTR)
+
+
+def _is_termination_edge(edge_data):
+    """A termination edge of the generative graph, including one kept at
+    weight 0 for a terminator declared with bond weight 0."""
+    return not edge_data.get(_STATIC_NAME, False) and edge_data.get(_PROPAGATION_NAME, 0) == 0 and edge_data.get(_TRANSITION_NAME, 0) == 0
 
 
 _DERIVED_NODE_FIELDS = ("unit_id", "bond_id")
@@ -540,6 +548,222 @@ def derive_unit_labels(generative_graph, node_sort_key=None):
     return UnitLabels(unit_id=unit_id, bond_id=bond_id, unit_nodes=nodes_by_unit)
 
 
+@dataclass
+class _TerminationResolution:
+    """What :func:`_resolve_termination_levels` decided for one open site."""
+
+    node: object
+    rank: int
+    declared_level: int
+    firing_level: int
+    terminators: tuple
+    shadowed: tuple
+    shadowed_levels: tuple
+    forced_exit: bool = False
+
+
+def _declaration_rank(stochastic_id_tree, level):
+    """How far out the stochastic object that declared a terminator sits: 0
+    when the site's own object declares it, one more per step outward.
+    Levels outside the site's ancestry rank last."""
+    for rank, ancestor in enumerate(stochastic_id_tree):
+        if ancestor != -2 and ancestor == level:
+            return rank
+    return len(stochastic_id_tree)
+
+
+def _resolve_termination_levels(generative_graph):
+    """Decide which declared terminator caps each open site, and which
+    stochastic object fires it.
+
+    Precedence: the declaration nearest the site wins, so a terminator
+    declared in the site's own stochastic object is wired over one reached
+    outward through the terminal bond connector path. The farther edges are
+    removed rather than left to compete in the terminate draw, because a
+    generative graph should carry no edge that can never fire. A terminator
+    declared with molar amount 0 or with bond weight 0 never fires either, so
+    it neither caps nor shadows: its edges are removed the same way once the
+    site has a live declaration, and a site with none keeps them, at their
+    zero weight, so generation reports the site as dead instead of leaving it
+    uncapped as if no terminator were written.
+
+    Firing level: a site is capped when the object owning its bond descriptor
+    finishes, which need not be the object that declared the terminator. A
+    site whose descriptor belongs to an enclosing object keeps growing after
+    its own object terminated, so a terminator declared beside it would never
+    fire. The surviving edges are re-stamped to the owning object, which both
+    the terminate pass and the average-cap estimate read, so the same cap is
+    priced and delivered; the cap keeps the molar amount declared beside it,
+    read at its own object by whichever object fires it. Only propagation and
+    stochastic transitions of the site's own object or of an enclosing one
+    count as growth that can own the site: a forced transition is no
+    decision of any level.
+
+    Forced exit: a site that leaves its stochastic object through a forced
+    exit is bonded by that exit on every instance, so no terminator declared
+    for it can fire. Every termination edge of such a site is removed and the
+    site is reported. Runs before weight normalization so the survivors
+    renormalize among themselves.
+    """
+    resolutions = []
+    for node in generative_graph.nodes():
+        stochastic_id_tree = generative_graph.nodes[node]["stochastic_id_tree"]
+        ancestry = {level for level in stochastic_id_tree if level >= 0}
+        terminations = []
+        never_firing = []
+        growth_levels = set()
+        forced_exit = False
+        for _source, target, key, data in generative_graph.out_edges(node, keys=True, data=True):
+            level = data[_EDGE_STOCHASTIC_ID_NAME]
+            if data[_TRANSITION_NAME] > 0:
+                if data[_TRANSITION_ROLE_NAME] == TransitionRole.FORCED_EXIT:
+                    forced_exit = True
+                elif data[_TRANSITION_ROLE_NAME] == TransitionRole.STOCHASTIC:
+                    growth_levels.add(level)
+            elif data[_PROPAGATION_NAME] > 0:
+                growth_levels.add(level)
+            elif _is_termination_edge(data):
+                entry = (_declaration_rank(stochastic_id_tree, level), level, target, key)
+                target_data = generative_graph.nodes[target]
+                # A bond weight of 0, or a molar amount of 0 declared beside the terminator at its own object: the cap never fires.
+                if data[_TERMINATION_NAME] == 0 or target_data["unit_molar_amounts"][target_data["stochastic_id_tree"][0]] == 0:
+                    never_firing.append(entry)
+                else:
+                    terminations.append(entry)
+        if forced_exit and (terminations or never_firing):
+            declared = terminations + never_firing
+            for _rank, _level, target, key in declared:
+                generative_graph.remove_edge(node, target, key)
+            rank, level = min((rank, level) for rank, level, _target, _key in declared)
+            resolutions.append(
+                _TerminationResolution(
+                    node=node,
+                    rank=rank,
+                    declared_level=level,
+                    firing_level=level,
+                    terminators=tuple(target for _rank, _level, target, _key in declared),
+                    shadowed=(),
+                    shadowed_levels=(),
+                    forced_exit=True,
+                )
+            )
+            continue
+        if not terminations:
+            # Only never-firing declarations: resolved as declared, so the zero-support checks see the site.
+            terminations, never_firing = never_firing, []
+        if not terminations:
+            continue
+
+        kept_rank = min(rank for rank, _level, _target, _key in terminations)
+        kept = [entry for entry in terminations if entry[0] == kept_rank]
+        shadowed = [entry for entry in terminations if entry[0] != kept_rank]
+        for _rank, _level, target, key in shadowed + never_firing:
+            generative_graph.remove_edge(node, target, key)
+
+        declared_level = kept[0][1]
+        firing_level = declared_level
+        # Only an object the site is written in can fire its cap: an instance
+        # is always registered under a declared object, never under the global
+        # level, and a transition stamped elsewhere is no decision of that site.
+        owning_levels = [level for level in growth_levels if level in ancestry]
+        if owning_levels and kept_rank < len(stochastic_id_tree):
+            firing_level = max(owning_levels, key=lambda level: _declaration_rank(stochastic_id_tree, level))
+            for _rank, _level, target, key in kept:
+                generative_graph.edges[node, target, key][_EDGE_STOCHASTIC_ID_NAME] = firing_level
+
+        resolutions.append(
+            _TerminationResolution(
+                node=node,
+                rank=kept_rank,
+                declared_level=declared_level,
+                firing_level=firing_level,
+                terminators=tuple(target for _rank, _level, target, _key in kept),
+                shadowed=tuple(target for _rank, _level, target, _key in shadowed),
+                shadowed_levels=tuple(level for _rank, level, _target, _key in shadowed),
+            )
+        )
+    return resolutions
+
+
+def _site_atom(graph, node):
+    """The atom that carries a site of the graph with bond connectors: the
+    node itself, or the atom a split-atom placeholder stands in for."""
+    from .bond import BondConnector
+
+    if graph.nodes[node].get(_CONNECTOR_PLACEHOLDER_NAME, False):
+        for neighbor in graph.neighbors(node):
+            if not isinstance(graph.nodes[neighbor]["obj"], BondConnector):
+                return neighbor
+    return node
+
+
+def _describe_site(graph, node):
+    """Name a site of the graph with bond connectors by text: the unit it is
+    written in, the atom that carries it and its bond connector."""
+    from .bond import BondConnector
+
+    atom = graph.nodes[_site_atom(graph, node)]
+    bond_connectors = sorted({str(graph.nodes[neighbor]["obj"]) for neighbor in graph.neighbors(node) if isinstance(graph.nodes[neighbor]["obj"], BondConnector)})
+    return atom.get("token_text", ""), atom.get("smi_text", ""), ", ".join(bond_connectors)
+
+
+def _warn_termination_levels(generative_graph, graph, resolutions):
+    """Report each resolution once per open site: a shadowed declaration, a
+    cap inherited from an enclosing object, a local cap that only an enclosing
+    object can fire, a cap declared for a site that a forced exit consumes,
+    and a site that can hand growth to another object with no terminator
+    reaching it at all. ``graph`` is the graph with bond connectors, which
+    names each site by the texts of its unit, its atom and its bond connector;
+    sites that read alike, such as the ports of one atom, are one report."""
+    reported = set()
+
+    def emit(warning):
+        text = str(warning)
+        if text not in reported:
+            reported.add(text)
+            warnings.warn(warning, stacklevel=1)
+
+    def terminator_texts(nodes):
+        return sorted({_describe_site(graph, node)[0] for node in nodes})
+
+    for resolution in resolutions:
+        site = _describe_site(graph, resolution.node)
+        stochastic_id_tree = generative_graph.nodes[resolution.node]["stochastic_id_tree"]
+        site_level = stochastic_id_tree[0]
+        terminators = terminator_texts(resolution.terminators)
+        if resolution.forced_exit:
+            emit(TerminatorOnForcedExitSite(*site, terminators, site_level))
+            continue
+        if resolution.shadowed:
+            shadowed = sorted({(_describe_site(graph, node)[0], level) for node, level in zip(resolution.shadowed, resolution.shadowed_levels, strict=True)})
+            emit(ShadowedTerminationDeclaration(*site, terminators, resolution.declared_level, [text for text, _level in shadowed], [level for _text, level in shadowed]))
+        if 0 < resolution.rank < len(stochastic_id_tree):
+            emit(InheritedTermination(*site, terminators, resolution.declared_level, resolution.firing_level, site_level))
+        elif resolution.rank == 0 and resolution.firing_level != resolution.declared_level:
+            emit(ForeignControlledTermination(*site, terminators, resolution.declared_level, resolution.firing_level, site_level))
+
+    capped = {resolution.node for resolution in resolutions}
+    for node, data in generative_graph.nodes(data=True):
+        if node in capped:
+            continue
+        # Only a site whose growth continues at an ENCLOSING stochastic
+        # object's discretion can be left open without a cap: that object may
+        # stop before growing through it. Everything else is consumed where it
+        # stands — propagation feeds the growth or mirrors it, a transition at
+        # the site's own level is the origin of that object's growth (capping
+        # initiator sites is a separate design question), a forced entry into
+        # a nested object written in the unit's own text is realized with the
+        # unit, a forced exit fires on every instance when the outermost object
+        # it leaves finalizes, and a global transition is a cross-family arm,
+        # whose consumption is decided elsewhere.
+        stochastic_id_tree = data["stochastic_id_tree"]
+        if any(
+            edge[_TRANSITION_NAME] > 0 and edge[_TRANSITION_ROLE_NAME] == TransitionRole.STOCHASTIC and edge[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree[1:]
+            for _source, _target, edge in generative_graph.out_edges(node, data=True)
+        ):
+            emit(MissingTermination(*_describe_site(graph, node)))
+
+
 def generative_graph_json_data(generative_graph):
     """
     JSON-serializable dict for a generative graph: a self-describing ``format`` block
@@ -974,12 +1198,12 @@ class GraphCreator:
                         else:
                             data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
 
-                    non_static_weights = [d[attr] if attr in d else 0 for attr in non_static_attribute_list]
-                    if max(non_static_weights) > 0:
-                        for attr, w in zip(non_static_attribute_list, non_static_weights):
-                            if w > 0:
-                                current_type = attr
-                                weight *= w
+                    # A hop is typed by the weight it carries, even a terminator's declared weight 0.
+                    non_static_present = [attr for attr in non_static_attribute_list if attr in d]
+                    if non_static_present:
+                        for attr in non_static_present:
+                            current_type = attr
+                            weight *= d[attr]
                     else:
                         current_type = _STATIC_NAME
 
@@ -1110,7 +1334,8 @@ class GraphCreator:
                             if self.init_weight is None:
                                 weight_type = _PROPAGATION_NAME
 
-                if weight > 0:
+                if weight > 0 or weight_type == _TERMINATION_NAME:
+                    # A terminator declared with bond weight 0 keeps its termination edge at weight 0, so the site is declared rather than uncapped.
                     data[weight_type] = weight
 
                 return weight, data
@@ -1141,7 +1366,7 @@ class GraphCreator:
                     self.only_bond_connectors
                     and self.contains_bc(bc_idx)
                     and (self.combined_attr is not None)
-                    and (self.weight > 0)
+                    and (self.weight > 0 or _TERMINATION_NAME in self.combined_attr)
                     # and self.num_stochastic_transitions < 3
                 )
 
@@ -1290,7 +1515,7 @@ class GraphCreator:
 
         - **{static_name}**: bool indicating static edges, that are always present.
         - **{propagation_name}**: float Propagation probability. If bond connectors are connecting between monomer repeat units inside stochastic objects, this indicates the probability \in [0, 1].
-        - **{termination_name}**: float Termination Probabilities. If bond connectors terminate with end-groups after the molecular weight is reached, this is the probability \in [0, 1].
+        - **{termination_name}**: float Termination Probabilities. If bond connectors terminate with end-groups after the molecular weight is reached, this is the probability \in [0, 1]. A terminator declared with bond weight 0 keeps its edge at 0, so a site whose every declared terminator is 0 is distinguishable from one with no terminator.
         - **{transition_name}**: float Transition Probabilities. If transitioning between stochastic objects, this is the probability to take.
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
         - **{transition_role_name}**: int Role of the bond (the ``TransitionRole`` encoding, stable across versions, present on every edge): 0 not a transition; 1 stochastic -- mediated by a bond connector of the managing stochastic object, competes as a weighted option at that level; 2 forced entry -- into a nested stochastic object with no parent bond connector on the path; 3 forced exit -- out of a nested stochastic object through its terminal bond connector with no bond connector of an enclosing object on the path, fires when the instance owning the source finalizes; 4 global -- stochastic id -1. The graph with bond connectors carries 0 on every edge, its transitions are not contracted.
@@ -1496,7 +1721,7 @@ class GraphCreator:
                         else:
                             d[_EDGE_STOCHASTIC_ID_NAME] = -1
                             d[_TRANSITION_ROLE_NAME] = int(TransitionRole.GLOBAL)
-                    elif d.get(_TERMINATION_NAME, 0) > 0:
+                    elif _is_termination_edge(d):
                         # Termination edges: stochastic_id = target node's SO.
                         # A node in an inner SO may have terminators at multiple SO levels;
                         # the target terminator's SO determines which cascade level it belongs to.
@@ -1509,6 +1734,8 @@ class GraphCreator:
                     d.pop("rank", None)
                     d.pop("sto_id", None)
                     d.pop("role", None)
+
+            termination_resolutions = _resolve_termination_levels(generative_graph)
 
         # Set the generation hierarchy of nodes when more than one node can transition from the same SO.
         # First, we set the lowest level of the stochastic tree.
@@ -1614,6 +1841,9 @@ class GraphCreator:
                 unit_g2rins[unit_id] = graph.nodes[n]["token_text"]
         generative_graph.graph["unit_g2rins"] = unit_g2rins
         generative_graph.graph["unit_node_ids"] = {unit_id: list(nodes) for unit_id, nodes in labels.unit_nodes.items()}
+
+        if not include_bond_connectors:
+            _warn_termination_levels(generative_graph, graph_with_bond_connectors, termination_resolutions)
 
         if return_extra_graph_info:
             return generative_graph, extra_graph_info

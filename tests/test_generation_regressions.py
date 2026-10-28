@@ -13,6 +13,7 @@ both runaway/over-counted growth and collapsed/truncated chains.
 
 import warnings
 
+import networkx as nx
 import numpy as np
 import pytest
 from rdkit import Chem
@@ -2180,6 +2181,320 @@ def test_side_port_caps_via_terminal_bond_connector_lists():
         assert counts["F"] == counts["N"] // 2, f"seed {seed}: {counts['N'] // 2} NN side ports but {counts['F']} F cap(s)"
         assert counts["Cl"] == 1, f"seed {seed}: expected exactly 1 outer Cl cap, found {counts['Cl']}"
         assert counts["Br"] == 1, f"seed {seed}: expected exactly 1 outer Br cap, found {counts['Br']}"
+
+
+def test_same_level_terminator_caps_exiting_site():
+    """A terminator declared beside the unit it caps reaches the site even
+    when the site's bond connector belongs to the enclosing stochastic object.
+    Such a site keeps growing after its own object finished, so the cap is
+    stamped with the object that fires it; stamped with the declaring one it
+    was unreachable and the [<1]Cl never appeared in any chain. Individual
+    chains can still show none, when every exiting site was grown through."""
+    smi = "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br, [<1]Cl [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|gauss(8000.0, 1000.0)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    chlorine_total = 0
+    for seed in SEEDS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        chlorine_total += sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
+    assert chlorine_total > 0, "the declared [<1]Cl never reached an exiting site"
+
+
+def test_nearest_terminator_declaration_wins():
+    """When a site is reached by terminators declared at two levels, the
+    nearer declaration is wired and the farther one is removed rather than
+    left to compete: a generative graph carries no shadowed edge.
+    Here the inner [<]Cl caps the NN exit that the outer [<]Br would otherwise
+    also reach."""
+    smi = "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]Cl [<]|[<1]}|poisson(100)|[>]|[>1]; [>]I; [<]Br, [<1]F []}|poisson(400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make(smi).get_graph_creator()
+        generative_graph = graph_creator.get_generative_graph(include_bond_connectors=False)
+        ensemble_creator = graph_creator.get_ensemble_creator()
+
+    unit_id = g2rins.derive_unit_labels(generative_graph).unit_id
+    unit_text = generative_graph.graph["unit_g2rins"]
+    capped_nn_sites = set()
+    for node in generative_graph.nodes():
+        terminators = frozenset(unit_text.get(unit_id.get(target), "") for _source, target, data in generative_graph.out_edges(node, data=True) if data["termination_weight"] > 0)
+        if terminators and unit_text.get(unit_id.get(node)) == "[<]NN([>1])[>]":
+            capped_nn_sites.add(terminators)
+    # The NN exit keeps the nearer [<]Cl alone; the [>1] side port inherits [<1]F.
+    assert capped_nn_sites == {frozenset({"[<]Cl"}), frozenset({"[<1]F"})}, capped_nn_sites
+
+    chlorine_total = 0
+    for seed in SEEDS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        counts = {symbol: sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == symbol) for symbol in ("Cl", "Br", "I")}
+        assert counts["I"] == 1, f"seed {seed}: expected the single declared initiator"
+        assert counts["Cl"] + counts["Br"] == 1, f"seed {seed}: expected exactly one chain-end cap, found {counts}"
+        chlorine_total += counts["Cl"]
+    assert chlorine_total >= 1, "the nearer [<]Cl never capped a chain"
+
+
+def test_nested_initiator_block_ends_inherit_outer_terminator():
+    """A nested stochastic object used as the initiator exposes its repeat-unit
+    chain ends through the terminal bond connector path; they inherit the
+    enclosing object's terminator exactly as a nested object in the repeat-unit
+    section does. The initiator wiring used to cap only bond connectors that
+    failed to connect, so these ends could never be capped — visible here as a
+    missing Cl, where an [H] cap would hide behind an inferred hydrogen. Chains
+    whose initiator port never grew are skipped (initiator ports carry no
+    termination edges, the one remaining gap)."""
+    smi = "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make(smi).get_graph_creator()
+        generative_graph = graph_creator.get_generative_graph(include_bond_connectors=False)
+        ensemble_creator = graph_creator.get_ensemble_creator()
+
+    inner_cap_levels = None
+    for node in generative_graph.nodes():
+        growth = set()
+        termination_levels = []
+        for _source, _target, data in generative_graph.out_edges(node, data=True):
+            if data["transition_weight"] > 0:
+                growth.add(("transition", data["stochastic_id"]))
+            elif data["propagation_weight"] > 0:
+                growth.add(("propagation", data["stochastic_id"]))
+            elif data["termination_weight"] > 0:
+                termination_levels.append(data["stochastic_id"])
+        if ("propagation", 1) in growth and ("transition", 0) in growth:
+            inner_cap_levels = termination_levels
+    assert inner_cap_levels == [0], f"inner block end expected the outer terminator stamped 0, found {inner_cap_levels}"
+
+    unit_labels = g2rins.derive_unit_labels(ensemble_creator._generative_graph).unit_id
+    central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
+    assert len(central) == 1
+    central_origin = str(central[0])
+    for seed in range(6):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        central_nodes = [n for n, d in mol_graph.nodes(data=True) if str(d.get("origin_idx")) == central_origin]
+        assert len(central_nodes) == 1
+        if mol_graph.degree(central_nodes[0]) < 2:
+            continue
+        mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
+        Chem.SanitizeMol(mol)
+        chlorine_count = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
+        assert chlorine_count == 2, f"seed {seed}: both block ends grew but {chlorine_count} Cl cap(s) landed"
+
+
+def test_literal_tail_ports_of_a_nested_initiator_stay_plain_initiator_ports():
+    """An initiator written as a nested stochastic object followed by atoms: the
+    bond connector written after the nested object exposes its repeat-unit chain
+    ends, which inherit the enclosing object's terminators, but the tail's own
+    bond connectors are plain initiator ports, consumed by the growth they
+    start. The wiring used to cap every bond connector of an initiator that
+    contains a nested object, so a tail port competed with growth for the
+    terminator: chains capped the tail with Cl and, once the nested object had
+    used up the target, grew no repeat unit of the enclosing object at all."""
+    for smi in (
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; CO[>]; [<]}|poisson(700)|CC(C)([>])C[>]; [<]Cl []}|poisson(800)|",
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; CO[>]; [<]}|poisson(790)|CC(C)C[>]; [<]Cl []}|poisson(800)|",
+    ):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        generative_graph = ensemble_creator.generative_graph
+        # The enclosing object's units by static bonds: the tail is the carbon-only one, the repeat unit the one with oxygen.
+        static = nx.Graph()
+        static.add_nodes_from(node for node, data in generative_graph.nodes(data=True) if data["stochastic_id_tree"][0] == 0)
+        static.add_edges_from((u, v) for u, v, data in generative_graph.edges(data=True) if data["static"] and u in static and v in static)
+        units = [({generative_graph.nodes[node]["atomic_num"] for node in unit}, unit) for unit in nx.connected_components(static)]
+        tail = next(unit for atomic_nums, unit in units if atomic_nums == {6})
+        repeat_unit = next(unit for atomic_nums, unit in units if 8 in atomic_nums)
+        assert not any(data["termination_weight"] > 0 for source, _target, data in generative_graph.edges(data=True) if source in tail), f"{smi}: a tail port carries a termination edge"
+        tail_origins = {str(node) for node in tail}
+        repeat_unit_origins = {str(node) for node in repeat_unit}
+        for seed in range(6):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+            chlorine = [node for node, data in mol_graph.nodes(data=True) if data["atomic_num"] == 17]
+            assert chlorine, f"{smi} seed {seed}: no Cl cap landed"
+            assert not any(str(mol_graph.nodes[neighbor]["origin_idx"]) in tail_origins for node in chlorine for neighbor in mol_graph.neighbors(node)), f"{smi} seed {seed}: Cl capped the tail"
+            assert any(str(data["origin_idx"]) in repeat_unit_origins for _node, data in mol_graph.nodes(data=True)), f"{smi} seed {seed}: no repeat unit of the enclosing object grew"
+
+
+def test_a_cap_fired_by_an_enclosing_object_keeps_its_declared_molar_amount():
+    """A terminator declared inside a nested object but fired by the enclosing
+    object (the site's bond descriptor belongs to the enclosing object) keeps
+    the molar amount declared beside it. The resolution re-stamps the cap edge
+    to the firing object, and the draw used to read the amount at that object,
+    where the terminator is not declared and the amount is the 1.0 default: a
+    cap declared with amount 0 fired as often as its sibling."""
+    smi = "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0|, [<1]F|1| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    chlorines = fluorines = 0
+    for seed in range(1, 13):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        chlorines += _count_atoms(mol_graph, 17)
+        fluorines += _count_atoms(mol_graph, 9)
+    assert chlorines == 0, f"a cap declared with molar amount 0 fired {chlorines} time(s)"
+    assert fluorines >= 1, "the sibling cap declared with molar amount 1 never fired"
+
+
+def test_a_zero_amount_declaration_neither_caps_nor_shadows():
+    """A terminator declared with molar amount 0 never fires, so it is no
+    declaration for the resolution: it neither caps the site nor shadows a
+    farther live cap, as the zero-weight spelling on its bond connector never
+    did. Ranked as the nearest declaration it kept the site while the outer
+    [<1]I was removed as shadowed, and every chain died in the termination
+    estimate."""
+    smi = "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in range(1, 7):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+        assert _count_atoms(mol_graph, 17) == 0, f"seed {seed}: the zero-amount chlorine capped a site"
+        assert _count_atoms(mol_graph, 53) >= 1, f"seed {seed}: no iodine cap delivered"
+
+
+# The same declarations with the terminator's 0 written as a molar amount and as a bond weight.
+ZERO_TERMINATOR_SPELLINGS = [
+    pytest.param(
+        "C{[>][<]CC[>];;[<][H]|0| []}|uniform(80,80)|",
+        "C{[>][<]CC[>];;[<|0|][H] []}|uniform(80,80)|",
+        id="lone-cap",
+    ),
+    pytest.param(
+        "{[] [<]CC[>]; C[>]; [<][H]|0|, [<]Br []}|poisson(100)|",
+        "{[] [<]CC[>]; C[>]; [<|0|][H], [<]Br []}|poisson(100)|",
+        id="live-sibling",
+    ),
+    pytest.param(
+        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; [<1][H]|0|, [<2][H] []}|uniform(80,80)|",
+        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; [<1|0|][H], [<2][H] []}|uniform(80,80)|",
+        id="dead-source-alternative",
+    ),
+    pytest.param(
+        "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)",
+        "C(O{[>1][<1]CC[>2];;[<2|0|][H] []}|uniform(80,80)|)(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)",
+        id="dead-arm",
+    ),
+    pytest.param(
+        "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1]Cl|0| [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|",
+        "{[] [<1]NN[>1]; {[] [<0]CC([>1])C[>0]; C[>0]; [<0]Br, [<1|0|]Cl [<1]}|poisson(200)|[>1]; [<1]I []}|poisson(400)|",
+        id="zero-beside-a-live-outer-cap",
+    ),
+    pytest.param(
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1]F|0| []}|poisson(400)|",
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1|0|]F []}|poisson(400)|",
+        id="lone-cap-of-a-nested-side-site",
+    ),
+]
+
+
+@pytest.mark.parametrize(("by_amount", "by_weight"), ZERO_TERMINATOR_SPELLINGS)
+def test_a_zero_weight_terminator_is_declared_like_a_zero_amount_one(by_amount, by_weight):
+    """A terminator's 0 means the same whether written as its molar amount or
+    as its bond weight: beside a live cap it is ignored, and as the only cap of
+    a site it leaves the site declared but dead. The bond-weight spelling used
+    to create no edge at all, so a site capped by nothing else ended uncapped
+    and silent where the molar spelling failed."""
+    from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
+
+    def outcome(smi):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+            try:
+                return ensemble_creator.create_ensemble(3, output_format="smiles", seed=1, max_number_of_discarded_chains=2)
+            except (AllZeroSamplingWeights, DeadSamplingPath) as error:
+                return (type(error), type(error.__cause__))
+
+    assert outcome(by_weight) == outcome(by_amount)
+
+
+@pytest.mark.parametrize("smi", ["C{[>][<]CC[>];;[<][H]|0| []}|uniform(80,80)|", "C{[>][<]CC[>];;[<|0|][H] []}|uniform(80,80)|"], ids=["amount", "weight"])
+def test_a_lone_zero_terminator_fails_fast_in_either_spelling(smi):
+    """The only cap of the only site is declared with 0, so every chain reaches
+    an all-zero termination draw: the proof sees the zero-weight edge and the
+    first chain fails fatally instead of burning retries."""
+    from g2rins.exception import AllZeroSamplingWeights
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(AllZeroSamplingWeights, match="termination MW estimate"):
+            ensemble_creator.create_ensemble(n_samples=1, max_number_of_discarded_chains=3)
+
+
+@pytest.mark.parametrize(
+    "smi",
+    [
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1]F|0| []}|poisson(400)|",
+        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1|0|]F []}|poisson(400)|",
+    ],
+    ids=["amount", "weight"],
+)
+def test_a_site_whose_only_cap_is_zero_is_a_dead_sampling_path(smi):
+    """The [>1] side sites of the nested unit are capped by [<1]F alone,
+    declared with 0, so a chain that grew the nested object meets an all-zero
+    termination draw when the enclosing object finishes. The bond-weight
+    spelling used to drop the terminator and leave those sites silently
+    unused. A chain of CC units alone can complete, so the path is retryable
+    rather than fatal."""
+    from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(DeadSamplingPath) as caught:
+            ensemble_creator.create_ensemble(1, output_format="smiles", seed=0, max_number_of_discarded_chains=1)
+    assert isinstance(caught.value.__cause__, AllZeroSamplingWeights)
+
+
+def test_an_inherited_cap_fired_by_its_owner_counts_toward_that_objects_target():
+    """A terminator declared in the enclosing object caps a site whose bond
+    descriptor belongs to the nested object that grows it. That object fires
+    the cap when it finishes and carries the cap's molecular weight: the mass
+    it reports for each instance, the one its target check reads, includes
+    the bromine, and a chain carries one bromine per nested instance. The
+    released behavior credited the cap to the enclosing object at its own
+    finalization, so the nested masses held no bromine."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; {[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; [<2]Br []}|poisson(2000)|"
+    # Residue masses: the dummy atoms weigh nothing.
+    entry_unit, repeat_unit, bromine = (Descriptors.MolWt(Chem.MolFromSmiles(fragment)) for fragment in ("*CCCO*", "*CCO*", "*Br"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = ensemble_creator.create_ensemble(3, output_format="smiles", ensemble_info=True, seed=seed)
+        nested_id = next(stochastic_id for stochastic_id, distribution in data.distributions.items() if distribution == "|poisson(200.0)|")
+        nested_masses = np.asarray(data.mol_weights[nested_id], dtype=float)
+        repeat_units = (nested_masses - entry_unit - bromine) / repeat_unit
+        assert (
+            np.allclose(repeat_units, np.round(repeat_units), atol=1e-3) and (repeat_units >= 0).all()
+        ), f"seed {seed}: a nested instance mass does not include its bromine cap: {nested_masses.tolist()}"
+        assert sum(chain.count("Br") for chain in data.chains) == len(nested_masses), f"seed {seed}: bromine caps and nested instances differ"
 
 
 def test_negative_target_draw_still_terminates():

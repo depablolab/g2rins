@@ -398,7 +398,7 @@ def test_transition_role_is_consistent_on_every_edge_of_the_corpus(graph_validat
                 assert data["stochastic_id"] in source_tree[1:] and data["stochastic_id"] in target_tree
             if role == 1:
                 assert data["stochastic_id"] >= 0
-    assert counts == {0: 1251, 1: 20, 2: 2, 3: 2, 4: 98}
+    assert counts == {0: 1252, 1: 20, 2: 2, 3: 2, 4: 98}
 
 
 @pytest.mark.parametrize(

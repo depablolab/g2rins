@@ -44,6 +44,9 @@ lint:
     - linters: [bandit]
       paths:
         - tests/**
+    - linters: [cspell]
+      paths:
+        - tests/graph_validation.json
 actions:
   enabled:
     - trunk-announce

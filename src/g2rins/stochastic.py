@@ -7,7 +7,6 @@ import warnings
 import networkx as nx
 import numpy as np
 
-from .g2rins_molecule import G2rinsMolecule
 from .bond import (
     BondConnector,
     TerminalBondConnectorList,
@@ -26,6 +25,7 @@ from .exception import (
     StochasticMissingPath,
     UndefinedDistribution,
 )
+from .g2rins_molecule import G2rinsMolecule
 from .generative_graph import (
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
@@ -288,9 +288,10 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     probabilities /= probabilities.sum()
                 # Assign bond attribute (stochastic, transition or termination)
                 for i, prob in enumerate(probabilities):
-                    if prob > 0:
-                        bc_idx_b = full_idx[i]
-                        graph.add_edge(bc_idx_a, bc_idx_b, **dict([(attr_name, prob)]))
+                    bc_idx_b = full_idx[i]
+                    # A terminator declared with bond weight 0 keeps its edge at weight 0: the site is declared, not uncapped.
+                    if prob > 0 or (attr_name == _TERMINATION_NAME and obj_a.is_compatible(graph.nodes[bc_idx_b]["obj"])):
+                        graph.add_edge(bc_idx_a, bc_idx_b, **{attr_name: float(prob)})
                 if prints:
                     print("At the end, probabilities are: ", probabilities)
                 if sum(probabilities) == 0:
@@ -411,8 +412,21 @@ class StochasticObject(G2rinsBase, GenerationBase):
         initiator_non_connected_bc = []
         if len(self._left_terminal_bc_list.terminal_bond_connectors) == 1 and self._left_terminal_bc_list.terminal_bond_connectors[0].symbol is None:
             graph, initiator_non_connected_bc = connect_initiators_to_monomers(graph, mono_idx_pos, initiator_idx_pos)
-            if len(initiator_non_connected_bc) > 0:
-                graph, _non_connected_bc = connect_initiators_to_terminators(graph, initiator_non_connected_bc, terminator_idx_pos)
+            # A nested stochastic object used as an initiator exposes repeat-unit
+            # chain ends through its terminal bond connector path; growth can
+            # leave those ends open, so they inherit this object's terminators
+            # exactly as a nested object in the repeat-unit section does. That
+            # path is the bond connector written after the nested object, which
+            # neighbors its terminal bond connector (only nested objects' nodes
+            # carry stochastic_obj here; this object's are stamped below). A bond
+            # connector on an atom written beside the nested object is a plain
+            # initiator bond connector, which stays unwired unless nothing could
+            # connect it: its site is the origin of the growth and is consumed by it.
+            terminator_wire_bc = [
+                bc_idx for bc_idx in initiator_idx_pos if bc_idx in initiator_non_connected_bc or any("stochastic_obj" in graph.nodes[neighbor] for neighbor in nx.all_neighbors(graph, bc_idx))
+            ]
+            if len(terminator_wire_bc) > 0:
+                graph, _non_connected_bc = connect_initiators_to_terminators(graph, terminator_wire_bc, terminator_idx_pos)
 
         # Add initiating bonds
         if self._left_terminal_bc_list.terminal_bond_connectors[0].symbol is None:
@@ -541,8 +555,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
         # means a deliberately closed '[]' object (whose missing-terminator
         # case NoExplicitTermination covers). A declared exit that generation
         # cannot reach is caught by the StochasticMissingPath check below.
-
-
 
         # To successfully generate molecules, there needs to be path from each entry point (left half bonds)
         # to at least one end, right half bonds
