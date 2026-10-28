@@ -689,11 +689,12 @@ def _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, resolut
         label = unit_id_map.get(node, "")
         # Only a repeat-unit or linker site whose growth continues at an
         # ENCLOSING stochastic object's discretion can be left open without a
-        # cap (the edge's level is an ancestor of the site): that object may
-        # stop before growing through it. Everything else is consumed where
-        # it stands — propagation feeds the growth or mirrors it, initiator
-        # sites are the origin of the growth (their capping is a separate
-        # design question), a transition INTO a nested object written in the
+        # cap (the edge's level is an ancestor of the site, never its own
+        # object): that object may stop before growing through it. Everything
+        # else is consumed where it stands — propagation feeds the growth or
+        # mirrors it, initiator sites and a transition at the site's own level
+        # are the origin of that object's growth (capping initiator sites is a
+        # separate design question), a transition INTO a nested object written in the
         # unit's own text is realized with the unit, a transition into a
         # terminator unit is a written endcap, a forced exit fires on every
         # instance when the outermost object it leaves finalizes, and -1
@@ -704,7 +705,7 @@ def _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, resolut
         if any(
             data[_TRANSITION_NAME] > 0
             and data[_EDGE_STOCHASTIC_ID_NAME] >= 0
-            and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree
+            and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree[1:]
             and data[_TRANSITION_ROLE_NAME] != TransitionRole.FORCED_EXIT
             and not unit_id_map.get(target, "").startswith("T")
             for _source, target, data in generative_graph.out_edges(node, data=True)

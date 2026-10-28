@@ -289,6 +289,10 @@ def test_zero_amount_declaration_neither_caps_nor_shadows():
         # Two nested objects joined directly: the join is a forced exit, delivered on every
         # instance of the first object, so its sites are never left open.
         "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|",
+        # An initiator written as a nested object followed by atoms: the tail's
+        # bond connector is a plain initiator port, consumed by its own object's
+        # growth, so neither a cap nor a warning belongs to it.
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; CO[>]; [<]}|poisson(700)|CC(C)([>])C[>]; [<]Cl []}|poisson(800)|",
     ],
 )
 def test_terminator_declared_beside_its_unit_is_silent(smi):
@@ -300,6 +304,20 @@ def test_terminator_declared_beside_its_unit_is_silent(smi):
         g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
     reported = [str(entry.message) for entry in caught if isinstance(entry.message, g2rins.exception.TerminationDeclarationWarning)]
     assert not reported, reported
+
+
+def test_a_transition_at_the_site_own_level_is_not_a_missing_cap():
+    """The initiator of the middle object, a nested object followed by atoms,
+    has no terminator of its own and needs none: its tail's bond connector
+    starts that object's growth, like any initiator port. Only a site whose
+    growth continues at an enclosing object's discretion can be left open, so
+    the site's own level never makes a cap missing."""
+    smi = "{[] [<]CC([>])C(=O)OC(C)(C)C; {[] [<]CC([>])(C)C(=O)OCCO; {[] [<]CCO[>]; CO[>]; [<]}|poisson(3000)|CCOC(=O)C(C)(C)[>]; [<]}|poisson(6000)|[>]; [<]Br []}|poisson(10000)|"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    missing = [str(entry.message) for entry in caught if isinstance(entry.message, g2rins.exception.MissingTermination)]
+    assert not missing, missing
 
 
 @pytest.mark.parametrize("smi", ["{[$] [>]CC[<];; [>]}|flory_schulz(0.9)|"])

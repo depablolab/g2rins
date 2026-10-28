@@ -12,7 +12,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 ### Changed
 
 - Which terminator caps an open site is resolved at graph construction: the declaration nearest the site wins, and termination edges that can never fire are removed from the generative graph. The stochastic object that owns the site's bond descriptor fires the cap, the cap's mass counts toward that object's molecular weight target, and the cap keeps the molar amount declared beside it; a terminator declared with molar amount 0 never fires, so it neither caps a site nor shadows a farther declaration.
-- A nested stochastic object used as an initiator now inherits the enclosing object's terminators for its exposed chain ends, as one used as a repeat unit already did.
+- A nested stochastic object used as an initiator now inherits the enclosing object's terminators for its repeat-unit chain ends, as one used as a repeat unit already did; the bond connectors of atoms written beside the nested object remain plain initiator bond connectors.
 
 ## [1.1.0] - 2026-10-05
 

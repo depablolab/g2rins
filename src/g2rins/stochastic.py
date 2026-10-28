@@ -414,11 +414,15 @@ class StochasticObject(G2rinsBase, GenerationBase):
             # A nested stochastic object used as an initiator exposes repeat-unit
             # chain ends through its terminal bond connector path; growth can
             # leave those ends open, so they inherit this object's terminators
-            # exactly as a nested object in the repeat-unit section does. A plain
-            # initiator bond connector stays unwired unless nothing could connect
-            # it: its site is the origin of the growth and is consumed by it.
+            # exactly as a nested object in the repeat-unit section does. That
+            # path is the bond connector written after the nested object, which
+            # neighbours its terminal bond connector (only nested objects' nodes
+            # carry stochastic_obj here; this object's are stamped below). A bond
+            # connector on an atom written beside the nested object is a plain
+            # initiator bond connector, which stays unwired unless nothing could
+            # connect it: its site is the origin of the growth and is consumed by it.
             terminator_wire_bc = [
-                bc_idx for bc_idx in initiator_idx_pos if bc_idx in initiator_non_connected_bc or "{" in self._initiation_residues[bond_idx_to_initiator_idx[bc_idx]].generate_string(True)
+                bc_idx for bc_idx in initiator_idx_pos if bc_idx in initiator_non_connected_bc or any("stochastic_obj" in graph.nodes[neighbor] for neighbor in nx.all_neighbors(graph, bc_idx))
             ]
             if len(terminator_wire_bc) > 0:
                 graph, _non_connected_bc = connect_initiators_to_terminators(graph, terminator_wire_bc, terminator_idx_pos)

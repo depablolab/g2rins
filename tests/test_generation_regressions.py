@@ -13,6 +13,7 @@ both runaway/over-counted growth and collapsed/truncated chains.
 
 import warnings
 
+import networkx as nx
 import numpy as np
 import pytest
 from rdkit import Chem
@@ -2281,6 +2282,43 @@ def test_nested_initiator_block_ends_inherit_outer_terminator():
         Chem.SanitizeMol(mol)
         chlorine_count = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "Cl")
         assert chlorine_count == 2, f"seed {seed}: both block ends grew but {chlorine_count} Cl cap(s) landed"
+
+
+def test_literal_tail_ports_of_a_nested_initiator_stay_plain_initiator_ports():
+    """An initiator written as a nested stochastic object followed by atoms: the
+    bond connector written after the nested object exposes its repeat-unit chain
+    ends, which inherit the enclosing object's terminators, but the tail's own
+    bond connectors are plain initiator ports, consumed by the growth they
+    start. The wiring used to cap every bond connector of an initiator that
+    contains a nested object, so a tail port competed with growth for the
+    terminator: chains capped the tail with Cl and, once the nested object had
+    used up the target, grew no repeat unit of the enclosing object at all."""
+    for smi in (
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; CO[>]; [<]}|poisson(700)|CC(C)([>])C[>]; [<]Cl []}|poisson(800)|",
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; CO[>]; [<]}|poisson(790)|CC(C)C[>]; [<]Cl []}|poisson(800)|",
+    ):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        generative_graph = ensemble_creator.generative_graph
+        # The enclosing object's units by static bonds: the tail is the carbon-only one, the repeat unit the one with oxygen.
+        static = nx.Graph()
+        static.add_nodes_from(node for node, data in generative_graph.nodes(data=True) if data["stochastic_id_tree"][0] == 0)
+        static.add_edges_from((u, v) for u, v, data in generative_graph.edges(data=True) if data["static"] and u in static and v in static)
+        units = [({generative_graph.nodes[node]["atomic_num"] for node in unit}, unit) for unit in nx.connected_components(static)]
+        tail = next(unit for atomic_nums, unit in units if atomic_nums == {6})
+        repeat_unit = next(unit for atomic_nums, unit in units if 8 in atomic_nums)
+        assert not any(data["termination_weight"] > 0 for source, _target, data in generative_graph.edges(data=True) if source in tail), f"{smi}: a tail port carries a termination edge"
+        tail_origins = {str(node) for node in tail}
+        repeat_unit_origins = {str(node) for node in repeat_unit}
+        for seed in range(6):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
+            chlorine = [node for node, data in mol_graph.nodes(data=True) if data["atomic_num"] == 17]
+            assert chlorine, f"{smi} seed {seed}: no Cl cap landed"
+            assert not any(str(mol_graph.nodes[neighbor]["origin_idx"]) in tail_origins for node in chlorine for neighbor in mol_graph.neighbors(node)), f"{smi} seed {seed}: Cl capped the tail"
+            assert any(str(data["origin_idx"]) in repeat_unit_origins for _node, data in mol_graph.nodes(data=True)), f"{smi} seed {seed}: no repeat unit of the enclosing object grew"
 
 
 def test_a_cap_fired_by_an_enclosing_object_keeps_its_declared_molar_amount():
