@@ -33,6 +33,7 @@ from .exception import (
     InheritedTermination,
     MissingTermination,
     ShadowedTerminationDeclaration,
+    TerminatorOnForcedExitSite,
     TooManyStochasticObjects,
     UnsupportedBondDescriptor,
 )
@@ -554,6 +555,8 @@ class _TerminationResolution:
     firing_level: int
     terminators: tuple
     shadowed: tuple
+    shadowed_levels: tuple
+    forced_exit: bool = False
 
 
 def _declaration_rank(stochastic_id_tree, level):
@@ -586,18 +589,33 @@ def _resolve_termination_levels(generative_graph):
     fire. The surviving edges are re-stamped to the owning object, which both
     the terminate pass and the average-cap estimate read, so the same cap is
     priced and delivered; the cap keeps the molar amount declared beside it,
-    read at its own object by whichever object fires it. Runs before weight
-    normalization so the survivors renormalize among themselves.
+    read at its own object by whichever object fires it. Only propagation and
+    stochastic transitions of the site's own object or of an enclosing one
+    count as growth that can own the site: a forced transition is no
+    decision of any level.
+
+    Forced exit: a site that leaves its stochastic object through a forced
+    exit is bonded by that exit on every instance, so no terminator declared
+    for it can fire. Every termination edge of such a site is removed and the
+    site is reported. Runs before weight normalization so the survivors
+    renormalize among themselves.
     """
     resolutions = []
     for node in generative_graph.nodes():
         stochastic_id_tree = generative_graph.nodes[node]["stochastic_id_tree"]
+        ancestry = {level for level in stochastic_id_tree if level >= 0}
         terminations = []
         never_firing = []
         growth_levels = set()
+        forced_exit = False
         for _source, target, key, data in generative_graph.out_edges(node, keys=True, data=True):
             level = data[_EDGE_STOCHASTIC_ID_NAME]
-            if data[_TRANSITION_NAME] > 0 or data[_PROPAGATION_NAME] > 0:
+            if data[_TRANSITION_NAME] > 0:
+                if data[_TRANSITION_ROLE_NAME] == TransitionRole.FORCED_EXIT:
+                    forced_exit = True
+                elif data[_TRANSITION_ROLE_NAME] == TransitionRole.STOCHASTIC:
+                    growth_levels.add(level)
+            elif data[_PROPAGATION_NAME] > 0:
                 growth_levels.add(level)
             elif data[_TERMINATION_NAME] > 0:
                 entry = (_declaration_rank(stochastic_id_tree, level), level, target, key)
@@ -607,6 +625,24 @@ def _resolve_termination_levels(generative_graph):
                     never_firing.append(entry)
                 else:
                     terminations.append(entry)
+        if forced_exit and (terminations or never_firing):
+            declared = terminations + never_firing
+            for _rank, _level, target, key in declared:
+                generative_graph.remove_edge(node, target, key)
+            rank, level = min((rank, level) for rank, level, _target, _key in declared)
+            resolutions.append(
+                _TerminationResolution(
+                    node=node,
+                    rank=rank,
+                    declared_level=level,
+                    firing_level=level,
+                    terminators=tuple(target for _rank, _level, target, _key in declared),
+                    shadowed=(),
+                    shadowed_levels=(),
+                    forced_exit=True,
+                )
+            )
+            continue
         if not terminations:
             # Only never-firing declarations: resolved as declared, so the zero-support checks see the site.
             terminations, never_firing = never_firing, []
@@ -621,9 +657,10 @@ def _resolve_termination_levels(generative_graph):
 
         declared_level = kept[0][1]
         firing_level = declared_level
-        # Only a real stochastic object can fire a cap: an instance is always
-        # registered under a declared object, never under the global level.
-        owning_levels = [level for level in growth_levels if level >= 0]
+        # Only an object the site is written in can fire its cap: an instance
+        # is always registered under a declared object, never under the global
+        # level, and a transition stamped elsewhere is no decision of that site.
+        owning_levels = [level for level in growth_levels if level in ancestry]
         if owning_levels and kept_rank < len(stochastic_id_tree):
             firing_level = max(owning_levels, key=lambda level: _declaration_rank(stochastic_id_tree, level))
             for _rank, _level, target, key in kept:
@@ -637,80 +674,89 @@ def _resolve_termination_levels(generative_graph):
                 firing_level=firing_level,
                 terminators=tuple(target for _rank, _level, target, _key in kept),
                 shadowed=tuple(target for _rank, _level, target, _key in shadowed),
+                shadowed_levels=tuple(level for _rank, level, _target, _key in shadowed),
             )
         )
     return resolutions
 
 
-def _warn_termination_levels(generative_graph, unit_id_map, unit_g2rins, resolutions):
+def _site_atom(graph, node):
+    """The atom that carries a site of the graph with bond connectors: the
+    node itself, or the atom a split-atom placeholder stands in for."""
+    from .bond import BondConnector
+
+    if graph.nodes[node].get(_CONNECTOR_PLACEHOLDER_NAME, False):
+        for neighbor in graph.neighbors(node):
+            if not isinstance(graph.nodes[neighbor]["obj"], BondConnector):
+                return neighbor
+    return node
+
+
+def _describe_site(graph, node):
+    """Name a site of the graph with bond connectors by text: the unit it is
+    written in, the atom that carries it and its bond connector."""
+    from .bond import BondConnector
+
+    atom = graph.nodes[_site_atom(graph, node)]
+    bond_connectors = sorted({str(graph.nodes[neighbor]["obj"]) for neighbor in graph.neighbors(node) if isinstance(graph.nodes[neighbor]["obj"], BondConnector)})
+    return atom.get("token_text", ""), atom.get("smi_text", ""), ", ".join(bond_connectors)
+
+
+def _warn_termination_levels(generative_graph, graph, resolutions):
     """Report each resolution once per open site: a shadowed declaration, a
     cap inherited from an enclosing object, a local cap that only an enclosing
-    object can fire, and a site that can hand growth to another object with no
-    terminator reaching it at all."""
+    object can fire, a cap declared for a site that a forced exit consumes,
+    and a site that can hand growth to another object with no terminator
+    reaching it at all. ``graph`` is the graph with bond connectors, which
+    names each site by the texts of its unit, its atom and its bond connector;
+    sites that read alike, such as the ports of one atom, are one report."""
     reported = set()
 
-    def describe(node):
-        label = unit_id_map.get(node, "?")
-        return label, unit_g2rins.get(label, "")
-
-    def terminator_texts(nodes):
-        return sorted({describe(node)[1] for node in nodes})
-
-    def emit(key, warning):
-        if key not in reported:
-            reported.add(key)
+    def emit(warning):
+        text = str(warning)
+        if text not in reported:
+            reported.add(text)
             warnings.warn(warning, stacklevel=1)
 
+    def terminator_texts(nodes):
+        return sorted({_describe_site(graph, node)[0] for node in nodes})
+
     for resolution in resolutions:
-        label, text = describe(resolution.node)
+        site = _describe_site(graph, resolution.node)
+        stochastic_id_tree = generative_graph.nodes[resolution.node]["stochastic_id_tree"]
+        site_level = stochastic_id_tree[0]
         terminators = terminator_texts(resolution.terminators)
-        depth = len(generative_graph.nodes[resolution.node]["stochastic_id_tree"])
+        if resolution.forced_exit:
+            emit(TerminatorOnForcedExitSite(*site, terminators, site_level))
+            continue
         if resolution.shadowed:
-            shadowed = terminator_texts(resolution.shadowed)
-            emit(
-                ("shadowed", label, tuple(terminators), tuple(shadowed)),
-                ShadowedTerminationDeclaration(label, text, terminators, shadowed),
-            )
-        if 0 < resolution.rank < depth:
-            emit(
-                ("inherited", label, tuple(terminators)),
-                InheritedTermination(label, text, terminators, resolution.declared_level, resolution.firing_level),
-            )
+            shadowed = sorted({(_describe_site(graph, node)[0], level) for node, level in zip(resolution.shadowed, resolution.shadowed_levels)})
+            emit(ShadowedTerminationDeclaration(*site, terminators, resolution.declared_level, [text for text, _level in shadowed], [level for _text, level in shadowed]))
+        if 0 < resolution.rank < len(stochastic_id_tree):
+            emit(InheritedTermination(*site, terminators, resolution.declared_level, resolution.firing_level, site_level))
         elif resolution.rank == 0 and resolution.firing_level != resolution.declared_level:
-            emit(
-                ("foreign", label, tuple(terminators)),
-                ForeignControlledTermination(label, text, terminators, resolution.declared_level, resolution.firing_level),
-            )
+            emit(ForeignControlledTermination(*site, terminators, resolution.declared_level, resolution.firing_level, site_level))
 
     capped = {resolution.node for resolution in resolutions}
-    for node in generative_graph.nodes():
+    for node, data in generative_graph.nodes(data=True):
         if node in capped:
             continue
-        label = unit_id_map.get(node, "")
-        # Only a repeat-unit or linker site whose growth continues at an
-        # ENCLOSING stochastic object's discretion can be left open without a
-        # cap (the edge's level is an ancestor of the site, never its own
-        # object): that object may stop before growing through it. Everything
-        # else is consumed where it stands — propagation feeds the growth or
-        # mirrors it, initiator sites and a transition at the site's own level
-        # are the origin of that object's growth (capping initiator sites is a
-        # separate design question), a transition INTO a nested object written in the
-        # unit's own text is realized with the unit, a transition into a
-        # terminator unit is a written endcap, a forced exit fires on every
-        # instance when the outermost object it leaves finalizes, and -1
-        # marks cross-family arms, whose consumption is decided elsewhere.
-        if not label.startswith(("R", "L")):
-            continue
-        stochastic_id_tree = generative_graph.nodes[node]["stochastic_id_tree"]
+        # Only a site whose growth continues at an ENCLOSING stochastic
+        # object's discretion can be left open without a cap: that object may
+        # stop before growing through it. Everything else is consumed where it
+        # stands — propagation feeds the growth or mirrors it, a transition at
+        # the site's own level is the origin of that object's growth (capping
+        # initiator sites is a separate design question), a forced entry into
+        # a nested object written in the unit's own text is realized with the
+        # unit, a forced exit fires on every instance when the outermost object
+        # it leaves finalizes, and a global transition is a cross-family arm,
+        # whose consumption is decided elsewhere.
+        stochastic_id_tree = data["stochastic_id_tree"]
         if any(
-            data[_TRANSITION_NAME] > 0
-            and data[_EDGE_STOCHASTIC_ID_NAME] >= 0
-            and data[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree[1:]
-            and data[_TRANSITION_ROLE_NAME] != TransitionRole.FORCED_EXIT
-            and not unit_id_map.get(target, "").startswith("T")
-            for _source, target, data in generative_graph.out_edges(node, data=True)
+            edge[_TRANSITION_NAME] > 0 and edge[_TRANSITION_ROLE_NAME] == TransitionRole.STOCHASTIC and edge[_EDGE_STOCHASTIC_ID_NAME] in stochastic_id_tree[1:]
+            for _source, _target, edge in generative_graph.out_edges(node, data=True)
         ):
-            emit(("missing", label), MissingTermination(label, unit_g2rins.get(label, "")))
+            emit(MissingTermination(*_describe_site(graph, node)))
 
 
 def generative_graph_json_data(generative_graph):
@@ -1791,7 +1837,7 @@ class GraphCreator:
         generative_graph.graph["unit_node_ids"] = {unit_id: list(nodes) for unit_id, nodes in labels.unit_nodes.items()}
 
         if not include_bond_connectors:
-            _warn_termination_levels(generative_graph, labels.unit_id, unit_g2rins, termination_resolutions)
+            _warn_termination_levels(generative_graph, graph_with_bond_connectors, termination_resolutions)
 
         if return_extra_graph_info:
             return generative_graph, extra_graph_info

@@ -243,7 +243,7 @@ def test_warn_termination_declaration(smi, category):
         # The block ends also exit to the enclosing object, which therefore fires the cap it declares.
         ("{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|", 0, 0, "That object decides when the site is capped"),
         # The inner object owns the sites, so it fires the cap the enclosing object declares and carries its mass.
-        (TERMINATION_DECLARATION_CASES[-1].values[0], 0, 1, "Stochastic object 1, which owns the site's bond descriptor, fires the cap"),
+        (TERMINATION_DECLARATION_CASES[-1].values[0], 0, 1, "The unit's own stochastic object 1 owns the site's bond descriptor, so it fires the cap"),
     ],
 )
 def test_inherited_termination_names_the_object_that_fires_the_cap(smi, declared_level, firing_level, phrase):
@@ -273,6 +273,59 @@ def test_zero_amount_declaration_neither_caps_nor_shadows():
     assert inherited and all(warning.terminators == ("[<]Br",) for warning in inherited)
     chlorine = {node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 17}
     assert chlorine and not any(v in chlorine and data["termination_weight"] > 0 for _u, v, data in generative_graph.edges(data=True))
+
+
+def _termination_warnings(smi, category):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    return generative_graph, [entry.message for entry in caught if isinstance(entry.message, category)]
+
+
+@pytest.mark.parametrize(
+    ("smi", "terminator", "atomic_num"),
+    [
+        # The forced exit leads into the next nested object.
+        ("{[] [<]CC({[<] [<]NN[>];; [>]Cl [>]}|poisson(80)|{[<] [<]CO[>];; [>]}|poisson(80)|Br)C[>]; C[>]; [<][H] []}|poisson(2000)|", "[>]Cl", 17),
+        # The forced exit leads into the atoms written after the nested object.
+        ("{[] [<]CC({[<] [<]NN[>];; [>]Br [>]}|poisson(80)|C)C[>]; C[>]; [<][H] []}|poisson(2000)|", "[>]Br", 35),
+    ],
+)
+def test_terminator_on_a_forced_exit_site_never_fires(smi, terminator, atomic_num):
+    """A site that leaves its stochastic object through a forced exit is bonded
+    by that exit on every instance, so a terminator declared for it can never
+    fire: its termination edge is removed and the site is reported as consumed,
+    not as capped under another object's control."""
+    generative_graph, reported = _termination_warnings(smi, g2rins.exception.TerminationDeclarationWarning)
+    assert [type(warning) for warning in reported] == [g2rins.exception.TerminatorOnForcedExitSite]
+    (warning,) = reported
+    assert (warning.unit_text, warning.atom_text, warning.bond_connector, warning.terminators, warning.site_level) == ("[<]NN[>]", "N", "[<]", (terminator,), 1)
+    assert f"so the terminator {terminator} declared for it never fires and its termination edge is removed" in str(warning)
+    cap_atoms = {node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == atomic_num}
+    assert cap_atoms and not any(target in cap_atoms and data["termination_weight"] > 0 for _source, target, data in generative_graph.edges(data=True))
+
+
+def test_termination_warnings_name_each_site():
+    """A site is named by the texts of its bond connector, its atom and its
+    unit: two capped sites of one unit are two reports, the two ports of one
+    atom are one, and a shadowed declaration names the object that declared
+    each list, which is all that tells the same list at two levels apart."""
+    two_sites = "{[] [<]CC[>], [<]{[>] [<]NC([>1])N[>1];; [<1]}|poisson(100)|[>1]; [>]I; [<1]Br []}|poisson(400)|"
+    _graph, inherited = _termination_warnings(two_sites, g2rins.exception.InheritedTermination)
+    assert sorted((warning.unit_text, warning.atom_text, warning.bond_connector) for warning in inherited) == [("[<]NC([>1])N[>1]", "C", "[>1]"), ("[<]NC([>1])N[>1]", "N", "[>1]")]
+    assert {(warning.terminators, warning.declared_level, warning.firing_level, warning.site_level) for warning in inherited} == {(("[<1]Br",), 0, 0, 1)}
+    assert all(str(warning).startswith(f"The site [>1] on {warning.atom_text} of unit '[<]NC([>1])N[>1]'") for warning in inherited)
+
+    two_ports = "{[] [<]CC[>], [<]{[>] [<]NC([>1])([>1])N[>];; [<1]}|poisson(100)|[>1]; [>]I; [<1]Br []}|poisson(400)|"
+    _graph, inherited = _termination_warnings(two_ports, g2rins.exception.InheritedTermination)
+    assert [(warning.unit_text, warning.atom_text, warning.bond_connector) for warning in inherited] == [("[<]NC([>1])([>1])N[>]", "C", "[>1]")]
+
+    same_list = "{[] [<]CC[>], [<]{[>] [<]NN[>];; [<]Br|2|, [<]Cl|1| [<]}|poisson(100)|[>]; [>]I; [<]Br|2|, [<]Cl|1| []}|poisson(400)|"
+    _graph, (shadowed,) = _termination_warnings(same_list, g2rins.exception.ShadowedTerminationDeclaration)
+    assert (shadowed.unit_text, shadowed.atom_text, shadowed.bond_connector) == ("[<]NN[>]", "N", "[>]")
+    assert shadowed.terminators == shadowed.shadowed and len(shadowed.terminators) == 2
+    assert (shadowed.declared_level, shadowed.shadowed_levels) == (1, (0, 0))
+    assert ", declared in stochastic object 1, caps it and " in str(shadowed) and ", declared in stochastic object 0, never will." in str(shadowed)
 
 
 @pytest.mark.parametrize(

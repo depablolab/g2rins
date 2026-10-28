@@ -319,48 +319,69 @@ class NoTerminationForStochasticObject(ParsingWarning):
 
 class TerminationDeclarationWarning(G2RINSWarning):
     """Family of warnings about which declared terminator caps an open site,
-    and about the stochastic object that decides when it fires."""
+    and about the stochastic object that decides when it fires. A site is
+    named by the text of its bond connector, of the atom that carries it and
+    of the unit both are written in."""
 
-    def __init__(self, unit_label, unit_text):
+    def __init__(self, unit_text, atom_text, bond_connector):
         super().__init__(unit_text)
-        self.unit_label = unit_label
         self.unit_text = unit_text
+        self.atom_text = atom_text
+        self.bond_connector = bond_connector
 
     def _site(self):
-        return f"An open site of unit {self.unit_label} '{self.unit_text}'"
+        return f"The site {self.bond_connector} on {self.atom_text} of unit '{self.unit_text}'"
+
+
+def _declared_in(terminators, levels):
+    """'[<]Br, [<1]F, declared in stochastic object 0', one group per declaring object."""
+    groups = {}
+    for terminator, level in zip(terminators, levels):
+        groups.setdefault(level, []).append(terminator)
+    return " and ".join(f"{', '.join(group)}, declared in stochastic object {level}" for level, group in groups.items())
 
 
 class ShadowedTerminationDeclaration(TerminationDeclarationWarning):
-    def __init__(self, unit_label, unit_text, terminators, shadowed):
-        super().__init__(unit_label, unit_text)
+    def __init__(self, unit_text, atom_text, bond_connector, terminators, declared_level, shadowed, shadowed_levels):
+        super().__init__(unit_text, atom_text, bond_connector)
         self.terminators = tuple(terminators)
+        self.declared_level = declared_level
         self.shadowed = tuple(shadowed)
+        self.shadowed_levels = tuple(shadowed_levels)
 
     def __str__(self):
         return (
             f"{self._site()} is reached by terminators declared at more than one level. The declaration nearest "
-            f"the site wins, so {', '.join(self.terminators)} caps it and {', '.join(self.shadowed)} never will. "
+            f"the site wins, so {', '.join(self.terminators)}, declared in stochastic object {self.declared_level}, "
+            f"caps it and {_declared_in(self.shadowed, self.shadowed_levels)}, never will. "
             "List the alternatives in one terminator list, with weights, if the site should draw among them."
         )
 
 
 class InheritedTermination(TerminationDeclarationWarning):
-    def __init__(self, unit_label, unit_text, terminators, declared_level, firing_level):
-        super().__init__(unit_label, unit_text)
+    def __init__(self, unit_text, atom_text, bond_connector, terminators, declared_level, firing_level, site_level):
+        super().__init__(unit_text, atom_text, bond_connector)
         self.terminators = tuple(terminators)
         self.declared_level = declared_level
         self.firing_level = firing_level
+        self.site_level = site_level
 
     def __str__(self):
         inherited = (
-            f"{self._site()} has no terminator declared in its own stochastic object, so it is capped by "
-            f"{', '.join(self.terminators)}, declared in the enclosing stochastic object {self.declared_level}. "
+            f"{self._site()} has no terminator declared in its own stochastic object {self.site_level}, so it is "
+            f"capped by {', '.join(self.terminators)}, declared in the enclosing stochastic object {self.declared_level}. "
         )
         if self.firing_level == self.declared_level:
             return inherited + (
                 "That object decides when the site is capped and carries the cap's molecular weight, which models a "
                 "later step of the generation. Declare a terminator with a matching bond descriptor in the unit's own "
                 "stochastic object to cap the site in the step that grows it."
+            )
+        if self.firing_level == self.site_level:
+            return inherited + (
+                f"The unit's own stochastic object {self.firing_level} owns the site's bond descriptor, so it fires "
+                "the cap when it finishes and carries the cap's molecular weight. Declare the terminator in that "
+                "object to state the cap where the site is."
             )
         return inherited + (
             f"Stochastic object {self.firing_level}, which owns the site's bond descriptor, fires the cap when it "
@@ -370,11 +391,12 @@ class InheritedTermination(TerminationDeclarationWarning):
 
 
 class ForeignControlledTermination(TerminationDeclarationWarning):
-    def __init__(self, unit_label, unit_text, terminators, declared_level, firing_level):
-        super().__init__(unit_label, unit_text)
+    def __init__(self, unit_text, atom_text, bond_connector, terminators, declared_level, firing_level, site_level):
+        super().__init__(unit_text, atom_text, bond_connector)
         self.terminators = tuple(terminators)
         self.declared_level = declared_level
         self.firing_level = firing_level
+        self.site_level = site_level
 
     def __str__(self):
         return (
@@ -384,6 +406,22 @@ class ForeignControlledTermination(TerminationDeclarationWarning):
             f"The declared terminator is the one that caps it, but stochastic object {self.firing_level} decides "
             "when it fires and its molecular weight counts toward that object's target, not toward the declaring "
             "object's."
+        )
+
+
+class TerminatorOnForcedExitSite(TerminationDeclarationWarning):
+    def __init__(self, unit_text, atom_text, bond_connector, terminators, site_level):
+        super().__init__(unit_text, atom_text, bond_connector)
+        self.terminators = tuple(terminators)
+        self.site_level = site_level
+
+    def __str__(self):
+        several = len(self.terminators) > 1
+        return (
+            f"{self._site()} leaves its stochastic object through a forced exit on every instance, so the "
+            f"{'terminators' if several else 'terminator'} {', '.join(self.terminators)} declared for it never "
+            f"{'fire and their termination edges are' if several else 'fires and its termination edge is'} removed. "
+            "Declare the terminator for a site that can stay open, or cap the chain in the object the exit leads into."
         )
 
 
