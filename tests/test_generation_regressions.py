@@ -2476,7 +2476,7 @@ def test_an_inherited_cap_fired_by_its_owner_counts_toward_that_objects_target()
     the cap when it finishes and carries the cap's molecular weight: the mass
     it reports for each instance, the one its target check reads, includes
     the bromine, and a chain carries one bromine per nested instance. The
-    released behaviour credited the cap to the enclosing object at its own
+    released behavior credited the cap to the enclosing object at its own
     finalization, so the nested masses held no bromine."""
     smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; {[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; [<2]Br []}|poisson(2000)|"
     # Residue masses: the dummy atoms weigh nothing.

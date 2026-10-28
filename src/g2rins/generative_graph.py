@@ -735,7 +735,7 @@ def _warn_termination_levels(generative_graph, graph, resolutions):
             emit(TerminatorOnForcedExitSite(*site, terminators, site_level))
             continue
         if resolution.shadowed:
-            shadowed = sorted({(_describe_site(graph, node)[0], level) for node, level in zip(resolution.shadowed, resolution.shadowed_levels)})
+            shadowed = sorted({(_describe_site(graph, node)[0], level) for node, level in zip(resolution.shadowed, resolution.shadowed_levels, strict=True)})
             emit(ShadowedTerminationDeclaration(*site, terminators, resolution.declared_level, [text for text, _level in shadowed], [level for _text, level in shadowed]))
         if 0 < resolution.rank < len(stochastic_id_tree):
             emit(InheritedTermination(*site, terminators, resolution.declared_level, resolution.firing_level, site_level))

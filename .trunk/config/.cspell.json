@@ -252,6 +252,8 @@
     "endcap",
     "renormalize",
     "unwired",
-    "fluorines"
+    "fluorines",
+    "OCCO",
+    "allclose"
   ]
 }

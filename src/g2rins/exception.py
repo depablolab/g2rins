@@ -336,7 +336,7 @@ class TerminationDeclarationWarning(G2RINSWarning):
 def _declared_in(terminators, levels):
     """'[<]Br, [<1]F, declared in stochastic object 0', one group per declaring object."""
     groups = {}
-    for terminator, level in zip(terminators, levels):
+    for terminator, level in zip(terminators, levels, strict=True):
         groups.setdefault(level, []).append(terminator)
     return " and ".join(f"{', '.join(group)}, declared in stochastic object {level}" for level, group in groups.items())
 

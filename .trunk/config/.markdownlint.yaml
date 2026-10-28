@@ -8,3 +8,6 @@ line_length: false
 spaces: false
 url: false
 whitespace: false
+# Keep a Changelog repeats the same subheadings under every version.
+MD024:
+  siblings_only: true

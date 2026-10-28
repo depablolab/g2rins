@@ -7,7 +7,6 @@ import warnings
 import networkx as nx
 import numpy as np
 
-from .g2rins_molecule import G2rinsMolecule
 from .bond import (
     BondConnector,
     TerminalBondConnectorList,
@@ -26,6 +25,7 @@ from .exception import (
     StochasticMissingPath,
     UndefinedDistribution,
 )
+from .g2rins_molecule import G2rinsMolecule
 from .generative_graph import (
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
@@ -417,7 +417,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
             # leave those ends open, so they inherit this object's terminators
             # exactly as a nested object in the repeat-unit section does. That
             # path is the bond connector written after the nested object, which
-            # neighbours its terminal bond connector (only nested objects' nodes
+            # neighbors its terminal bond connector (only nested objects' nodes
             # carry stochastic_obj here; this object's are stamped below). A bond
             # connector on an atom written beside the nested object is a plain
             # initiator bond connector, which stays unwired unless nothing could
