@@ -2195,7 +2195,7 @@ def test_same_level_terminator_caps_exiting_site():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
     chlorine_total = 0
-    for seed in range(6):
+    for seed in SEEDS:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
@@ -2208,7 +2208,7 @@ def test_same_level_terminator_caps_exiting_site():
 def test_nearest_terminator_declaration_wins():
     """When a site is reached by terminators declared at two levels, the
     nearer declaration is wired and the farther one is removed rather than
-    left to compete: a generative graph carries no edge that can never fire.
+    left to compete: a generative graph carries no shadowed edge.
     Here the inner [<]Cl caps the NN exit that the outer [<]Br would otherwise
     also reach."""
     smi = "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]Cl [<]|[<1]}|poisson(100)|[>]|[>1]; [>]I; [<]Br, [<1]F []}|poisson(400)|"
@@ -2220,10 +2220,15 @@ def test_nearest_terminator_declaration_wins():
 
     unit_id = g2rins.derive_unit_labels(generative_graph).unit_id
     unit_text = generative_graph.graph["unit_g2rins"]
+    capped_nn_sites = set()
     for node in generative_graph.nodes():
-        terminators = {unit_text.get(unit_id.get(target), "") for _source, target, data in generative_graph.out_edges(node, data=True) if data["termination_weight"] > 0}
-        assert not ("[<]Cl" in terminators and "[<]Br" in terminators), f"shadowed [<]Br survived on {unit_id.get(node)}"
+        terminators = frozenset(unit_text.get(unit_id.get(target), "") for _source, target, data in generative_graph.out_edges(node, data=True) if data["termination_weight"] > 0)
+        if terminators and unit_text.get(unit_id.get(node)) == "[<]NN([>1])[>]":
+            capped_nn_sites.add(terminators)
+    # The NN exit keeps the nearer [<]Cl alone; the [>1] side port inherits [<1]F.
+    assert capped_nn_sites == {frozenset({"[<]Cl"}), frozenset({"[<1]F"})}, capped_nn_sites
 
+    chlorine_total = 0
     for seed in SEEDS:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -2233,6 +2238,8 @@ def test_nearest_terminator_declaration_wins():
         counts = {symbol: sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == symbol) for symbol in ("Cl", "Br", "I")}
         assert counts["I"] == 1, f"seed {seed}: expected the single declared initiator"
         assert counts["Cl"] + counts["Br"] == 1, f"seed {seed}: expected exactly one chain-end cap, found {counts}"
+        chlorine_total += counts["Cl"]
+    assert chlorine_total >= 1, "the nearer [<]Cl never capped a chain"
 
 
 def test_nested_initiator_block_ends_inherit_outer_terminator():

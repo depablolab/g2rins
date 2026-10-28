@@ -353,7 +353,7 @@ class ShadowedTerminationDeclaration(TerminationDeclarationWarning):
         return (
             f"{self._site()} is reached by terminators declared at more than one level. The declaration nearest "
             f"the site wins, so {', '.join(self.terminators)}, declared in stochastic object {self.declared_level}, "
-            f"caps it and {_declared_in(self.shadowed, self.shadowed_levels)}, never will. "
+            f"{'cap' if len(self.terminators) > 1 else 'caps'} it and {_declared_in(self.shadowed, self.shadowed_levels)}, never will. "
             "List the alternatives in one terminator list, with weights, if the site should draw among them."
         )
 
@@ -399,13 +399,14 @@ class ForeignControlledTermination(TerminationDeclarationWarning):
         self.site_level = site_level
 
     def __str__(self):
+        several = len(self.terminators) > 1
         return (
             f"{self._site()} is capped by {', '.join(self.terminators)}, declared in its own stochastic object "
             f"{self.declared_level}, but the site's bond descriptor belongs to the enclosing stochastic object "
             f"{self.firing_level}, which can still grow through the site after the declaring object has finished. "
-            f"The declared terminator is the one that caps it, but stochastic object {self.firing_level} decides "
-            "when it fires and its molecular weight counts toward that object's target, not toward the declaring "
-            "object's."
+            f"{'The declared terminators are the ones that cap it' if several else 'The declared terminator is the one that caps it'}, "
+            f"but stochastic object {self.firing_level} decides when {'they fire and their' if several else 'it fires and its'} "
+            "molecular weight counts toward that object's target, not toward the declaring object's."
         )
 
 

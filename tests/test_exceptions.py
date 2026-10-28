@@ -185,56 +185,72 @@ def test_warn_no_initiation_for_stochastic_object(smi):
         obj.get_graph_creator()
 
 
+def _termination_warnings(smi, category):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    return generative_graph, [entry.message for entry in caught if isinstance(entry.message, category)]
+
+
+# Inner [<]Cl and outer [<]Br both reach the NN exit, whose bond descriptor
+# belongs to the enclosing object; the [>1] side port is capped by [<1]F alone.
+SHADOWED_DECLARATION = "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]Cl [<]|[<1]}|poisson(100)|[>]|[>1]; [>]I; [<]Br, [<1]F []}|poisson(400)|"
+# [<1]Cl is declared beside the unit, but its bond connector belongs to the
+# enclosing object, which fires the cap and carries its mass; the enclosing
+# object's own [<1]Br is shadowed at that site.
+FOREIGN_CONTROLLED_DECLARATION = (
+    "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br, [<1]Cl [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|gauss(8000.0, 1000.0)|"
+)
+# The inner [>2] sites have no growth partner at the enclosing level, so the
+# inner object owns them and fires the enclosing object's [<2]Br; the [>1]
+# site of the second object's repeat unit has no cap at any level.
+INHERITED_FIRED_BY_THE_OWNER = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; {[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; [<2]Br []}|poisson(2000)|"
+
 TERMINATION_DECLARATION_CASES = [
     pytest.param(
-        # Inner [<]Cl and outer [<]Br both reach the NN exit: the nearer
-        # declaration wins and the outer edge is dropped.
-        "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]Cl [<]|[<1]}|poisson(100)|[>]|[>1]; [>]I; [<]Br, [<1]F []}|poisson(400)|",
-        g2rins.exception.ShadowedTerminationDeclaration,
+        SHADOWED_DECLARATION,
+        (g2rins.exception.ShadowedTerminationDeclaration, g2rins.exception.ForeignControlledTermination, g2rins.exception.InheritedTermination),
         id="shadowed",
     ),
     pytest.param(
-        # The NN side port declares no terminator of its own, so the enclosing
-        # object's [<1]F caps it and controls when.
+        # Neither NN port declares a terminator of its own, so the enclosing
+        # object's [<]Br and [<1]F cap them and control when.
         "{[] [<]CC[>], [<]{[>] [<]NN([>1])[>];; [<]|[<1]}|poisson(100)|[>]|[>1]; [>]Cl; [<]Br, [<1]F []}|poisson(400)|",
-        g2rins.exception.InheritedTermination,
+        (g2rins.exception.InheritedTermination, g2rins.exception.InheritedTermination),
         id="inherited",
     ),
     pytest.param(
-        # [<1]Cl is declared beside the unit, but its bond connector belongs to
-        # the enclosing object, which fires the cap and carries its mass.
-        "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br, [<1]Cl [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|gauss(8000.0, 1000.0)|",
-        g2rins.exception.ForeignControlledTermination,
+        FOREIGN_CONTROLLED_DECLARATION,
+        (g2rins.exception.ForeignControlledTermination, g2rins.exception.ShadowedTerminationDeclaration),
         id="foreign-controlled",
     ),
     pytest.param(
         # A nested object used as the initiator: its block ends inherit the
         # enclosing object's Cl through the terminal bond connector path.
         "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|",
-        g2rins.exception.InheritedTermination,
+        (g2rins.exception.InheritedTermination,),
         id="inherited-initiator-section",
     ),
     pytest.param(
         # Same string with no terminator anywhere: the block ends hand their
         # growth to the enclosing object and nothing can cap them.
         "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; []}|poisson(2200)|",
-        g2rins.exception.MissingTermination,
+        (g2rins.exception.MissingTermination,),
         id="missing",
     ),
     pytest.param(
-        # The inner [>2] sites have no growth partner at the enclosing level, so
-        # the inner object owns them and fires the enclosing object's [<2]Br.
-        "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; {[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; [<2]Br []}|poisson(2000)|",
-        g2rins.exception.InheritedTermination,
+        INHERITED_FIRED_BY_THE_OWNER,
+        (g2rins.exception.InheritedTermination, g2rins.exception.InheritedTermination, g2rins.exception.MissingTermination),
         id="inherited-fired-by-the-owner",
     ),
 ]
 
 
-@pytest.mark.parametrize(("smi", "category"), TERMINATION_DECLARATION_CASES)
-def test_warn_termination_declaration(smi, category):
-    with pytest.warns(category):
-        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+@pytest.mark.parametrize(("smi", "reported"), TERMINATION_DECLARATION_CASES)
+def test_warn_termination_declaration(smi, reported):
+    """Every warning a string raises is pinned, one per open site."""
+    _graph, caught = _termination_warnings(smi, g2rins.exception.TerminationDeclarationWarning)
+    assert sorted(type(warning).__name__ for warning in caught) == sorted(category.__name__ for category in reported)
 
 
 @pytest.mark.parametrize(
@@ -243,7 +259,7 @@ def test_warn_termination_declaration(smi, category):
         # The block ends also exit to the enclosing object, which therefore fires the cap it declares.
         ("{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<]Cl []}|poisson(2200)|", 0, 0, "That object decides when the site is capped"),
         # The inner object owns the sites, so it fires the cap the enclosing object declares and carries its mass.
-        (TERMINATION_DECLARATION_CASES[-1].values[0], 0, 1, "The unit's own stochastic object 1 owns the site's bond descriptor, so it fires the cap"),
+        (INHERITED_FIRED_BY_THE_OWNER, 0, 1, "The unit's own stochastic object 1 owns the site's bond descriptor, so it fires the cap"),
     ],
 )
 def test_inherited_termination_names_the_object_that_fires_the_cap(smi, declared_level, firing_level, phrase):
@@ -273,13 +289,6 @@ def test_zero_amount_declaration_neither_caps_nor_shadows():
     assert inherited and all(warning.terminators == ("[<]Br",) for warning in inherited)
     chlorine = {node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 17}
     assert chlorine and not any(v in chlorine and data["termination_weight"] > 0 for _u, v, data in generative_graph.edges(data=True))
-
-
-def _termination_warnings(smi, category):
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
-    return generative_graph, [entry.message for entry in caught if isinstance(entry.message, category)]
 
 
 @pytest.mark.parametrize(
@@ -325,7 +334,33 @@ def test_termination_warnings_name_each_site():
     assert (shadowed.unit_text, shadowed.atom_text, shadowed.bond_connector) == ("[<]NN[>]", "N", "[>]")
     assert shadowed.terminators == shadowed.shadowed and len(shadowed.terminators) == 2
     assert (shadowed.declared_level, shadowed.shadowed_levels) == (1, (0, 0))
-    assert ", declared in stochastic object 1, caps it and " in str(shadowed) and ", declared in stochastic object 0, never will." in str(shadowed)
+    assert ", declared in stochastic object 1, cap it and " in str(shadowed) and ", declared in stochastic object 0, never will." in str(shadowed)
+
+    _graph, (foreign,) = _termination_warnings(FOREIGN_CONTROLLED_DECLARATION, g2rins.exception.ForeignControlledTermination)
+    assert (foreign.unit_text, foreign.atom_text, foreign.bond_connector) == ("[<]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>]", "C", "[>1]")
+    assert (foreign.terminators, foreign.declared_level, foreign.firing_level, foreign.site_level) == (("[<1]Cl",), 1, 0, 1)
+    assert "declared in its own stochastic object 1, but the site's bond descriptor belongs to the enclosing stochastic object 0" in str(foreign)
+
+
+def _cap_edges_reaching(graph, atomic_num):
+    """Termination edges into the terminator made of that element; with bond
+    connectors they land on the terminator's bond connector node."""
+    terminator = {node for node, data in graph.nodes(data=True) if data["atomic_num"] == atomic_num}
+    terminator |= {target for node in terminator for _source, target, data in graph.out_edges(node, data=True) if data["static"]}
+    return sum(1 for _source, target, data in graph.edges(data=True) if target in terminator and data["termination_weight"] > 0)
+
+
+def test_a_shadowed_declaration_keeps_its_edge_in_the_graph_with_bond_connectors():
+    """The resolution runs on the graph without bond connectors, the one
+    generation reads. With bond connectors the outer [<]Br is still reached
+    from the NN exit through the terminal bond connector path, besides the
+    enclosing object's own site."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make(SHADOWED_DECLARATION).get_graph_creator()
+        with_connectors = graph_creator.get_generative_graph(include_bond_connectors=True)
+        without_connectors = graph_creator.get_generative_graph(include_bond_connectors=False)
+    assert (_cap_edges_reaching(with_connectors, 35), _cap_edges_reaching(without_connectors, 35)) == (2, 1)
 
 
 @pytest.mark.parametrize(

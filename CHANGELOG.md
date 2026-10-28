@@ -7,11 +7,10 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 ### Added
 
 - Warnings that report how each open site of a generative graph will be capped: `ShadowedTerminationDeclaration`, `InheritedTermination`, `ForeignControlledTermination`, `TerminatorOnForcedExitSite`, and `MissingTermination`. Each names the site by the texts of its bond connector, its atom and its unit. The canonical configuration — a site capped in the step that grows it — stays silent.
-- When a nested stochastic object finishes, its continuation and the level's remaining entry sites compete in one weighted draw at the owning level, instead of the continuation firing unconditionally.
 
 ### Changed
 
-- Which terminator caps an open site is resolved at graph construction: the declaration nearest the site wins, and termination edges that can never fire are removed from the generative graph. The stochastic object that owns the site's bond descriptor fires the cap, the cap's mass counts toward that object's molecular weight target, and the cap keeps the molar amount declared beside it; a terminator declared with molar amount 0 never fires, so it neither caps a site nor shadows a farther declaration, and a terminator declared for a site that leaves its stochastic object through a forced exit never fires either, so its edge is removed as well.
+- Which terminator caps an open site is resolved at graph construction: the declaration nearest the site wins, and the termination edges of the farther declarations are removed from the generative graph. The stochastic object that owns the site's bond descriptor fires the cap, the cap's mass counts toward that object's molecular weight target, and the cap keeps the molar amount declared beside it; a terminator declared with molar amount 0 never fires, so it neither caps a site nor shadows a farther declaration, and a terminator declared for a site that leaves its stochastic object through a forced exit never fires either; both lose their termination edges as well.
 - A nested stochastic object used as an initiator now inherits the enclosing object's terminators for its repeat-unit chain ends, as one used as a repeat unit already did; the bond connectors of atoms written beside the nested object remain plain initiator bond connectors.
 
 ## [1.1.0] - 2026-10-05

@@ -44,7 +44,7 @@ lint:
     - linters: [bandit]
       paths:
         - tests/**
-    - linters: [prettier, cspell]
+    - linters: [cspell]
       paths:
         - tests/graph_validation.json
 actions:
