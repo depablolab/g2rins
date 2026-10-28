@@ -2369,6 +2369,33 @@ def test_a_zero_amount_declaration_neither_caps_nor_shadows():
         assert _count_atoms(mol_graph, 53) >= 1, f"seed {seed}: no iodine cap delivered"
 
 
+def test_an_inherited_cap_fired_by_its_owner_counts_toward_that_objects_target():
+    """A terminator declared in the enclosing object caps a site whose bond
+    descriptor belongs to the nested object that grows it. That object fires
+    the cap when it finishes and carries the cap's molecular weight: the mass
+    it reports for each instance, the one its target check reads, includes
+    the bromine, and a chain carries one bromine per nested instance. The
+    released behaviour credited the cap to the enclosing object at its own
+    finalization, so the nested masses held no bromine."""
+    smi = "{[] [<1]{[>1] [<1]CCCO[>2], [<2]CCO[>2]; ; [<2]}|poisson(200)|[>2]; {[] [<][Si](C)([>1])O[>]; O[>]; [<][H] [<1]}|poisson(1000)|[>1]; [<2]Br []}|poisson(2000)|"
+    # Residue masses: the dummy atoms weigh nothing.
+    entry_unit, repeat_unit, bromine = (Descriptors.MolWt(Chem.MolFromSmiles(fragment)) for fragment in ("*CCCO*", "*CCO*", "*Br"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    for seed in SEEDS:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data = ensemble_creator.create_ensemble(3, output_format="smiles", ensemble_info=True, seed=seed)
+        nested_id = next(stochastic_id for stochastic_id, distribution in data.distributions.items() if distribution == "|poisson(200.0)|")
+        nested_masses = np.asarray(data.mol_weights[nested_id], dtype=float)
+        repeat_units = (nested_masses - entry_unit - bromine) / repeat_unit
+        assert (
+            np.allclose(repeat_units, np.round(repeat_units), atol=1e-3) and (repeat_units >= 0).all()
+        ), f"seed {seed}: a nested instance mass does not include its bromine cap: {nested_masses.tolist()}"
+        assert sum(chain.count("Br") for chain in data.chains) == len(nested_masses), f"seed {seed}: bromine caps and nested instances differ"
+
+
 def test_negative_target_draw_still_terminates():
     """A high-dispersity gauss target can draw negative; storing that draw like
     the negative no-target sentinel disables crossing checks and grows forever.
