@@ -1,6 +1,92 @@
 # G2RINS performance references
 
+> **NB diagnostics are historical — 2026-10-30.** NB reports and scripts below
+> describe the retired count-led implementation. The scripts need that old
+> source snapshot and are not runnable against the current package. Frozen
+> measurements remain unchanged and do not establish direct Gamma MWD speed
+> or validation. See [current MWD semantics and migration](../docs/mwd.md).
+
 This directory establishes deterministic measurements and behavioral guardrails before sampler internals are optimized.
+
+## Physical negative-binomial diagnostic
+
+### Generalized independent macros (October 29)
+
+The [current macro receipt](NB_MACROS_2026-10-29.md) covers pure/anchored
+backbones, heterogeneous nesting, correlated B3 pendant rewards and an old
+pendant control. [The harness](benchmark_nb_macros.py) normally compiles each
+recipe, then patches only root/child counts for 360 real-molecule elemental,
+owner-credit and none/full-metadata audits. Startup and sampling are separate.
+[Public-example validation](NB_MACROS_EXAMPLES_2026-10-29.json) executes the
+three documented examples unchanged: 300 valid connected SMILES with unpatched
+counts. The [fresh legacy comparison](NB_MACROS_LEGACY_2026-10-29.json) retains
+all measured parity fields but **fails the proposed 1% pipeline budget** for
+small and large linear fixtures. No release or full enabled-law acceptance is
+claimed. Earlier receipts below remain frozen historical evidence.
+
+### Branching B1/B2 (October 29)
+
+[benchmark_nb_branching.py](benchmark_nb_branching.py) compares the native
+physical branching path to the **existing legacy Uniform mass-stop branching
+body**, not the two-port `target_mass` NB binder. The
+[review receipt](NB_BRANCHING_2026-10-29.md) and
+[raw branching receipt](NB_BRANCHING_2026-10-29.json) record five alternating
+measured pairs plus one warmup per condition, two samples per variant/run,
+matched `N=8/128/512`, and no/full public legacy metadata. Only the draws are
+patched: physical count `N` and legacy mass `q*N+b`; growth, all actual caps,
+finalization and requested metadata are native. Preparation is separate.
+
+| Whole-molecule count | Physical sampling change, no metadata | Full metadata |
+| --- | ---: | ---: |
+| 8 | −38.96% | −28.22% |
+| 128 | −74.12% | −67.43% |
+| 512 | −91.60% | −87.86% |
+
+These are median **paired** changes, not ratios of timing medians. Physical
+per-chain time from `N=128` to `512` increased by **4.00× / 4.19×** without/with
+metadata: roughly near-linear scaling in this series, not a universal bound.
+Every graph is independently checked for actual `N`, formula
+$C_{3N}H_{6N+2}$, `N+2` H caps, origins, ownership, valence, count ledger and
+requested metadata. Parsed model/source/target probability laws agree; isomers,
+sampled topologies and RNG consumption are **not** matched. The grouped physical
+source selector preserves the legacy weighted-port law, not its draw trajectory.
+
+Additional heterogeneous and heterogeneous/random-cap cases measure **total
+normal preparation only**, respectively **1.523 s / 2.441 s**, including parse,
+graph construction and creator caches/binding/compile/fit. These are not isolated
+fit times; disjoint phases are in the JSON. No sampling comparison is claimed
+for those extra cases.
+
+This controlled fixed-count diagnostic is **not the full enabled-feature budget**
+or a full unpatched population benchmark. It excludes SMILES, public ensemble
+orchestration, convergence, workers, checkpoints and RSS. Runs were completed
+without concurrent tests, on a shared, non-isolated host; the harness does not
+detect other host load. Warm caches and five-pair noise limit inference. New
+measurements must use new output paths, not overwrite frozen receipts.
+
+The [fresh legacy rerun](NB_BRANCHING_LEGACY_2026-10-29.json) uses the existing
+[fresh-process harness](benchmark_negative_binomial.py) against archived
+pre-feature HEAD `ef1c4c92d008ea402dce45f755601c453b36b6bf`. All 30 pairs
+(25 measured plus five warmups, including two snapshot-copy diagnostics) retain
+selected-graph/count/vector-width/export parity. Legacy small/large/nested
+end-to-end median paired changes are **+3.4027% / +0.3255% / +1.8879%**.
+Small and nested therefore **fail the proposed 1% gate**; shared-host noise is
+not a waiver or release acceptance. Snapshot-copy rows do not measure full
+enabled-feature overhead. Source identities and raw pairs remain in each JSON.
+See the [current implementation and validation scope](../docs/negative-binomial-implementation-status.md).
+
+### Earlier linear C1/C2 (October 28)
+
+[benchmark_nb_physical.py](benchmark_nb_physical.py) compares real count-led
+two-port linear assembly to target-mass assembly at controlled matched counts,
+with independent chemistry/metadata validation and separate C1/C2 preparation
+timing. Count/mass draws are patched only for this microbenchmark; it is not the full enabled-NB
+end-to-end budget. The [C1/C2 receipt](NB_PHYSICAL_2026-10-28.md) also records a
+fresh-process pre-feature legacy rerun, limitations and the uncleared 1% small-
+linear gate. Raw timings, source identities and individual pairs are linked there.
+These frozen October 28 receipts predate **both** the `mwd` naming change and
+B1/B2 branching. They retain their original identities and spellings; they are
+historical linear evidence, not current-tree timings.
 
 ## Benchmark protocol
 
@@ -50,6 +136,17 @@ paths do not perform the optimized copying. Reproduce with
 [benchmark_graph_copy.py](benchmark_graph_copy.py), selecting `--workflow sample`
 or `--workflow fixed`, repeated `--case` options, `--runs 5`, and `--warmups 1`.
 Use new output paths rather than overwriting the recorded evidence.
+
+## Experimental negative-binomial diagnostics
+
+The [October 28 receipt](NEGATIVE_BINOMIAL_REVIEW_2026-10-28.md) records
+the earlier affine-review snapshot, before naming and branching: five
+alternating fresh-process pairs for three legacy recipes against a
+pre-feature checkout, plus two NB snapshot-copy diagnostics. Exact selected-
+graph parity passed; the proposed runtime release gates remain unproven.
+The [harness](benchmark_negative_binomial.py) requires a separate
+`--baseline-root`, at least five `--repetitions`, and accepts an `--output`
+path. It does not measure full enabled-feature overhead or compound assembly.
 
 ## Compare a source tree with the original checkout
 

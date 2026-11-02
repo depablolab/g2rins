@@ -38,6 +38,7 @@ from ._ensemble_assembly import _assemble_ensemble_data
 from ._ensemble_export import _fixed_ensemble_json_data
 from ._ensemble_options import _ChainConversionOptions, _ConversionMode
 from ._graph_copy import _copy_unit_graph
+from ._model_fingerprint import model_fingerprint, validate_model_fingerprint
 from ._metadata_equality import (
     _RECURSIVE_METADATA_TYPES,
     _array_equal,
@@ -63,7 +64,8 @@ from .chem_resource import (
     atomic_masses,
     smi_bond_mapping,
 )
-from .distribution import StochasticDistribution
+from .distribution import Mwd, StochasticDistribution
+from ._mwd_transport import validate_mwd_transport
 from .exception import (
     AllZeroSamplingWeights,
     DeadSamplingPath,
@@ -593,6 +595,23 @@ def _parallel_chain_records(
         )
 
 
+def _checkpoint_model_fingerprint(creator, checkpoint):
+    """Shared preflight for the coordinator and its parallel scheduler wrapper."""
+    if checkpoint is not None and (
+        "nb_model_identity" in checkpoint.settings
+        or getattr(checkpoint, "nb_origin_order", None) is not None
+    ):
+        raise ValueError(
+            "Retired NB checkpoints cannot resume under Gamma MWD; start a new ensemble."
+        )
+    fingerprint = model_fingerprint(creator._generative_graph)
+    if checkpoint is not None:
+        validate_model_fingerprint(
+            checkpoint.settings.get("model_fingerprint"), fingerprint,
+        )
+    return fingerprint
+
+
 def _with_parallel_convergence_scheduler(method):
     signature = inspect.signature(method)
 
@@ -630,6 +649,10 @@ def _with_parallel_convergence_scheduler(method):
             )
         if n_workers < 2:
             return method(*args, **kwargs)
+        if isinstance(values["checkpoint"], ConvergenceCheckpoint):
+            # The wrapper enters process-environment contexts before the method.
+            # Reject incompatible models before even those scheduler side effects.
+            _checkpoint_model_fingerprint(values["self"], values["checkpoint"])
         with _ParallelChainScheduler(
             values["self"],
             n_workers,
@@ -1196,6 +1219,7 @@ class _StochasticObjectTracker:
         self._active_transactions = []
 
         if prepared_distributions is None:
+            validate_mwd_transport(generative_graph)
             for _node_idx, data in generative_graph.nodes(data=True):
                 for index, stochastic_vector in enumerate(
                     data["molecular_weight_distribution"]
@@ -4365,7 +4389,6 @@ class _PartialAtomGraph:
         return new_sto_atom_id
 
     def nested_transition(self, sto_atom_id, rng):
-
         def pop_nested_bonds():
             if sto_atom_id not in self._open_half_bond_map:
                 return []
@@ -4720,9 +4743,7 @@ class _GrowthTransaction:
 
     def record_terminal_occurrences(self):
         if self.terminal_unit_occurrences is None:
-            self.terminal_unit_occurrences = list(
-                self.graph._terminal_unit_occurrences
-            )
+            self.terminal_unit_occurrences = list(self.graph._terminal_unit_occurrences)
 
     def _restore_tracker(self, tracker):
         for name, value in self.tracker_scalars.items():
@@ -4844,6 +4865,7 @@ class EnsembleCreator:
 
     def __init__(self, generative_graph):
 
+        validate_mwd_transport(generative_graph)
         self._generative_graph = generative_graph.copy()
         wildcard_nodes = []
         placeholder_nodes = []
@@ -4975,28 +4997,7 @@ class EnsembleCreator:
             self._provably_zero_termination_states = frozenset()
         self._source_provably_dead_cache = {}
 
-        self._repeat_unit_starting_node_idx, self._repeat_unit_starting_node_weight = (
-            self._create_repeat_unit_initiation_weights(self._generative_graph)
-        )
-        self._repeat_unit_initiation = not any(
-            data["init_weight"] > 0
-            for _node, data in self._generative_graph.nodes(data=True)
-        )
-        if self._repeat_unit_initiation:
-            self._starting_node_idx = self._repeat_unit_starting_node_idx
-            self._starting_node_weight = self._repeat_unit_starting_node_weight
-            if self._starting_node_idx:
-                warnings.warn(
-                    RepeatUnitInitiation(
-                        self._generative_graph.graph.get("g2rins_string"),
-                        self._source_unit_texts(self._starting_node_idx),
-                    ),
-                    stacklevel=2,
-                )
-        else:
-            self._starting_node_idx, self._starting_node_weight = self._create_init_weights(
-                self.generative_graph
-            )
+        self._prepare_start_weights()
 
         # A sticky branch flag is insufficient on its own: several positive
         # sources (or repeat-unit choices) may all converge on the same dead
@@ -5023,6 +5024,30 @@ class EnsembleCreator:
             ) > 1,
         }
 
+    def _prepare_start_weights(self):
+        self._repeat_unit_starting_node_idx, self._repeat_unit_starting_node_weight = (
+            self._create_repeat_unit_initiation_weights(self._generative_graph)
+        )
+        self._repeat_unit_initiation = not any(
+            data["init_weight"] > 0
+            for _node, data in self._generative_graph.nodes(data=True)
+        )
+        if self._repeat_unit_initiation:
+            self._starting_node_idx = self._repeat_unit_starting_node_idx
+            self._starting_node_weight = self._repeat_unit_starting_node_weight
+            if self._starting_node_idx:
+                warnings.warn(
+                    RepeatUnitInitiation(
+                        self._generative_graph.graph.get("g2rins_string"),
+                        self._source_unit_texts(self._starting_node_idx),
+                    ),
+                    stacklevel=3,
+                )
+        else:
+            self._starting_node_idx, self._starting_node_weight = self._create_init_weights(
+                self.generative_graph
+            )
+
     def __getstate__(self):
         """Exclude transient sequence strings from worker initialization IPC."""
         state = self.__dict__.copy()
@@ -5030,7 +5055,8 @@ class EnsembleCreator:
         return state
 
     def __setstate__(self, state):
-        """Restore creators pickled before the transient cache was introduced."""
+        """Restore ordinary creators; retired NB snapshots are incompatible."""
+        validate_mwd_transport(state["_generative_graph"])
         self.__dict__.update(state)
         self.__dict__.setdefault("_sequence_smiles_cache", OrderedDict())
 
@@ -6058,8 +6084,6 @@ class EnsembleCreator:
                 else self._get_random_start_node(rng)
             )
 
-        # The generative_graph property copies the whole template graph on every access:
-        # take one copy per sample instead of one per use.
         generative_graph = self.generative_graph
 
         if source not in generative_graph.nodes():
@@ -6745,6 +6769,17 @@ class EnsembleCreator:
         checkpoints.clear()
         _sync_transactions()
 
+        return self._finalize_partial_sample(
+            partial_atom_graph, metadata_mode=metadata_mode,
+            internal_request=internal_request, termination_flag=termination_flag,
+            forced_overshoot_no_boundary=forced_overshoot_no_boundary,
+        )
+
+    def _finalize_partial_sample(
+        self, partial_atom_graph, *, metadata_mode, internal_request,
+        termination_flag, forced_overshoot_no_boundary,
+    ):
+        collect_info = metadata_mode is not _MetadataLevel.NONE
         _collapse_phantom_nodes(partial_atom_graph.atom_graph)
 
         # Reconcile hydrogen credits with the FINAL realized connectivity:
@@ -7417,7 +7452,10 @@ class EnsembleCreator:
         receives ``(global_chain_index, record)`` for every accepted chain.
         To resume at a batch boundary, pass a :class:`ConvergenceCheckpoint`
         previously received by ``checkpoint_callback``. Exact resume requires
-        an integer seed. ``checkpoint_policy='full'`` preserves retained
+        an integer seed and matching versioned model/origin fingerprints.
+        Restore the original creator to preserve origin IDs; freshly parsing
+        identical source is not sufficient. Legacy checkpoints without a
+        fingerprint cannot resume. ``checkpoint_policy='full'`` preserves retained
         payloads; ``'statistics'`` omits them from checkpoints and therefore
         returns no retained sample payload after resume. ``native_diagnostics_path`` has the same durable
         native-stage logging semantics as :meth:`create_ensemble`, as does the
@@ -7562,6 +7600,38 @@ class EnsembleCreator:
             ),
             "smiles_policy": smiles_policy,
         }
+        mwd_requests = tuple(
+            (index, distribution.serialize())
+            for index, distribution in getattr(self, "_prepared_distributions", {}).items()
+            if isinstance(distribution, Mwd)
+        )
+        if mwd_requests:
+            checkpoint_settings["mwd_semantics"] = (
+                "gamma-number-target/v1",
+                mwd_requests,
+            )
+        # Compute only for checkpoint workflows, never for ordinary sampling.
+        # Do not cache: a caller may have changed graph attributes between runs.
+        if checkpoint is not None or checkpoint_callback is not None:
+            checkpoint_settings["model_fingerprint"] = _checkpoint_model_fingerprint(
+                self, checkpoint,
+            )
+        # All compatibility checks precede generator construction and restoration.
+        if checkpoint is not None:
+            if checkpoint.seed != seed:
+                raise ValueError("checkpoint seed does not match seed.")
+            saved_settings = dict(checkpoint.settings)
+            saved_settings.setdefault(
+                "checkpoint_policy", getattr(checkpoint, "policy", "full"),
+            )
+            saved_settings.setdefault("use_repeat_units_as_source", False)
+            saved_settings.setdefault("fallback_on_worker_crash", True)
+            saved_settings.setdefault("representative_distance", None)
+            saved_settings.setdefault("smiles_policy", smiles_policy)
+            saved_settings.setdefault("unit_path_max_motifs", unit_path_max_motifs)
+            saved_settings.setdefault("unit_junctions", False)
+            if saved_settings != checkpoint_settings:
+                raise ValueError("checkpoint settings do not match this convergence run.")
         reservoir_rng = None
         if retain_samples and reservoir_size is not None:
             retention_seed = np.random.SeedSequence(seed).spawn(2)[1]
@@ -7610,24 +7680,6 @@ class EnsembleCreator:
             representative_features = []
             representative_counts = []
         else:
-            if checkpoint.seed != seed:
-                raise ValueError("checkpoint seed does not match seed.")
-            saved_settings = dict(checkpoint.settings)
-            saved_settings.setdefault(
-                "checkpoint_policy",
-                getattr(checkpoint, "policy", "full"),
-            )
-            saved_settings.setdefault("use_repeat_units_as_source", False)
-            saved_settings.setdefault("fallback_on_worker_crash", True)
-            saved_settings.setdefault("representative_distance", None)
-            # Checkpoints written before the policy was persisted inherit the
-            # caller's current choice. Explicitly recorded policies remain
-            # strict resume settings.
-            saved_settings.setdefault("smiles_policy", smiles_policy)
-            saved_settings.setdefault("unit_path_max_motifs", unit_path_max_motifs)
-            saved_settings.setdefault("unit_junctions", False)
-            if saved_settings != checkpoint_settings:
-                raise ValueError("checkpoint settings do not match this convergence run.")
             aggregate_unit_counts = Counter(
                 {
                     unit_id: unit_data["count"]

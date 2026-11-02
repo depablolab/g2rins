@@ -243,7 +243,8 @@ def test_checkpoint_policy_mismatch_is_rejected():
         )
 
 
-def test_legacy_full_checkpoint_without_new_settings_remains_resumable():
+def test_fingerprinted_full_checkpoint_without_optional_settings_remains_resumable():
+    # Optional settings retain their defaults; model identity is never inferred.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         creator = (

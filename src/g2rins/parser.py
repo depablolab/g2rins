@@ -43,6 +43,7 @@ _DEFAULT_START_TOKENS = (
     "log_normal",
     "gauss",
     "poisson",
+    "mwd",
 )
 
 

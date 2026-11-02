@@ -47,6 +47,7 @@ from .distribution import (
     LogNormal,
     Poisson,
     SchulzZimm,
+    Mwd,
     StochasticDistribution,
     Uniform,
 )
@@ -127,6 +128,7 @@ __all__ = [
     "Gauss",
     "LogNormal",
     "Poisson",
+    "Mwd",
     "StochasticDistribution",
     "StochasticObject",
     "Uniform",

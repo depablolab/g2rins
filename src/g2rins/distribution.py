@@ -8,6 +8,7 @@ various statistical distributions.
 import math
 import re
 from abc import abstractmethod
+from types import MappingProxyType
 from typing import Any, ClassVar, List, Optional, Tuple, Type, TypeVar, Union
 
 import numpy as np
@@ -43,6 +44,27 @@ _CURRENT_SERIAL_LAYOUT = (
     ("log_normal", 2),
     ("poisson", 2),
 )
+# Permanently reserve the retired NB slot; old vectors must not become Gamma.
+_MWD_SERIAL_LAYOUT = _CURRENT_SERIAL_LAYOUT + (("retired_nb", 2), ("mwd", 2))
+
+
+def _serial_layout(layout=None):
+    """Select an explicit writer layout; the historical default stays twelve."""
+    if layout is None or layout in (12, "legacy12"):
+        return _CURRENT_SERIAL_LAYOUT
+    if layout in (16, "mwd16"):
+        return _MWD_SERIAL_LAYOUT
+    raise ValueError(f"Unsupported distribution writer layout {layout!r}; expected 12 or 16 (Gamma MWD).")
+
+
+def _finite_serial_parameters(params):
+    try:
+        values = tuple(float(value) for value in params)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Distribution serialization requires finite numeric parameters.") from error
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("Distribution serialization requires finite numeric parameters.")
+    return values
 
 
 _GROUPED_NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?(?:[eE][+-]?\d+)?")
@@ -627,18 +649,18 @@ class StochasticDistribution(StochasticGeneration):
         return tuple((-1.0 for _ in range(n)))
 
     @classmethod
-    def get_empty_serial_vector(cls: Type["StochasticDistribution"]) -> List[float]:
+    def get_empty_serial_vector(cls: Type["StochasticDistribution"], *, layout=None) -> List[float]:
         """
         Returns an empty serialization vector with the correct length to hold
         the default serialization of all known stochastic distributions.
         """
         return [
             _SERIAL_SENTINEL
-            for _token_name, width in _CURRENT_SERIAL_LAYOUT
+            for _token_name, width in _serial_layout(layout)
             for _ in range(width)
         ]
 
-    def get_serial_vector(self) -> List[float]:
+    def get_serial_vector(self, *, layout=None) -> List[float]:
         """
         Returns the serialization vector for this specific stochastic distribution instance.
 
@@ -647,7 +669,12 @@ class StochasticDistribution(StochasticGeneration):
         """
         vector: List[float] = []
         own_token = type(self).token_name_snake_case
-        for token_name, width in _CURRENT_SERIAL_LAYOUT:
+        if layout is None and own_token == "mwd":
+            layout = 16
+        selected_layout = _serial_layout(layout)
+        if own_token not in dict(selected_layout):
+            raise ValueError(f"Distribution {own_token!r} cannot be encoded in this layout.")
+        for token_name, width in selected_layout:
             if own_token == token_name:
                 serialized = tuple(self.serialize())
                 if len(serialized) != width:
@@ -664,7 +691,7 @@ class StochasticDistribution(StochasticGeneration):
         """Reconstruct a distribution from a class-local serialized parameter tuple."""
         if params is None:
             return None
-        params = tuple(params)
+        params = _finite_serial_parameters(params)
         if not params:
             return None
         if all(float(value) == -1.0 for value in params):
@@ -680,8 +707,8 @@ class StochasticDistribution(StochasticGeneration):
 
     @classmethod
     def from_serial_vector(cls: Type[_T], vector: List[float]) -> Optional[_T]:
-        """Decode either the legacy 10-slot layout or the newer 12-slot layout."""
-        values = list(vector)
+        """Decode legacy 10/12-wide or Gamma MWD 16-wide vectors; reject retired NB."""
+        values = list(_finite_serial_parameters(vector))
         distribution_types = {
             distribution_type.token_name_snake_case: distribution_type
             for distribution_type in cls._known_distributions
@@ -692,13 +719,20 @@ class StochasticDistribution(StochasticGeneration):
             type_candidates: List[Type[_T]] = []
             index = 0
             for token_name, width in layout:
-                distr_type = distribution_types[token_name]
                 segment = tuple(values[index:index + width])
                 index += width
                 default_serial = (_SERIAL_SENTINEL,) * width
                 if segment != default_serial:
+                    if token_name == "retired_nb":
+                        raise ValueError("Retired NB slot cannot be decoded as Gamma MWD; recreate the model.")
+                    if _SERIAL_SENTINEL in segment and not (
+                        token_name in ("flory_schulz", "poisson")
+                        and width == 2 and segment[0] != _SERIAL_SENTINEL
+                        and segment[1] == _SERIAL_SENTINEL
+                    ):
+                        raise ValueError(f"Invalid partial sentinel in {token_name} segment.")
                     candidates.append(segment)
-                    type_candidates.append(distr_type)
+                    type_candidates.append(distribution_types[token_name])
             if not candidates:
                 return None
             if len(candidates) != 1:
@@ -710,10 +744,14 @@ class StochasticDistribution(StochasticGeneration):
 
         if len(values) == 12:
             return decode(_CURRENT_SERIAL_LAYOUT)
+        if len(values) == 14:
+            raise ValueError("Retired 14-wide NB vectors are incompatible with Gamma MWD; recreate the model.")
+        if len(values) == 16:
+            return decode(_MWD_SERIAL_LAYOUT)
 
         raise ValueError(
             f"Unrecognized stochastic-distribution serialization length {len(values)}. "
-            "Expected the legacy length 10 or the current length 12."
+            "Expected legacy length 10/12 or Gamma MWD length 16."
         )
 
     @abstractmethod
@@ -861,6 +899,7 @@ class FlorySchulz(StochasticDistribution):
 
     @classmethod
     def from_serialized(cls: Type[Self], params: Tuple[float, ...]) -> Optional[Self]:
+        params = _finite_serial_parameters(params)
         if tuple(params) == (_SERIAL_SENTINEL, _SERIAL_SENTINEL):
             return None
         if len(params) == 1 or (len(params) == 2 and params[1] == _SERIAL_SENTINEL):
@@ -1369,7 +1408,7 @@ class LogNormal(StochasticDistribution):
         """
         return self._distribution is not None
 
-    def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None) -> Any:
+    def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None, **kwargs) -> Any:
         """
         Draws a sample from the LogNormal distribution.
         """
@@ -1391,6 +1430,130 @@ class LogNormal(StochasticDistribution):
 
 
 StochasticDistribution._known_distributions.append(LogNormal)
+
+
+class Mwd(StochasticDistribution):
+    """Gamma/Schulz–Zimm NUMBER distribution of target masses in g/mol.
+
+    ``mwd(Mw, Mn)`` specifies two mass moments, without any count model or
+    recipe binding. Actual assembled masses can differ from target masses.
+    """
+
+    @classmethod
+    def make(cls: Type[Self], text: str) -> Self:
+        try:
+            return G2rinsBase.make.__func__(cls, text)
+        except VisitError as error:
+            raise error.orig_exc from error
+
+    @classmethod
+    def from_moments(cls, *, Mn: float, Mw: Optional[float] = None,
+                     dispersity: Optional[float] = None) -> Self:
+        Mn = float(Mn)
+        if not math.isfinite(Mn) or Mn <= 0:
+            raise ValueError("mwd requires finite Mn > 0.")
+        if dispersity is not None:
+            dispersity = float(dispersity)
+            if not math.isfinite(dispersity) or dispersity < 1:
+                raise ValueError("mwd requires finite dispersity >= 1.")
+        if Mw is None:
+            if dispersity is None:
+                raise ValueError("Supply Mw or dispersity.")
+            Mw = Mn * dispersity
+        Mw = float(Mw)
+        if dispersity is not None:
+            actual = Mw / Mn
+            if not math.isfinite(actual) or abs(actual - dispersity) > 4 * max(math.ulp(actual), math.ulp(dispersity)):
+                raise ValueError("Redundant Mw and dispersity are inconsistent.")
+        return cls([Mw, Mn])
+
+    def __init__(self, children: List[Any]):
+        super().__init__(children)
+        values = [child for child in self._children if isinstance(child, float)]
+        if len(values) != 2:
+            raise ValueError("mwd accepts exactly (Mw, Mn).")
+        self._Mw, self._Mn = values
+        if not (math.isfinite(self._Mw) and math.isfinite(self._Mn)
+                and 0 < self._Mn <= self._Mw):
+            raise ValueError("mwd requires finite Mw >= Mn > 0.")
+        self._point_mass = self._Mw == self._Mn
+        self._variance = self._Mn * (self._Mw - self._Mn)
+        if not math.isfinite(self._variance) or (not self._point_mass and self._variance == 0):
+            raise ValueError("mwd mass variance is not numerically representable.")
+        if self._point_mass:
+            self._shape = self._scale = None
+            self._distribution = None
+        else:
+            self._scale = self._Mw - self._Mn
+            self._shape = self._Mn / self._scale
+            if not math.isfinite(self._shape) or self._shape <= 0:
+                raise ValueError("mwd Gamma shape is not numerically representable.")
+            self._distribution = stats.gamma(a=self._shape, scale=self._scale)
+
+    @classmethod
+    def default_serialize(cls):
+        return cls._default_serialize(2)
+
+    def serialize(self):
+        return (self._Mw, self._Mn)
+
+    def generate_string(self, extension: bool) -> str:
+        return f"|mwd({self._Mw!r}, {self._Mn!r})|" if extension else ""
+
+    @property
+    def generable(self):
+        return True
+
+    @property
+    def moments(self):
+        return MappingProxyType(dict(Mn=self._Mn, Mw=self._Mw,
+            variance=self._variance, dispersity=self._Mw / self._Mn))
+
+    def reference_mw(self):
+        return self._Mn
+
+    def support_mw(self):
+        return (self._Mn, self._Mn) if self._point_mass else (0.0, math.inf)
+
+    def draw_mw(self, rng=None, lower=None, upper=None, **kwargs):
+        if self._point_mass:
+            lo = -math.inf if lower is None else float(lower)
+            hi = math.inf if upper is None else float(upper)
+            if not lo <= self._Mn <= hi:
+                raise EmptyTruncatedDistributionSupport(type(self).__name__, lo, hi)
+            return self._Mn
+        try:
+            value = float(super().draw_mw(rng=rng, lower=lower, upper=upper, **kwargs))
+        except EmptyTruncatedDistributionSupport as error:
+            # Gamma has positive density everywhere on (0, inf). CDF/SF
+            # underflow on a nonempty interval is a numerical failure, not a
+            # chain-local support miss that the sampler may discard/retry.
+            if (not math.isnan(error.lower) and not math.isnan(error.upper)
+                    and error.lower < math.inf and max(0.0, error.lower) < error.upper):
+                raise RuntimeError(
+                    "mwd Gamma interval has positive probability but numerical "
+                    "CDF/SF underflow prevents a representable bounded draw."
+                ) from error
+            raise
+        if not math.isfinite(value) or value <= 0:
+            raise RuntimeError("mwd Gamma draw is not a representable positive mass.")
+        return value
+
+    def prob_mw(self, mw, **kwargs):
+        if self._point_mass:
+            if isinstance(mw, RememberAdd):
+                return float(mw.previous < self._Mn <= mw.value)
+            return float(float(mw) == self._Mn)
+        if isinstance(mw, RememberAdd):
+            lo, hi = float(mw.previous), float(mw.value)
+            if lo > hi:
+                raise ValueError("mwd interval must be increasing.")
+            if self._distribution.cdf(lo) > 0.5:
+                return float(self._distribution.sf(lo) - self._distribution.sf(hi))
+        return float(super().prob_mw(mw, **kwargs))
+
+
+StochasticDistribution._known_distributions.append(Mwd)
 
 
 class Poisson(StochasticDistribution):
@@ -1490,6 +1653,7 @@ class Poisson(StochasticDistribution):
 
     @classmethod
     def from_serialized(cls: Type[Self], params: Tuple[float, ...]) -> Optional[Self]:
+        params = _finite_serial_parameters(params)
         if tuple(params) == (_SERIAL_SENTINEL, _SERIAL_SENTINEL):
             return None
         if len(params) == 1 or (len(params) == 2 and params[1] == _SERIAL_SENTINEL):

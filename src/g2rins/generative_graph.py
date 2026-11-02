@@ -678,12 +678,19 @@ def generative_graph_json_data(generative_graph):
     a source-less legacy dataset with known placeholder semantics, explicitly use
     :func:`mark_legacy_connector_placeholders`.
 
+    Direct Gamma MWD graphs retain their v4 schema and 16-wide distribution
+    arrays in node-link metadata. Inconsistent widths/replicas, unknown
+    versions and retired NB artifacts are rejected before export. No recipe
+    context or chemistry-specific distribution binding is required.
+
     Inactive split-atom placeholders are retained, even when their descriptor
     has no compatible partner. They have no bond_id and are omitted from unit
     pSMILES. The graph and DOT view preserve these encoded connector sites;
     a partnerless descriptor on an unsplit atom needs no extra node. The export
     represents the generative graph, not a contracted molecular structure.
     """
+    from ._mwd_transport import validate_mwd_transport
+    validate_mwd_transport(generative_graph)
     # node_link_data builds fresh top-level node dictionaries. Only those are
     # edited here; _json_safe detaches every nested container before returning.
     data = nx.node_link_data(generative_graph, edges="edges")
@@ -901,12 +908,7 @@ class GraphCreator:
         bc_idx_set = self._bc_idx_set
         list_of_multiple_bonds = {}
         for node in graph.nodes():
-
-            if node not in bc_idx_set:  # Regular atoms
-                # Order-preserving dedup: iterating a SET of (uuid string) node ids
-                # is PYTHONHASHSEED-dependent, and the loop below inserts new nodes
-                # in this order — which must be parse-stable for the generated
-                # graph structure to be reproducible across processes.
+            if node not in bc_idx_set:
                 attached_bc = []
                 for _u, v in graph.out_edges(node):
                     if v in bc_idx_set and v not in attached_bc:
@@ -919,14 +921,11 @@ class GraphCreator:
                 bc_to_node_edges_data = list(graph.get_edge_data(bc, node).values())
                 self._g.remove_edges_from([(node, bc, k) for k in list(graph[node][bc].keys())])
                 self._g.remove_edges_from([(bc, node, k) for k in list(graph[bc][node].keys())])
-
                 new_node_idx = str(uuid.uuid4())
-
                 self._g.add_node(new_node_idx, **{_CONNECTOR_PLACEHOLDER_NAME: True})
                 self._g.nodes[new_node_idx]["smi_text"] = "[*]"
                 obj = self._create_bracket_atom("[*]")
                 self._g.nodes[new_node_idx]["obj"] = obj
-
                 try:
                     self._g.nodes[new_node_idx]["stochastic_obj"] = graph.nodes[node]["stochastic_obj"]
                 except KeyError:
@@ -935,7 +934,6 @@ class GraphCreator:
                     self._g.nodes[new_node_idx]["stochastic_id"] = self._stochastic_id_map[id(graph.nodes[node]["stochastic_obj"])]
                 except KeyError:
                     pass
-
                 for attrs in node_to_bc_edges_data:
                     self._g.add_edge(new_node_idx, bc, **deepcopy(attrs))
                 for attrs in bc_to_node_edges_data:
@@ -946,16 +944,12 @@ class GraphCreator:
     @staticmethod
     def _mark_aromatic_bonds(graph):
         from .atom import Atom
-
-        # Post-process, marking aromatic bonds
         for edge in graph.edges(data=True):
             node_a = graph.nodes()[edge[0]]["obj"]
             node_b = graph.nodes()[edge[1]]["obj"]
             if isinstance(node_a, Atom) and isinstance(node_b, Atom):
-                # Association edges (bond_type ".") between aromatic ions are not aromatic bonds.
                 if node_a.aromatic and node_b.aromatic and edge[2].get(_BOND_TYPE_NAME) != ".":
                     edge[2][_AROMATIC_NAME] = True
-
         return graph
 
     def _duplicate_static_edges(self):
@@ -970,31 +964,6 @@ class GraphCreator:
                 if not edge_found:
                     self._g.add_edge(v, u, **d)
 
-    # @staticmethod
-    # def _remove_unnecessary_static_edges(graph):
-    #     init_nodes = {}
-    #     for node, data in graph.nodes(data=True):
-    #         if "init_weight" in data and data["init_weight"] is not None:
-    #             init_nodes[node] = set(nx.bfs_tree(graph, source=node).nodes())
-
-    #     if len(init_nodes) > 0:
-    #         for node in list(graph.nodes()):
-    #             for u, v, k, d in graph.edges(node, keys=True, data=True):
-    #                 if is_static_edge(d):
-    #                     tmp_graph = graph.copy()
-    #                     tmp_graph.remove_edge(u,v,k)
-
-    #                     accept_graph = True
-    #                     for start_node in init_nodes:
-    #                         new_set = set(nx.bfs_tree(tmp_graph, source=start_node).nodes())
-    #                         if new_set != init_nodes[start_node]:
-    #                             accept_graph = False
-    #                             break
-    #                     if accept_graph:
-    #                         print(u,v,k,d)
-    #                         graph = tmp_graph
-    #     return graph
-
     def __str__(self):
         return f"GraphCreator({self.g})"
 
@@ -1006,19 +975,6 @@ class GraphCreator:
         self._validate_bond_descriptor_anchors()
 
         def conditional_traversal(graph, source, stop_condition):
-            """
-            Perform a graph traversal starting from the source node.
-            Stop traversal if a node fulfills the stop_condition and return all nodes where traversal stopped.
-
-            Args:
-                graph (nx.DiGraph): The directed graph.
-                source: The starting node for the traversal.
-                stop_condition (function): A function that takes a node and returns True if traversal should stop.
-
-            Returns:
-                set: A set of nodes where the traversal stopped.
-
-            """
             stopped_nodes = set()
             visited = set()
 
@@ -1026,12 +982,9 @@ class GraphCreator:
                 if node in visited:
                     return
                 visited.add(node)
-
                 if stop_condition(node):
                     stopped_nodes.add(node)
-                    return  # Stop traversal from this node
-
-                # Continue traversal to neighbors
+                    return
                 for neighbor in graph.neighbors(node):
                     dfs(neighbor)
 
@@ -1039,7 +992,6 @@ class GraphCreator:
             return stopped_nodes
 
         graph = self.g.copy()
-
         bc_idx_set = self._bc_idx_set
         outer_self = self
 
@@ -1048,17 +1000,13 @@ class GraphCreator:
                 self.graph = graph
                 self.edge_path = edge_path
                 self._stochastic_id_map = outer_self._stochastic_id_map
-
                 node_path: list = []
                 data_path: list = []
-
                 last_node = None
                 have_last = False
-
                 for edge in self.edge_path:
                     data = graph.get_edge_data(*edge)
                     data_path.append(data)
-
                     for node in edge[:2]:
                         if not have_last:
                             node_path.append(node)
@@ -1068,7 +1016,6 @@ class GraphCreator:
                             if last_node != node:
                                 node_path.append(node)
                                 last_node = node
-
                 self.node_path = node_path
                 self.data_path = data_path
                 self._weight, self._combined_attr = self.create_combined_attr()
@@ -1099,7 +1046,6 @@ class GraphCreator:
                                 return 0.0, None
                         else:
                             data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
-
                     non_static_weights = [d[attr] if attr in d else 0 for attr in non_static_attribute_list]
                     if max(non_static_weights) > 0:
                         for attr, w in zip(non_static_attribute_list, non_static_weights):
@@ -1108,15 +1054,11 @@ class GraphCreator:
                                 weight *= w
                     else:
                         current_type = _STATIC_NAME
-
                     weight_type_list.append(current_type)
-
                 last_rank = 0
                 max_rank = 0
-
                 for edge in self.edge_path:
                     u, v = edge[:2]
-
                     if "stochastic_obj" in graph.nodes[u]:
                         if "stochastic_obj" in graph.nodes[v]:
                             if self.graph.nodes[u]["stochastic_obj"].stochastic_parent is not None:
@@ -1127,29 +1069,13 @@ class GraphCreator:
                                 target_parent = self._stochastic_id_map[id(graph.nodes[v]["stochastic_obj"].stochastic_parent)]
                                 if graph.nodes[u]["stochastic_id"] == target_parent:
                                     last_rank -= 1
-                        #    if termination: rank +=1 ?
                         else:
                             last_rank += 1
-
                     max_rank = max(max_rank, last_rank)
-
                 data["rank"] = [max_rank, last_rank]
-
-                # sto_id = the "managing SO": the SO at max_rank levels up from the source atom's SO.
-                # This is the first unterminated ancestor in a termination cascade, i.e. the SO
-                # whose bond connectors the path traverses at its outermost point and which
-                # therefore decides to create the next repeat unit.
-                # Firing sto_id=X means: "SO X is the first unterminated ancestor — use its transitions."
-                #
-                # Special case — "forced nested" transition (parent -> descendant with no parent BC
-                # on the path): when the source atom descends into a child SO via a SMILES branch
-                # without any of its own SO's bond connectors mediating the bond, the parent has no
-                # stochastic decision to make and the transition is controlled by the highest-order
-                # child SO encountered on the descent (the first BC met after the source).
                 source_node = self.node_path[0]
                 if "stochastic_obj" in graph.nodes[source_node]:
                     source_so_id = self._stochastic_id_map[id(graph.nodes[source_node]["stochastic_obj"])]
-
                     forced_nested_sto_id = None
                     if max_rank == 0 and last_rank < 0:
                         first_descendant_so_id = None
@@ -1165,7 +1091,6 @@ class GraphCreator:
                                 first_descendant_so_id = bc_so_id
                         if not parent_bc_present and first_descendant_so_id is not None:
                             forced_nested_sto_id = first_descendant_so_id
-
                     if forced_nested_sto_id is not None:
                         data["sto_id"] = forced_nested_sto_id
                     else:
@@ -1178,18 +1103,15 @@ class GraphCreator:
                         data["sto_id"] = self._stochastic_id_map[id(managing_so)]
                 else:
                     data["sto_id"] = None
-
                 last_weight_type = _STATIC_NAME
                 for weight_type in weight_type_list:
                     if last_weight_type != _STATIC_NAME and weight_type != _STATIC_NAME:
                         return 0.0, None
                     last_weight_type = weight_type
-
                 weight_type = _STATIC_NAME
                 for attr in [_PROPAGATION_NAME, _TRANSITION_NAME, _TERMINATION_NAME]:
                     if attr in weight_type_list:
                         weight_type = attr
-
                 if max_rank == 0 and last_rank < 0:
                     zeroth_node = self.node_path[0]
                     first_node = self.node_path[1]
@@ -1197,10 +1119,8 @@ class GraphCreator:
                         if graph.nodes[zeroth_node]["stochastic_id"] == graph.nodes[first_node]["stochastic_id"]:
                             if self.init_weight is None:
                                 weight_type = _PROPAGATION_NAME
-
                 if weight > 0:
                     data[weight_type] = weight
-
                 return weight, data
 
             def __len__(self):
@@ -1230,7 +1150,6 @@ class GraphCreator:
                     and self.contains_bc(bc_idx)
                     and (self.combined_attr is not None)
                     and (self.weight > 0)
-                    # and self.num_stochastic_transitions < 3
                 )
 
             def get_stochastic_transition_path(self):
@@ -1240,10 +1159,8 @@ class GraphCreator:
                         stochastic_id = self.graph.nodes[node]["stochastic_id"]
                     except KeyError:
                         stochastic_id = -1
-
                     if len(stochastic_id_list) == 0 or stochastic_id_list[len(stochastic_id_list) - 1] != stochastic_id:
                         stochastic_id_list += [stochastic_id]
-
                 return stochastic_id_list
 
             @property
@@ -1260,7 +1177,6 @@ class GraphCreator:
             @property
             def init_weight(self):
                 init_weight = None
-                # for node_idx in self.node_path:
                 if len(self.node_path) > 1:
                     node_idx = self.node_path[1]
                     node_init_weight = self.graph.nodes[node_idx].get("init_weight", None)
@@ -1276,27 +1192,44 @@ class GraphCreator:
             def __call__(self, x):
                 return (x not in self.bc_idx_set) and (x != self.in_idx)
 
+        def connector_paths(source, target):
+            """Preserve DFS edge order, pruning paths that can never be valid.
+
+            Valid paths have connector-only interiors and cannot contain two
+            adjacent non-static edges. Enumerating all atom paths first can be
+            exponential for a branched model before either check is applied.
+            """
+            visited = {source}
+            path = []
+
+            def walk(node, previous_nonstatic=False):
+                for u, v, key, data in graph.out_edges(node, keys=True, data=True):
+                    if v in visited or (v != target and v not in bc_idx_set):
+                        continue
+                    nonstatic = any(data.get(attr, 0) > 0 for attr in _NON_STATIC_ATTR)
+                    if previous_nonstatic and nonstatic:
+                        continue
+                    path.append((u, v, key))
+                    if v == target:
+                        yield list(path)
+                    else:
+                        visited.add(v)
+                        yield from walk(v, nonstatic)
+                        visited.remove(v)
+                    path.pop()
+
+            yield from walk(source)
+
         edges_to_add = []
-
-        # Iterating SETS of (uuid string) node ids is PYTHONHASHSEED-dependent;
-        # the loops below build weighted edges in iteration order, which must be
-        # parse-stable so the generated graph is reproducible across processes.
         _graph_node_order = {node: index for index, node in enumerate(graph.nodes())}
-
-        # Add edges jumping over the pairs of bond connectors with correct weights.
-        # The following routine loops over all bond connectors and finds the in_edges that are atoms. Then it finds successor atoms
-        # for those. These successors are then used to find all paths between the initial atom and the successor atoms, and pick only those paths
-        # that are valid considering the criteria built in the BondConnectorPath class.
         for bc_idx in sorted(bc_idx_set, key=_graph_node_order.__getitem__):
             for in_edge in graph.in_edges(bc_idx, data=True):
                 in_idx = in_edge[0]
-                # Only do it for sources of the bond connectors that are not bond connectors themselves. I.e. at the start of a chain.
                 if in_idx not in bc_idx_set:
                     traversal_condition = GraphDecider(bc_idx_set, in_idx)
                     non_bond_connector_successor = conditional_traversal(graph, in_idx, traversal_condition)
                     for target in sorted(non_bond_connector_successor, key=_graph_node_order.__getitem__):
-                        all_paths = list(nx.all_simple_edge_paths(graph, in_idx, target))
-                        for path in all_paths:
+                        for path in connector_paths(in_idx, target):
                             bond_connector_path = BondConnectorPath(path, graph)
                             if bond_connector_path.valid(bc_idx):
                                 data = bond_connector_path.combined_attr
@@ -1304,13 +1237,9 @@ class GraphCreator:
                                 if bond_connector_path.init_weight is not None:
                                     graph.nodes[in_idx]["init_weight"] = bond_connector_path.init_weight
                                 graph.nodes[in_idx]["weight"] = graph.nodes[bc_idx]["obj"].weight
-
-        # The previous approach does not handle self-loops on bond connectors, since they are cycles.
-        # However, these are important and easily addressed manually.
         for bc_idx in sorted(bc_idx_set, key=_graph_node_order.__getitem__):
             in_edges = set(graph.in_edges(bc_idx, keys=True))
             out_edges = set(graph.out_edges(bc_idx, keys=True))
-            # A loop to itself is the intersection
             loop_edges = in_edges.intersection(out_edges)
             for loop_edge in sorted(loop_edges, key=lambda edge: (_graph_node_order[edge[0]], _graph_node_order[edge[1]], edge[2])):
                 for in_u, in_v, in_k, in_data in graph.in_edges(bc_idx, keys=True, data=True):
@@ -1322,95 +1251,38 @@ class GraphCreator:
                                 if bond_connector_path.valid(bc_idx):
                                     data = bond_connector_path.combined_attr
                                     edges_to_add.append((in_u, out_v, data))
-
         for edge in edges_to_add:
             graph.add_edge(edge[0], edge[1], **edge[2])
-        # Remove all bond connectors from the graph.
         graph.remove_nodes_from(bc_idx_set)
-
-        # Normalize transition weights
         for node in graph.nodes():
             total_weight = 0
             for _u, _v, _k, d in graph.out_edges(node, keys=True, data=True):
                 if _TRANSITION_NAME in d:
                     total_weight += d[_TRANSITION_NAME]
-
             if total_weight > 0:
                 for u, v, k, d in graph.out_edges(node, keys=True, data=True):
                     if _TRANSITION_NAME in d:
                         graph.edges[u, v, k][_TRANSITION_NAME] /= total_weight
-
         graph = GraphCreator._mark_aromatic_bonds(graph)
-
         return graph
 
-    @_docstring_format(
-        propagation_name=_PROPAGATION_NAME,
-        termination_name=_TERMINATION_NAME,
-        transition_name=_TRANSITION_NAME,
-        static_name=_STATIC_NAME,
-        stochastic_id_name=_EDGE_STOCHASTIC_ID_NAME,
-        aromatic_name=_AROMATIC_NAME,
-        bond_type_name=_BOND_TYPE_NAME,
-        smi_bond_mapping=smi_bond_mapping,
-    )
     def get_generative_graph(self, include_bond_connectors=False, return_extra_graph_info=False):
-        r"""
-        The generative graph has well defined properties that do not rely on the specifics of this library.
+        """Build the generative graph.
 
-        Nodes (Atoms) have the following properties:
-
-        - **atomic_num**: int Atomic number, can be converted to Chemical Symbol Name or one-hot encoding.
-        - **is_connector_placeholder**: bool True only for internal split-atom connector placeholders. User-written atoms, including wildcards, carry False.
-        - **{aromatic_name}**: bool Indicating the aromaticity of the atom.
-        - **charge**: float Nominal charge (not partial charge in Force-Fields) in elementary unit *e*.
-        - **molecular_weight_distribution**: array[float] representing the molecular weight distribution of each stochastic object in the graph. The index of each vector is the stochastic id.
-        - **mol_molecular_weight** float Molecular Weight of the total molecular weight in the system from this molecular species. If this is unspecified by the string, negative values are used.
-        - **total_molecular_weight** float Molecular Weight of the entire material system, this is equal to the sum **mol_molecular_weight** of the comprising molecules. If only one molecule species is present, they are identical. If this is unspecified by the string, negative values are used.
-        - **unit_molar_amounts** vector[float] Molar amount of the unit (repeat unit, initiator, or terminator) to which the node belongs, at each stochastic object. Default is 1.0.
-        - **init_weight** float Molecular Weight fractions for entry points into the graph generation. If no molecular weights are specified, 1.0 is used. Negative values indicate nodes that are not starting positions for the generation.
-        - **gen_weight** float Weight to select this atom for the next generation step.
-        - **gen_hierarchy**: int Hierarchy for the selection of the atom for the next generation step. Default is 0. Atoms with a higher hierarchy number will be chosen first.
-        - **stochastic_id_tree**: vector[int] Identification of the stochastic objects to which the node belongs. The vector is ordered from nearest to farthest ancestor (e.g., first element is node stochastic id, second element is parent, third is grandparent, etc.).  All elements are -1 if not a stochastic object, element is -2 if ancestor is absent.
-
-        Edges (Bonds) have the following properties:
-
-        - **{static_name}**: bool indicating static edges, that are always present.
-        - **{propagation_name}**: float Propagation probability. If bond connectors are connecting between monomer repeat units inside stochastic objects, this indicates the probability \in [0, 1].
-        - **{termination_name}**: float Termination Probabilities. If bond connectors terminate with end-groups after the molecular weight is reached, this is the probability \in [0, 1].
-        - **{transition_name}**: float Transition Probabilities. If transitioning between stochastic objects, this is the probability to take.
-        - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
-        - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
-        - **{aromatic_name}**: bool Indicates aromatic bonds.
-
-        The graph carries the G2RINS string it was generated from as the
-        graph-level attribute **g2rins_string**, and a mapping from unit_id to
-        the G2RINS text of the token each unit originates from as the
-        graph-level attribute **unit_g2rins**. The graph-level **unit_node_ids**
-        mapping saves each unit's node IDs as a list at parse time. Consumers
-        use it to verify unit membership before quoting source text: removed
-        nodes or reassigned labels make that text unavailable. Older graphs
-        without this mapping retain unit text only if every saved unit ID is
-        still derived. A present but empty or malformed map verifies no text.
-        These attributes
-        are optional parser provenance, never required for generation.
-
-        Unit and bond labels (``unit_id``, ``bond_id``) are NOT stored on
-        nodes; they are derived annotations — compute them on demand with
-        :func:`derive_unit_labels`. The node and edge properties listed above
-        are the full graph contract: a generative model emitting
-        **atomic_num**, **is_connector_placeholder**, **{aromatic_name}**, **charge**, **num_explicit_h**,
-        **init_weight**, the **{static_name}** edge flag and the three
-        non-static weights produces a graph that every consumer, including the
-        label derivation, can handle. Generation requires an explicit boolean
-        **is_connector_placeholder** on zero-number nodes: True identifies an
-        internal placeholder; False identifies a user wildcard, which can be
-        parsed and exported but cannot be used for ensemble generation. Older
-        graphs without zero-number nodes may omit this attribute.
+        Legacy distributions retain 12-wide vectors. Models containing direct
+        mwd(Mw, Mn) Gamma number-target-mass distributions use 16-wide vectors
+        and g2rins-distribution-vector/v4; retired NB slots stay empty. No
+        recipe binding or count-led realization is performed. Existing node,
+        connector, edge, ownership and extra-info behavior is unchanged.
         """
+        from .distribution import Mwd, StochasticDistribution
 
-        from .distribution import StochasticDistribution
-
+        graph_with_bond_connectors = self.g.copy()
+        stochastic_objects = {data["stochastic_id"]: data["stochastic_obj"]
+                              for _, data in graph_with_bond_connectors.nodes(data=True)
+                              if "stochastic_obj" in data}
+        has_mwd = any(isinstance(obj.stochastic_generation, Mwd)
+                      for obj in stochastic_objects.values())
         extra_graph_info = {}
         extra_graph_info_reverse = {}
 
@@ -1422,16 +1294,14 @@ class GraphCreator:
         generative_graph = nx.MultiDiGraph()
         generative_graph.graph["g2rins_string"] = self.text
 
-        graph_with_bond_connectors = self.g.copy()
-        MW_distribution_array = [StochasticDistribution.get_empty_serial_vector()] * 10
-
-        for node, data in graph_with_bond_connectors.nodes(data=True):
-            try:
-                stochastic_id = data["stochastic_id"]
-                MW_distribution_vector = data["stochastic_obj"].stochastic_generation.get_serial_vector()
-                MW_distribution_array[stochastic_id] = MW_distribution_vector
-            except KeyError:
-                pass
+        layout = 16 if has_mwd else 12
+        MW_distribution_array = [StochasticDistribution.get_empty_serial_vector(layout=layout)
+                                 for _ in range(_STOCHASTIC_TREE_DEPTH)]
+        for stochastic_id, obj in stochastic_objects.items():
+            MW_distribution_array[stochastic_id] = obj.stochastic_generation.get_serial_vector(layout=layout)
+        if has_mwd:
+            from ._mwd_transport import MWD_SCHEMA
+            generative_graph.graph["molecular_weight_distribution_schema"] = MWD_SCHEMA
 
         for node, data in graph.nodes(data=True):
             obj = data["obj"]
@@ -1713,14 +1583,7 @@ class GraphCreator:
         return generative_graph
 
     def write_generative_graph_json(self, filename):
-        """
-        Write the generative graph (see :meth:`get_generative_graph`) to `filename` as JSON: a
-        self-describing ``format`` block plus the node-link ``graph`` with the
-        derived unit/bond annotations injected (see :func:`generative_graph_json_data`).
-
-        Load the graph back with
-        ``networkx.node_link_graph(json.load(fp)["graph"], edges="edges")``.
-        """
+        """Write the self-describing generative graph JSON."""
         data = generative_graph_json_data(self.get_generative_graph())
         with open(filename, "w") as file_handle:
             json.dump(data, file_handle, indent=2)
@@ -1923,13 +1786,8 @@ class GraphCreator:
         return dot_str
 
     def get_ensemble_creator(self):
-        """Build an ensemble creator from the graph without bond connectors.
-
-        Raises:
-            UnsupportedWildcardGeneration: The input contains a user-written
-                wildcard atom. Parsing and graph export remain supported;
-                generation requires explicit atoms and end groups.
-        """
+        """Create the standard target-mass ensemble sampler."""
         from .ensemble_creator import EnsembleCreator
 
-        return EnsembleCreator(self.get_generative_graph(include_bond_connectors=False))
+        graph = self.get_generative_graph(include_bond_connectors=False)
+        return EnsembleCreator(graph)

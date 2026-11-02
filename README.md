@@ -94,6 +94,28 @@ development output fields and JSON changes.
 Worked examples are in [G2RINS_guide.ipynb](G2RINS_guide.ipynb); check its APIs
 against your installed revision.
 
+### Direct molar-mass target distributions
+
+Use `|mwd(Mw,Mn)|`, for example `|mwd(1500,1000)|`, to draw target masses
+from a Gamma/Schulz–Zimm **number distribution**, with **Mw first and Mn second**
+in g/mol. It needs no recipe binding or polymerization-degree conversion.
+The existing sampler grows molecular graphs near these targets; actual
+ensemble moments can differ because of discrete chemistry and stopping rules.
+
+```python
+model = g2rins.G2rins.make("{[] [<]CC[>];; [<][H], [>][H] []}|mwd(1500,1000)|")
+creator = model.get_graph_creator().get_ensemble_creator()
+chains = creator.create_ensemble(100, output_format="smiles", seed=42)
+```
+
+**Breaking development change — 2026-10-30:** the recipe-bound NB/count-led
+implementation and `nb_realization` selector have been removed. Old NB graphs,
+vectors and checkpoints are rejected, not silently reinterpreted. Old `mwd`
+source strings must be reviewed before reuse because their meaning has changed.
+See [MWD semantics, sampling scope and migration](docs/mwd.md).
+
+---
+
 ## Documentation
 
 - [Documentation index and feature support matrix](docs/index.md): fixed-size
@@ -102,6 +124,8 @@ against your installed revision.
   hydrogen policy, branches/paths, and independent motif analytics.
 - [Building-block population statistics](docs/building-block-statistics.md):
   usage, schema, neighborhoods, and probability denominators.
+- [Direct molar-mass distributions](docs/mwd.md): Gamma number-target-mass law,
+  scope, actual-mass caveats and migration from the retired NB model.
 - [Migration guide](docs/migration.md): format v2, wildcard/placeholder safety,
   source selection, termination, and validation changes.
 - [Changelog](CHANGELOG.md), [contribution guide](CONTRIBUTING.md), and
