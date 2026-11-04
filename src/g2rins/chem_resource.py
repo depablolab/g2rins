@@ -1,3 +1,7 @@
+import warnings
+
+from .exception import UnknownIsotopeMass
+
 atom_name_mapping = {
     1: "H",
     2: "He",
@@ -452,3 +456,60 @@ smi_bond_mapping = {
 }
 
 bond_num_smi = dict((v, k) for k, v in smi_bond_mapping.items())
+
+# General chiral specification (@TH1 ... @OH30): one stable integer per explicit class and
+# order, 0 = no mark. A bare @/@@ is order 1/2 of the class selected by the written degree.
+chirality_class_degrees = {"TH": (3, 4), "AL": (2,), "SP": (4,), "TB": (5,), "OH": (6,)}
+chirality_class_by_degree = {2: "AL", 3: "TH", 4: "TH", 5: "TB", 6: "OH"}
+chirality_codes = {
+    klass_order: code
+    for code, klass_order in enumerate([(klass, order) for klass, max_order in (("TH", 2), ("AL", 2), ("SP", 3), ("TB", 20), ("OH", 30)) for order in range(1, max_order + 1)], start=1)
+}
+chirality_code_classes = dict((v, k) for k, v in chirality_codes.items())
+
+# Isotopic masses of the stable isotopes of the common elements (RDKit 2026.03 periodic table).
+isotope_masses = {
+    (1, 1): 1.00783,
+    (1, 2): 2.01410,
+    (1, 3): 3.01605,
+    (3, 6): 6.01512,
+    (3, 7): 7.01600,
+    (5, 10): 10.01294,
+    (5, 11): 11.00931,
+    (6, 12): 12.00000,
+    (6, 13): 13.00335,
+    (6, 14): 14.00324,
+    (7, 14): 14.00307,
+    (7, 15): 15.00011,
+    (8, 16): 15.99491,
+    (8, 17): 16.99913,
+    (8, 18): 17.99916,
+    (9, 19): 18.99840,
+    (11, 23): 22.98977,
+    (14, 28): 27.97693,
+    (14, 29): 28.97649,
+    (14, 30): 29.97377,
+    (15, 31): 30.97376,
+    (16, 32): 31.97207,
+    (16, 33): 32.97146,
+    (16, 34): 33.96787,
+    (16, 36): 35.96708,
+    (17, 35): 34.96885,
+    (17, 37): 36.96590,
+    (19, 39): 38.96371,
+    (19, 41): 40.96183,
+    (35, 79): 78.91834,
+    (35, 81): 80.91629,
+    (53, 127): 126.90447,
+}
+
+
+def atom_mass(atomic_num, isotope=0):
+    """Mass of an atom: the standard atomic weight for isotope 0, the isotopic mass otherwise."""
+    if isotope <= 0:
+        return atomic_masses[atomic_num]
+    try:
+        return isotope_masses[(atomic_num, isotope)]
+    except KeyError:
+        warnings.warn(UnknownIsotopeMass(atomic_num, isotope), stacklevel=2)
+        return float(isotope)

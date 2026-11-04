@@ -237,14 +237,14 @@ class StochasticMissingPath(ParsingWarning):
         return f"The stochastic object {str(self.token)} defines that it can be entered via the bond connector in position {str(self.source_bc_pos)} as defined by the left terminal connector. However, when entered there there is no path to reach any of the exit bond connectors as defined by the right terminal bond connector."
 
 
-class IncompatibleBondTypeBondConnector(ParsingWarning):
+class IncompatibleBondTypeBondConnector(ParsingError):
     def __init__(self, bond_type_lhs, bond_type_rhs):
         super().__init__(None)
         self.bond_type_lhs = bond_type_lhs
         self.bond_type_rhs = bond_type_rhs
 
     def __str__(self):
-        return f"There is a connection between bond connectors with different bond types, the left is {str(self.bond_type_lhs)} and the right is {str(self.bond_type_rhs)}. There will be no generation path, since the bond type is undefined. This maybe an incorrect input G2RINS string, check the bond types for compatibility around the bond connectors: connecting bond connectors have of same type i.e. '[<]=CC[>]' is invalid, since it connects a double bond = with a single bond implicit `-`, correct would be `[<]=CC=[>]`."
+        return f"Two bond connectors that bond to each other are reached through bonds of different order, {str(self.bond_type_lhs)} on one side and {str(self.bond_type_rhs)} on the other, so the bond between them is undefined. The bonds leading to connecting bond connectors must have the same order (the cis/trans symbols / and \\ are single bonds): '[<]=CC[>]' joins a double bond with an implicit single bond, '[<]=CC=[>]' is consistent."
 
 
 class UnvalidatedGenerationSource(G2RINSWarning):
@@ -527,3 +527,33 @@ class IncompleteStochasticGeneration(G2RINSError):
         if num_bonds == 0:
             return f"Incomplete Stochastic Generation: since there are {num_bonds} open bonds this may be intended. You can catch this exception and use the `atom_graph` property as a result."
         return f"Incomplete Stochastic Generation: {num_bonds} are still unaccounted for this is likely an imprecise G2RINS string or a bug."
+
+
+class InvalidChiralityOrder(ParsingError):
+    def __str__(self):
+        return f"The chirality specification {self.token} has an order outside the range of its class (TH and AL 1-2, SP 1-3, TB 1-20, OH 1-30)."
+
+
+class InconsistentChiralityClass(ParsingError):
+    def __init__(self, token, atom_text, degree):
+        super().__init__(token)
+        self.atom_text = atom_text
+        self.degree = degree
+
+    def __str__(self):
+        return f"The chirality specification {self.token} of atom {self.atom_text} does not fit its written degree {self.degree}: a bare @/@@ means AL at degree 2, TH at 3 or 4, TB at 5, OH at 6, and an explicit class must match the degree."
+
+
+class ChiralityNotApplied(G2RINSWarning):
+    def __str__(self):
+        return f"Chirality class {self.token} is carried in the graph but not applied to the RDKit molecule; those centers are left unspecified."
+
+
+class UnknownIsotopeMass(G2RINSWarning):
+    def __init__(self, atomic_num, isotope):
+        super().__init__((atomic_num, isotope))
+        self.atomic_num = atomic_num
+        self.isotope = isotope
+
+    def __str__(self):
+        return f"No tabulated mass for isotope {self.isotope} of element {self.atomic_num}; its mass number is used as the mass."

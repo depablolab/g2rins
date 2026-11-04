@@ -13,7 +13,7 @@ from .exception import (
     SmilesHasNonZeroBondConnectors,
     UnmatchedCounterion,
 )
-from .generative_graph import _BOND_DIR_NAME, _BOND_TYPE_NAME, _PartialGraph
+from .generative_graph import _BOND_TYPE_NAME, _CIS_TRANS_MARK_NAME, _PartialGraph
 
 
 class Branch(G2rinsBase, GenerationBase):
@@ -64,8 +64,8 @@ class Branch(G2rinsBase, GenerationBase):
                 if _BOND_TYPE_NAME in lhb.bond_attributes:
                     raise DoubleBondSymbolDefinition(partial_graph, self._bond_symbol, lhb.bond_attributes)
                 lhb.bond_attributes[_BOND_TYPE_NAME] = self._bond_symbol
-                if self._bond_symbol.direction:
-                    lhb.bond_attributes[_BOND_DIR_NAME] = self._bond_symbol.direction
+                if self._bond_symbol.cis_trans_mark:
+                    lhb.bond_attributes[_CIS_TRANS_MARK_NAME] = self._bond_symbol.cis_trans_mark
 
         for element in self._elements[1:]:
             element_partial_graph = element._generate_partial_graph()
@@ -206,8 +206,8 @@ class AtomAssembly(G2rinsBase, GenerationBase):
                 if _BOND_TYPE_NAME in half_bond.bond_attributes:
                     raise DoubleBondSymbolDefinition(partial_graph, self.bond_symbol, half_bond.bond_attributes)
                 half_bond.bond_attributes[_BOND_TYPE_NAME] = self.bond_symbol
-                if self.bond_symbol.direction:
-                    half_bond.bond_attributes[_BOND_DIR_NAME] = self.bond_symbol.direction
+                if self.bond_symbol.cis_trans_mark:
+                    half_bond.bond_attributes[_CIS_TRANS_MARK_NAME] = self.bond_symbol.cis_trans_mark
 
         return partial_graph
 

@@ -22,6 +22,7 @@ G²RINS encodes repeat units, end groups, connectivity, architecture, compositio
 - Encodes polymer connectivity, architecture, composition, and molecular-weight distributions
 - Converts G²RINS strings into generative graphs
 - Generates molecular ensembles as SMILES strings, RDKit molecules, or molecular graphs
+- Carries stereochemistry (`@`, `@@`, `/`, `\`) and isotopes (`[13C]`) from the string into the graphs, the molecules and the P-SMILES
 
 ---
 

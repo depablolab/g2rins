@@ -104,3 +104,21 @@ def test_bond_connector_recognition(smi, expected_bc_list):
 
     for actual, expected in zip(big_smi.bond_connectors, expected_bc_list):
         assert str(actual) == expected
+
+
+@pytest.mark.parametrize("smi", ["C1CCCCC=1", "C=1CCCCC1", "C=1CCCCC=1"])
+def test_ring_closure_bond_symbol_sets_the_bond_order(smi):
+    graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    bond_types = [data["bond_type"] for _u, _v, data in graph.edges(data=True)]
+    assert bond_types.count(2) == 2  # one double bond, stored in both directions
+    assert bond_types.count(1) == 10
+
+
+def test_ring_closure_cis_trans_mark_reaches_the_graph():
+    graph = g2rins.G2rins.make("CC/1CCCCC/C=C1").get_graph_creator().get_generative_graph()
+    assert sorted(data["cis_trans_mark"] for _u, _v, data in graph.edges(data=True) if data["cis_trans_mark"]) == [1, 1, 2, 2]
+
+
+def test_conflicting_ring_closure_bond_symbols_raise():
+    with pytest.raises(g2rins.exception.DoubleBondSymbolDefinition):
+        g2rins.G2rins.make("C=1CCCCC-1").get_graph_creator()

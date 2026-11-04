@@ -27,9 +27,9 @@ class BondSymbol(G2rinsBase):
         return self._symbol
 
     @property
-    def direction(self) -> str:
-        """The cis/trans direction mark ("/" or "\\") of this bond, or "" when it carries none."""
-        return self._symbol if self._symbol in ("/", "\\") else ""
+    def cis_trans_mark(self) -> int:
+        """Cis/trans mark of a directional single bond: 1 for "/", 2 for "\\", 0 when it carries none."""
+        return {"/": 1, "\\": 2}.get(self._symbol, 0)
 
 
 class RingBond(G2rinsBase):
@@ -65,6 +65,10 @@ class RingBond(G2rinsBase):
     @property
     def idx(self) -> int:
         return self._num
+
+    @property
+    def bond_symbol(self) -> None | BondSymbol:
+        return self._bond_symbol
 
 
 class BondConnectorSymbol(G2rinsBase):

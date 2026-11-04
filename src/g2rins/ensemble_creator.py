@@ -23,6 +23,7 @@ from rdkit import Chem, rdBase
 from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
 from .chem_resource import (
     atom_color_mapping,
+    atom_mass,
     atom_name_mapping,
     atomic_masses,
     smi_bond_mapping,
@@ -45,11 +46,13 @@ from .exception import (
 )
 from .generative_graph import (
     _AROMATIC_NAME,
-    _BOND_DIR_NAME,
     _BOND_TYPE_NAME,
     _CHIRAL_NAME,
+    _CHIRAL_NEIGHBOR_RANK_NAME,
+    _CIS_TRANS_FLIP_NAME,
+    _CIS_TRANS_MARK_NAME,
     _EDGE_STOCHASTIC_ID_NAME,
-    _NBR_RANK_NAME,
+    _ISOTOPE_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
     _STATIC_NAME,
@@ -173,6 +176,7 @@ class _HalfAtomBond:
         self.gen_hierarchy: int = graph.nodes[node_idx]["gen_hierarchy"]
         self.stochastic_id: int = graph.nodes[node_idx]["stochastic_id_tree"][0]
         self.parent: int = graph.nodes[node_idx]["stochastic_id_tree"][1]
+        self.marks_inverted: int = 0  # 1 when the owning unit instance was placed with its cis/trans marks inverted
         self._graph = graph
 
         self._mode_attr_map = {}
@@ -459,13 +463,13 @@ class _StochasticObjectTracker:
 
         return new_sto_atom_id, parent_list
 
-    def add_molw(self, sto_atom_id, atomic_num, total_atom_bonds, stochastic_id_tree, num_explicit_h=-1, charge=0, aromatic=False):
+    def add_molw(self, sto_atom_id, atomic_num, total_atom_bonds, stochastic_id_tree, num_explicit_h=-1, charge=0, aromatic=False, isotope=0):
         # A bracket atom that wrote its H count (e.g. [nH]) fixes num_H exactly;
         # other atoms infer it from the charge- and aromaticity-aware valence so
         # the tracked MW matches the RDKit molecule ([NH3+] binds more hydrogens
         # than the neutral valence implies, thiophene sulfur binds none).
         num_H = _infer_hydrogen_count(atomic_num, charge, total_atom_bonds, num_explicit_h, aromatic)
-        added_mass = atomic_masses[atomic_num] + num_H * atomic_masses.get(1)
+        added_mass = atom_mass(atomic_num, isotope) + num_H * atomic_masses.get(1)
         self._sto_atom_id_actual_molw[sto_atom_id] += added_mass
 
         # Ancestors are credited the exact same mass as the instance itself: an
@@ -726,11 +730,14 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", _CHIRAL_NAME}
-    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME, _BOND_DIR_NAME, _NBR_RANK_NAME}
+    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", _CHIRAL_NAME, _ISOTOPE_NAME}
+    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME, _CIS_TRANS_MARK_NAME, _CHIRAL_NEIGHBOR_RANK_NAME}
     # Defaults for optional node/edge attributes so a generative_graph built before an attribute
     # existed still yields an EnsembleCreator (required attributes stay strict).
-    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CHIRAL_NAME: "", _BOND_DIR_NAME: "", _NBR_RANK_NAME: [0, 0]}
+    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CHIRAL_NAME: 0, _ISOTOPE_NAME: 0}
+    _BOND_ATTR_DEFAULTS = {_CIS_TRANS_MARK_NAME: 0, _CHIRAL_NEIGHBOR_RANK_NAME: [0, 0], _CIS_TRANS_FLIP_NAME: 0}
+    # A bond that joins two units also carries the generation-only flip bit, consumed by merge and never stored on the molecule.
+    _JUNCTION_ATTRS = _BOND_ATTRS | {_CIS_TRANS_FLIP_NAME}
 
     def __init__(self, generative_graph, static_graph, source_node, stochastic_tracker, sto_atom_id, rng, collect_info=True):
         self._atom_id = 0
@@ -765,15 +772,27 @@ class _PartialAtomGraph:
             setattr(new_graph, key, copy.deepcopy(value, memo))
         return new_graph
 
-    def merge(self, other, self_idx, other_idx, bond_attr):
+    def merge(self, other, self_half_bond, other_idx, bond_attr):
+        self_idx = self_half_bond.atom_idx
+        # Junction marks are stored as written. A source placed with inverted marks reads its junction mark inverted, and a
+        # target whose written junction mark disagrees (cis_trans_flip) is placed with all its marks inverted too, so every
+        # unit keeps its written double-bond geometry whatever the junction.
+        marks_inverted = self_half_bond.marks_inverted ^ bond_attr.pop(_CIS_TRANS_FLIP_NAME, 0)
+        if self_half_bond.marks_inverted and bond_attr.get(_CIS_TRANS_MARK_NAME):
+            bond_attr[_CIS_TRANS_MARK_NAME] = 3 - bond_attr[_CIS_TRANS_MARK_NAME]
         # relabel other idx
         remapping_dict = {idx: idx + self._atom_id for idx in other.atom_graph.nodes}
         other_graph = nx.relabel_nodes(other.atom_graph, remapping_dict, copy=True)
+        if marks_inverted:
+            for _u, _v, d in other_graph.edges(data=True):
+                if d.get(_CIS_TRANS_MARK_NAME):
+                    d[_CIS_TRANS_MARK_NAME] = 3 - d[_CIS_TRANS_MARK_NAME]
         other_open_half_bond_map = {}
         for stochastic_id in other._open_half_bond_map:
             for half_bond in other._open_half_bond_map[stochastic_id]:
                 new_half_bond = copy.copy(half_bond)
                 new_half_bond.atom_idx += self._atom_id
+                new_half_bond.marks_inverted = marks_inverted
                 try:
                     other_open_half_bond_map[stochastic_id] += [new_half_bond]
                 except KeyError:
@@ -928,6 +947,7 @@ class _PartialAtomGraph:
                 num_explicit_h=data.get("num_explicit_h", -1),
                 charge=data["charge"],
                 aromatic=data.get(_AROMATIC_NAME, False),
+                isotope=data.get(_ISOTOPE_NAME, 0),
             )
             # Runtime accounting state: realized bonds added later (merge
             # junctions, phantom collapse) re-infer this atom's hydrogens and
@@ -956,7 +976,7 @@ class _PartialAtomGraph:
 
             u_atom_idx = gen_key_to_atom_key[u]
             v_atom_idx = gen_key_to_atom_key[v]
-            bond_attr = self.gen_edge_attr_to_bond_attr(self.static_graph.get_edge_data(u, v, k))
+            bond_attr = self.gen_edge_attr_to_bond_attr(self.static_graph.get_edge_data(u, v, k), self._BOND_ATTRS)
             # The undirected atom graph yields edges from the lower to the higher atom id; directional bond attributes are read that way.
             if u_atom_idx > v_atom_idx:
                 u_atom_idx, v_atom_idx, bond_attr = v_atom_idx, u_atom_idx, _reverse_edge_data(bond_attr)
@@ -973,7 +993,7 @@ class _PartialAtomGraph:
 
     def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | set[str] = None) -> dict[str, bool | int]:
         if keys_to_copy is None:
-            keys_to_copy = self._BOND_ATTRS
+            keys_to_copy = self._JUNCTION_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
     @staticmethod
@@ -984,7 +1004,7 @@ class _PartialAtomGraph:
                 new_dict[k] = dictionary[k]
             else:
                 # Missing optional attr -> its default; missing required attr -> KeyError.
-                new_dict[k] = _PartialAtomGraph._ATOM_ATTR_DEFAULTS[k]
+                new_dict[k] = (_PartialAtomGraph._ATOM_ATTR_DEFAULTS | _PartialAtomGraph._BOND_ATTR_DEFAULTS)[k]
         return new_dict
 
     def pop_target_open_half_bond(self, sto_atom_idx, target_idx) -> _HalfAtomBond:
@@ -1220,7 +1240,7 @@ class _PartialAtomGraph:
                         data.get("num_explicit_h", -1),
                         data.get(_AROMATIC_NAME, False),
                     )
-                    terminator_weight += atomic_masses[atomic_number] + num_H * atomic_masses.get(1)
+                    terminator_weight += atom_mass(atomic_number, data.get(_ISOTOPE_NAME, 0)) + num_H * atomic_masses.get(1)
                 if attach_order not in source_delta_by_order:
                     delta = 0.0
                     for anchor in self._real_anchors(termination_bond.atom_idx, exclude=None):
@@ -1353,7 +1373,7 @@ class _PartialAtomGraph:
             pre_merge_watermark = terminated_graph._atom_id
             terminated_graph.merge(
                 other_partial_graph,
-                termination_bond.atom_idx,
+                termination_bond,
                 other_half_bond_atom_idx,
                 selected_attr,
             )
@@ -1426,7 +1446,7 @@ class _PartialAtomGraph:
                 pre_merge_watermark = self._atom_id
                 self.merge(
                     other_partial_graph,
-                    half_bond.atom_idx,
+                    half_bond,
                     other_half_bond_atom_idx,
                     selected_attr,
                 )
@@ -1509,7 +1529,7 @@ class _PartialAtomGraph:
         )
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, half_bond.atom_idx, other_half_bond_atom_idx, selected_attr)
+        self.merge(other_graph, half_bond, other_half_bond_atom_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -1674,7 +1694,7 @@ class _PartialAtomGraph:
 
         other_target_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, transition_bond.atom_idx, other_target_idx, selected_attr)
+        self.merge(other_graph, transition_bond, other_target_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -1745,7 +1765,7 @@ class _PartialAtomGraph:
 
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
-        self.merge(other_graph, stochastic_bond.atom_idx, other_half_bond_atom_idx, selected_attr)
+        self.merge(other_graph, stochastic_bond, other_half_bond_atom_idx, selected_attr)
         last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
         self.add_unit_to_sequence(last_unit)
         self.nested_transition(new_sto_atom_id, rng)
@@ -1797,7 +1817,7 @@ class _PartialAtomGraph:
             other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
 
             pre_merge_watermark = self._atom_id
-            self.merge(other_graph, nested_transition_bond.atom_idx, other_half_bond_atom_idx, selected_attr)
+            self.merge(other_graph, nested_transition_bond, other_half_bond_atom_idx, selected_attr)
             last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
             self.add_unit_to_sequence(last_unit)
             self.nested_transition(new_sto_atom_id, rng)
@@ -3601,7 +3621,7 @@ class EnsembleCreator:
                 star_node = ("star", node)
                 # The converter renders map numbers as connection + 1.
                 star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
-                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False, _NBR_RANK_NAME: [origin_rank.get(data["origin_idx"], 0), 0]})
+                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False, _CHIRAL_NEIGHBOR_RANK_NAME: [origin_rank.get(data["origin_idx"], 0), 0]})
         return star_graph
 
     def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None):
@@ -3811,7 +3831,7 @@ class EnsembleCreator:
         origin_rank = {}  # neighbor rank, at the connection atom, of its inter-unit bond
         for u, _v, d in self._generative_graph.edges(data=True):
             if not d[_STATIC_NAME]:
-                origin_rank.setdefault(str(u), d.get(_NBR_RANK_NAME, [0, 0])[0])
+                origin_rank.setdefault(str(u), d.get(_CHIRAL_NEIGHBOR_RANK_NAME, [0, 0])[0])
 
         # unit_g2rins was composed against the same derivation at parse time;
         # if the graph was mutated since, omit the texts rather than mislabel.

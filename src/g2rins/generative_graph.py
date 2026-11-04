@@ -3,7 +3,6 @@
 
 import json
 import uuid
-import warnings
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
@@ -23,6 +22,7 @@ from .chem_resource import (
     smi_bond_mapping,
 )
 from .exception import (
+    DoubleBondSymbolDefinition,
     IncompatibleBondTypeBondConnector,
     TooManyStochasticObjects,
 )
@@ -35,20 +35,26 @@ _STATIC_NAME = "static"
 _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
-_BOND_DIR_NAME = "bond_dir"
 _CHIRAL_NAME = "chiral"
-_NBR_RANK_NAME = "nbr_rank"
+_ISOTOPE_NAME = "isotope"
+_CIS_TRANS_MARK_NAME = "cis_trans_mark"
+_CHIRAL_NEIGHBOR_RANK_NAME = "chiral_neighbor_rank"
+_CIS_TRANS_FLIP_NAME = "cis_trans_flip"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 10
+
+
+def _bond_order(bond_type):
+    return smi_bond_mapping.get(str(bond_type), 1)
 
 
 def _reverse_edge_data(edge_data):
     """Edge attributes as seen from the opposite endpoint: a "/" read one way is a "\\" read the other, and the neighbor ranks swap."""
     reversed_data = dict(edge_data)
-    if edge_data.get(_BOND_DIR_NAME):
-        reversed_data[_BOND_DIR_NAME] = {"/": "\\", "\\": "/"}[edge_data[_BOND_DIR_NAME]]
-    if _NBR_RANK_NAME in edge_data:
-        reversed_data[_NBR_RANK_NAME] = edge_data[_NBR_RANK_NAME][::-1]
+    if edge_data.get(_CIS_TRANS_MARK_NAME):
+        reversed_data[_CIS_TRANS_MARK_NAME] = 3 - edge_data[_CIS_TRANS_MARK_NAME]
+    if _CHIRAL_NEIGHBOR_RANK_NAME in edge_data:
+        reversed_data[_CHIRAL_NEIGHBOR_RANK_NAME] = edge_data[_CHIRAL_NEIGHBOR_RANK_NAME][::-1]
     return reversed_data
 
 
@@ -326,9 +332,10 @@ class _PartialGraph:
         half_bond_tuples = list(half_bond_tuples)
 
         new_ring_bond_map = self.ring_bond_map
+        ring_bond_pairs = []
         for ring_bond_idx in other.ring_bond_map:
             if ring_bond_idx in new_ring_bond_map:
-                half_bond_tuples.append((new_ring_bond_map[ring_bond_idx], other.ring_bond_map[ring_bond_idx]))
+                ring_bond_pairs.append((new_ring_bond_map[ring_bond_idx], other.ring_bond_map[ring_bond_idx]))
                 del new_ring_bond_map[ring_bond_idx]
             else:
                 new_ring_bond_map[ring_bond_idx] = other.ring_bond_map[ring_bond_idx]
@@ -336,6 +343,9 @@ class _PartialGraph:
         self.ring_bond_map = new_ring_bond_map
 
         self.g = nx.union(self.g, other.g)
+
+        for opening, closing in ring_bond_pairs:
+            self._close_ring_bond(opening, closing)
 
         for self_bond, other_bond in half_bond_tuples:
             if ("matching_index" in self.g.nodes[self_bond.node_id]) and ("matching_index" in other.g.nodes[other_bond.node_id]):
@@ -350,18 +360,36 @@ class _PartialGraph:
             raise ValueError(overlapping_keys)
 
         new_bond_attributes = self_half_bond_edge.bond_attributes | other_half_bond_edge.bond_attributes
-        new_bond_attributes[_NBR_RANK_NAME] = [self_half_bond_edge.rank, other_half_bond_edge.rank]
+        new_bond_attributes[_CHIRAL_NEIGHBOR_RANK_NAME] = [self_half_bond_edge.rank, other_half_bond_edge.rank]
         self.g.add_edge(self_half_bond_edge.node_id, other_half_bond_edge.node_id, **new_bond_attributes)
 
     def add_ring_bond(self, ring_bond, half_bond: _HalfBond) -> bool:
+        # The digit's own bond symbol belongs to the ring bond alone, so it goes on a copy of the atom's half-bond attributes.
+        half_bond = _HalfBond(half_bond.node, half_bond.node_id, dict(half_bond.bond_attributes), half_bond.rank)
+        symbol = ring_bond.bond_symbol
+        if symbol is not None:
+            half_bond.bond_attributes[_BOND_TYPE_NAME] = symbol
+            if symbol.cis_trans_mark:
+                half_bond.bond_attributes[_CIS_TRANS_MARK_NAME] = symbol.cis_trans_mark
 
         if ring_bond.idx in self.ring_bond_map:
-            self.add_half_bond_edge(half_bond, self.ring_bond_map[ring_bond.idx])
-            del self.ring_bond_map[ring_bond.idx]
+            self._close_ring_bond(self.ring_bond_map.pop(ring_bond.idx), half_bond)
             return False
 
         self.ring_bond_map[ring_bond.idx] = half_bond
         return True
+
+    def _close_ring_bond(self, opening: _HalfBond, closing: _HalfBond) -> None:
+        closing = _HalfBond(closing.node, closing.node_id, dict(closing.bond_attributes), closing.rank)
+        # The edge runs from the opening digit to the closing one, so a mark written at the closing digit is read the other way.
+        if closing.bond_attributes.get(_CIS_TRANS_MARK_NAME):
+            closing.bond_attributes[_CIS_TRANS_MARK_NAME] = 3 - closing.bond_attributes[_CIS_TRANS_MARK_NAME]
+        for key in (_BOND_TYPE_NAME, _CIS_TRANS_MARK_NAME):
+            if key in opening.bond_attributes and key in closing.bond_attributes:
+                if str(opening.bond_attributes[key]) != str(closing.bond_attributes[key]):
+                    raise DoubleBondSymbolDefinition(self, closing.bond_attributes[key], opening.bond_attributes)
+                del closing.bond_attributes[key]
+        self.add_half_bond_edge(opening, closing)
 
     def __str__(self):
         return f"PartialGraph({self.g}, {self.left_half_bonds}, {self.right_half_bonds}, {self.ring_bond_map})"
@@ -612,7 +640,10 @@ class GraphCreator:
                 self.data_path = data_path
                 self._weight, self._combined_attr = self.create_combined_attr()
 
-            def create_combined_attr(self) -> dict | None:
+            def create_combined_attr(self) -> tuple[float, dict | None]:
+                if not self.only_bond_connectors:
+                    # A path through atoms never becomes a bond; its bond symbols are not compared.
+                    return 0.0, None
                 data = {}
                 weight = 1.0
                 weight_type_list = []
@@ -628,19 +659,8 @@ class GraphCreator:
                             data[_AROMATIC_NAME] |= d[_AROMATIC_NAME]
                         else:
                             data[_AROMATIC_NAME] = d[_AROMATIC_NAME]
-                    if _BOND_TYPE_NAME in d:
-                        if _BOND_TYPE_NAME in data:
-                            if str(data[_BOND_TYPE_NAME]) != str(d[_BOND_TYPE_NAME]):
-                                warnings.warn(
-                                    IncompatibleBondTypeBondConnector(str(data[_BOND_TYPE_NAME]), str(d[_BOND_TYPE_NAME])),
-                                    stacklevel=2,
-                                )
-                                return 0.0, None
-                        else:
-                            data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
-                    # A conflicting direction always comes with a conflicting bond symbol, so the check above covers it.
-                    if d.get(_BOND_DIR_NAME):
-                        data[_BOND_DIR_NAME] = d[_BOND_DIR_NAME]
+                    if _BOND_TYPE_NAME in d and _BOND_TYPE_NAME not in data:
+                        data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
 
                     non_static_weights = [d[attr] if attr in d else 0 for attr in non_static_attribute_list]
                     if max(non_static_weights) > 0:
@@ -653,8 +673,19 @@ class GraphCreator:
 
                     weight_type_list.append(current_type)
 
-                # The path runs atom -> bond connectors -> atom; the ranks at its two atoms are the ranks the merged bond gets.
-                data[_NBR_RANK_NAME] = [self.data_path[0].get(_NBR_RANK_NAME, [0, 0])[0], self.data_path[-1].get(_NBR_RANK_NAME, [0, 0])[1]]
+                # The path runs source atom -> bond connectors -> target atom; its first and last edges are the two half bonds.
+                # Only their bond order has to agree: an unwritten bond is single, and so are the cis/trans symbols / and \.
+                source_bond, target_bond = (d.get(_BOND_TYPE_NAME, "-") for d in (self.data_path[0], self.data_path[-1]))
+                if _bond_order(source_bond) != _bond_order(target_bond):
+                    raise IncompatibleBondTypeBondConnector(str(source_bond), str(target_bond))
+                # The merged bond carries the source's written mark; a target that wrote the opposite mark on its side is
+                # placed with all its marks inverted (cis_trans_flip), which keeps the double-bond geometry written in both units.
+                source_mark = self.data_path[0].get(_CIS_TRANS_MARK_NAME, 0)
+                target_mark = self.data_path[-1].get(_CIS_TRANS_MARK_NAME, 0)
+                data[_CIS_TRANS_MARK_NAME] = source_mark or target_mark
+                data[_CIS_TRANS_FLIP_NAME] = int(bool(source_mark and target_mark and source_mark != target_mark))
+                # The ranks at the two atoms of the path are the ranks the merged bond gets.
+                data[_CHIRAL_NEIGHBOR_RANK_NAME] = [self.data_path[0].get(_CHIRAL_NEIGHBOR_RANK_NAME, [0, 0])[0], self.data_path[-1].get(_CHIRAL_NEIGHBOR_RANK_NAME, [0, 0])[1]]
 
                 last_rank = 0
                 max_rank = 0
@@ -897,9 +928,11 @@ class GraphCreator:
         stochastic_id_name=_EDGE_STOCHASTIC_ID_NAME,
         aromatic_name=_AROMATIC_NAME,
         bond_type_name=_BOND_TYPE_NAME,
-        bond_dir_name=_BOND_DIR_NAME,
         chiral_name=_CHIRAL_NAME,
-        nbr_rank_name=_NBR_RANK_NAME,
+        isotope_name=_ISOTOPE_NAME,
+        cis_trans_mark_name=_CIS_TRANS_MARK_NAME,
+        cis_trans_flip_name=_CIS_TRANS_FLIP_NAME,
+        chiral_neighbor_rank_name=_CHIRAL_NEIGHBOR_RANK_NAME,
         smi_bond_mapping=smi_bond_mapping,
     )
     def get_generative_graph(self, include_bond_connectors=False, return_extra_graph_info=False):
@@ -911,7 +944,8 @@ class GraphCreator:
         - **atomic_num**: int Atomic number, can be converted to Chemical Symbol Name or one-hot encoding.
         - **{aromatic_name}**: bool Indicating the aromaticity of the atom.
         - **charge**: float Nominal charge (not partial charge in Force-Fields) in elementary unit *e*.
-        - **{chiral_name}**: str Chirality mark of the atom as written ("@", "@@", ... or "" when unspecified).
+        - **{chiral_name}**: int Chirality of the atom as a stable code: 0 none, 1 @TH1, 2 @TH2, 3 @AL1, 4 @AL2, 5-7 @SP1-@SP3, 8-27 @TB1-@TB20, 28-57 @OH1-@OH30 (chem_resource.chirality_codes). A bare @ or @@ is resolved to the class of the atom's written degree (2 AL, 3-4 TH, 5 TB, 6 OH). The code is read against the atom's neighbors sorted by **{chiral_neighbor_rank_name}**.
+        - **{isotope_name}**: int Mass number written for the atom ([13C] gives 13); 0 when unspecified.
         - **molecular_weight_distribution**: array[float] representing the molecular weight distribution of each stochastic object in the graph. The index of each vector is the stochastic id.
         - **mol_molecular_weight** float Molecular Weight of the total molecular weight in the system from this molecular species. If this is unspecified by the string, negative values are used.
         - **total_molecular_weight** float Molecular Weight of the entire material system, this is equal to the sum **mol_molecular_weight** of the comprising molecules. If only one molecule species is present, they are identical. If this is unspecified by the string, negative values are used.
@@ -930,8 +964,9 @@ class GraphCreator:
         - **{stochastic_id_name}**: integer Stochastic-object id that manages the bond. Transition bonds carry the managing SO's id (-1 for cross-family/global transitions fired after all SOs terminate); termination bonds carry the target terminator's SO id; propagation and static bonds carry the source node's SO id. -2 marks edges of the include_bond_connectors=True graph, where no assignment is performed.
         - **{bond_type_name}**: int Integer category that maps to different bond_types as follows{smi_bond_mapping}. Category 0 is an association edge (e.g. an ion pair with a trailing counterion): the atoms travel together with the unit but share no covalent bond.
         - **{aromatic_name}**: bool Indicates aromatic bonds.
-        - **{bond_dir_name}**: str Cis/trans direction mark of the bond ("/", "\\" or "") as written when reading the edge from u to v; the reverse edge carries the opposite mark.
-        - **{nbr_rank_name}**: [int, int] Position of the bond among the neighbors of u and of v in SMILES writing order (preceding atom first). The **{chiral_name}** mark of an atom refers to its neighbors sorted by this rank.
+        - **{cis_trans_mark_name}**: int Cis/trans mark of a directional single bond read from u to v: 0 none, 1 "/", 2 "\\"; the reverse edge carries the opposite mark. On a bond that joins two units it is the mark written in the source unit (the target's when the source wrote none).
+        - **{cis_trans_flip_name}**: int 1 on a bond that joins two units when the target unit wrote the opposite mark on its side of the junction: that unit is placed with all its marks inverted, which keeps the geometry written in both units. 0 otherwise.
+        - **{chiral_neighbor_rank_name}**: [int, int] Position of the bond among the written neighbors of u and of v: 0 the preceding atom, then ring closures, branches and the following atom in writing order. The **{chiral_name}** code of an atom refers to its neighbors sorted by this rank.
 
         The graph carries the G2RINS string it was generated from as the
         graph-level attribute **g2rins_string**, and a mapping from unit_id to
@@ -974,6 +1009,13 @@ class GraphCreator:
             except KeyError:
                 pass
 
+        # Written degree of each atom: its distinct bond ranks (alternative connectors share one) plus the bracket H count.
+        ranks_at_node = defaultdict(set)
+        for u, v, d in graph.edges(data=True):
+            if _CHIRAL_NEIGHBOR_RANK_NAME in d and str(d.get(_BOND_TYPE_NAME, "")) != ".":
+                ranks_at_node[u].add(d[_CHIRAL_NEIGHBOR_RANK_NAME][0])
+                ranks_at_node[v].add(d[_CHIRAL_NEIGHBOR_RANK_NAME][1])
+
         for node, data in graph.nodes(data=True):
             obj = data["obj"]
             try:
@@ -1008,7 +1050,13 @@ class GraphCreator:
             except AttributeError:
                 charge = float("nan")
 
-            chiral = str(getattr(obj, "chiral", None) or "")
+            chiral = 0
+            chiral_spec = getattr(obj, "chiral", None)
+            if chiral_spec is not None:
+                h_count = getattr(obj, "h_count", None)
+                chiral = chiral_spec.code(len(ranks_at_node[node]) + (h_count.num if h_count is not None else 0), str(obj))
+            isotope_spec = getattr(obj, "isotope", None)
+            isotope = isotope_spec.num_nuclei if isotope_spec is not None else 0
 
             # Explicit hydrogen count of AROMATIC bracket atoms that write one
             # (e.g. [nH]). Only aromatic atoms need this: it is the one case where
@@ -1074,6 +1122,7 @@ class GraphCreator:
                     "charge": charge,
                     "num_explicit_h": int(num_explicit_h),
                     _CHIRAL_NAME: chiral,
+                    _ISOTOPE_NAME: isotope,
                     "molecular_weight_distribution": MW_distribution_array,
                     "mol_molecular_weight": mol_molecular_weight,
                     "total_molecular_weight": total_molecular_weight,
@@ -1098,8 +1147,9 @@ class GraphCreator:
             else:
                 d[_BOND_TYPE_NAME] = 1
             d.setdefault(_AROMATIC_NAME, False)
-            d.setdefault(_BOND_DIR_NAME, "")
-            d.setdefault(_NBR_RANK_NAME, [0, 0])
+            d.setdefault(_CIS_TRANS_MARK_NAME, 0)
+            d.setdefault(_CIS_TRANS_FLIP_NAME, 0)
+            d.setdefault(_CHIRAL_NEIGHBOR_RANK_NAME, [0, 0])
 
             generative_graph.add_edge(u, v, **d)
 

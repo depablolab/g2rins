@@ -4,6 +4,9 @@
 import threading
 import warnings
 
+from .chem_resource import chirality_code_classes
+from .exception import ChiralityNotApplied
+
 # RDKit's SMILES writer recurses per atom in C++; the default stack overflows
 # (hard 0xC00000FD on Windows) near 3k atoms. Empirically a 2000-atom linear
 # chain is safe on the default stack and 4000 crashes, so gate with margin.
@@ -55,6 +58,40 @@ def _run_with_big_stack(fn, *args):
     return result[0]
 
 
+# Trans ligand pairs of each square-planar class, by written position of the four neighbors.
+_SQUARE_PLANAR_TRANS_PAIRS = {
+    1: {frozenset((0, 2)), frozenset((1, 3))},
+    2: {frozenset((0, 1)), frozenset((2, 3))},
+    3: {frozenset((0, 3)), frozenset((1, 2))},
+}
+
+
+def _apply_chirality(mol, mol_idx, code, ranks, Chem):
+    """Set the chiral tag of atom ``mol_idx`` from its chirality code and the written ranks of its bonds in bond order.
+
+    Returns the chirality class when it cannot be applied to the RDKit molecule, else None.
+    """
+    klass, order = chirality_code_classes[code]
+    atom = mol.GetAtomWithIdx(mol_idx)
+    if klass == "TH":
+        # RDKit reads the tag against bond order; the mark was written against SMILES order. Correct the parity of the
+        # permutation between the two, counting an implicit H or lone pair written before any neighbor (no rank-0 bond
+        # on a three-coordinate atom) as one more swap.
+        swaps = sum(a > b for i, a in enumerate(ranks) for b in ranks[i + 1 :]) + (len(ranks) == 3 and 0 not in ranks)
+        clockwise = (order == 2) != bool(swaps % 2)
+        atom.SetChiralTag(Chem.ChiralType.CHI_TETRAHEDRAL_CW if clockwise else Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+        return None
+    if klass == "SP" and len(ranks) == 4:
+        # The class is the trans pairing of the four neighbors; restate that pairing in bond order.
+        written_position = {rank: position for position, rank in enumerate(sorted(ranks))}
+        bond_position = {written_position[rank]: position for position, rank in enumerate(ranks)}
+        pairing = {frozenset(bond_position[w] for w in pair) for pair in _SQUARE_PLANAR_TRANS_PAIRS[order]}
+        atom.SetChiralTag(Chem.ChiralType.CHI_SQUAREPLANAR)
+        atom.SetIntProp("_chiralPermutation", next(p for p, pairs in _SQUARE_PLANAR_TRANS_PAIRS.items() if pairs == pairing))
+        return None
+    return klass
+
+
 def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
     try:
         from rdkit import Chem
@@ -73,17 +110,17 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         if bond_attr["bond_type"] == 4:
             return Chem.BondType.QUADRUPLE
 
-    chiral_tags = {"@": Chem.ChiralType.CHI_TETRAHEDRAL_CCW, "@@": Chem.ChiralType.CHI_TETRAHEDRAL_CW}
-    bond_dirs = {"/": Chem.BondDir.ENDUPRIGHT, "\\": Chem.BondDir.ENDDOWNRIGHT}
+    bond_dirs = {1: Chem.BondDir.ENDUPRIGHT, 2: Chem.BondDir.ENDDOWNRIGHT}
 
     mol = Chem.RWMol()
     graph_idx_to_mol_idx = {}
-    neighbor_ranks = {}  # mol atom index -> SMILES-order rank of each of its bonds, in the order the bonds were added
+    neighbor_ranks = {}  # mol atom index -> written rank of each of its bonds, in the order the bonds were added
     for graph_idx, data in mol_graph.nodes(data=True):
         atom = Chem.Atom(data["atomic_num"])
         atom.SetIsAromatic(data["aromatic"])
         atom.SetFormalCharge(data["charge"])
-        atom.SetChiralTag(chiral_tags.get(data.get("chiral"), Chem.ChiralType.CHI_UNSPECIFIED))
+        if int(data.get("isotope") or 0) > 0:
+            atom.SetIsotope(int(data["isotope"]))
         # Preserve the written H count of aromatic bracket atoms that specify one
         # (e.g. [nH]); a negative value (or a caller-supplied None) leaves RDKit to
         # infer implicit H by valence. This is a public API taking a caller-built
@@ -105,22 +142,22 @@ def mol_graph_to_rdkit_mol(mol_graph, kekulize=True):
         # counterion renders as a separate "." fragment.
         if attr["bond_type"] == 0:
             continue
-        # bond_dir and nbr_rank are read in the orientation edges() yields the edge (lower to higher atom id for sampled graphs).
+        # cis_trans_mark and chiral_neighbor_rank are read in the orientation edges() yields the edge (lower to higher atom id for sampled graphs).
         num_bonds = mol.AddBond(graph_idx_to_mol_idx[u], graph_idx_to_mol_idx[v], convert_bond_type(attr))
-        mol.GetBondWithIdx(num_bonds - 1).SetBondDir(bond_dirs.get(attr.get("bond_dir"), Chem.BondDir.NONE))
-        for node, rank in zip((u, v), attr.get("nbr_rank", (0, 0))):
+        mol.GetBondWithIdx(num_bonds - 1).SetBondDir(bond_dirs.get(attr.get("cis_trans_mark", 0), Chem.BondDir.NONE))
+        for node, rank in zip((u, v), attr.get("chiral_neighbor_rank", (0, 0))):
             neighbor_ranks.setdefault(graph_idx_to_mol_idx[node], []).append(rank)
 
-    # RDKit reads a chiral tag against the order the bonds were added; the mark was written against SMILES order.
-    # Correct the parity of the permutation between the two, counting an implicit H or lone pair written before
-    # any neighbor (no rank-0 bond on a three-coordinate atom) as one more swap.
-    for mol_idx, ranks in neighbor_ranks.items():
-        atom = mol.GetAtomWithIdx(mol_idx)
-        if atom.GetChiralTag() == Chem.ChiralType.CHI_UNSPECIFIED:
-            continue
-        swaps = sum(a > b for i, a in enumerate(ranks) for b in ranks[i + 1 :]) + (len(ranks) == 3 and 0 not in ranks)
-        if swaps % 2:
-            atom.InvertChirality()
+    not_applied = set()
+    for graph_idx, data in mol_graph.nodes(data=True):
+        code = int(data.get("chiral") or 0)
+        if code:
+            mol_idx = graph_idx_to_mol_idx[graph_idx]
+            klass = _apply_chirality(mol, mol_idx, code, neighbor_ranks.get(mol_idx, []), Chem)
+            if klass is not None:
+                not_applied.add(klass)
+    for klass in sorted(not_applied):
+        warnings.warn(ChiralityNotApplied(klass), stacklevel=2)
     if kekulize:
         Chem.SanitizeMol(mol)
         mol.UpdatePropertyCache()
