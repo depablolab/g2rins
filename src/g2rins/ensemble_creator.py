@@ -10,7 +10,7 @@ import os
 import pickle
 import warnings
 from collections import Counter, OrderedDict, deque
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -20,7 +20,6 @@ import networkx as nx
 import numpy as np
 from rdkit import Chem, rdBase
 
-from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
 from .chem_resource import (
     atom_color_mapping,
     atom_mass,
@@ -38,10 +37,12 @@ from .exception import (
     IncompatibleGenerativeGraphSchema,
     IncompleteStochasticGeneration,
     InvalidGenerationSource,
+    InvalidUnitPSmiles,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
     TooManyDiscardedChains,
     UndershootSnapshotMissed,
+    UnsupportedWildcardGeneration,
     UnvalidatedGenerationSource,
 )
 from .generative_graph import (
@@ -51,6 +52,8 @@ from .generative_graph import (
     _CHIRAL_NEIGHBOR_RANK_NAME,
     _CIS_TRANS_FLIP_NAME,
     _CIS_TRANS_MARK_NAME,
+    _CONNECTOR_PLACEHOLDER_NAME,
+    _DERIVED_NODE_FIELDS,
     _EDGE_STOCHASTIC_ID_NAME,
     _ISOTOPE_NAME,
     _NON_STATIC_ATTR,
@@ -58,9 +61,24 @@ from .generative_graph import (
     _STATIC_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
+    _TRANSITION_ROLE_NAME,
+    TransitionRole,
+    _atomic_number,
+    _check_transition_role,
+    _connector_placeholder_flag,
+    _is_connector_placeholder,
+    _json_safe,
     _reverse_edge_data,
+    _static_neighbors,
+    _verified_unit_texts,
     derive_unit_labels,
     generative_graph_json_data,
+)
+from .nx_rdkit_mol import (
+    _ATOM_MAP_OFFSET,
+    mol_graph_to_rdkit_mol,
+    mol_graph_to_smiles,
+    rdkit_mol_to_smiles,
 )
 from .util import _determine_darkness_from_hex, get_global_rng
 
@@ -127,6 +145,67 @@ def _rdkit_implicit_hydrogens(atomic_num: int, charge: int, occupied_valence: in
     return int(probe_atom.GetNumImplicitHs())
 
 
+def _transition_competes_at(attr, sto_gen_id):
+    """A transition edge at ``sto_gen_id`` that competes as a draw: forced exits never do."""
+    return attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id and attr.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT
+
+
+def _forced_exit_owner(generative_graph, half_bond, attr):
+    """Stochastic id of the object whose finalization fires the forced exit ``attr`` on
+    ``half_bond``: the outermost object the exit leaves, just below its stamp (the nearest
+    common ancestor) on the source atom's chain, or None if ``attr`` is no forced exit."""
+    if attr.get(_TRANSITION_ROLE_NAME) != TransitionRole.FORCED_EXIT:
+        return None
+    tree = list(generative_graph.nodes[half_bond.node_idx]["stochastic_id_tree"])
+    return tree[tree.index(attr[_EDGE_STOCHASTIC_ID_NAME]) - 1]
+
+
+def _molar_at(molar_amounts, sto_gen_id):
+    try:
+        return float(molar_amounts[sto_gen_id])
+    except (IndexError, KeyError, TypeError):
+        return 1.0
+
+
+def _level_target_weights(generative_graph, target_idx, edge_weights, molar_amounts, sto_gen_id):
+    """Weights that draw one target among ``target_idx`` level by level from ``sto_gen_id``.
+
+    The repeat units of ``sto_gen_id`` compete by edge weight times their molar amount at
+    that level; a repeat unit that is itself a nested object competes with the summed
+    edge weight of its targets (the edge weights split the bond-connector weights level by
+    level, so that sum is the unit's own bond weight) and passes its share to that
+    object's units, which compete the same way inside it, down to the target atom's
+    object. Without such a target the weights are edge weight times molar amount at
+    ``sto_gen_id``, as before.
+    """
+    paths = []
+    for idx in target_idx:
+        tree = list(generative_graph.nodes[idx]["stochastic_id_tree"])
+        paths.append(tree[: tree.index(sto_gen_id) + 1][::-1] if sto_gen_id in tree else [sto_gen_id])
+    if all(len(path) == 1 for path in paths):
+        return np.asarray([float(weight) * _molar_at(molar, sto_gen_id) for weight, molar in zip(edge_weights, molar_amounts, strict=True)], dtype=float)
+    shares = np.zeros(len(target_idx), dtype=float)
+
+    def split(members, depth, share):
+        level = paths[members[0]][depth]
+        groups = {}
+        for i in members:
+            key = paths[i][depth + 1] if len(paths[i]) > depth + 1 else ("unit", i)
+            groups.setdefault(key, []).append(i)
+        group_weights = {key: sum(float(edge_weights[i]) for i in group) * _molar_at(molar_amounts[group[0]], level) for key, group in groups.items()}
+        total = sum(group_weights.values())
+        if total <= 0:
+            return
+        for key, group in groups.items():
+            if isinstance(key, tuple):
+                shares[group[0]] = share * group_weights[key] / total
+            else:
+                split(group, depth + 1, share * group_weights[key] / total)
+
+    split(list(range(len(target_idx))), 0, 1.0)
+    return shares
+
+
 def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit_h=-1, aromatic=False) -> int:
     """Number of hydrogens completing an atom's valence for MW tracking.
 
@@ -146,6 +225,7 @@ def _infer_hydrogen_count(atomic_num: int, charge, total_bond: int, num_explicit
     # Missing/NaN charge (unparsed) counts as neutral.
     charge = int(charge) if charge is not None and np.isfinite(charge) else 0
     return _rdkit_implicit_hydrogens(int(atomic_num), charge, int(total_bond), bool(aromatic))
+
 
 def _detach_tracebacks(error):
     """Drop traceback frames from ``error`` and its cause/context chain.
@@ -208,24 +288,26 @@ class _HalfAtomBond:
                 if d[_TRANSITION_NAME] > 0:
                     target_stochastic_id = graph.nodes[v]["stochastic_id_tree"][0]
                     target_parents_stochastic_id = graph.nodes[v]["stochastic_id_tree"][1:]
-                    if (self.stochastic_id in target_parents_stochastic_id and
-                            d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id and target_stochastic_id !=-1):
+                    # A forced entry is stamped with the first object it enters, which is not the
+                    # target atom's own object when that object's repeat unit begins with a nested one.
+                    entered_here = d.get(_EDGE_STOCHASTIC_ID_NAME) == target_stochastic_id or d.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_ENTRY
+                    if self.stochastic_id in target_parents_stochastic_id and entered_here and target_stochastic_id != -1:
                         special_target_list += [(v, d)]
                         special_target_weight += [d[_TRANSITION_NAME]]
                         special_target_molar_amounts += [graph.nodes[v]["unit_molar_amounts"]]
 
         if len(special_target_weight) > 0:
-            weights = np.asarray(special_target_weight, dtype=float)
-            # Weight each entry unit by its declared molar amount at its OWN
-            # (managing child-SO) level — the same slot the normal transition
-            # draw uses. The parent-SO slot is shared by every candidate here,
-            # so it would cancel in normalization and silently ignore the
-            # declared entry ratios.
-            molar = np.asarray(
-                [m[graph.nodes[v]["stochastic_id_tree"][0]] for (v, _d), m in zip(special_target_list, special_target_molar_amounts)],
-                dtype=float,
-            )
-            weights *= molar
+            # The entered object's repeat units compete by weight times their molar
+            # amount at that object's level (not at the parent's, which every candidate
+            # shares), and an entry that lands inside a nested repeat unit competes on,
+            # level by level, among that object's units.
+            entered = {list(graph.nodes[v]["stochastic_id_tree"])[list(graph.nodes[v]["stochastic_id_tree"]).index(self.stochastic_id) - 1] for v, _d in special_target_list}
+            if len(entered) == 1:
+                weights = _level_target_weights(graph, [v for v, _d in special_target_list], special_target_weight, special_target_molar_amounts, entered.pop())
+            else:
+                weights = np.asarray(
+                    [w * m[graph.nodes[v]["stochastic_id_tree"][0]] for w, (v, _d), m in zip(special_target_weight, special_target_list, special_target_molar_amounts)], dtype=float
+                )
             chosen = stochastic_tracker.choose(
                 rng,
                 len(special_target_list),
@@ -336,11 +418,7 @@ class _StochasticObjectTracker:
                 raise DeadSamplingPath(context) from error
             raise
 
-        if (
-            record_branch
-            and not self._path_is_conditional
-            and np.count_nonzero(probabilities > 0.0) > 1
-        ):
+        if record_branch and not self._path_is_conditional and np.count_nonzero(probabilities > 0.0) > 1:
             self._path_is_conditional = True
         return probabilities
 
@@ -387,9 +465,7 @@ class _StochasticObjectTracker:
                         # Mirror normalized_probabilities: on a provably
                         # all-dead template the empty support is a model
                         # error, not per-chain budget luck.
-                        raise AllZeroSamplingWeights(
-                            "nested molecular-weight draw (empty truncated support)"
-                        ) from error
+                        raise AllZeroSamplingWeights("nested molecular-weight draw (empty truncated support)") from error
                     raise
             else:
                 new_molw = self._sto_gen_id_distribution[sto_gen_id].draw_mw(self._rng)
@@ -530,19 +606,214 @@ class _StochasticObjectTracker:
         return unterminated_sto_atom_ids
 
 
+def _edge_ids(graph):
+    """Edge identities of ``graph``, orientation-free for undirected graphs."""
+    edges = graph.edges(keys=True) if graph.is_multigraph() else graph.edges
+    if graph.is_directed():
+        return set(edges)
+    return {(frozenset(edge[:2]), *edge[2:]) for edge in edges}
+
+
+def _graphs_equal(left, right, active):
+    """Structural graph equality with array-aware attribute comparison."""
+    if left.is_directed() != right.is_directed() or left.is_multigraph() != right.is_multigraph():
+        return False
+    if set(left.nodes) != set(right.nodes) or not _graph_aware_equal(left.graph, right.graph, active):
+        return False
+    if not all(_graph_aware_equal(left.nodes[node], right.nodes[node], active) for node in left.nodes):
+        return False
+    if _edge_ids(left) != _edge_ids(right):
+        return False
+    edges = left.edges(keys=True) if left.is_multigraph() else left.edges
+    return all(_graph_aware_equal(left.edges[edge], right.edges[edge], active) for edge in edges)
+
+
+def _array_equal(left, right, active):
+    """Value equality of two NumPy arrays (0-d for scalars). Object arrays
+    compare element-wise through :func:`_graph_aware_equal`; structured data
+    compares only with structured data of the same dtype, field by field when
+    a field holds Python objects; types NumPy cannot compare are unequal
+    instead of raising."""
+    if left.shape != right.shape:
+        return False
+    if left.dtype.names is not None or right.dtype.names is not None:
+        # Structured data equals structured data of the same dtype only; an
+        # object array holding the same tuples is a different representation.
+        if left.dtype != right.dtype:
+            return False
+        if left.dtype.hasobject:
+            return all(_array_equal(left[name], right[name], active) for name in left.dtype.names)
+        return bool(np.array_equal(left, right))
+    if left.dtype.kind == "O" or right.dtype.kind == "O":
+        # tolist() yields Python objects, except for scalar types without a
+        # Python equivalent (longdouble), which _graph_aware_equal settles
+        # directly against a plain value instead of coming back here.
+        return _graph_aware_equal(left.tolist(), right.tolist(), active)
+    try:
+        return bool(np.array_equal(left, right))
+    except Exception:
+        return False
+
+
+def _masked_equal(left, right, active):
+    """Masked arrays compare by mask and by the values that are not masked,
+    field by field for structured data; an array without a mask counts as
+    unmasked everywhere, and values hidden under matching masks are ignored."""
+    try:
+        left, right = np.ma.asarray(left), np.ma.asarray(right)
+        left_mask, right_mask = np.ma.getmaskarray(left), np.ma.getmaskarray(right)
+    except Exception:
+        return False
+    if left.shape != right.shape:
+        return False
+    if left.dtype.names is not None or right.dtype.names is not None:
+        return left.dtype == right.dtype and all(_masked_equal(left[name], right[name], active) for name in left.dtype.names)
+    if not np.array_equal(left_mask, right_mask):
+        return False
+    kept = ~left_mask
+    return _array_equal(np.ma.getdata(left)[kept], np.ma.getdata(right)[kept], active)
+
+
+def _comparison_result(left, right):
+    """``left == right`` as a bool, best effort: a comparison that raises, or
+    that yields anything but a boolean (an array, when NumPy broadcasts a
+    scalar against a sequence), means unequal."""
+    try:
+        result = left == right
+    except Exception:
+        return False
+    return bool(result) if isinstance(result, (bool, np.bool_)) else False
+
+
+def _is_collection(value):
+    return isinstance(value, Collection) and not isinstance(value, (str, bytes, bytearray, np.ndarray))
+
+
+_RECURSIVE_TYPES = (dict, list, tuple, deque, np.ndarray, nx.Graph)
+
+
+def _graph_aware_equal(left, right, active=None):
+    """Structural equality for the metadata types :class:`EnsembleData`
+    supports (see its docstring); other objects compare best effort.
+    ``active`` holds the pairs of containers being compared up the call
+    chain, so metadata that refers back to itself compares unequal instead
+    of recursing, while a structure that merely shares references compares
+    normally. Keep dict and sequence traversal in this frame with explicit
+    loops: recursive generators add a frame per level, and on Python 3.10
+    their ``all()`` calls also count toward the recursion limit. For dicts
+    and sequences, this direct recursion leaves more headroom than the deep
+    copy into a unit subgraph. Object arrays and structured arrays with
+    object fields still use additional recursive helper calls and may reach
+    the recursion limit before the deep copy does."""
+    if left is right:
+        return True
+    if active is None:
+        active = set()
+    pair = None
+    if isinstance(left, _RECURSIVE_TYPES) and isinstance(right, _RECURSIVE_TYPES):
+        pair = (id(left), id(right))
+        if pair in active:
+            return False
+        active.add(pair)
+    try:
+        if isinstance(left, nx.Graph) or isinstance(right, nx.Graph):
+            return isinstance(left, nx.Graph) and isinstance(right, nx.Graph) and _graphs_equal(left, right, active)
+        if isinstance(left, dict) and isinstance(right, dict):
+            if left.keys() != right.keys():
+                return False
+            for key in left:
+                if not _graph_aware_equal(left[key], right[key], active):
+                    return False
+            return True
+        if isinstance(left, (list, tuple, deque)) and isinstance(right, (list, tuple, deque)):
+            if len(left) != len(right):
+                return False
+            for a, b in zip(left, right, strict=True):
+                if not _graph_aware_equal(a, b, active):
+                    return False
+            return True
+        if _is_collection(left) != _is_collection(right):
+            # A collection never equals a scalar or an array; NumPy would broadcast.
+            return False
+        if isinstance(left, np.ma.MaskedArray) or isinstance(right, np.ma.MaskedArray):
+            return _masked_equal(left, right, active)
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray) or (isinstance(left, np.generic) and isinstance(right, np.generic)):
+            try:
+                arrays = np.asarray(left), np.asarray(right)
+            except Exception:
+                return False
+            return _array_equal(*arrays, active)
+        # A NumPy scalar against a plain value, or any other pair of objects: their
+        # own comparison, guarded, so an ambiguous comparison means unequal.
+        return _comparison_result(left, right)
+    finally:
+        if pair is not None:
+            active.discard(pair)
+
+
 @dataclass
 class EnsembleData:
     """
     Full result of :meth:`EnsembleCreator.create_ensemble` with ``ensemble_info=True``.
 
-    ``chains`` and ``sequences`` follow the requested ``output_format``;
-    the ensemble aggregates are format-independent: ``units`` maps each
-    derived unit_id (see :func:`g2rins.derive_unit_labels`) to
-    ``{"psmiles", "g2rins", "frequency"}`` and ``bonds`` is a list of
-    undirected linkage records ``{"between": ["I0.1", "R0.1"], "count": n}``
-    whose endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
-    ``endpoint.rsplit(".", 1)``), sorted so the same linkage always prints
-    identically.
+    ``chains`` and ``sequences`` follow the requested ``output_format``; the
+    ensemble aggregates are template-level and format-independent. ``units``
+    maps each derived unit_id (see :func:`g2rins.derive_unit_labels`) to
+    ``{"psmiles", "g2rins", "subgraph", "count"}``, ordered by unit role and
+    number, where ``subgraph`` is a detached copy of the unit's static
+    subgraph of the creator's private copy of the generative graph: original
+    node ids, static edges only (multigraph keys kept), nodes in derivation
+    order and edges in template order, node data as the creator holds it
+    (``atomic_num`` as ``int``, the placeholder flag on every node, no derived
+    export fields) plus ``unit_id`` stamped on the copy's nodes, and no
+    graph-level attributes. ``bonds`` is a list of undirected linkage records
+    ``{"labels": ["I0.1", "R0.1"], "nodes": [id, id], "count": n}``:
+    ``labels`` endpoints are ``"<unit_id>.<bond_id>"`` strings (parse with
+    ``endpoint.rsplit(".", 1)``) sorted so the same linkage always prints
+    identically, and ``nodes`` holds the generative-graph node ids of the
+    same two connection atoms, aligned with ``labels``. Labels survive a
+    fresh parse of the same string; node ids are only valid for this parsed
+    graph.
+
+    ``subgraph`` values are networkx graphs, so a unit record is not JSON
+    serializable as is: use ``json_file``, or ``nx.node_link_data(subgraph,
+    edges="edges")``. Their node and edge data are deep copies, so every
+    template node and edge attribute must be deep-copyable when ensemble
+    information is requested (it must already be JSON-safe for ``json_file``).
+
+    ``==`` is structural, and tested, for these metadata types: ``None``,
+    ``bool``, ``int``, ``float`` (NaN unequal unless the same object),
+    ``str`` and ``bytes``; NumPy scalars and arrays of numeric, boolean,
+    string, object and structured dtypes, structured data only against
+    structured data of the same dtype, and masked arrays by mask and
+    unmasked values; ``dict`` with structurally compared values; ``list``,
+    ``tuple`` and ``deque`` element-wise; networkx graphs by structure. A
+    collection never equals a scalar, there is no ``equal_nan``, and
+    metadata that refers back to itself compares unequal. Any other object
+    compares best effort: equal when it is the same object, otherwise by its
+    own ``==``, where a comparison that raises or is ambiguous means unequal;
+    no structural semantics are promised for such objects.
+
+    Each unit's pSMILES has one mapped star ``[*:n]`` per template bond_id.
+    Internal split-atom placeholders with no bond_id are omitted.
+
+    A sequence fragment marks its split sites, not every connection site. A
+    split site whose connection the sampler recorded carries a mapped stub
+    ``[*:n]``, whose map number identifies a sampled connection, not the
+    template bond_id used in unit pSMILES; in molecule graphs such a stub
+    carries ``is_connector_placeholder=False`` and an explicit ``connection``
+    attribute, retains the far-side ``origin_idx``, and is neutral and
+    non-aromatic with no explicit hydrogen count or sampling bookkeeping copied
+    from that atom, and its bond to the fragment is never aromatic. Any other
+    split site keeps its placeholder as an unmapped ``*`` with
+    ``is_connector_placeholder=True`` and no ``connection``, so an interior
+    split unit is not rendered as a complete small molecule.
+
+    A connection atom carrying a single descriptor has no split-atom placeholder,
+    but can still receive a mapped stub when the sampler records a connection
+    (for example, ``CO[>]`` can appear as ``CO[*:1]``). Fragment masses do not
+    sum to the chain mass, because each fragment is hydrogen-capped when read
+    in isolation. Use ``chains`` for composition and mass.
     """
 
     chains: list
@@ -552,27 +823,74 @@ class EnsembleData:
     mol_weights: dict
     distributions: dict
 
+    def __eq__(self, other):
+        # Unit subgraphs (and molecule-graph chains or sequences) are graph
+        # objects; two ensembles with the same content compare equal.
+        if not isinstance(other, EnsembleData):
+            return NotImplemented
+        return all(_graph_aware_equal(getattr(self, name), getattr(other, name)) for name in ("chains", "units", "bonds", "sequences", "mol_weights", "distributions"))
+
 
 def _bond_endpoint_sort_key(endpoint):
     unit_id, bond_id = endpoint.rsplit(".", 1)
     return unit_id[0], int(unit_id[1:]), int(bond_id)
 
 
-def _bond_records(bond_counts, origin_endpoint):
+def _bond_records(bond_counts, origin_endpoint, origin_node):
     """
     Undirected linkage records from the growth-direction ``bond_counts``
     (origin_idx pairs): both orientations of a chemical linkage merge into one
-    record with summed counts, endpoints sorted by (unit role, unit number,
-    bond id).
+    record with summed counts. Endpoint labels are sorted by (unit role, unit
+    number, bond id); ``nodes`` carries the generative-graph node key of each
+    endpoint in the same order (``origin_node`` maps the sampler's string
+    provenance back to the template key, which need not be a string).
     """
     merged = {}
     for (origin_u, origin_v), count in bond_counts.items():
-        pair = tuple(sorted((origin_endpoint[origin_u], origin_endpoint[origin_v]), key=_bond_endpoint_sort_key))
+        pair = tuple(
+            sorted(
+                ((origin_endpoint[origin_u], origin_u), (origin_endpoint[origin_v], origin_v)),
+                key=lambda endpoint: _bond_endpoint_sort_key(endpoint[0]),
+            )
+        )
         merged[pair] = merged.get(pair, 0) + count
     return [
-        {"between": list(pair), "count": count}
-        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(endpoint) for endpoint in item[0]))
+        {"labels": [label for label, _node in pair], "nodes": [origin_node[origin] for _label, origin in pair], "count": count}
+        for pair, count in sorted(merged.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
     ]
+
+
+def _unit_subgraphs(generative_graph, unit_nodes):
+    """
+    Detached static subgraph per unit: the unit's nodes with their static
+    edges only (non-static edges are generative rules, not template
+    structure -- an induced subgraph would drag intra-unit self-transitions
+    along). Node ids are kept; ``unit_id`` is stamped on the copy's nodes,
+    never on the generative graph itself. Nodes follow the derivation order
+    of ``unit_nodes`` and edges the template's order, so the copies do not
+    depend on hash seeds; graph-level attributes are not copied.
+    """
+    subgraphs = {}
+    for unit_id, nodes in unit_nodes.items():
+        members = set(nodes)
+        subgraph = generative_graph.__class__()
+        subgraph.add_nodes_from((node, {**_copied_attributes(generative_graph.nodes[node], f"node {node!r}"), "unit_id": unit_id}) for node in nodes)
+        subgraph.add_edges_from(
+            (u, v, key, _copied_attributes(data, f"edge {(u, v, key)!r}")) for u, v, key, data in generative_graph.edges(nodes, keys=True, data=True) if v in members and data["static"]
+        )
+        subgraphs[unit_id] = subgraph
+    return subgraphs
+
+
+def _copied_attributes(data, where):
+    """Deep copy of an attribute dict, naming the attribute that cannot be copied."""
+    copied = {}
+    for key, value in data.items():
+        try:
+            copied[key] = deepcopy(value)
+        except Exception as error:
+            raise TypeError(f"Template {where} attribute {key!r} cannot be deep-copied for the unit subgraph: {error}") from error
+    return copied
 
 
 @contextmanager
@@ -643,9 +961,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         mol_graph = sample
         molecule_units = bonds = sequences = mol_weights = distributions = None
 
-    if molecule_format == "mol":
-        molecule = mol_graph_to_rdkit_mol(mol_graph)
-    elif molecule_format == "smiles":
+    if molecule_format == "smiles":
         molecule = mol_graph_to_smiles(mol_graph)
     else:
         molecule = mol_graph
@@ -655,9 +971,7 @@ def _convert_chain(sample, molecule_format, collect_info):
         # Units are static-connected fragments with dangling inter-unit
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
-        if molecule_format == "mol":
-            converted_sequences = [[mol_graph_to_rdkit_mol(unit, kekulize=False) for unit in sequence] for sequence in sequences]
-        elif molecule_format == "smiles":
+        if molecule_format == "smiles":
             converted_sequences = [[mol_graph_to_smiles(unit, kekulize=False) for unit in sequence] for sequence in sequences]
         else:
             converted_sequences = sequences
@@ -730,14 +1044,15 @@ def _sample_chain_batch(atom_graph, chain_jobs, molecule_format, collect_info, m
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", _CHIRAL_NAME, _ISOTOPE_NAME}
-    _BOND_ATTRS = {_BOND_TYPE_NAME, _AROMATIC_NAME, _CIS_TRANS_MARK_NAME, _CHIRAL_NEIGHBOR_RANK_NAME}
+    # Ordered, so copied chain attributes keep one key order across processes.
+    _ATOM_ATTRS = ("atomic_num", _CONNECTOR_PLACEHOLDER_NAME, _AROMATIC_NAME, "charge", "num_explicit_h", _CHIRAL_NAME, _ISOTOPE_NAME)
+    _BOND_ATTRS = (_BOND_TYPE_NAME, _AROMATIC_NAME, _CIS_TRANS_MARK_NAME, _CHIRAL_NEIGHBOR_RANK_NAME)
     # Defaults for optional node/edge attributes so a generative_graph built before an attribute
     # existed still yields an EnsembleCreator (required attributes stay strict).
-    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CHIRAL_NAME: 0, _ISOTOPE_NAME: 0}
+    _ATOM_ATTR_DEFAULTS = {"num_explicit_h": -1, _CONNECTOR_PLACEHOLDER_NAME: False, _CHIRAL_NAME: 0, _ISOTOPE_NAME: 0}
     _BOND_ATTR_DEFAULTS = {_CIS_TRANS_MARK_NAME: 0, _CHIRAL_NEIGHBOR_RANK_NAME: [0, 0], _CIS_TRANS_FLIP_NAME: 0}
     # A bond that joins two units also carries the generation-only flip bit, consumed by merge and never stored on the molecule.
-    _JUNCTION_ATTRS = _BOND_ATTRS | {_CIS_TRANS_FLIP_NAME}
+    _JUNCTION_ATTRS = _BOND_ATTRS + (_CIS_TRANS_FLIP_NAME,)
 
     def __init__(self, generative_graph, static_graph, source_node, stochastic_tracker, sto_atom_id, rng, collect_info=True):
         self._atom_id = 0
@@ -874,7 +1189,7 @@ class _PartialAtomGraph:
         itself if real, otherwise the real atoms reached through the phantom
         chain (never crossing back over the junction toward `exclude`)."""
         graph = self.atom_graph
-        if graph.nodes[atom_idx].get("atomic_num", 0) > 0:
+        if not _is_connector_placeholder(graph.nodes[atom_idx]):
             return [atom_idx]
         anchors = []
         seen = {atom_idx, exclude}
@@ -885,7 +1200,7 @@ class _PartialAtomGraph:
                 if neighbor in seen:
                     continue
                 seen.add(neighbor)
-                if graph.nodes[neighbor].get("atomic_num", 0) > 0:
+                if not _is_connector_placeholder(graph.nodes[neighbor]):
                     anchors.append(neighbor)
                 else:
                     queue.append(neighbor)
@@ -908,7 +1223,7 @@ class _PartialAtomGraph:
         template_nodes = self.generative_graph.nodes
 
         for _u, v, attr in self.generative_graph.out_edges(node_idx, data=True):
-            if attr.get("static") and template_nodes[v].get("atomic_num", 0) > 0:
+            if attr.get("static") and not _is_connector_placeholder(template_nodes[v]):
                 total_bond += attr.get("bond_type", 0)
                 if attr.get("aromatic"):
                     has_aromatic = True
@@ -986,18 +1301,18 @@ class _PartialAtomGraph:
         for u_atom_idx, v_atom_idx in edges_data_map:
             self.atom_graph.add_edge(u_atom_idx, v_atom_idx, **edges_data_map[(u_atom_idx, v_atom_idx)])
 
-    def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | set[str] = None) -> dict[str, bool | float | int]:
+    def gen_node_attr_to_atom_attr(self, attr: dict[str, bool | float | int], keys_to_copy: None | Iterable[str] = None) -> dict[str, bool | float | int]:
         if keys_to_copy is None:
             keys_to_copy = self._ATOM_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
-    def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | set[str] = None) -> dict[str, bool | int]:
+    def gen_edge_attr_to_bond_attr(self, attr: dict[str, bool | int], keys_to_copy: None | Iterable[str] = None) -> dict[str, bool | int]:
         if keys_to_copy is None:
             keys_to_copy = self._JUNCTION_ATTRS
         return self._copy_some_dict_attr(attr, keys_to_copy)
 
     @staticmethod
-    def _copy_some_dict_attr(dictionary: dict[str, Any], keys_to_copy: set[str]) -> dict[str, Any]:
+    def _copy_some_dict_attr(dictionary: dict[str, Any], keys_to_copy: Iterable[str]) -> dict[str, Any]:
         new_dict = {}
         for k in keys_to_copy:
             if k in dictionary:
@@ -1041,11 +1356,8 @@ class _PartialAtomGraph:
         """
         if not half_bonds:
             raise ValueError("Cannot pop from empty list")
-        eligible_half_bonds = [
-            half_bond
-            for half_bond in half_bonds
-            if any(attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))
-        ]
+        # A forced exit is never drawn: it fires at its source instance's finalization.
+        eligible_half_bonds = [half_bond for half_bond in half_bonds if any(_transition_competes_at(attr, sto_gen_id) for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []))]
         if not eligible_half_bonds:
             return None, []
         max_hierarchy = max(half_bond.gen_hierarchy for half_bond in eligible_half_bonds)
@@ -1089,21 +1401,24 @@ class _PartialAtomGraph:
 
         return chosen, non_used_half_bonds
 
-    def _get_level_termination_bonds(
-        self,
-        owner_sto_atom_id,
-        level_sto_atom_id,
-        include_transition_bonds=False,
-        require_transition_bonds=False,
-    ):
-        """Return open bonds owned by one instance that can terminate at a
-        particular stochastic-object level.
+    def _custody_bucket_ids(self, sto_atom_id):
+        """The instance's own bucket plus its terminated descendants' buckets:
+        the custody set one level's termination acts on (a frontier can end
+        inside a deeper terminated instance — the rescue flavor).
+        terminate_graph, cap_junction_bonds and promote_level_transitions all
+        compose their scans over this set, and the average-cap estimates must
+        price the same set: a cap fired from a descendant's bucket after the
+        parking decision would otherwise arrive unpriced and bias the
+        realized mass past the target by its weight."""
+        tracker = self.stochastic_tracker
+        return [sto_atom_id] + [
+            bucket_id for bucket_id in self._open_half_bond_map if bucket_id != sto_atom_id and tracker.is_terminated(bucket_id) and sto_atom_id in tracker.parent_map.get(bucket_id, [])
+        ]
 
-        Normal end-group attachment asks for ``owner == level`` and excludes
-        continuation sites.  A parked ancestor is the one exception: a
-        finished descendant's continuation site is deliberately capped at the
-        ancestor's level, so callers estimating that conditional cap must be
-        able to include transition-capable bonds without mutating the graph.
+    def _get_level_termination_bonds(self, owner_sto_atom_id, level_sto_atom_id):
+        """Return open bonds owned by one instance that can terminate at a
+        particular stochastic-object level: ``owner == level`` for end-group
+        attachment, excluding continuation sites some level still needs.
         """
         # This helper scans ONE bucket (the owner's); terminate_graph composes
         # it over the owner plus terminated-descendant buckets. It never scans
@@ -1116,9 +1431,7 @@ class _PartialAtomGraph:
         termination_bonds = []
         sto_gen_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[level_sto_atom_id]
         for _, half_bond in zip(*self.get_open_half_bonds(owner_sto_atom_id), strict=False):
-            if require_transition_bonds and not half_bond.has_mode_bonds(_TRANSITION_NAME):
-                continue
-            if not include_transition_bonds and self._transition_blocks_termination(half_bond, sto_gen_id):
+            if self._transition_blocks_termination(half_bond, sto_gen_id):
                 # A bond whose continuation some level still needs is not an
                 # end: capping it would either kill that continuation or, once
                 # re-opened, over-bond the atom. Transition at the terminating
@@ -1138,6 +1451,10 @@ class _PartialAtomGraph:
         than ``sto_gen_id`` that still has a live instance."""
         tracker = self.stochastic_tracker
         for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, []):
+            if attr.get(_TRANSITION_ROLE_NAME) == TransitionRole.FORCED_EXIT:
+                # Owed unconditionally: fired by fire_forced_exits when the outermost
+                # object it leaves finalizes, whatever the owner level's liveness.
+                return True
             level = attr.get(_EDGE_STOCHASTIC_ID_NAME)
             if level == -1:
                 return True
@@ -1145,48 +1462,20 @@ class _PartialAtomGraph:
                 return True
         return False
 
-    def _get_average_level_termination_mw(
-        self,
-        owner_sto_atom_id,
-        level_sto_atom_id,
-        static_graph,
-        rng,
-        include_transition_bonds=False,
-        require_transition_bonds=False,
-    ):
+    def _get_average_level_termination_mw(self, owner_sto_atom_id, level_sto_atom_id, static_graph, rng):
         # Estimation is observational: constructing candidate cap fragments can
         # initialize half-bonds with stochastic special targets, but merely
         # checking a boundary must not advance the sample's RNG stream.
         estimator_rng = copy.deepcopy(rng)
 
         def _get_terminator_atom_graph(source):
-            stochastic_object_tracker = _StochasticObjectTracker(
-                self.generative_graph,
-                estimator_rng,
-                path_is_conditional=self.stochastic_tracker.path_is_conditional,
-                zero_support_is_unavoidable=(
-                    self.stochastic_tracker.zero_support_is_unavoidable
-                ),
-            )
-            source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
-            term_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
-            terminator_atom_graph = _PartialAtomGraph(
-                self.generative_graph,
-                static_graph,
-                source,
-                stochastic_object_tracker,
-                term_sto_atom_id,
-                estimator_rng,
-            )
-            del stochastic_object_tracker
-            return terminator_atom_graph
+            return self._observational_fragment(source, static_graph, estimator_rng)
 
-        termination_bonds = self._get_level_termination_bonds(
-            owner_sto_atom_id,
-            level_sto_atom_id,
-            include_transition_bonds=include_transition_bonds,
-            require_transition_bonds=require_transition_bonds,
-        )
+        # Price the same custody set the terminate/cap passes fire from: the
+        # owner's bucket plus its terminated descendants'. A cap held in a
+        # descendant's bucket is attached at finalization, so leaving it out
+        # of the margin let heavy end groups overshoot the target mass.
+        termination_bonds = [half_bond for bucket_id in self._custody_bucket_ids(owner_sto_atom_id) for half_bond in self._get_level_termination_bonds(bucket_id, level_sto_atom_id)]
         avg_termination_mw = 0
         # The source endpoint's hydrogen loss only depends on the attach order,
         # not on which terminator fires: share it across candidates.
@@ -1220,42 +1509,66 @@ class _PartialAtomGraph:
                 # existing endpoint sheds and, for split-dummy connectors, by
                 # charging the attach order to the massless dummy instead of
                 # its real anchors (so their hydrogens stayed uncounted).
-                extra_occupied = {}
-                for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    if data["origin_idx"] == str(node_id):
-                        for anchor in terminator_atom_graph._real_anchors(frag_node, exclude=None):
-                            extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
-                        break
-                terminator_weight = 0
-                for frag_node, data in terminator_atom_graph.atom_graph.nodes(data=True):
-                    atomic_number = data["atomic_num"]
-                    if atomic_number <= 0:
-                        # Phantom placeholders carry no mass and no hydrogens.
-                        continue
-                    occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
-                    num_H = _infer_hydrogen_count(
-                        atomic_number,
-                        data.get("charge", 0),
-                        occupied,
-                        data.get("num_explicit_h", -1),
-                        data.get(_AROMATIC_NAME, False),
-                    )
-                    terminator_weight += atom_mass(atomic_number, data.get(_ISOTOPE_NAME, 0)) + num_H * atomic_masses.get(1)
+                terminator_weight = self._fragment_gross_mw(terminator_atom_graph, node_id, attach_order)
                 if attach_order not in source_delta_by_order:
-                    delta = 0.0
-                    for anchor in self._real_anchors(termination_bond.atom_idx, exclude=None):
-                        anchor_data = self.atom_graph.nodes[anchor]
-                        new_h = _infer_hydrogen_count(
-                            anchor_data["atomic_num"],
-                            anchor_data["charge"],
-                            anchor_data["occupied_valence"] + attach_order,
-                            anchor_data.get("num_explicit_h", -1),
-                            anchor_data.get(_AROMATIC_NAME, False),
-                        )
-                        delta += (new_h - anchor_data["credited_h"]) * atomic_masses.get(1)
-                    source_delta_by_order[attach_order] = delta
+                    source_delta_by_order[attach_order] = self._source_attach_delta(termination_bond.atom_idx, attach_order)
                 avg_termination_mw += target_prob[i] * (terminator_weight + source_delta_by_order[attach_order])
         return avg_termination_mw
+
+    def _observational_fragment(self, source, static_graph, estimator_rng):
+        """Build the static fragment that starts at ``source`` under a throwaway tracker, so an
+        estimate can read its atoms without touching the sample's tracker or RNG stream."""
+        stochastic_object_tracker = _StochasticObjectTracker(
+            self.generative_graph,
+            estimator_rng,
+            path_is_conditional=self.stochastic_tracker.path_is_conditional,
+            zero_support_is_unavoidable=(self.stochastic_tracker.zero_support_is_unavoidable),
+        )
+        source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
+        fragment_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
+        return _PartialAtomGraph(self.generative_graph, static_graph, source, stochastic_object_tracker, fragment_sto_atom_id, estimator_rng)
+
+    def _fragment_gross_mw(self, fragment, target_node, attach_order):
+        """Mass ``fragment`` adds when attached at ``target_node`` with a bond of ``attach_order``:
+        atoms plus inferred hydrogens, the attach order charged to the target's real anchors
+        (never to a massless split dummy). Placeholders carry no mass and no hydrogens."""
+        extra_occupied = {}
+        for frag_node, data in fragment.atom_graph.nodes(data=True):
+            if data["origin_idx"] == str(target_node):
+                for anchor in fragment._real_anchors(frag_node, exclude=None):
+                    extra_occupied[anchor] = extra_occupied.get(anchor, 0) + attach_order
+                break
+        gross = 0.0
+        for frag_node, data in fragment.atom_graph.nodes(data=True):
+            if _is_connector_placeholder(data):
+                continue
+            atomic_number = data["atomic_num"]
+            occupied = self._compute_total_bond(data["origin_idx"]) + extra_occupied.get(frag_node, 0)
+            num_H = _infer_hydrogen_count(
+                atomic_number,
+                data.get("charge", 0),
+                occupied,
+                data.get("num_explicit_h", -1),
+                data.get(_AROMATIC_NAME, False),
+            )
+            gross += atom_mass(atomic_number, data.get(_ISOTOPE_NAME, 0)) + num_H * atomic_masses.get(1)
+        return gross
+
+    def _source_attach_delta(self, source_atom_idx, attach_order):
+        """Net hydrogen mass the existing endpoint ``source_atom_idx`` sheds when a bond of
+        ``attach_order`` is added to it (its real anchors, for a split dummy)."""
+        delta = 0.0
+        for anchor in self._real_anchors(source_atom_idx, exclude=None):
+            anchor_data = self.atom_graph.nodes[anchor]
+            new_h = _infer_hydrogen_count(
+                anchor_data["atomic_num"],
+                anchor_data["charge"],
+                anchor_data["occupied_valence"] + attach_order,
+                anchor_data.get("num_explicit_h", -1),
+                anchor_data.get(_AROMATIC_NAME, False),
+            )
+            delta += (new_h - anchor_data["credited_h"]) * atomic_masses.get(1)
+        return delta
 
     def get_average_termination_mw(self, sto_atom_id, static_graph, rng):
         return self._get_average_level_termination_mw(
@@ -1263,24 +1576,6 @@ class _PartialAtomGraph:
             sto_atom_id,
             static_graph,
             rng,
-        )
-
-    def get_average_junction_termination_mw(
-        self,
-        owner_sto_atom_id,
-        level_sto_atom_id,
-        static_graph,
-        rng,
-    ):
-        """Expected net mass of the cap that replaces ``owner``'s
-        continuation when ``level`` has already parked."""
-        return self._get_average_level_termination_mw(
-            owner_sto_atom_id,
-            level_sto_atom_id,
-            static_graph,
-            rng,
-            include_transition_bonds=True,
-            require_transition_bonds=True,
         )
 
     def terminate_graph(self, sto_atom_id, rng):
@@ -1293,11 +1588,7 @@ class _PartialAtomGraph:
             # instance). Composing the per-bucket scan over those buckets is
             # safe: a consumed bond is popped from its holding bucket and
             # never re-added, so nothing double-caps.
-            bucket_ids = [sto_atom_id] + [
-                bucket_id
-                for bucket_id in terminated_graph._open_half_bond_map
-                if bucket_id != sto_atom_id and tracker.is_terminated(bucket_id) and sto_atom_id in tracker.parent_map.get(bucket_id, [])
-            ]
+            bucket_ids = terminated_graph._custody_bucket_ids(sto_atom_id)
             pairs = []
             for bucket_id in bucket_ids:
                 for half_bond in terminated_graph._get_level_termination_bonds(bucket_id, sto_atom_id):
@@ -1328,9 +1619,7 @@ class _PartialAtomGraph:
         for _i, half_bond in zip(*terminated_graph.get_open_half_bonds(sto_atom_id), strict=False):
             if half_bond.has_mode_bonds(_TRANSITION_NAME):
                 transition_half_bonds.append(half_bond)
-            elif half_bond.has_mode_bonds(_TERMINATION_NAME) and all(
-                attr.get(_EDGE_STOCHASTIC_ID_NAME) != own_gen_sto_id for attr in half_bond._mode_attr_map[_TERMINATION_NAME]
-            ):
+            elif half_bond.has_mode_bonds(_TERMINATION_NAME) and all(attr.get(_EDGE_STOCHASTIC_ID_NAME) != own_gen_sto_id for attr in half_bond._mode_attr_map[_TERMINATION_NAME]):
                 # An ancestor level's declared cap rides this instance's
                 # frontier without a transition partner (e.g. a side port
                 # whose terminator models a post-polymerization modification,
@@ -1414,14 +1703,18 @@ class _PartialAtomGraph:
         junction bond (the termination flavor of the transition rescue)."""
         tracker = self.stochastic_tracker
         gen_sto_id = tracker._stochastic_atom_id_to_gen_id[level_sto_atom_id]
-        bucket_ids = [owner_sto_atom_id] + [
-            bucket_id
-            for bucket_id in self._open_half_bond_map
-            if bucket_id != owner_sto_atom_id and tracker.is_terminated(bucket_id) and owner_sto_atom_id in tracker.parent_map.get(bucket_id, [])
-        ]
+        owner_gen_id = tracker._stochastic_atom_id_to_gen_id[owner_sto_atom_id]
+        bucket_ids = self._custody_bucket_ids(owner_sto_atom_id)
         for bucket_id in bucket_ids:
             bucket = self._open_half_bond_map.get(bucket_id, [])
             for half_bond in list(bucket):
+                exit_owners = {_forced_exit_owner(self.generative_graph, half_bond, attr) for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])} - {None}
+                if owner_gen_id in exit_owners:
+                    raise RuntimeError("A forced exit survived its instance's finalization unfired and reached the junction cap. This is a bug, please report on github.")
+                if exit_owners:
+                    # Owed by an enclosing object the exit leaves too: that object's
+                    # finalization fires it from this bucket.
+                    continue
                 all_attributes, all_ids, all_molar = half_bond.get_mode_bonds(_TERMINATION_NAME)
                 level_indices = [i for i, attr in enumerate(all_attributes) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == gen_sto_id]
                 if not level_indices:
@@ -1486,16 +1779,14 @@ class _PartialAtomGraph:
         self._open_half_bond_map[bucket_id].remove(half_bond)
 
         all_target_attr, all_target_idx, all_molar_amounts = half_bond.get_mode_bonds(_TRANSITION_NAME)
-        minus_one_indices = [
-            i for i, attr in enumerate(all_target_attr) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == -1
-        ]
+        minus_one_indices = [i for i, attr in enumerate(all_target_attr) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == -1]
 
         target_attr = [all_target_attr[i] for i in minus_one_indices]
         target_idx = [all_target_idx[i] for i in minus_one_indices]
         target_molar_amounts = [all_molar_amounts[i] for i in minus_one_indices]
 
         target_weights = []
-        for attr, idx, molar in zip(target_attr, target_idx, target_molar_amounts):
+        for attr, idx, molar in zip(target_attr, target_idx, target_molar_amounts, strict=False):
             w = float(attr[_TRANSITION_NAME])
             target_sto_gen_id = self.generative_graph.nodes[idx]["stochastic_id_tree"][0]
             if target_sto_gen_id >= 0:
@@ -1519,13 +1810,15 @@ class _PartialAtomGraph:
         selected_target_sto_parent_id = self.generative_graph.nodes[selected_target_idx]["stochastic_id_tree"][1:]
 
         # Each -1 arm is independent: register a fresh instance chain.
-        new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(
-            selected_target_sto_gen_id, -1, selected_target_sto_parent_id, reuse_existing=False
-        )
+        new_sto_atom_id, _parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, -1, selected_target_sto_parent_id, reuse_existing=False)
 
         other_graph = _PartialAtomGraph(
-            self.generative_graph, self.static_graph, selected_target_idx,
-            self.stochastic_tracker, new_sto_atom_id, rng,
+            self.generative_graph,
+            self.static_graph,
+            selected_target_idx,
+            self.stochastic_tracker,
+            new_sto_atom_id,
+            rng,
         )
         other_half_bond_atom_idx = other_graph.pop_target_open_half_bond(new_sto_atom_id, selected_target_idx)
         pre_merge_watermark = self._atom_id
@@ -1582,6 +1875,95 @@ class _PartialAtomGraph:
             return rescued_id, True
         return sto_atom_id, False
 
+    def promote_level_transitions(self, child_sto_atom_id, owner_sto_atom_id, sto_gen_id):
+        """Hand a finished instance's level-``sto_gen_id`` transition sites to
+        that level's live owner as ordinary propagation options, so the
+        owner's next growth step is one weighted draw over ALL its options
+        (chain continuation and unfired entry ports alike) instead of a
+        deterministic continuation fire — the multifunctional initiation
+        principle generalized to every level of the nested tree.
+
+        The draw's contract: at each owner step the site to grow is drawn
+        among the owner's open propagation-capable sites in proportion to
+        their bond-descriptor weights (``gen_weight`` of the atom carrying
+        the site), normalized over the sites open at that moment; the unit
+        the chosen site adds is then drawn by propagation weight times the
+        target unit's molar amount, so molar amounts describe the reservoir
+        and never bias which site grows. A promoted site keeps the
+        descriptor weight of the inner atom it sits on; a weight written on
+        the port after the object's closing brace is ignored by the graph
+        creator (no atom carries it and no edge arrives at it). The number
+        of owner steps is set by the mass rule.
+
+        Promotion is per-edge and lazy: only edges declared at the owner's
+        level convert; transition edges of shallower levels ride along
+        unchanged and are promoted, in turn, at their own level's hand-off.
+        Termination modes ride along too, so a site the owner never draws is
+        capped by the owner's own terminate pass when it carries owner-level
+        terminators (a parked owner included). A promoted bond retaining a -1
+        or live-other-level transition edge is deliberately NOT capped there
+        — that continuation is still owed and the bond travels onward at its
+        own level's turn — and a channel with neither terminators nor
+        retained transitions is retired unfired by the terminate-time wipe,
+        the weighted competition's legal zero-growth outcome. A forced exit the
+        finished object owes (its terminal bond connector bonded straight to the
+        enclosing unit's plain SMILES, or to a sibling object) never reaches
+        promotion: fire_forced_exits delivers it first. One owed by an
+        enclosing object that the exit leaves too rides along as a retained
+        transition until that object finalizes.
+        The finished level's own propagation modes are dropped: that level is
+        decided. Scans the child's bucket plus its terminated descendants'
+        buckets (a frontier can end inside a deeper instance), the same
+        custody set terminate_graph composes.
+        """
+        tracker = self.stochastic_tracker
+        bucket_ids = self._custody_bucket_ids(child_sto_atom_id)
+        child_gen_id = tracker._stochastic_atom_id_to_gen_id[child_sto_atom_id]
+        owner_parents = tracker.parent_map.get(owner_sto_atom_id, [])
+        # Pool-native parent tag: a promoted option must rank exactly like
+        # the owner's own bonds under the prefer_parent filter.
+        native_parent = tracker._stochastic_atom_id_to_gen_id[owner_parents[-1]] if owner_parents else -2
+        promoted_bonds = []
+        for bucket_id in bucket_ids:
+            kept_bonds = []
+            for half_bond in self._open_half_bond_map.get(bucket_id, []):
+                attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
+                if any(_forced_exit_owner(self.generative_graph, half_bond, attr) == child_gen_id for attr in attr_list):
+                    raise RuntimeError("A forced exit survived its instance's finalization unfired and reached promotion. This is a bug, please report on github.")
+                level_indices = [i for i, attr in enumerate(attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
+                if not level_indices:
+                    kept_bonds.append(half_bond)
+                    continue
+                promoted_bond = copy.copy(half_bond)
+                promoted_bond._mode_attr_map = {}
+                promoted_bond._mode_target_map = {}
+                promoted_bond._mode_target_molar_amounts_map = {}
+                bond_attr_list = copy.deepcopy([attr_list[i] for i in level_indices])
+                for bond_attr in bond_attr_list:
+                    bond_attr[_PROPAGATION_NAME] = bond_attr[_TRANSITION_NAME]
+                    bond_attr[_TRANSITION_NAME] = 0
+                promoted_bond._mode_attr_map[_PROPAGATION_NAME] = bond_attr_list
+                promoted_bond._mode_target_map[_PROPAGATION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in level_indices]
+                promoted_bond._mode_target_molar_amounts_map[_PROPAGATION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in level_indices]
+                retained_indices = [i for i in range(len(attr_list)) if i not in level_indices]
+                if retained_indices:
+                    promoted_bond._mode_attr_map[_TRANSITION_NAME] = [attr_list[i] for i in retained_indices]
+                    promoted_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
+                    promoted_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
+                if half_bond.has_mode_bonds(_TERMINATION_NAME):
+                    promoted_bond._mode_attr_map[_TERMINATION_NAME] = list(half_bond._mode_attr_map[_TERMINATION_NAME])
+                    promoted_bond._mode_target_map[_TERMINATION_NAME] = list(half_bond._mode_target_map[_TERMINATION_NAME])
+                    promoted_bond._mode_target_molar_amounts_map[_TERMINATION_NAME] = list(half_bond._mode_target_molar_amounts_map[_TERMINATION_NAME])
+                promoted_bond.parent = native_parent
+                promoted_bonds.append(promoted_bond)
+            self._open_half_bond_map[bucket_id] = kept_bonds
+        for promoted_bond in promoted_bonds:
+            try:
+                self._open_half_bond_map[owner_sto_atom_id] += [promoted_bond]
+            except KeyError:
+                self._open_half_bond_map[owner_sto_atom_id] = [promoted_bond]
+        return len(promoted_bonds)
+
     def _transition_graph_single_bucket(self, sto_atom_id, sto_gen_id, rng):
         # Early exit if no transition necessary
         if len(self.get_open_half_bonds(sto_atom_id)[0]) < 1:
@@ -1600,7 +1982,7 @@ class _PartialAtomGraph:
         # only keep target_attr and target_idx of the requested stochastic level (sto_gen_id)
         all_target_attr, all_target_idx, all_molar_amounts = transition_bond.get_mode_bonds(_TRANSITION_NAME)
 
-        filtered_indices = [i for i, attr in enumerate(all_target_attr) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
+        filtered_indices = [i for i, attr in enumerate(all_target_attr) if _transition_competes_at(attr, sto_gen_id)]
 
         if not filtered_indices:
             raise RuntimeError("A popped transition bond carries no edge at the level it was selected for. This is a bug, please report on github.")
@@ -1611,14 +1993,12 @@ class _PartialAtomGraph:
 
         target_weights = np.asarray([attr[_TRANSITION_NAME] for attr in target_attr])
         if sto_gen_id >= 0:
-            target_amounts = [molar_amount[sto_gen_id] for molar_amount in all_target_amounts]
-        else:
-            # -1 (global) level: unit_molar_amounts has no slot for it — a negative
-            # index would silently read the last SO's slot (same guard as
-            # trigger_global_transitions).
-            target_amounts = [1.0] * len(all_target_amounts)
-        molar_amounts = np.asarray(target_amounts)
-        target_weights *= molar_amounts
+            # The level's repeat units compete by weight times molar amount, and a
+            # target inside a nested repeat unit competes on, level by level.
+            target_weights = _level_target_weights(self.generative_graph, target_idx, target_weights, all_target_amounts, sto_gen_id)
+        # A -1 (global) level has no slot in unit_molar_amounts (a negative index would
+        # silently read the last SO's slot, same guard as trigger_global_transitions):
+        # its weights stand as they are.
         target_id = self.stochastic_tracker.choose(
             rng,
             len(target_idx),
@@ -1635,20 +2015,71 @@ class _PartialAtomGraph:
 
         new_sto_atom_id, parent_list = self.stochastic_tracker.register_parent_atom_instances(selected_target_sto_gen_id, sto_atom_id, selected_target_sto_parent_id)
 
-        # Transfer non-used transition bonds to new stochastic bonds
+        # Transfer the source bucket's remaining same-level transition bonds,
+        # converted to propagation, to the instance OF THE FIRED LEVEL. When
+        # the target lies inside a nested stochastic object (own instance, own
+        # MW draw) that owner differs from new_sto_atom_id: filing the bonds
+        # under the landing instance pooled every sibling junction into its
+        # one draw, and the terminate-time wipe then destroyed the unfired
+        # ones (graft architectures could never reach the outer target). For
+        # targets at the fired level itself the two owners coincide (star
+        # initiators, outer-level graft-from), keeping that behavior intact.
+        if sto_gen_id < 0 or selected_target_sto_gen_id == sto_gen_id:
+            owner_sto_atom_id = new_sto_atom_id
+        elif self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id] == sto_gen_id and not self.stochastic_tracker.is_terminated(sto_atom_id):
+            owner_sto_atom_id = sto_atom_id
+        else:
+            # Nearest LIVE instance at the fired level. Liveness is required:
+            # the root/inter-object continuation fires from a source
+            # terminate_graph has already finalized, and a terminated bucket
+            # is never grown, rescued, or capped again — filing the converted
+            # bonds there would strand them, termination modes and all. The
+            # source's ancestry serves the live cases (the rescue flavor); the
+            # landing target's freshly registered parent chain serves a
+            # terminated source whose target lies under the fired level. No
+            # live instance at all means the level fired after its last
+            # instance finished. No valid string reaches that today (the
+            # own-level transition sites a bucket can hold are an initiator's,
+            # consumed at sampling's first step, or a block-to-block join that
+            # nothing fires yet), so fail loudly rather than file the sites
+            # under another level's bucket, where propagation would fire them
+            # as that level's own growth.
+            owner_sto_atom_id = None
+            candidates = list(reversed(self.stochastic_tracker.parent_map.get(sto_atom_id, []))) + list(reversed(parent_list))
+            for ancestor in candidates:
+                if self.stochastic_tracker._stochastic_atom_id_to_gen_id[ancestor] == sto_gen_id and not self.stochastic_tracker.is_terminated(ancestor):
+                    owner_sto_atom_id = ancestor
+                    break
+            if owner_sto_atom_id is None:
+                raise RuntimeError(
+                    f"A level-{sto_gen_id} transition fired from a finished instance and no live instance of that level exists, "
+                    "in the source's ancestry or the target's parent chain, to take custody of its remaining sites. This is a bug, please report on github."
+                )
+
+        # Converted bonds become ordinary members of the owner's pool: tag
+        # them with the owner level's native parent value so prefer_parent
+        # ranks them exactly like the owner's own bonds.
+        owner_parents = self.stochastic_tracker.parent_map.get(owner_sto_atom_id, [])
+        owner_native_parent = self.stochastic_tracker._stochastic_atom_id_to_gen_id[owner_parents[-1]] if owner_parents else -2
 
         list_of_new_bonds = []
         list_of_bond_idx_to_delete = []
 
         for j, half_bond in enumerate(half_bonds):
             prop_attr_list = half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
-            fired_level_indices = [i for i, attr in enumerate(prop_attr_list) if attr.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id]
-            if prop_attr_list and not fired_level_indices:
-                # Transition edges only at OTHER levels (-1 continuations for
-                # trigger_global_transitions, or a level a later call must be
-                # able to fire): leave the bond untouched in this bucket.
-                # Sweeping it into the delete/convert below handed those
-                # continuations a mode-less copy and silently truncated them.
+            # A forced exit at the fired level is neither converted nor dropped: it stays a
+            # transition mode on the transferred copy and fires at its own instance's finalization.
+            fired_level_indices = [i for i, attr in enumerate(prop_attr_list) if _transition_competes_at(attr, sto_gen_id)]
+            if not fired_level_indices:
+                # No transition edge at the fired level: leave the bond
+                # untouched in its bucket. Other levels' continuations (-1
+                # arms for trigger_global_transitions, levels a later call
+                # must fire) would be silently truncated by a mode-less copy,
+                # and termination-only bonds (e.g. outer-declared side-port
+                # caps) must keep their custody for the terminated-descendant
+                # scan — a stripped duplicate of them in an ancestor bucket
+                # masked that bucket's real growth bonds via prefer_parent
+                # and stalled the molecule before its terminators fired.
                 continue
 
             # Shallow copy: all three mode maps are rebound below, the other
@@ -1659,36 +2090,54 @@ class _PartialAtomGraph:
             new_stochastic_bond._mode_target_map = {}
             new_stochastic_bond._mode_target_molar_amounts_map = {}
 
-            if fired_level_indices:
-                list_of_bond_idx_to_delete.append(j)
-                if half_bond.gen_hierarchy == transition_bond.gen_hierarchy and half_bond not in non_used_half_bonds:
-                    bond_attr_list = copy.deepcopy([prop_attr_list[i] for i in fired_level_indices])
-                    for bond_attr in bond_attr_list:
-                        bond_attr[_PROPAGATION_NAME] = bond_attr[_TRANSITION_NAME]
-                        bond_attr[_TRANSITION_NAME] = 0
-                    new_stochastic_bond._mode_attr_map[_PROPAGATION_NAME] = bond_attr_list
-                    new_stochastic_bond._mode_target_map[_PROPAGATION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in fired_level_indices]
-                    new_stochastic_bond._mode_target_molar_amounts_map[_PROPAGATION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in fired_level_indices]
-                    retained_indices = [i for i in range(len(prop_attr_list)) if i not in fired_level_indices]
-                    if retained_indices:
-                        # A mixed bond also carries other-level transition
-                        # edges: keep them as transition modes on the
-                        # transferred copy so their continuations survive for
-                        # their own level's call.
-                        new_stochastic_bond._mode_attr_map[_TRANSITION_NAME] = [prop_attr_list[i] for i in retained_indices]
-                        new_stochastic_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
-                        new_stochastic_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
+            list_of_bond_idx_to_delete.append(j)
+            if half_bond.gen_hierarchy == transition_bond.gen_hierarchy and half_bond not in non_used_half_bonds:
+                bond_attr_list = copy.deepcopy([prop_attr_list[i] for i in fired_level_indices])
+                for bond_attr in bond_attr_list:
+                    bond_attr[_PROPAGATION_NAME] = bond_attr[_TRANSITION_NAME]
+                    bond_attr[_TRANSITION_NAME] = 0
+                new_stochastic_bond._mode_attr_map[_PROPAGATION_NAME] = bond_attr_list
+                new_stochastic_bond._mode_target_map[_PROPAGATION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in fired_level_indices]
+                new_stochastic_bond._mode_target_molar_amounts_map[_PROPAGATION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in fired_level_indices]
+                retained_indices = [i for i in range(len(prop_attr_list)) if i not in fired_level_indices]
+                if retained_indices:
+                    # A mixed bond also carries other-level transition
+                    # edges: keep them as transition modes on the
+                    # transferred copy so their continuations survive for
+                    # their own level's call.
+                    new_stochastic_bond._mode_attr_map[_TRANSITION_NAME] = [prop_attr_list[i] for i in retained_indices]
+                    new_stochastic_bond._mode_target_map[_TRANSITION_NAME] = [half_bond._mode_target_map[_TRANSITION_NAME][i] for i in retained_indices]
+                    new_stochastic_bond._mode_target_molar_amounts_map[_TRANSITION_NAME] = [half_bond._mode_target_molar_amounts_map[_TRANSITION_NAME][i] for i in retained_indices]
+                if half_bond.has_mode_bonds(_TERMINATION_NAME):
+                    # Termination modes ride along with the converted copy, as
+                    # in promote_level_transitions: the copy holds the same
+                    # valence slot under the owner's custody, so a site the
+                    # owner never grows is capped by its declared terminators
+                    # instead of finalizing bare. The owner's own average-cap
+                    # estimate reads the same bucket and level stamp that its
+                    # terminate pass fires, so the moved cap stays priced.
+                    new_stochastic_bond._mode_attr_map[_TERMINATION_NAME] = list(half_bond._mode_attr_map[_TERMINATION_NAME])
+                    new_stochastic_bond._mode_target_map[_TERMINATION_NAME] = list(half_bond._mode_target_map[_TERMINATION_NAME])
+                    new_stochastic_bond._mode_target_molar_amounts_map[_TERMINATION_NAME] = list(half_bond._mode_target_molar_amounts_map[_TERMINATION_NAME])
 
-            new_stochastic_bond.parent = parent_list[len(parent_list)-1] if parent_list else -2
+            if not new_stochastic_bond.has_any_bonds():
+                # Hierarchy-filtered or non-used old-SO bonds are retired
+                # whole: the fired-level edges are deliberately dropped with
+                # the source entry, and (as on main) any termination modes or
+                # other levels' transition edges they carried die with them —
+                # the mode-less copy serves no consumer and would pollute the
+                # owner bucket.
+                continue
+            new_stochastic_bond.parent = owner_native_parent
             list_of_new_bonds.append(new_stochastic_bond)
 
         self._open_half_bond_map[sto_atom_id] = [bond for j, bond in enumerate(half_bonds) if j not in list_of_bond_idx_to_delete]
 
         for bond in list_of_new_bonds:
             try:
-                self._open_half_bond_map[new_sto_atom_id] += [bond]
+                self._open_half_bond_map[owner_sto_atom_id] += [bond]
             except KeyError:
-                self._open_half_bond_map[new_sto_atom_id] = [bond]
+                self._open_half_bond_map[owner_sto_atom_id] = [bond]
 
         other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, selected_target_idx, self.stochastic_tracker, new_sto_atom_id, rng)
 
@@ -1707,7 +2156,7 @@ class _PartialAtomGraph:
             # Find a transition bond
             stochastic_idx = []
             propagation_weight = []
-            for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds)):
+            for i, half_bond in zip(*self.get_open_half_bonds(sto_atom_id, prefer_parent=prefer_parent_bonds), strict=False):
                 if half_bond.propagation_suitable:
                     # TODO carefully check if stochastic bonds have the right weight here!
                     propagation_weight += [half_bond.weight]
@@ -1734,11 +2183,10 @@ class _PartialAtomGraph:
             raise IncompleteStochasticGeneration(self)
 
         target_attr, target_idx, all_target_molar_amounts = stochastic_bond.get_mode_bonds(_PROPAGATION_NAME)
-        target_weights = np.asarray([attr[_PROPAGATION_NAME] for attr in target_attr])
         gen_sto_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
-        target_molar_amounts = [molar_amount[gen_sto_id] for molar_amount in all_target_molar_amounts]
-        molar_amounts = np.asarray(target_molar_amounts)
-        target_weights *= molar_amounts
+        # The level's repeat units compete by weight times molar amount, and a target
+        # inside a nested repeat unit competes on, level by level.
+        target_weights = _level_target_weights(self.generative_graph, target_idx, [attr[_PROPAGATION_NAME] for attr in target_attr], all_target_molar_amounts, gen_sto_id)
         target_id = self.stochastic_tracker.choose(
             rng,
             len(target_idx),
@@ -1822,6 +2270,91 @@ class _PartialAtomGraph:
             self.add_unit_to_sequence(last_unit)
             self.nested_transition(new_sto_atom_id, rng)
 
+    def fire_forced_exits(self, sto_atom_id, rng):
+        """Fire every forced exit the finalized instance ``sto_atom_id`` owes; return how many.
+
+        A forced exit (``transition_role`` FORCED_EXIT) is the literal text that follows a
+        nested stochastic object inside a unit, or a sibling object joined to it directly:
+        chemistry of the enclosing unit that must not depend on a later draw. It fires here,
+        after the instance's own end groups and before its remaining sites are capped or
+        promoted, whether or not the owner has parked. An exit that also leaves an enclosing
+        object (the nested object ends that object's repeat unit) is owed by the outermost
+        object it leaves and fires at that object's finalization; until then it rides with
+        its site. The custody set is the instance's bucket plus its terminated descendants'
+        buckets, as terminate_graph scans it; bonds fire in bucket order so a seeded run
+        stays reproducible.
+        """
+        fired = 0
+        gen_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+        for bucket_id in self._custody_bucket_ids(sto_atom_id):
+            for half_bond in list(self._open_half_bond_map.get(bucket_id, [])):
+                if any(_forced_exit_owner(self.generative_graph, half_bond, attr) == gen_id for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])):
+                    self._fire_forced_exit(bucket_id, half_bond, sto_atom_id, rng)
+                    fired += 1
+        return fired
+
+    def _fire_forced_exit(self, bucket_id, half_bond, sto_atom_id, rng):
+        all_attr, all_idx, all_molar = half_bond.get_mode_bonds(_TRANSITION_NAME)
+        gen_id = self.stochastic_tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+        indices = [i for i, attr in enumerate(all_attr) if _forced_exit_owner(self.generative_graph, half_bond, attr) == gen_id]
+        # Several targets means a join into an object with several units: the
+        # first unit is drawn like every other transition target, level by level
+        # from the joined object (the one just below the exit's stamp), by weight
+        # times molar amount (a unit declared with amount 0 is never entered). A
+        # literal tail has one target.
+        stamp = all_attr[indices[0]][_EDGE_STOCHASTIC_ID_NAME]
+        trees = [list(self.generative_graph.nodes[all_idx[i]]["stochastic_id_tree"]) for i in indices]
+        joined = {stamp if tree[0] == stamp else tree[tree.index(stamp) - 1] for tree in trees}
+        if len(joined) == 1:
+            weights = _level_target_weights(self.generative_graph, [all_idx[i] for i in indices], [all_attr[i][_TRANSITION_NAME] for i in indices], [all_molar[i] for i in indices], joined.pop())
+        else:
+            weights = np.asarray([all_attr[i][_TRANSITION_NAME] * all_molar[i][tree[0]] for i, tree in zip(indices, trees, strict=True)], dtype=float)
+        if len(indices) == 1 and weights[0] > 0:
+            chosen = indices[0]
+        else:
+            chosen = indices[self.stochastic_tracker.choose(rng, len(indices), weights, "forced exit target selection")]
+        target_idx = all_idx[chosen]
+        selected_attr = self.gen_edge_attr_to_bond_attr(all_attr[chosen])
+        tracker = self.stochastic_tracker
+        target_tree = self.generative_graph.nodes[target_idx]["stochastic_id_tree"]
+        target_gen_id = target_tree[0]
+
+        # The instance that receives the fragment and its mass. A literal tail belongs to
+        # the finalized instance's own ancestor at the target's level, parked or not, taken
+        # from its recorded parent chain. A join into a sibling object registers that
+        # object's instance now, at the first object's finalization, under the ancestors the
+        # two share: an instance is created by the fire that attaches its first unit. When
+        # the joined object's repeat unit begins with a nested object, the target atom sits
+        # deeper, and every level between the shared ancestors and it is registered,
+        # outermost first.
+        target_sto_atom_id = None
+        parent_list = tracker.parent_map.get(sto_atom_id, [])
+        for ancestor in reversed(parent_list):
+            if tracker._stochastic_atom_id_to_gen_id[ancestor] == target_gen_id and not tracker.is_terminated(ancestor):
+                target_sto_atom_id = ancestor
+                break
+        if target_sto_atom_id is None:
+            chain = [ancestor for ancestor in parent_list if tracker._stochastic_atom_id_to_gen_id[ancestor] in target_tree]
+            shared_gen_ids = {tracker._stochastic_atom_id_to_gen_id[ancestor] for ancestor in chain}
+            for gen_id in [gen_id for gen_id in reversed(target_tree) if gen_id >= 0 and gen_id not in shared_gen_ids]:
+                parent_expected_molw = tracker._sto_atom_id_expected_molw.get(chain[-1]) if chain else None
+                new_sto_atom_id = tracker.register_new_atom_instance(gen_id, sto_atom_id, parent_expected_molw, False)
+                if chain:
+                    tracker.parent_map[new_sto_atom_id] = list(chain)
+                chain.append(new_sto_atom_id)
+            target_sto_atom_id = chain[-1]
+        if _DECISION_TRACE is not None:
+            _DECISION_TRACE.append({"kind": "forced_exit", "id": sto_atom_id, "bucket": bucket_id, "target": target_sto_atom_id, "target_gen": target_gen_id})
+
+        self._open_half_bond_map[bucket_id].remove(half_bond)
+        other_graph = _PartialAtomGraph(self.generative_graph, self.static_graph, target_idx, tracker, target_sto_atom_id, rng)
+        other_target_idx = other_graph.pop_target_open_half_bond(target_sto_atom_id, target_idx)
+        pre_merge_watermark = self._atom_id
+        self.merge(other_graph, half_bond, other_target_idx, selected_attr)
+        last_unit = self.add_new_unit_and_bond(pre_merge_watermark)
+        self.add_unit_to_sequence(last_unit)
+        self.nested_transition(target_sto_atom_id, rng)
+
     def add_new_unit_and_bond(self, pre_merge_watermark):
         # `pre_merge_watermark` is self._atom_id captured BEFORE the most recent
         # merge: merge() relabels incoming nodes to ids >= that watermark, so the
@@ -1865,6 +2398,30 @@ class _PartialAtomGraph:
         else:
             return None
 
+    def _add_sequence_connection_stub(self, unit, anchor, far_side):
+        """Create a neutral, non-aromatic dummy with far-side provenance.
+
+        The realized junction bond order is preserved, but its aromatic flag is
+        not: a stub is a non-ring dummy, and an aromatic bond to it cannot be
+        kekulized (AtomKekulizeException, 'non-ring atom marked aromatic').
+        """
+        source_data = self.atom_graph.nodes[far_side]
+        stub_data = {
+            "origin_idx": deepcopy(source_data["origin_idx"]),
+            "atomic_num": 0,
+            _AROMATIC_NAME: False,
+            "charge": 0,
+            "num_explicit_h": -1,
+            _CONNECTOR_PLACEHOLDER_NAME: False,
+            "connection": self.current_connection,
+        }
+        stub = "C" + str(self.current_connection)
+        stub_edge = deepcopy(self.atom_graph.edges[anchor, far_side])
+        stub_edge[_AROMATIC_NAME] = False
+        unit.add_node(stub, **stub_data)
+        unit.add_edge(anchor, stub, **stub_edge)
+        self.current_connection += 1
+
     def add_unit_to_sequence(self, last_unit):
         added_unit = deepcopy(last_unit)
         if added_unit is None:
@@ -1878,15 +2435,7 @@ class _PartialAtomGraph:
             initiator = self.sequence[0][0]
             for u, v in self.atom_graph.edges():
                 if ((u, v) not in added_unit.edges()) and (v in added_unit.nodes()):
-                    initiator.add_node("C" + str(self.current_connection))
-                    initiator.add_edge(u, "C" + str(self.current_connection))
-                    for attribute in self.atom_graph.edges[(u, v)]:
-                        initiator.edges[(u, "C" + str(self.current_connection))][attribute] = self.atom_graph.edges[(u, v)][attribute]
-                    for attribute in self.atom_graph.nodes[v]:
-                        initiator.nodes["C" + str(self.current_connection)][attribute] = self.atom_graph.nodes[v][attribute]
-                    initiator.nodes["C" + str(self.current_connection)]["atomic_num"] = 0
-                    initiator.nodes["C" + str(self.current_connection)]["connection"] = self.current_connection
-                    self.current_connection += 1
+                    self._add_sequence_connection_stub(initiator, u, v)
             return
 
         connection = None
@@ -1909,15 +2458,7 @@ class _PartialAtomGraph:
                                 self.terminal_units.append(added_unit)
                                 self.sequence[sequence_idx].append(added_unit)
                             else:
-                                unit.add_node("C" + str(self.current_connection))
-                                unit.add_edge(u, "C" + str(self.current_connection))
-                                for attribute in self.atom_graph.edges[(u, v)]:
-                                    unit.edges[(u, "C" + str(self.current_connection))][attribute] = self.atom_graph.edges[(u, v)][attribute]
-                                for attribute in self.atom_graph.nodes[v]:
-                                    unit.nodes["C" + str(self.current_connection)][attribute] = self.atom_graph.nodes[v][attribute]
-                                unit.nodes["C" + str(self.current_connection)]["atomic_num"] = 0
-                                unit.nodes["C" + str(self.current_connection)]["connection"] = self.current_connection
-                                self.current_connection += 1
+                                self._add_sequence_connection_stub(unit, u, v)
                                 self.terminal_units.append(added_unit)
                                 self.sequence.append([added_unit])
                             break
@@ -1930,48 +2471,105 @@ class _PartialAtomGraph:
 
 
 class EnsembleCreator:
+    """Generate molecules from a graph with explicit connector placeholders.
+
+    User wildcard atoms remain valid for parsing and graph export, but raise
+    UnsupportedWildcardGeneration here, before any sampling. Legacy graphs
+    containing unmarked zero-number nodes must be rebuilt from their input
+    strings or explicitly migrated with mark_legacy_connector_placeholders;
+    model-generated graphs must supply explicit flags in their
+    producer. Placeholder identity cannot be recovered from topology.
+    Python and NumPy boolean flags are accepted; NumPy flags are normalized
+    to Python booleans in the creator's copy without changing the input graph,
+    and a flag omitted on a real atom is filled in as False there.
+    """
 
     def __init__(self, generative_graph):
 
         self._generative_graph = generative_graph.copy()
+        wildcard_nodes = []
+        placeholder_nodes = []
+        for node, data in self._generative_graph.nodes(data=True):
+            atomic_num = data["atomic_num"] = _atomic_number(node, data)
+            # The copy carries the flag on every node: a legacy graph that omits
+            # it on a real atom means False, so unit subgraphs stay uniform.
+            placeholder = _connector_placeholder_flag(node, data)
+            data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+            # Derived export annotations are re-derived at export; a template
+            # restored from a JSON file must not carry them into the copy.
+            for field in _DERIVED_NODE_FIELDS:
+                data.pop(field, None)
+            if atomic_num < 0:
+                # Negative numbers label non-atom graph objects (descriptors); the
+                # sampler would otherwise fail deep inside RDKit atom construction.
+                raise IncompatibleGenerativeGraphSchema(
+                    "atomic_num",
+                    "nodes",
+                    node_id=node,
+                    reason="invalid",
+                    detail=(
+                        f"Expected a non-negative integer; received {atomic_num!r}. Negative values label non-atom "
+                        "graph objects such as bond descriptors: build the graph with include_bond_connectors=False."
+                    ),
+                )
+            if placeholder:
+                placeholder_nodes.append(node)
+            elif atomic_num == 0:
+                wildcard_nodes.append(node)
+
+        if wildcard_nodes:
+            node = wildcard_nodes[0]
+            # Unit labels can be derived for ML graphs too; source text is
+            # optional parser provenance. Preserve the node diagnostic even
+            # when malformed graph data prevents label derivation.
+            unit_id = None
+            unit_text = None
+            try:
+                labels = derive_unit_labels(self._generative_graph)
+            except (KeyError, TypeError, ValueError, AttributeError, nx.NetworkXException):
+                labels = None
+            if labels is not None:
+                unit_id = labels.unit_id.get(node)
+                unit_text = _verified_unit_texts(self._generative_graph, labels).get(unit_id)
+            raise UnsupportedWildcardGeneration(node, unit_id, unit_text)
 
         # Sampling filters every non-static decision by the per-edge stochastic id;
         # a graph built against the older schema (per-edge 'hierarchy') would not
         # error but silently generate truncated, end-group-less molecules.
-        for _u, _v, edge_data in self._generative_graph.edges(data=True):
+        for u, v, edge_data in self._generative_graph.edges(data=True):
             if _EDGE_STOCHASTIC_ID_NAME not in edge_data:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
+            # Sampling decides forced fires by the transition role; a graph written before the
+            # field existed, or one that contradicts its own weights and stamps, is refused.
+            _check_transition_role((u, v), edge_data)
 
         self._static_graph = self._create_static_graph(self.generative_graph)
-        self._static_proof_supported = all(
-            u == v or self._static_graph.has_edge(v, u)
-            for u, v in self._static_graph.edges()
-        )
+        # A placeholder is one half of a split atom. Its sole static neighbor
+        # must be real, so contraction always has an anchor in every output mode.
+        for node in placeholder_nodes:
+            neighbors = _static_neighbors(self._static_graph, node)
+            static_degree = len(neighbors)
+            if static_degree != 1:
+                detail = f"A connector placeholder must have exactly one static neighbor, its split atom; found {static_degree}."
+            else:
+                anchor = next(iter(neighbors))
+                if self._generative_graph.nodes[anchor]["atomic_num"] > 0:
+                    continue
+                detail = f"A connector placeholder's static neighbor must be a real atom; node {anchor!r} is another placeholder."
+            raise IncompatibleGenerativeGraphSchema(_CONNECTOR_PLACEHOLDER_NAME, "nodes", node_id=node, reason="invalid", detail=detail)
+        self._static_proof_supported = all(u == v or self._static_graph.has_edge(v, u) for u, v in self._static_graph.edges())
 
         # The static partition: a unit is one static-connected component.
-        static_components = tuple(
-            frozenset(component)
-            for component in nx.connected_components(
-                self._static_graph.to_undirected(as_view=True)
-            )
-        )
+        static_components = tuple(frozenset(component) for component in nx.connected_components(self._static_graph.to_undirected(as_view=True)))
         self._static_components = static_components
-        self._node_to_static_component = {
-            node: component_id
-            for component_id, component in enumerate(static_components)
-            for node in component
-        }
-        self._statically_empty_nested_mw_sto_gen_ids = (
-            self._find_statically_empty_nested_mw_sto_gen_ids()
-        )
+        self._node_to_static_component = {node: component_id for component_id, component in enumerate(static_components) for node in component}
+        self._statically_empty_nested_mw_sto_gen_ids = self._find_statically_empty_nested_mw_sto_gen_ids()
         if self._static_proof_supported:
             (
                 self._provably_dead_construction_states,
                 self._provably_immediate_zero_components,
             ) = self._find_provably_dead_construction_states()
-            self._provably_zero_termination_states = (
-                self._find_provably_zero_termination_states()
-            )
+            self._provably_zero_termination_states = self._find_provably_zero_termination_states()
         else:
             self._provably_dead_construction_states = frozenset()
             self._provably_immediate_zero_components = frozenset()
@@ -1999,12 +2597,8 @@ class EnsembleCreator:
         # Both weight vectors are immutable after this point, so whether the
         # automatic source draw branches is a per-mode constant.
         self._automatic_source_is_conditional = {
-            False: np.count_nonzero(
-                np.asarray(self._starting_node_weight) > 0.0
-            ) > 1,
-            True: np.count_nonzero(
-                np.asarray(self._repeat_unit_starting_node_weight) > 0.0
-            ) > 1,
+            False: np.count_nonzero(np.asarray(self._starting_node_weight) > 0.0) > 1,
+            True: np.count_nonzero(np.asarray(self._repeat_unit_starting_node_weight) > 0.0) > 1,
         }
 
     def _find_statically_empty_nested_mw_sto_gen_ids(self):
@@ -2020,20 +2614,14 @@ class EnsembleCreator:
         """
         try:
             first_node = next(iter(self._generative_graph.nodes))
-            serial_vectors = tuple(
-                self._generative_graph.nodes[first_node][
-                    "molecular_weight_distribution"
-                ]
-            )
+            serial_vectors = tuple(self._generative_graph.nodes[first_node]["molecular_weight_distribution"])
         except (StopIteration, KeyError, TypeError):
             return frozenset()
 
         bounds = {}
         for sto_gen_id, serial_vector in enumerate(serial_vectors):
             try:
-                distribution = StochasticDistribution.from_serial_vector(
-                    list(serial_vector)
-                )
+                distribution = StochasticDistribution.from_serial_vector(list(serial_vector))
                 frozen = distribution._distribution
                 parameters = getattr(frozen, "kwds", {})
                 scale = parameters.get("scale")
@@ -2083,11 +2671,7 @@ class EnsembleCreator:
                 continue
             child_lower = max(child_bounds[0], 1.0)
             parent_upper = parent_bounds[1]
-            if (
-                np.isfinite(child_lower)
-                and np.isfinite(parent_upper)
-                and child_lower > parent_upper
-            ):
+            if np.isfinite(child_lower) and np.isfinite(parent_upper) and child_lower > parent_upper:
                 empty_ids.add(child)
 
         return frozenset(empty_ids)
@@ -2105,10 +2689,7 @@ class EnsembleCreator:
         Malformed data and unseeded cycles remain unknown (not dead).
         """
         graph = self._generative_graph
-        groups_by_component = {
-            component_id: []
-            for component_id in range(len(self._static_components))
-        }
+        groups_by_component = {component_id: [] for component_id in range(len(self._static_components))}
         immediate_zero_components = set()
         seed_dead_states = set()
 
@@ -2128,12 +2709,7 @@ class EnsembleCreator:
                         target_tree = graph.nodes[target]["stochastic_id_tree"]
                         target_sto_id = target_tree[0]
                         is_special = (
-                            not data["static"]
-                            and transition_weight > 0
-                            and source_sto_id in target_tree[1:]
-                            and data.get(_EDGE_STOCHASTIC_ID_NAME)
-                            == target_sto_id
-                            and target_sto_id != -1
+                            not data["static"] and transition_weight > 0 and source_sto_id in target_tree[1:] and data.get(_EDGE_STOCHASTIC_ID_NAME) == target_sto_id and target_sto_id != -1
                         )
                     except (KeyError, IndexError, TypeError, ValueError):
                         continue
@@ -2142,12 +2718,8 @@ class EnsembleCreator:
                         continue
                     group_found = True
                     try:
-                        molar_amount = graph.nodes[target][
-                            "unit_molar_amounts"
-                        ][target_sto_id]
-                        effective_weight = float(
-                            transition_weight * molar_amount
-                        )
+                        molar_amount = graph.nodes[target]["unit_molar_amounts"][target_sto_id]
+                        effective_weight = float(transition_weight * molar_amount)
                         target_component = self._node_to_static_component[target]
                     except (KeyError, IndexError, TypeError, ValueError):
                         group_unknown = True
@@ -2158,10 +2730,7 @@ class EnsembleCreator:
                     elif effective_weight > 0:
                         target_state = (target_component, target)
                         targets.append(target_state)
-                        if (
-                            target_sto_id
-                            in self._statically_empty_nested_mw_sto_gen_ids
-                        ):
+                        if target_sto_id in self._statically_empty_nested_mw_sto_gen_ids:
                             # Instantiating this nested object dies at its
                             # truncated MW draw before any construction, so
                             # the entered state is dead a priori.
@@ -2175,11 +2744,7 @@ class EnsembleCreator:
                             followable = gen_weight > 0
                     except (KeyError, TypeError, ValueError):
                         pass
-                    group = (
-                        None
-                        if group_unknown
-                        else (node, followable, tuple(targets))
-                    )
+                    group = None if group_unknown else (node, followable, tuple(targets))
                     groups_by_component[component_id].append(group)
                     if group is not None and not targets:
                         immediate_zero_components.add(component_id)
@@ -2202,11 +2767,7 @@ class EnsembleCreator:
                             dead_states.add(state)
                             changed = True
                             break
-                        if (
-                            followable is True
-                            and source_node != consumed_node
-                            and all(target in dead_states for target in targets)
-                        ):
+                        if followable is True and source_node != consumed_node and all(target in dead_states for target in targets):
                             dead_states.add(state)
                             changed = True
                             break
@@ -2252,12 +2813,7 @@ class EnsembleCreator:
                     except (KeyError, TypeError, ValueError):
                         malformed = True
                         break
-                    if (
-                        not np.isfinite(transition_weight)
-                        or transition_weight < 0
-                        or not np.isfinite(termination_weight)
-                        or termination_weight < 0
-                    ):
+                    if not np.isfinite(transition_weight) or transition_weight < 0 or not np.isfinite(termination_weight) or termination_weight < 0:
                         malformed = True
                         break
                     if transition_weight > 0:
@@ -2270,12 +2826,8 @@ class EnsembleCreator:
                         malformed = True
                         break
                     try:
-                        molar_amount = graph.nodes[target][
-                            "unit_molar_amounts"
-                        ][level]
-                        effective_weight = float(
-                            termination_weight * molar_amount
-                        )
+                        molar_amount = graph.nodes[target]["unit_molar_amounts"][level]
+                        effective_weight = float(termination_weight * molar_amount)
                     except (KeyError, IndexError, TypeError, ValueError):
                         unknown_levels.add(level)
                         continue
@@ -2288,18 +2840,11 @@ class EnsembleCreator:
                     continue
 
                 for level, effective_weights in groups.items():
-                    if (
-                        level in unknown_levels
-                        or any(
-                            weight > 0 for weight in effective_weights
-                        )
-                    ):
+                    if level in unknown_levels or any(weight > 0 for weight in effective_weights):
                         continue
                     for consumed_node in (None, *component):
                         if consumed_node != node:
-                            zero_states.add(
-                                (component_id, consumed_node, level)
-                            )
+                            zero_states.add((component_id, consumed_node, level))
 
         return frozenset(zero_states)
 
@@ -2307,25 +2852,19 @@ class EnsembleCreator:
         """Known zero-support failure after attaching ``target``, or None."""
         try:
             component_id = self._node_to_static_component[target]
-            sto_gen_id = self._generative_graph.nodes[target][
-                "stochastic_id_tree"
-            ][0]
+            sto_gen_id = self._generative_graph.nodes[target]["stochastic_id_tree"][0]
         except (KeyError, IndexError, TypeError):
             return None
         if not isinstance(sto_gen_id, (int, np.integer)) or sto_gen_id < 0:
             return None
-        return (
-            (component_id, target)
-            in self._provably_dead_construction_states
-            or (
-                component_id,
-                target,
-                sto_gen_id,
-            ) in getattr(
-                self,
-                "_provably_zero_termination_states",
-                frozenset(),
-            )
+        return (component_id, target) in self._provably_dead_construction_states or (
+            component_id,
+            target,
+            sto_gen_id,
+        ) in getattr(
+            self,
+            "_provably_zero_termination_states",
+            frozenset(),
         )
 
     def _global_source_is_provably_dead(self, component):
@@ -2356,11 +2895,7 @@ class EnsembleCreator:
                     return False
                 if not np.isfinite(transition_weight) or transition_weight < 0:
                     return False
-                if (
-                    not data.get("static", False)
-                    and transition_weight > 0
-                    and data.get(_EDGE_STOCHASTIC_ID_NAME) == -1
-                ):
+                if not data.get("static", False) and transition_weight > 0 and data.get(_EDGE_STOCHASTIC_ID_NAME) == -1:
                     global_edges.append((target, transition_weight))
 
             if not global_edges:
@@ -2370,28 +2905,17 @@ class EnsembleCreator:
             group_has_non_dead_target = False
             for target, transition_weight in global_edges:
                 try:
-                    target_sto_gen_id = graph.nodes[target][
-                        "stochastic_id_tree"
-                    ][0]
-                    if (
-                        not isinstance(target_sto_gen_id, (int, np.integer))
-                        or target_sto_gen_id < 0
-                    ):
+                    target_sto_gen_id = graph.nodes[target]["stochastic_id_tree"][0]
+                    if not isinstance(target_sto_gen_id, (int, np.integer)) or target_sto_gen_id < 0:
                         return False
-                    molar_amount = graph.nodes[target][
-                        "unit_molar_amounts"
-                    ][target_sto_gen_id]
-                    effective_weight = float(
-                        transition_weight * molar_amount
-                    )
+                    molar_amount = graph.nodes[target]["unit_molar_amounts"][target_sto_gen_id]
+                    effective_weight = float(transition_weight * molar_amount)
                 except (KeyError, IndexError, TypeError, ValueError):
                     return False
                 if not np.isfinite(effective_weight) or effective_weight < 0:
                     return False
                 if effective_weight > 0:
-                    target_is_dead = self._attached_target_is_provably_dead(
-                        target
-                    )
+                    target_is_dead = self._attached_target_is_provably_dead(target)
                     if target_is_dead is None:
                         return False
                     if not target_is_dead:
@@ -2460,11 +2984,7 @@ class EnsembleCreator:
                     return False
                 if not np.isfinite(transition_weight) or transition_weight < 0:
                     return False
-                if (
-                    not data.get("static", False)
-                    and transition_weight > 0
-                    and data.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id
-                ):
+                if not data.get("static", False) and transition_weight > 0 and data.get(_EDGE_STOCHASTIC_ID_NAME) == sto_gen_id:
                     level_edges.append((target, data))
             if level_edges:
                 eligible.append((node, level_edges))
@@ -2492,11 +3012,7 @@ class EnsembleCreator:
                 return False
             hierarchy_by_node[node] = hierarchy
         max_hierarchy = max(hierarchy_by_node.values())
-        eligible = [
-            (node, edges)
-            for node, edges in eligible
-            if hierarchy_by_node[node] == max_hierarchy
-        ]
+        eligible = [(node, edges) for node, edges in eligible if hierarchy_by_node[node] == max_hierarchy]
 
         for node, edges in eligible:
             try:
@@ -2518,33 +3034,20 @@ class EnsembleCreator:
             route_has_non_dead_target = False
             for target, data in edges:
                 try:
-                    effective_weight = float(
-                        data[_TRANSITION_NAME]
-                        * graph.nodes[target]["unit_molar_amounts"][sto_gen_id]
-                    )
-                    target_sto_gen_id = graph.nodes[target][
-                        "stochastic_id_tree"
-                    ][0]
+                    effective_weight = float(data[_TRANSITION_NAME] * graph.nodes[target]["unit_molar_amounts"][sto_gen_id])
+                    target_sto_gen_id = graph.nodes[target]["stochastic_id_tree"][0]
                 except (KeyError, IndexError, TypeError, ValueError):
                     return False
                 if not np.isfinite(effective_weight) or effective_weight < 0:
                     return False
                 if effective_weight <= 0:
                     continue
-                if (
-                    target_sto_gen_id == sto_gen_id
-                    and (
-                        source_expansion_is_dead
-                        or source_termination_is_dead
-                    )
-                ):
+                if target_sto_gen_id == sto_gen_id and (source_expansion_is_dead or source_termination_is_dead):
                     continue
                 target_is_dead = self._attached_target_is_provably_dead(target)
                 if target_is_dead is None:
                     return False
-                if (
-                    not target_is_dead
-                ):
+                if not target_is_dead:
                     route_has_non_dead_target = True
 
             if route_has_non_dead_target:
@@ -2568,10 +3071,7 @@ class EnsembleCreator:
             if probability > 0:
                 reachable_sources.append(source)
 
-        return bool(reachable_sources) and all(
-            self._source_is_provably_dead(source)
-            for source in reachable_sources
-        )
+        return bool(reachable_sources) and all(self._source_is_provably_dead(source) for source in reachable_sources)
 
     @staticmethod
     def _create_init_weights(graph):
@@ -2759,14 +3259,8 @@ class EnsembleCreator:
         source_is_conditional = False
         zero_support_is_unavoidable = False
         if automatic_source:
-            zero_support_is_unavoidable = (
-                self._automatic_zero_support_is_unavoidable[
-                    bool(use_repeat_units_as_source)
-                ]
-            )
-            source_is_conditional = self._automatic_source_is_conditional[
-                bool(use_repeat_units_as_source)
-            ]
+            zero_support_is_unavoidable = self._automatic_zero_support_is_unavoidable[bool(use_repeat_units_as_source)]
+            source_is_conditional = self._automatic_source_is_conditional[bool(use_repeat_units_as_source)]
             source = self._get_random_start_node(rng, use_repeat_units_as_source)
 
         # The generative_graph property copies the whole template graph on every access:
@@ -2846,7 +3340,6 @@ class EnsembleCreator:
         checkpoints = {}
         owner_epochs = {}
         forced_overshoot_no_boundary = set()
-        deferred_continuation = None
         mutations = 0
 
         def _commit_mutation():
@@ -2857,119 +3350,28 @@ class EnsembleCreator:
             nonlocal mutations
             partial_atom_graph.stochastic_tracker.mark_path_conditional()
             mutations += 1
+
         pending_termination = set()
         max_step_gain = {}
         gain_floor = {}
         last_checked_proj = {}
-        own_termination_cache = {}
         avg_termination_cache = {}
 
-        def _live_forest_children(tracker, live_ids, live_set, sto_atom_id):
-            """Live descendants of sto_atom_id with no live instance strictly
-            between: their subtree's future mass reaches sto_atom_id exactly
-            once (a live intermediate's remainder already contains its own
-            subtree's)."""
-            children = []
-            for candidate in live_ids:
-                if candidate == sto_atom_id:
-                    continue
-                ancestors = tracker.parent_map.get(candidate, [])
-                if sto_atom_id not in ancestors:
-                    continue
-                between = ancestors[ancestors.index(sto_atom_id) + 1:]
-                if all(ancestor not in live_set for ancestor in between):
-                    children.append(candidate)
-            return children
+        def _projected_molw(tracker, sto_atom_id):
+            """Tracked mass of sto_atom_id EXCLUDING its own termination caps
+            (callers add the fresh/cached cap estimate). Consulted for a
+            termination decision only while the instance has no live
+            descendant, so everything its units deliver through forced exits
+            (literal tails, per-unit ports, joined sibling objects) is already
+            realized in ``actual`` and no live descendant exists whose drawn
+            target could be credited. A terminated descendant's realized mass
+            stands as-is: freezing its ``expected - actual`` residual into the
+            ancestor (a previous "settled credit" design) made every level
+            inherit its children's structural overshoot and biased 3-level
+            ensembles +7 %."""
+            return tracker._sto_atom_id_actual_molw[sto_atom_id]
 
-        def _conditional_junction_mw(
-            graph,
-            tracker,
-            live_ids,
-            live_set,
-            sto_atom_id,
-            deferred_junction=None,
-        ):
-            """Net caps that would replace live descendant continuations if
-            ``sto_atom_id`` parked in this exact topology.
-
-            A finalization-boundary snapshot has already terminated its child
-            but has not yet fired the ancestor-level continuation.  Its
-            deferred owner is therefore also a conditional junction even
-            though it is no longer in ``live_ids``.
-            """
-            owners = _live_forest_children(tracker, live_ids, live_set, sto_atom_id)
-            if deferred_junction is not None and deferred_junction[1] == sto_atom_id:
-                owners.append(deferred_junction[0])
-            return sum(
-                graph.get_average_junction_termination_mw(
-                    owner_sto_atom_id,
-                    sto_atom_id,
-                    self._static_graph,
-                    rng,
-                )
-                for owner_sto_atom_id in dict.fromkeys(owners)
-            )
-
-        def _remaining_credit(tracker, sto_atom_id):
-            """Signed correction that makes a live descendant contribute its
-            drawn target, independent of its temporary or rounded actual mass.
-
-            This applies after parking too.  Replacing it with only pending cap
-            mass makes a child's over/under outcome move every ancestor's
-            projection, even though no ancestor-level unit was added.
-            """
-            expected = tracker._sto_atom_id_expected_molw[sto_atom_id]
-            if expected < 0:
-                return 0.0
-            # Keep this remainder SIGNED.  A child temporarily above its target
-            # must reduce its remaining credit by the same amount its actual
-            # mass just added to the ancestor.  Clamping at zero made an
-            # ancestor appear to cross first and consume the child's fresh
-            # rounding boundary, systematically biasing small nested objects.
-            return expected - tracker._sto_atom_id_actual_molw[sto_atom_id]
-
-        def _projected_molw(tracker, live_ids, sto_atom_id):
-            """Projected final tracked mass of sto_atom_id EXCLUDING its own
-            termination caps (callers add the fresh/cached cap estimate).
-
-            Only LIVE descendants contribute their signed target correction.
-            A terminated descendant's realized mass stands as-is: freezing its
-            ``expected - actual`` residual into the ancestor (a previous
-            "settled credit" design) made every level inherit its children's
-            structural overshoot — a sub-unit-target child can only land
-            above its target, and the compounded inheritance biased 3-level
-            ensembles +7% — whereas accounting the realized mass lets the
-            ancestor compensate with its own growth."""
-            live_set = set(live_ids)
-            projected = tracker._sto_atom_id_actual_molw[sto_atom_id]
-            for child in _live_forest_children(tracker, live_ids, live_set, sto_atom_id):
-                projected += _remaining_credit(tracker, child)
-            return projected
-
-        def _total_termination_mw(
-            graph,
-            tracker,
-            live_ids,
-            sto_atom_id,
-            deferred_junction=None,
-        ):
-            live_set = set(live_ids)
-            own_mw = graph.get_average_termination_mw(
-                sto_atom_id,
-                self._static_graph,
-                rng,
-            )
-            conditional_mw = _conditional_junction_mw(
-                graph,
-                tracker,
-                live_ids,
-                live_set,
-                sto_atom_id,
-                deferred_junction,
-            )
-            return own_mw, own_mw + conditional_mw
-
-        def _capture_checkpoint(checkpoint_owner, deferred_junction=None):
+        def _capture_checkpoint(checkpoint_owner):
             """Capture both molecular topology and loop-control state.
 
             Restoring only the graph leaves pending ids and adaptive caches on
@@ -2990,22 +3392,15 @@ class EnsembleCreator:
             )
             return {
                 "graph": copy.deepcopy(partial_atom_graph),
-                "pending": set(pending_termination),
                 "max_step_gain": dict(max_step_gain),
                 "gain_floor": dict(gain_floor),
                 "last_checked_proj": dict(last_checked_proj),
-                "own_termination_cache": dict(own_termination_cache),
                 "avg_termination_cache": dict(avg_termination_cache),
                 "owner_epochs": dict(owner_epochs),
                 "forced_overshoot_no_boundary": set(forced_overshoot_no_boundary),
-                "checkpoints": {
-                    owner: checkpoint
-                    for owner, checkpoint in checkpoints.items()
-                    if owner in compatible_ancestors
-                },
+                "checkpoints": {owner: checkpoint for owner, checkpoint in checkpoints.items() if owner in compatible_ancestors},
                 "owner": checkpoint_owner,
                 "epoch": owner_epochs.get(checkpoint_owner, 0),
-                "deferred_junction": deferred_junction,
             }
 
         def _advance_owner_epoch(sto_atom_id):
@@ -3017,22 +3412,31 @@ class EnsembleCreator:
             """
             owner_epochs[sto_atom_id] = owner_epochs.get(sto_atom_id, 0) + 1
             checkpoint = checkpoints.get(sto_atom_id)
-            if (
-                checkpoint is not None
-                and checkpoint["epoch"] != owner_epochs[sto_atom_id] - 1
-            ):
+            if checkpoint is not None and checkpoint["epoch"] != owner_epochs[sto_atom_id] - 1:
                 checkpoints.pop(sto_atom_id, None)
 
         def _finalize_pending(sto_atom_id):
-            """Fire the parked instance's declared end groups and continue the
-            chain at the nearest live ancestor's level (e.g. the diblock
-            junction at the parent level). If that ancestor is itself parked,
-            the junction must NOT continue: cap it with the ancestor's end
-            groups instead (graft-through chains otherwise grow a decided
-            level forever, one nested instance per continued unit)."""
+            """Fire the parked instance's declared end groups and its forced
+            exits (the enclosing unit's literal text after the object), then
+            hand its remaining continuation sites to the nearest live ancestor as
+            ordinary growth options (the multifunctional initiation principle
+            generalized to every level of the nested tree): the ancestor's
+            next step is one weighted draw over chain continuation and
+            unfired entry ports alike, instead of a deterministic
+            continuation fire. If that ancestor is itself parked, the
+            junction must NOT continue: cap it with the ancestor's end groups
+            instead (graft-through chains otherwise grow a decided level
+            forever, one nested instance per continued unit); an ancestor is
+            only decided once its subtree is quiet, so this is a safety net
+            today. With no live
+            ancestor at all the continuation is inter-object/root and the
+            caller fires it directly."""
             tracker = partial_atom_graph.stochastic_tracker
             partial_atom_graph.terminate_graph(sto_atom_id, rng)
             pending_termination.discard(sto_atom_id)
+            # Literal chemistry of the enclosing unit is delivered now, before the
+            # instance's remaining sites are capped or promoted (see fire_forced_exits).
+            partial_atom_graph.fire_forced_exits(sto_atom_id, rng)
             nearest_live_ancestor = None
             for ancestor in reversed(tracker.parent_map.get(sto_atom_id, [])):
                 if not tracker.is_terminated(ancestor):
@@ -3042,12 +3446,13 @@ class EnsembleCreator:
                 partial_atom_graph.cap_junction_bonds(sto_atom_id, nearest_live_ancestor, rng)
                 return None
             if nearest_live_ancestor is None:
-                continuation_gen_id = tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
-            else:
-                continuation_gen_id = tracker._stochastic_atom_id_to_gen_id[nearest_live_ancestor]
-            # The caller owns the continuation so it can preserve the exact
-            # post-child/pre-continuation boundary used for ancestor rounding.
-            return sto_atom_id, nearest_live_ancestor, continuation_gen_id
+                return sto_atom_id, None, tracker._stochastic_atom_id_to_gen_id[sto_atom_id]
+            partial_atom_graph.promote_level_transitions(
+                sto_atom_id,
+                nearest_live_ancestor,
+                tracker._stochastic_atom_id_to_gen_id[nearest_live_ancestor],
+            )
+            return None
 
         while True:
             tracker = partial_atom_graph.stochastic_tracker
@@ -3065,68 +3470,59 @@ class EnsembleCreator:
             # Finalize parked instances whose subtree finished, deepest first
             # (a child's caps credit its ancestors before those are decided).
             finalized = None
-            if deferred_continuation is None:
-                for sto_atom_id in sorted(pending_termination, key=lambda i: len(parent_map.get(i, [])), reverse=True):
-                    if any(sto_atom_id in parent_map.get(d, []) for d in unterminated_sto_atom_ids):
-                        continue
-                    finalized = sto_atom_id
-                    break
+            for sto_atom_id in sorted(pending_termination, key=lambda i: len(parent_map.get(i, [])), reverse=True):
+                if any(sto_atom_id in parent_map.get(d, []) for d in unterminated_sto_atom_ids):
+                    continue
+                finalized = sto_atom_id
+                break
             if finalized is not None:
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "finalize", "id": finalized,
-                        "gen": tracker._stochastic_atom_id_to_gen_id[finalized],
-                        "expected": tracker._sto_atom_id_expected_molw[finalized],
-                        "actual": tracker._sto_atom_id_actual_molw[finalized],
-                    })
-                # Finish the child's own level, then defer its ancestor-level
-                # continuation for one pass.  The nearest live ancestor must be
-                # tested in the post-child/pre-continuation state: finalization
-                # can expose a structural residual that crosses the ancestor,
-                # while its retained owner checkpoint is still the true state
-                # before the unit which spawned this child.
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "finalize",
+                            "id": finalized,
+                            "gen": tracker._stochastic_atom_id_to_gen_id[finalized],
+                            "expected": tracker._sto_atom_id_expected_molw[finalized],
+                            "actual": tracker._sto_atom_id_actual_molw[finalized],
+                        }
+                    )
+                # Finish the child's own level. A live-ancestor continuation
+                # is promoted into that ancestor's pool inside
+                # _finalize_pending and fires later as an ordinary owner-level
+                # propagation draw; only the inter-object/root case (no live
+                # ancestor) still fires a transition directly here.
                 continuation = _finalize_pending(finalized)
                 checkpoints.pop(finalized, None)
                 if continuation is not None:
-                    owner_sto_atom_id, continuation_level, continuation_gen_id = continuation
-                    if continuation_level is None:
-                        # No live owner can cross; this is an inter-object/root
-                        # continuation, not an owner-level epoch.
-                        _new_sto_atom_id, transition_success = partial_atom_graph.transition_graph(
-                            owner_sto_atom_id,
-                            continuation_gen_id,
-                            rng,
-                        )
-                        if transition_success:
-                            _commit_mutation()
-                    else:
-                        deferred_continuation = continuation
+                    origin_sto_atom_id, _continuation_level, continuation_gen_id = continuation
+                    # No live owner can cross; this is an inter-object/root
+                    # continuation, not an owner-level epoch.
+                    _new_sto_atom_id, transition_success = partial_atom_graph.transition_graph(
+                        origin_sto_atom_id,
+                        continuation_gen_id,
+                        rng,
+                    )
+                    if transition_success:
+                        _commit_mutation()
                 continue
 
             growable = [i for i in unterminated_sto_atom_ids if i not in pending_termination]
             if not growable:
-                # All live instances are parked: the deepest one has no live
-                # descendants, so the next pass finalizes it.
-                continue
+                # The finalize block above always consumes a parked instance
+                # without live descendants (the deepest one has none), so this
+                # state cannot occur; a silent pass here would spin forever.
+                raise RuntimeError("Every live instance is parked and none can be finalized. This is a bug, please report on github.")
 
-            # A deferred child exit belongs to the nearest live ancestor and
-            # must run before any unrelated growth. Otherwise active is the
-            # deepest live non-parked instance (every descendant lists all of
-            # its ancestors, so one pass suffices).
-            if deferred_continuation is not None:
-                active_sto_atom_id = deferred_continuation[1]
-            else:
-                active_sto_atom_id = growable[0]
-                for sto_atom_id in growable:
-                    if sto_atom_id in parent_map:
-                        for ancestor in parent_map[sto_atom_id]:
-                            if active_sto_atom_id == ancestor:
-                                active_sto_atom_id = sto_atom_id
+            # Active is the deepest live non-parked instance (every
+            # descendant lists all of its ancestors, so one pass suffices).
+            active_sto_atom_id = growable[0]
+            for sto_atom_id in growable:
+                if sto_atom_id in parent_map:
+                    for ancestor in parent_map[sto_atom_id]:
+                        if active_sto_atom_id == ancestor:
+                            active_sto_atom_id = sto_atom_id
 
-            if (
-                deferred_continuation is None
-                and len(partial_atom_graph.get_open_half_bonds(active_sto_atom_id)[1]) == 0
-            ):
+            if len(partial_atom_graph.get_open_half_bonds(active_sto_atom_id)[1]) == 0:
                 # A live instance with no open half-bonds can never grow, transition,
                 # or terminate: retire it so the remaining instances and -1 arms
                 # continue instead of truncating the whole molecule. Only a
@@ -3136,18 +3532,22 @@ class EnsembleCreator:
                 # dead-ends below its own drawn target retires silently: the chain
                 # completes on target regardless, and warning here made
                 # create_ensemble discard every chain of such architectures.
-                if (not partial_atom_graph.stochastic_tracker.parent_map.get(active_sto_atom_id)
-                        and partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id] > 0
-                        and partial_atom_graph.stochastic_tracker._sto_atom_id_actual_molw[active_sto_atom_id]
-                        < partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id]):
+                if (
+                    not partial_atom_graph.stochastic_tracker.parent_map.get(active_sto_atom_id)
+                    and partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id] > 0
+                    and partial_atom_graph.stochastic_tracker._sto_atom_id_actual_molw[active_sto_atom_id] < partial_atom_graph.stochastic_tracker._sto_atom_id_expected_molw[active_sto_atom_id]
+                ):
                     warnings.warn(PossibleNonRepresentativePolymerChain(), stacklevel=1)
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "retire", "id": active_sto_atom_id,
-                        "gen": tracker._stochastic_atom_id_to_gen_id[active_sto_atom_id],
-                        "expected": tracker._sto_atom_id_expected_molw[active_sto_atom_id],
-                        "actual": tracker._sto_atom_id_actual_molw[active_sto_atom_id],
-                    })
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "retire",
+                            "id": active_sto_atom_id,
+                            "gen": tracker._stochastic_atom_id_to_gen_id[active_sto_atom_id],
+                            "expected": tracker._sto_atom_id_expected_molw[active_sto_atom_id],
+                            "actual": tracker._sto_atom_id_actual_molw[active_sto_atom_id],
+                        }
+                    )
                 partial_atom_graph.stochastic_tracker.terminate(active_sto_atom_id)
                 checkpoints.pop(active_sto_atom_id, None)
                 continue
@@ -3166,12 +3566,13 @@ class EnsembleCreator:
             # unit-with-arms jump that actually crosses it.
             proj_now = {}
             for sto_atom_id in growable:
-                projected = _projected_molw(
-                    tracker,
-                    unterminated_sto_atom_ids,
-                    sto_atom_id,
-                )
+                projected = _projected_molw(tracker, sto_atom_id)
                 proj_now[sto_atom_id] = projected
+                if any(sto_atom_id in parent_map.get(d, []) for d in unterminated_sto_atom_ids):
+                    # A step is measured only once its subtree is quiet, so a
+                    # recorded gain is the whole unit an instance added, blocks
+                    # and forced tails included, not the pieces as they land.
+                    continue
                 if sto_atom_id in last_checked_proj:
                     step_gain = projected - last_checked_proj[sto_atom_id]
                     max_step_gain[sto_atom_id] = max(step_gain, max_step_gain.get(sto_atom_id, 0.0))
@@ -3179,53 +3580,37 @@ class EnsembleCreator:
                     gain_floor[sto_atom_id] = projected
                 last_checked_proj[sto_atom_id] = projected
 
-            # Resolve the deepest crossing first.  A descendant owns the
-            # mutation boundary for its growth; ancestors see that subtree at
-            # its signed expected-mass credit and therefore cannot legitimately
-            # consume the descendant's checkpoint. The termination-MW estimate is only
-            # recomputed once an instance is plausibly near its target (its
-            # previous estimate serves as the margin; the active instance
+            # An instance decides its termination only while it has no live
+            # descendant: everything its last unit commits to through forced
+            # exits (literal tails, per-unit ports, joined sibling objects) has
+            # then been realized, so the decision compares two realized states
+            # instead of a projection that would need an estimate of what the
+            # subtree still owes. An instance cannot grow while a descendant
+            # is live, so nothing its decision could affect happens meanwhile.
+            # The price is bounded waste: a rollback discards the subtree the
+            # undone unit spawned after it has grown (at most one subtree per
+            # instance, since a rolled-back instance is parked), where an
+            # early projection would have discarded an unborn one. Deciding
+            # earlier would need exactly the estimate this rule removes.
+            # Deepest first among the candidates. The termination-MW estimate
+            # is only recomputed once an instance is plausibly near its target
+            # (its previous estimate serves as the margin; the active instance
             # keeps the exact per-iteration check).
             crossing_sto_atom_id = None
             crossing_projected = None
-            current_deferred_junction = None
-            crossing_candidates = (
-                [deferred_continuation[1]]
-                if deferred_continuation is not None
-                else sorted(
-                    growable,
-                    key=lambda i: len(parent_map.get(i, [])),
-                    reverse=True,
-                )
+            crossing_candidates = sorted(
+                [i for i in growable if not any(i in parent_map.get(d, []) for d in unterminated_sto_atom_ids)],
+                key=lambda i: len(parent_map.get(i, [])),
+                reverse=True,
             )
             for sto_atom_id in crossing_candidates:
                 expected_i = tracker._sto_atom_id_expected_molw[sto_atom_id]
                 if expected_i < 0:
                     continue
                 cached_margin = avg_termination_cache.get(sto_atom_id)
-                if (
-                    sto_atom_id != active_sto_atom_id
-                    and cached_margin is not None
-                    and proj_now[sto_atom_id] + cached_margin < expected_i
-                ):
+                if sto_atom_id != active_sto_atom_id and cached_margin is not None and proj_now[sto_atom_id] + cached_margin < expected_i:
                     continue
-                current_deferred_junction = None
-                if (
-                    deferred_continuation is not None
-                    and deferred_continuation[1] == sto_atom_id
-                ):
-                    current_deferred_junction = (
-                        deferred_continuation[0],
-                        sto_atom_id,
-                    )
-                own_termination_weight, avg_termination_weight = _total_termination_mw(
-                    partial_atom_graph,
-                    tracker,
-                    unterminated_sto_atom_ids,
-                    sto_atom_id,
-                    current_deferred_junction,
-                )
-                own_termination_cache[sto_atom_id] = own_termination_weight
+                avg_termination_weight = partial_atom_graph.get_average_termination_mw(sto_atom_id, self._static_graph, rng)
                 avg_termination_cache[sto_atom_id] = avg_termination_weight
                 if proj_now[sto_atom_id] + avg_termination_weight >= expected_i:
                     crossing_sto_atom_id = sto_atom_id
@@ -3246,41 +3631,18 @@ class EnsembleCreator:
                 snapshot_valid = False
                 projected_under = None
                 checkpoint = checkpoints.get(crossing_sto_atom_id)
-                if (
-                    checkpoint is not None
-                    and checkpoint["epoch"] + 1
-                    == owner_epochs.get(crossing_sto_atom_id, 0)
-                ):
+                if checkpoint is not None and checkpoint["epoch"] + 1 == owner_epochs.get(crossing_sto_atom_id, 0):
                     snapshot_graph = checkpoint["graph"]
                     snapshot_tracker = snapshot_graph.stochastic_tracker
-                    if (
-                        crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw
-                        and not snapshot_tracker.is_terminated(crossing_sto_atom_id)
-                    ):
-                        snapshot_live_ids = snapshot_tracker.get_unterminated_sto_atom_ids()
-                        _under_own_mw, under_caps_molw = _total_termination_mw(
-                            snapshot_graph,
-                            snapshot_tracker,
-                            snapshot_live_ids,
-                            crossing_sto_atom_id,
-                            checkpoint["deferred_junction"],
-                        )
-                        projected_under = (
-                            _projected_molw(
-                                snapshot_tracker,
-                                snapshot_live_ids,
-                                crossing_sto_atom_id,
-                            )
-                            + under_caps_molw
-                        )
+                    if crossing_sto_atom_id in snapshot_tracker._sto_atom_id_actual_molw and not snapshot_tracker.is_terminated(crossing_sto_atom_id):
+                        under_caps_molw = snapshot_graph.get_average_termination_mw(crossing_sto_atom_id, self._static_graph, rng)
+                        projected_under = _projected_molw(snapshot_tracker, crossing_sto_atom_id) + under_caps_molw
                         snapshot_valid = projected_under < expected_molw
                 if termination_flag == 0:
                     adopt_overshoot = True
                 elif not snapshot_valid:
                     owner_epoch = owner_epochs.get(crossing_sto_atom_id, 0)
-                    if termination_flag == 1 and (
-                        owner_epoch == 0 or projected_under is not None
-                    ):
+                    if termination_flag == 1 and (owner_epoch == 0 or projected_under is not None):
                         # The first state (or the immediately preceding owner
                         # boundary) is already at/over target: no undershoot
                         # timeline exists for this instance. A nested residual
@@ -3308,112 +3670,49 @@ class EnsembleCreator:
                         p_over = max(0.0, min(1.0, (expected_molw - projected_under) / span))
                         adopt_overshoot = rng.random() < p_over
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "crossing", "id": crossing_sto_atom_id,
-                        "gen": tracker._stochastic_atom_id_to_gen_id[crossing_sto_atom_id],
-                        "expected": expected_molw, "caps": caps_molw,
-                        "proj_over": crossing_projected, "proj_under": projected_under,
-                        "snapshot_valid": snapshot_valid, "adopt_overshoot": adopt_overshoot,
-                        "flag": termination_flag,
-                    })
-                adopted_deferred_junction = None
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "crossing",
+                            "id": crossing_sto_atom_id,
+                            "gen": tracker._stochastic_atom_id_to_gen_id[crossing_sto_atom_id],
+                            "expected": expected_molw,
+                            "caps": caps_molw,
+                            "proj_over": crossing_projected,
+                            "proj_under": projected_under,
+                            "snapshot_valid": snapshot_valid,
+                            "adopt_overshoot": adopt_overshoot,
+                            "flag": termination_flag,
+                        }
+                    )
                 if not adopt_overshoot:
-                    adopted_deferred_junction = checkpoint["deferred_junction"]
                     partial_atom_graph = checkpoint["graph"]
                     # Deepcopy clones the tracker's generator.  Keep consuming
                     # the caller's already-advanced stream; rewinding it would
                     # replay the rejected over-step and can loop forever.
                     partial_atom_graph.stochastic_tracker._rng = rng
                     partial_atom_graph.stochastic_tracker.mark_path_conditional()
-                    pending_termination = set(checkpoint["pending"])
                     max_step_gain = dict(checkpoint["max_step_gain"])
                     gain_floor = dict(checkpoint["gain_floor"])
                     last_checked_proj = dict(checkpoint["last_checked_proj"])
-                    own_termination_cache = dict(checkpoint["own_termination_cache"])
                     avg_termination_cache = dict(checkpoint["avg_termination_cache"])
                     owner_epochs = dict(checkpoint["owner_epochs"])
-                    forced_overshoot_no_boundary = set(
-                        checkpoint["forced_overshoot_no_boundary"]
-                    )
+                    forced_overshoot_no_boundary = set(checkpoint["forced_overshoot_no_boundary"])
                     restored_tracker = partial_atom_graph.stochastic_tracker
                     restored_live = set(restored_tracker.get_unterminated_sto_atom_ids())
-                    checkpoints = {
-                        owner: prior
-                        for owner, prior in checkpoint["checkpoints"].items()
-                        if (
-                            owner in restored_live
-                            and prior["epoch"] + 1 == owner_epochs.get(owner, 0)
-                        )
-                    }
+                    checkpoints = {owner: prior for owner, prior in checkpoint["checkpoints"].items() if (owner in restored_live and prior["epoch"] + 1 == owner_epochs.get(owner, 0))}
                 else:
-                    adopted_deferred_junction = current_deferred_junction
                     checkpoints.pop(crossing_sto_atom_id, None)
-                if (
-                    deferred_continuation is not None
-                    and deferred_continuation[1] == crossing_sto_atom_id
-                ):
-                    # This child exit was either replaced by a cap on the over
-                    # timeline or disappeared when an older under state won.
-                    deferred_continuation = None
-                # Parking changes control state only, not the mass epoch.
+                # Parking changes control state only, not the mass epoch. An
+                # unconsumed promoted continuation site in the parked
+                # instance's pool needs no redirect: owner-level terminators
+                # riding it fire in the instance's own terminate pass at
+                # finalization, a retained -1 or live-other-level transition
+                # edge keeps the bond alive past that pass for its own
+                # level's turn, and a channel carrying neither is retired
+                # unfired — the weighted competition's zero-growth outcome.
                 pending_termination.add(crossing_sto_atom_id)
-                if (
-                    adopted_deferred_junction is not None
-                    and adopted_deferred_junction[1] == crossing_sto_atom_id
-                ):
-                    # The undershoot timeline ends immediately before the
-                    # ancestor continuation.  Parking redirects that exact
-                    # junction to the ancestor's end group.
-                    partial_atom_graph.cap_junction_bonds(
-                        adopted_deferred_junction[0],
-                        crossing_sto_atom_id,
-                        rng,
-                    )
-                    _commit_mutation()
 
             else:
-                if deferred_continuation is not None:
-                    owner_sto_atom_id, continuation_level, continuation_gen_id = deferred_continuation
-                    deferred_junction = (owner_sto_atom_id, continuation_level)
-                    observed_gain = max_step_gain.get(continuation_level)
-                    lookahead_gain = max(
-                        observed_gain or 0.0,
-                        gain_floor.get(continuation_level, 0.0),
-                    )
-                    expected_i = tracker._sto_atom_id_expected_molw[continuation_level]
-                    need_snapshot = (
-                        termination_flag != 0
-                        and expected_i >= 0
-                        and (
-                            observed_gain is None
-                            or lookahead_gain <= 0.0
-                            or proj_now[continuation_level]
-                            + _LOOKAHEAD_MARGIN * lookahead_gain
-                            >= expected_i - avg_termination_cache.get(continuation_level, 0.0)
-                        )
-                    )
-                    previous_checkpoint = checkpoints.get(continuation_level)
-                    if need_snapshot:
-                        checkpoints[continuation_level] = _capture_checkpoint(
-                            continuation_level,
-                            deferred_junction,
-                        )
-                    _new_sto_atom_id, transition_success = partial_atom_graph.transition_graph(
-                        owner_sto_atom_id,
-                        continuation_gen_id,
-                        rng,
-                    )
-                    deferred_continuation = None
-                    if transition_success:
-                        _advance_owner_epoch(continuation_level)
-                        _commit_mutation()
-                    elif need_snapshot:
-                        if previous_checkpoint is None:
-                            checkpoints.pop(continuation_level, None)
-                        else:
-                            checkpoints[continuation_level] = previous_checkpoint
-                    continue
-
                 # Lazy snapshot: only deepcopy when the NEXT step could cross
                 # the active owner's threshold and an undershoot boundary is
                 # actually needed (never for termination_flag == 0).
@@ -3434,19 +3733,21 @@ class EnsembleCreator:
                     need_snapshot = expected_i >= 0 and (
                         observed_gain is None
                         or lookahead_gain <= 0.0
-                        or proj_now[active_sto_atom_id]
-                        + _LOOKAHEAD_MARGIN * lookahead_gain
-                        >= expected_i - avg_termination_cache.get(active_sto_atom_id, 0.0)
+                        or proj_now[active_sto_atom_id] + _LOOKAHEAD_MARGIN * lookahead_gain >= expected_i - avg_termination_cache.get(active_sto_atom_id, 0.0)
                     )
                 if need_snapshot:
                     checkpoints[active_sto_atom_id] = _capture_checkpoint(active_sto_atom_id)
                 if _DECISION_TRACE is not None:
-                    _DECISION_TRACE.append({
-                        "kind": "grow", "active": active_sto_atom_id,
-                        "mutations": mutations, "need_snapshot": need_snapshot,
-                        "proj": dict(proj_now),
-                        "gains": {k: max_step_gain.get(k) for k in growable},
-                    })
+                    _DECISION_TRACE.append(
+                        {
+                            "kind": "grow",
+                            "active": active_sto_atom_id,
+                            "mutations": mutations,
+                            "need_snapshot": need_snapshot,
+                            "proj": dict(proj_now),
+                            "gains": {k: max_step_gain.get(k) for k in growable},
+                        }
+                    )
                 try:
                     partial_atom_graph.propagate_graph(active_sto_atom_id, rng, True)
                     _advance_owner_epoch(active_sto_atom_id)
@@ -3467,25 +3768,25 @@ class EnsembleCreator:
                         if highest_actual_mol_weight < highest_expected_mol_weight:
                             warnings.warn(PossibleNonRepresentativePolymerChain(), stacklevel=1)
                         # Truncated chain: no growth or transition is possible
-                        # any more. Fire the caps of every parked instance (its
-                        # still-live descendants first, deepest first) so the
-                        # return shape matches a completed chain, then stop and
+                        # any more. Terminate every live instance, deepest
+                        # first, so each fires its declared end groups and the
+                        # return shape matches a completed chain (a dead-ended
+                        # instance's forced exits stay unfired), then stop and
                         # fall through to the normal finalization so the caller
                         # gets a phantom-free graph (the raw early return used
                         # to leak placeholder atoms and break create_ensemble's
                         # tuple unpack).
                         cleanup_tracker = partial_atom_graph.stochastic_tracker
-                        for parked in sorted(pending_termination, key=lambda i: len(cleanup_tracker.parent_map.get(i, [])), reverse=True):
-                            live_now = cleanup_tracker.get_unterminated_sto_atom_ids()
-                            descendants = [d for d in live_now if parked in cleanup_tracker.parent_map.get(d, [])]
-                            descendants.sort(key=lambda i: len(cleanup_tracker.parent_map.get(i, [])), reverse=True)
-                            for descendant in descendants:
-                                partial_atom_graph.terminate_graph(descendant, rng)
-                            if not cleanup_tracker.is_terminated(parked):
-                                partial_atom_graph.terminate_graph(parked, rng)
-                        pending_termination.clear()
+                        for live in sorted(cleanup_tracker.get_unterminated_sto_atom_ids(), key=lambda i: len(cleanup_tracker.parent_map.get(i, [])), reverse=True):
+                            partial_atom_graph.terminate_graph(live, rng)
                         break
 
+        # TODO: replace this legacy clique closure in a focused follow-up. It
+        # selects explicitly marked placeholders below but attempts to traverse
+        # them via the absent ``num`` attribute. Correct junction attributes
+        # currently depend on merge() inserting the junction edge last;
+        # reordering edges can select a static placeholder edge's attributes.
+        # Remove that ordering dependency in the bond-semantics follow-up.
         def find_non_phantom_endpoints(G, phantom_node):
 
             visited = set()
@@ -3511,7 +3812,7 @@ class EnsembleCreator:
 
             return non_phantom_endpoints, attr
 
-        phantom_nodes = [node for node, data in partial_atom_graph.atom_graph.nodes(data=True) if data.get("atomic_num") == 0]
+        phantom_nodes = [node for node, data in partial_atom_graph.atom_graph.nodes(data=True) if _is_connector_placeholder(data)]
         processed = set()
 
         for phantom_node in phantom_nodes:
@@ -3571,6 +3872,15 @@ class EnsembleCreator:
                 data["occupied_valence"] = occupied
                 partial_atom_graph.stochastic_tracker.credit_hydrogen_delta(data["owner_sto_atom_id"], delta)
 
+        # Sequence fragments are independent snapshots made before the whole
+        # molecule's phantom collapse. Normalize them once here, before any of
+        # create_ensemble's mol-graph/RDKit/SMILES conversion paths. Sequence
+        # stubs retain the far-side atom's origin_idx and are not placeholders.
+        if partial_atom_graph.sequence:
+            labels = derive_unit_labels(self._generative_graph)
+            origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
+            self._contract_sequence_phantoms(partial_atom_graph.sequence, origin_bond_id)
+
         # Only report an unavailable explicit undershoot when it survives all
         # descendant rounding and final hydrogen reconciliation. Nested
         # first-step overshoots are structural quantization that a live
@@ -3582,8 +3892,7 @@ class EnsembleCreator:
                 if (
                     sto_atom_id in final_tracker._sto_atom_id_actual_molw
                     and not final_tracker.parent_map.get(sto_atom_id)
-                    and final_tracker._sto_atom_id_actual_molw[sto_atom_id]
-                    > final_tracker._sto_atom_id_expected_molw[sto_atom_id] + 1e-9
+                    and final_tracker._sto_atom_id_actual_molw[sto_atom_id] > final_tracker._sto_atom_id_expected_molw[sto_atom_id] + 1e-9
                 ):
                     warnings.warn(ForcedOvershootNoBoundary(), stacklevel=1)
 
@@ -3604,27 +3913,109 @@ class EnsembleCreator:
                 break
         return (partial_atom_graph.atom_graph, partial_atom_graph.units, partial_atom_graph.bonds_idx, partial_atom_graph.sequence, actual_mol_weights, distributions)
 
+    @staticmethod
+    def _contract_sequence_phantoms(sequences, origin_bond_id):
+        """Omit inactive split sites and collapse sites represented by mapped stubs.
+
+        Identified internal placeholders without a template bond id cannot bond
+        and are omitted, just as in unit pSMILES, leaving room for implicit H.
+        A mapped sequence connection stub hanging from a placeholder is
+        reattached directly to that placeholder's real anchor, with the realized
+        junction edge attributes preserved, and the placeholder is dropped so the
+        site is not counted twice. An active placeholder with no such stub is the
+        only remaining marker of its split site, so it stays as an unmapped dummy:
+        removing it would render an interior fragment as a complete small
+        molecule with phantom hydrogens (a divalent carbanion as methanide).
+        """
+        for sequence in sequences:
+            for unit_graph in sequence:
+                phantom_nodes = {node for node, data in unit_graph.nodes(data=True) if _is_connector_placeholder(data) and "connection" not in data}
+                inactive_nodes = {node for node in phantom_nodes if origin_bond_id.get(unit_graph.nodes[node]["origin_idx"]) is None}
+                unit_graph.remove_nodes_from(inactive_nodes)
+                phantom_nodes.difference_update(inactive_nodes)
+                for component in list(nx.connected_components(unit_graph.subgraph(phantom_nodes))):
+                    real_anchors = set()
+                    connection_edges = []
+                    for phantom_node in component:
+                        for neighbor in list(unit_graph.neighbors(phantom_node)):
+                            if neighbor in component:
+                                continue
+                            neighbor_data = unit_graph.nodes[neighbor]
+                            if "connection" in neighbor_data:
+                                connection_edges.append((neighbor, deepcopy(unit_graph[phantom_node][neighbor])))
+                            elif _is_connector_placeholder(neighbor_data):
+                                raise RuntimeError("A sequence phantom has an unsupported boundary node. Please report this bug.")
+                            else:
+                                real_anchors.add(neighbor)
+
+                    if len(real_anchors) != 1:
+                        raise RuntimeError(f"A sequence phantom component must have exactly one real anchor, found {len(real_anchors)}. Please report this bug.")
+                    real_anchor = next(iter(real_anchors))
+                    for connection_node, edge_data in connection_edges:
+                        if unit_graph.has_edge(real_anchor, connection_node):
+                            raise RuntimeError("A sequence connection is already attached to its phantom's real anchor. Please report this bug.")
+                        unit_graph.add_edge(real_anchor, connection_node, **edge_data)
+                    if connection_edges:
+                        unit_graph.remove_nodes_from(component)
 
     @staticmethod
-    def _unit_graph_with_stars(unit_graph, origin_bond_id, origin_rank):
+    def _unit_graph_with_stars(unit_graph, origin_bond_id, origin_rank=None):
         """
-        Copy of `unit_graph` with a star atom bonded to every atom whose origin
-        is a connection atom (has a derived bond id); the star's map number is
-        that bond id, so the P-SMILES prints numbered stars ``[*:n]``. The star
+        Copy of `unit_graph` with one mapped star for every template bond id.
+        A split-atom phantom already is the connection star, while a real
+        connection atom receives a new star. Bond ids deliberately remain on
+        placeholder nodes in the generative graph and its JSON export. Internal
+        placeholders without a bond id cannot bond and are omitted. A new star
         bond takes the neighbor rank of the inter-unit bond it stands in for, so
-        a chiral connection atom keeps its configuration.
+        a chiral connection atom keeps its configuration (rank 0 when no map is given).
         """
+        origin_rank = origin_rank or {}
         star_graph = unit_graph.copy()
         for node, data in unit_graph.nodes(data=True):
             bond_id = origin_bond_id.get(data["origin_idx"])
             if bond_id is not None:
-                star_node = ("star", node)
-                # The converter renders map numbers as connection + 1.
-                star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
-                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False, _CHIRAL_NEIGHBOR_RANK_NAME: [origin_rank.get(data["origin_idx"], 0), 0]})
+                # Use the converter's offset from connection indices to maps.
+                if _is_connector_placeholder(data):
+                    star_graph.nodes[node]["connection"] = bond_id - _ATOM_MAP_OFFSET
+                else:
+                    star_node = ("star", node)
+                    star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - _ATOM_MAP_OFFSET})
+                    star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False, _CHIRAL_NEIGHBOR_RANK_NAME: [origin_rank.get(data["origin_idx"], 0), 0]})
+            elif _is_connector_placeholder(data):
+                star_graph.remove_node(node)
         return star_graph
 
-    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None):
+    @staticmethod
+    def _validate_unit_psmiles_mol(unit_id, star_mol, expected_maps, expected_real_atom_count):
+        """Check mapped-star IDs and degrees and the template's real-atom count."""
+        dummy_atoms = [atom for atom in star_mol.GetAtoms() if atom.GetAtomicNum() == 0]
+        actual_maps = sorted(atom.GetAtomMapNum() for atom in dummy_atoms)
+        invalid_dummy_degrees = tuple((atom.GetIdx(), atom.GetAtomMapNum(), atom.GetDegree()) for atom in dummy_atoms if atom.GetDegree() != 1)
+        actual_real_atom_count = sum(atom.GetAtomicNum() > 0 for atom in star_mol.GetAtoms())
+        expected_maps = sorted(expected_maps)
+        if actual_maps != expected_maps or invalid_dummy_degrees or actual_real_atom_count != expected_real_atom_count:
+            raise InvalidUnitPSmiles(
+                unit_id,
+                expected_maps,
+                actual_maps,
+                invalid_dummy_degrees,
+                expected_real_atom_count,
+                actual_real_atom_count,
+            )
+
+    def create_ensemble(
+        self,
+        n_samples,
+        output_format="mol_graph",
+        ensemble_info=False,
+        max_number_of_discarded_chains: int = 100,
+        termination_flag: Optional[int] = None,
+        json_file: Optional[str] = None,
+        json_max_chains: Optional[int] = None,
+        parallel: bool = False,
+        n_workers: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
         """Sample an ensemble while rejecting explicitly chain-local failures.
 
         ``max_number_of_discarded_chains`` limits consecutive rejected paths
@@ -3639,10 +4030,38 @@ class EnsembleCreator:
 
         ``json_file`` writes the originating G2RINS string, the generative graph (with
         derived unit/bond annotations) and the ensemble data to that path as
-        JSON; chains and sequences are written as SMILES regardless of
-        ``output_format``. ``json_max_chains``
-        caps only the number of chains stored in the file (default ``None`` =
-        all); statistics always cover every sampled chain.
+        JSON. The file's chains follow ``output_format`` -- SMILES strings, or
+        node-link graph dicts for ``"mol_graph"`` (a few hundred times larger
+        per chain, so for any sizeable ensemble picking the format is picking
+        the file size) -- as recorded in ``format.chain_format``; sequences
+        are written as SMILES
+        regardless. With the default ``output_format="mol_graph"`` the file
+        therefore holds node-link chains; pass ``"smiles"`` for the compact
+        chains of earlier versions. ``json_max_chains`` caps only the number
+        of chains stored in the file (default ``None`` = all); statistics
+        always cover every sampled chain.
+
+        The file's ``ensemble`` section mirrors :class:`EnsembleData`:
+        ``units`` in the same order, each ``subgraph`` as networkx node-link
+        data (``nx.node_link_graph(data, edges="edges")`` restores it,
+        multigraph keys included); node-link chains whose nodes carry the
+        atom attributes ``atomic_num``, ``is_connector_placeholder``,
+        ``aromatic``, ``charge``, ``num_explicit_h`` and ``origin_idx`` (the
+        template's own key of the node the atom came from, whereas the
+        in-memory chain graphs carry it as the sampler's string form) and
+        whose bonds carry ``bond_type`` and ``aromatic``, without the
+        sampler's in-memory bookkeeping;
+        ``bonds`` with ``nodes`` holding the graph section's ``id`` values,
+        whatever type the template used;
+        ``mol_weights`` and ``distributions`` keyed by the stochastic id as a
+        JSON string. The graph section and the unit subgraphs are exports of
+        the creator's private copy of the template (``atomic_num`` as ``int``,
+        the placeholder flag on every node, derived export fields dropped), so
+        they can differ from :func:`generative_graph_json_data` on the input
+        graph for legacy or NumPy-typed graphs. The whole payload is
+        normalized like the graph section; non-finite values raise
+        ``ValueError`` before the file is opened, and the bytes do not depend
+        on the interpreter's hash seed.
 
         ``parallel=False`` (the default) samples everything in this process.
         ``parallel=True`` samples chains in ``n_workers`` subprocesses:
@@ -3669,7 +4088,7 @@ class EnsembleCreator:
         chain), so the cross-mode equality applies to failure-free runs.
         """
 
-        supported_formats = {"mol", "smiles", "mol_graph"}
+        supported_formats = {"smiles", "mol_graph"}
         molecule_format = output_format.lower()
         if molecule_format not in supported_formats:
             raise ValueError(f"Unsupported format: '{output_format}'. " f"Please choose from {list(supported_formats)}.")
@@ -3684,6 +4103,11 @@ class EnsembleCreator:
         # The JSON dump needs unit/sequence info even when the caller did not
         # ask for the returned ensemble information.
         collect_info = ensemble_info or json_file is not None
+        if collect_info:
+            # Unit labels and subgraphs read only the immutable template, so a
+            # template attribute that cannot be copied fails before sampling.
+            labels = derive_unit_labels(self._generative_graph)
+            unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_nodes)
 
         total_discards = 0
         discard_reasons = Counter()
@@ -3698,10 +4122,7 @@ class EnsembleCreator:
             chunk_size = max(1, n_samples // n_workers)
             chunks = [chain_jobs[i : i + chunk_size] for i in range(0, n_samples, chunk_size)]
             with _no_main_reimport(), concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = [
-                    executor.submit(_sample_chain_batch, self, chunk, molecule_format, collect_info, max_number_of_discarded_chains, termination_flag)
-                    for chunk in chunks
-                ]
+                futures = [executor.submit(_sample_chain_batch, self, chunk, molecule_format, collect_info, max_number_of_discarded_chains, termination_flag) for chunk in chunks]
                 # Collected in submission order: records come back sorted by
                 # chain index, and a fatal worker error re-raises here exactly
                 # like on the serial path.
@@ -3820,11 +4241,11 @@ class EnsembleCreator:
 
             list_of_sequences.append(record["sequences"])
 
-        # Ensemble aggregates are format-independent: units and bonds are keyed
-        # by the derived labels (which also keeps chemically identical units --
-        # e.g. two Br terminators -- apart), only chains/sequences follow
-        # output_format.
-        labels = derive_unit_labels(self._generative_graph)
+        # Ensemble aggregates are template-level and format-independent: units
+        # and bonds are keyed by the derived labels (which also keeps
+        # chemically identical units -- e.g. two Br terminators -- apart) and
+        # carry the generative-graph node ids alongside; only chains/sequences
+        # follow output_format.
         origin_unit_id = {str(node): unit_id for node, unit_id in labels.unit_id.items()}
         origin_bond_id = {str(node): bond_id for node, bond_id in labels.bond_id.items()}
         origin_endpoint = {origin: f"{origin_unit_id[origin]}.{bond_id}" for origin, bond_id in origin_bond_id.items()}
@@ -3832,60 +4253,90 @@ class EnsembleCreator:
         for u, _v, d in self._generative_graph.edges(data=True):
             if not d[_STATIC_NAME]:
                 origin_rank.setdefault(str(u), d.get(_CHIRAL_NEIGHBOR_RANK_NAME, [0, 0])[0])
+        origin_node = {str(node): node for node in self._generative_graph.nodes}
 
-        # unit_g2rins was composed against the same derivation at parse time;
-        # if the graph was mutated since, omit the texts rather than mislabel.
-        unit_g2rins = self._generative_graph.graph.get("unit_g2rins", {})
-        if not set(unit_g2rins).issubset(origin_unit_id.values()):
-            unit_g2rins = {}
+        # The public unit representation is validated against the immutable
+        # template rather than the sampled unit snapshot it renders. Besides
+        # renderer defects, this catches snapshots that lost a real atom or
+        # connection site at a merge watermark. This template-only contract
+        # could move to a pre-flight check in a future change.
+        template_nodes = self._generative_graph.nodes
+        template_unit_bond_ids = {unit_id: [labels.bond_id[node] for node in nodes if node in labels.bond_id] for unit_id, nodes in labels.unit_nodes.items()}
+        template_unit_real_atom_counts = {unit_id: sum(not _is_connector_placeholder(template_nodes[node]) for node in nodes) for unit_id, nodes in labels.unit_nodes.items()}
+
+        unit_g2rins = _verified_unit_texts(self._generative_graph, labels)
 
         canonical_units = {}
-        for unit_graph, frequency in units.items():
+        for unit_graph, count in units.items():
             # Unit fragments have dangling inter-unit valences: kekulize=False
             # (an aromatic ring at a connection point can't be kekulized in
             # isolation).
             star_mol = mol_graph_to_rdkit_mol(self._unit_graph_with_stars(unit_graph, origin_bond_id, origin_rank), kekulize=False)
             unit_id = origin_unit_id[next(iter(unit_graph.nodes(data=True)))[1]["origin_idx"]]
-            canonical_units[unit_id] = {"psmiles": rdkit_mol_to_smiles(star_mol), "g2rins": unit_g2rins.get(unit_id, ""), "frequency": frequency}
+            self._validate_unit_psmiles_mol(
+                unit_id,
+                star_mol,
+                template_unit_bond_ids[unit_id],
+                template_unit_real_atom_counts[unit_id],
+            )
+            canonical_units[unit_id] = {
+                "psmiles": rdkit_mol_to_smiles(star_mol),
+                "g2rins": unit_g2rins.get(unit_id, ""),
+                "subgraph": unit_subgraphs[unit_id],
+                "count": count,
+            }
         canonical_units = dict(sorted(canonical_units.items(), key=lambda item: (item[0][0], int(item[0][1:]))))
 
-        bond_records = _bond_records(bond_counts, origin_endpoint)
+        bond_records = _bond_records(bond_counts, origin_endpoint, origin_node)
 
         if json_file is not None:
+            # The file's chains follow output_format (the caller's format
+            # choice decides the file size); sequences are always SMILES.
             if molecule_format == "smiles":
 
-                def _chain_smiles(molecule):
+                def _chain_json(molecule):
                     return molecule
 
-                def _unit_smiles(unit):
+                def _sequence_unit_smiles(unit):
                     return unit
-
-            elif molecule_format == "mol":
-
-                def _chain_smiles(molecule):
-                    return rdkit_mol_to_smiles(molecule)
-
-                def _unit_smiles(unit):
-                    return rdkit_mol_to_smiles(unit)
 
             else:
 
-                def _chain_smiles(molecule):
-                    return mol_graph_to_smiles(molecule)
+                def _chain_json(molecule):
+                    # The file carries the atom and bond attributes plus the
+                    # template provenance as the template's own node key (the
+                    # sampler tracks it as a string); bookkeeping stays in memory.
+                    data = nx.node_link_data(molecule, edges="edges")
+                    data["nodes"] = [
+                        {key: origin_node[node[key]] if key == "origin_idx" else node[key] for key in ("id", *_PartialAtomGraph._ATOM_ATTRS, "origin_idx") if key in node} for node in data["nodes"]
+                    ]
+                    data["edges"] = [{key: edge[key] for key in ("source", "target", *_PartialAtomGraph._BOND_ATTRS) if key in edge} for edge in data["edges"]]
+                    return data
 
-                def _unit_smiles(unit):
+                def _sequence_unit_smiles(unit):
                     return mol_graph_to_smiles(unit, kekulize=False)
 
             saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
-            json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
+            # Every part of the file is normalized before it is opened: the
+            # source string here, the graph section by its exporter, and the
+            # ensemble section piece by piece below.
+            json_data = {"string": _json_safe(self._generative_graph.graph.get("g2rins_string", ""), "$['string']")}
             json_data.update(generative_graph_json_data(self._generative_graph))
+            json_data["format"]["chain_format"] = molecule_format
+            # The ensemble section (unit subgraphs, node-link chains, weights) is
+            # normalized like the graph section before the file is opened, one
+            # piece at a time so that only one normalized copy of each
+            # node-link chain is ever held.
+            ensemble_path = "$['ensemble']"
             json_data["ensemble"] = {
-                "units": canonical_units,
-                "chains": [_chain_smiles(molecule) for molecule in saved_chains],
-                "bonds": bond_records,
-                "mol_weights": mol_weight_lists,
-                "distributions": ensemble_distributions,
-                "sequences": [[[_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
+                "units": _json_safe({unit_id: {**info, "subgraph": nx.node_link_data(info["subgraph"], edges="edges")} for unit_id, info in canonical_units.items()}, f"{ensemble_path}['units']"),
+                "chains": [_json_safe(_chain_json(molecule), f"{ensemble_path}['chains'][{index}]") for index, molecule in enumerate(saved_chains)],
+                "bonds": _json_safe(bond_records, f"{ensemble_path}['bonds']"),
+                "mol_weights": _json_safe(mol_weight_lists, f"{ensemble_path}['mol_weights']"),
+                "distributions": _json_safe(ensemble_distributions, f"{ensemble_path}['distributions']"),
+                "sequences": _json_safe(
+                    [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences], f"{ensemble_path}['sequences']"
+                ),
             }
             with open(json_file, "w") as file_handle:
                 json.dump(json_data, file_handle, indent=2)

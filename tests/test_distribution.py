@@ -10,6 +10,12 @@ EPSILON = 0.15
 NSTAT = 2000
 
 
+@pytest.fixture
+def rng():
+    """Make statistical checks reproducible and independent of test order."""
+    return np.random.default_rng(0)
+
+
 def test_empty_serialize():
     vector = g2rins.StochasticDistribution.get_empty_serial_vector()
     instance = g2rins.StochasticDistribution.from_serial_vector(vector)
@@ -17,7 +23,7 @@ def test_empty_serialize():
 
 
 @pytest.mark.parametrize("a", [0.01, 0.05, 0.1, 0.3, 0.5])
-def test_flory_schulz(a):
+def test_flory_schulz(a, rng):
     def mean(a):
         return 2 / a - 1
 
@@ -35,10 +41,10 @@ def test_flory_schulz(a):
 
     assert isinstance(flory_schulz, g2rins.FlorySchulz)
 
-    random_mw = flory_schulz.draw_mw()
+    random_mw = flory_schulz.draw_mw(rng=rng)
     assert flory_schulz.prob_mw(random_mw) > 0
 
-    data = np.asarray([flory_schulz.draw_mw() for i in range(4 * NSTAT)])
+    data = np.asarray([flory_schulz.draw_mw(rng=rng) for i in range(4 * NSTAT)])
 
     assert np.abs((np.mean(data) - mean(a)) / mean(a)) < EPSILON
     assert np.abs((np.var(data) - variance(a)) / variance(a)) < EPSILON
@@ -92,16 +98,13 @@ def test_flory_schulz_unbounded_draw_uses_stable_exact_sampler():
     expected_rng = np.random.default_rng(0)
 
     actual = [flory_schulz.draw_mw(rng=actual_rng) for _ in range(100)]
-    expected = [
-        1 + expected_rng.negative_binomial(2, 0.01)
-        for _ in range(100)
-    ]
+    expected = [1 + expected_rng.negative_binomial(2, 0.01) for _ in range(100)]
 
     np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize(("mu", "sigma"), [(100.0, 10.0), (200.0, 100.0), (500.0, 1.0), (600.0, 0.0)])
-def test_gauss(mu, sigma):
+def test_gauss(mu, sigma, rng):
     def mean(mu, sigma):
         return mu
 
@@ -114,10 +117,10 @@ def test_gauss(mu, sigma):
     gauss = g2rins.StochasticDistribution.make(f"gauss({mu}, {sigma})")
     assert isinstance(gauss, g2rins.Gauss)
 
-    example = gauss.draw_mw()
+    example = gauss.draw_mw(rng=rng)
     assert gauss.prob_mw(example) > 0
 
-    data = np.asarray([gauss.draw_mw() for i in range(NSTAT)])
+    data = np.asarray([gauss.draw_mw(rng=rng) for i in range(NSTAT)])
 
     assert np.abs((np.mean(data) - mean(mu, sigma)) / mean(mu, sigma)) < EPSILON
     if sigma > 0:
@@ -132,7 +135,7 @@ def test_gauss(mu, sigma):
 
 
 @pytest.mark.parametrize(("low", "high"), [(10.0, 100.0), (200.0, 1000.0), (50.0, 100.0), (0.0, 600.0)])
-def test_uniform(low, high):
+def test_uniform(low, high, rng):
     def mean(low, high):
         return 0.5 * (low + high)
 
@@ -145,9 +148,9 @@ def test_uniform(low, high):
     uniform = g2rins.StochasticDistribution.make(f"uniform({low}, {high})")
     assert isinstance(uniform, g2rins.Uniform)
 
-    assert uniform.prob_mw(uniform.draw_mw()) > 0
+    assert uniform.prob_mw(uniform.draw_mw(rng=rng)) > 0
 
-    data = np.asarray([uniform.draw_mw() for i in range(NSTAT)])
+    data = np.asarray([uniform.draw_mw(rng=rng) for i in range(NSTAT)])
 
     assert np.abs((np.mean(data) - mean(low, high)) / mean(low, high)) < EPSILON
     assert np.abs((np.var(data) - variance(low, high)) / variance(low, high)) < EPSILON
@@ -161,7 +164,7 @@ def test_uniform(low, high):
 
 
 @pytest.mark.parametrize(("Mw", "factor"), [(11.3e3, 4)])
-def test_schulz_zimm(Mw, factor):
+def test_schulz_zimm(Mw, factor, rng):
     def mean(Mn, z):
         return Mn
 
@@ -175,7 +178,7 @@ def test_schulz_zimm(Mw, factor):
 
     data = []
     for _i in range(100 * NSTAT):
-        data.append(schulz_zimm.draw_mw())
+        data.append(schulz_zimm.draw_mw(rng=rng))
     data = np.asarray(data)
 
     # x = np.linspace(1e3, 40e3, 1000).astype(int)
@@ -193,7 +196,7 @@ def test_schulz_zimm(Mw, factor):
 
 
 @pytest.mark.parametrize(("M", "D"), [(11.3e3, 1.1), (5.3e3, 1.5), (20.3e3, 2.0)])
-def test_log_normal(M, D):
+def test_log_normal(M, D, rng):
     def mean(M, D):
         return M
 
@@ -202,7 +205,7 @@ def test_log_normal(M, D):
 
     data = []
     for _i in range(NSTAT):
-        d = log_normal.draw_mw()
+        d = log_normal.draw_mw(rng=rng)
         data.append(d)
     data = np.asarray(data)
 
@@ -221,7 +224,7 @@ def test_log_normal(M, D):
 
 
 @pytest.mark.parametrize("M", [11.3e3, 5.3e3, 20.3e3])
-def test_poisson(M):
+def test_poisson(M, rng):
     def mean(M):
         return M
 
@@ -233,7 +236,7 @@ def test_poisson(M):
 
     data = []
     for _i in range(NSTAT):
-        d = poisson.draw_mw()
+        d = poisson.draw_mw(rng=rng)
         data.append(d)
     data = np.asarray(data)
 

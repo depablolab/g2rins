@@ -14,9 +14,19 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import networkx as nx
 
-from .chem_resource import chirality_class_by_degree, chirality_class_degrees, chirality_codes
+from .chem_resource import (
+    chirality_class_by_degree,
+    chirality_class_degrees,
+    chirality_codes,
+)
 from .core import G2rinsBase, GenerationBase
-from .exception import InconsistentChiralityClass, InvalidChiralityOrder, ParsingError, TooManyTokens
+from .exception import (
+    InconsistentChiralityClass,
+    InvalidChiralityOrder,
+    MissingAtomSymbol,
+    ParsingError,
+    TooManyTokens,
+)
 from .generative_graph import _HalfBond, _PartialGraph
 
 if TYPE_CHECKING:
@@ -35,21 +45,27 @@ class Atom(G2rinsBase, GenerationBase):
         """Returns the atom symbol."""
         return self._symbol
 
-    def __init__(self, children: List[Union["AtomSymbol", "Isotope", "Chiral", "HCount", "AtomCharge", "AtomClass"]]):
+    def __init__(self, children: List[Union["AtomSymbol", "Isotope", "Chiral", "HCount", "AtomCharge", "AtomClass", "Token"]]):
         """
         Initializes an Atom object.
 
         Args:
-            children (List[Union[AtomSymbol, Isotope, Chiral, HCount, AtomCharge, AtomClass]]):
+            children (List[Union[AtomSymbol, Isotope, Chiral, HCount, AtomCharge, AtomClass, Token]]):
                 List of child elements parsed by Lark.
         """
         super().__init__(children)
 
         for child in self._children:
+            # The grammar emits a bare '*' token directly under atom, unlike
+            # bracketed wildcards whose symbol already is an AtomSymbol.
+            if isinstance(child, str) and child == "*":
+                child = AtomSymbol([child])
             if isinstance(child, AtomSymbol):
                 if self._symbol is not None:
                     raise TooManyTokens(self.__class__, self._symbol, child)
                 self._symbol = child
+        if self._symbol is None:
+            raise MissingAtomSymbol(type(self).__name__)
 
     def generate_string(self, extension: bool) -> str:
         """

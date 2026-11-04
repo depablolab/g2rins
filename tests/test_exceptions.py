@@ -1,12 +1,32 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
 
+import copy
 import pickle
 
 import lark
 import pytest
 
 import g2rins
+from g2rins.atom import AtomSymbol
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        g2rins.exception.ParsingError("missing symbol"),
+        g2rins.exception.MissingAtomSymbol("Atom"),
+        g2rins.exception.TooManyTokens("Atom", "C", "N"),
+        g2rins.exception.UnsupportedBondDescriptor("[<]", "O=[<]C[>]", 2),
+    ],
+)
+@pytest.mark.parametrize("copy_method", ["pickle", "deepcopy"])
+def test_parser_and_descriptor_diagnostics_preserve_context(diagnostic, copy_method):
+    restored = pickle.loads(pickle.dumps(diagnostic)) if copy_method == "pickle" else copy.deepcopy(diagnostic)
+    assert type(restored) is type(diagnostic)
+    assert restored.args == diagnostic.args
+    assert vars(restored) == vars(diagnostic)
+    assert str(restored) == str(diagnostic)
 
 
 @pytest.mark.parametrize(
@@ -201,3 +221,15 @@ def test_undefined_distribution(smi):
 
 
 # TODO: implement tests for IncorrectNumberOfBondProbabilities and EmptyBondConnectorInTerminalBondConnectorList. Add nested examples.
+
+
+def test_too_many_tokens_round_trips_with_atom_symbol_tokens():
+    """Real symbol tokens have no equality, so compare by type and rendering."""
+    first, second = AtomSymbol.make("C"), AtomSymbol.make("N")
+    diagnostic = g2rins.exception.TooManyTokens("Atom", first, second)
+    for restored in (pickle.loads(pickle.dumps(diagnostic)), copy.deepcopy(diagnostic)):
+        assert type(restored) is g2rins.exception.TooManyTokens
+        assert str(restored) == str(diagnostic)
+        assert [str(token) for token in restored.args] == ["Atom", "C", "N"]
+        assert str(restored.token) == "N"
+        assert str(restored.existing_token) == "C"
