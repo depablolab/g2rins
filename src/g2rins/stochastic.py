@@ -116,7 +116,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
         try:
             for element in [self] + self._repeat_residues + self._initiation_residues + self._termination_residues:
                 graph_creator = element.get_graph_creator()
-                generative_graph = graph_creator.get_generative_graph(include_bond_connectors=True)
+                generative_graph = graph_creator._build_generative_graph(include_bond_connectors=True, return_extra_graph_info=False)
                 for node, data in generative_graph.nodes(data=True):
                     if node in graph_creator._bc_idx_set:
                         if data["stochastic_id_tree"][0] == data["stochastic_id_tree"][1]:
