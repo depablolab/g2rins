@@ -53,3 +53,16 @@ def test_cis_alkene_generates_without_losing_the_double_bonds():
     bond_types = Counter(data["bond_type"] for _u, _v, data in chain.edges(data=True))
     assert bond_types[2] > 5
     assert bond_types[2] == (chain.number_of_nodes() - 2) // 2
+
+
+@pytest.mark.filterwarnings("ignore::g2rins.exception.G2RINSWarning")
+def test_opposite_directional_symbols_on_both_ring_digits_describe_one_single_bond():
+    graph = g2rins.G2rins.make(r"C/1CCCCC\1").get_graph_creator().get_generative_graph()
+    assert graph.number_of_nodes() == 6
+    assert {data["bond_type"] for _u, _v, data in graph.edges(data=True)} == {1}
+
+
+@pytest.mark.parametrize("text", ["C/1CCCCC/1", r"C\1CCCCC\1"])
+def test_equal_directional_symbols_on_both_ring_digits_raise(text):
+    with pytest.raises(g2rins.exception.DoubleBondSymbolDefinition):
+        g2rins.G2rins.make(text).get_graph_creator()

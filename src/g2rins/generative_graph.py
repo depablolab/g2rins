@@ -363,7 +363,14 @@ class _PartialGraph:
         closing = _HalfBond(closing.node, closing.node_id, dict(closing.bond_attributes))
         # Both digits may write the bond symbol, in which case they have to agree and it is kept once.
         if _BOND_TYPE_NAME in opening.bond_attributes and _BOND_TYPE_NAME in closing.bond_attributes:
-            if str(opening.bond_attributes[_BOND_TYPE_NAME]) != str(closing.bond_attributes[_BOND_TYPE_NAME]):
+            opening_symbol = str(opening.bond_attributes[_BOND_TYPE_NAME])
+            closing_symbol = str(closing.bond_attributes[_BOND_TYPE_NAME])
+            # Two directional symbols are read along the string, so they describe the same bond only when opposite.
+            if opening_symbol in _CIS_TRANS_SYMBOLS and closing_symbol in _CIS_TRANS_SYMBOLS:
+                agree = opening_symbol != closing_symbol
+            else:
+                agree = opening_symbol == closing_symbol
+            if not agree:
                 raise DoubleBondSymbolDefinition(self, closing.bond_attributes[_BOND_TYPE_NAME], opening.bond_attributes)
             del closing.bond_attributes[_BOND_TYPE_NAME]
         self.add_half_bond_edge(opening, closing)
