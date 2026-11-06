@@ -114,9 +114,24 @@ def test_ring_closure_bond_symbol_sets_the_bond_order(smi):
     assert bond_types.count(1) == 10
 
 
-def test_ring_closure_cis_trans_mark_reaches_the_graph():
-    graph = g2rins.G2rins.make("CC/1CCCCC/C=C1").get_graph_creator().get_generative_graph()
+@pytest.mark.parametrize("smi", ["CC/1CCCCC/C=C1", r"CC/1CCCCC/C=C\1"])
+def test_ring_closure_cis_trans_mark_reaches_the_graph(smi):
+    graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
     assert sorted(data["cis_trans_mark"] for _u, _v, data in graph.edges(data=True) if data["cis_trans_mark"]) == [1, 1, 2, 2]
+
+
+@pytest.mark.parametrize("smi", [r"C/1CCCCC\1", r"C\1CCCCC/1"])
+def test_opposite_directional_symbols_on_both_ring_digits_describe_one_bond(smi):
+    graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    assert graph.number_of_nodes() == 6
+    assert {data["bond_type"] for _u, _v, data in graph.edges(data=True)} == {1}
+    assert sorted(data["cis_trans_mark"] for _u, _v, data in graph.edges(data=True) if data["cis_trans_mark"]) == [1, 2]
+
+
+@pytest.mark.parametrize("smi", ["C/1CCCCC/1", r"C\1CCCCC\1"])
+def test_equal_directional_symbols_on_both_ring_digits_raise(smi):
+    with pytest.raises(g2rins.exception.DoubleBondSymbolDefinition):
+        g2rins.G2rins.make(smi).get_graph_creator()
 
 
 def test_conflicting_ring_closure_bond_symbols_raise():

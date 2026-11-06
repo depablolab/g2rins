@@ -248,6 +248,8 @@
     "deques",
     "setrecursionlimit",
     "goldens",
-    "ddof"
+    "ddof",
+    "klass",
+    "excinfo"
   ]
 }

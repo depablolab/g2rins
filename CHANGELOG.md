@@ -16,7 +16,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 ### Fixed
 
 - A repeat unit whose two junction bonds carry different cis/trans symbols (`[<]/C=C\[>]`) was rejected as a bond-type mismatch and produced a single repeat unit, and `[$]`-paired alkenes could come out with mixed or inverted geometry; every unit now keeps its written geometry at every junction.
-- A bond symbol written on a ring-closure digit (`C1CCCCC=1`, `C/1CCCCC/C=C1`) was dropped; the bond order and the cis/trans mark now reach the graph, and different symbols on the two digits of one ring closure raise `DoubleBondSymbolDefinition`.
+- A bond symbol written on a ring-closure digit (`C1CCCCC=1`, `C/1CCCCC/C=C1`) was dropped; the bond order and the cis/trans mark now reach the graph, and contradicting symbols on the two digits of one ring closure raise `DoubleBondSymbolDefinition`; the directional symbols are read along the string, so on the two digits they agree when opposite (`C/1CCCCC\1`).
 
 ## [1.1.0] - 2026-10-05
 

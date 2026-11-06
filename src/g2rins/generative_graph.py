@@ -720,9 +720,11 @@ class _PartialGraph:
         # The edge runs from the opening digit to the closing one, so a mark written at the closing digit is read the other way.
         if closing.bond_attributes.get(_CIS_TRANS_MARK_NAME):
             closing.bond_attributes[_CIS_TRANS_MARK_NAME] = 3 - closing.bond_attributes[_CIS_TRANS_MARK_NAME]
+        both_directional = bool(opening.bond_attributes.get(_CIS_TRANS_MARK_NAME) and closing.bond_attributes.get(_CIS_TRANS_MARK_NAME))
         for key in (_BOND_TYPE_NAME, _CIS_TRANS_MARK_NAME):
             if key in opening.bond_attributes and key in closing.bond_attributes:
-                if str(opening.bond_attributes[key]) != str(closing.bond_attributes[key]):
+                # Two directional symbols are read along the string, so their marks, not their spellings, decide whether they agree.
+                if not (both_directional and key == _BOND_TYPE_NAME) and str(opening.bond_attributes[key]) != str(closing.bond_attributes[key]):
                     raise DoubleBondSymbolDefinition(self, closing.bond_attributes[key], opening.bond_attributes)
                 del closing.bond_attributes[key]
         self.add_half_bond_edge(opening, closing)
