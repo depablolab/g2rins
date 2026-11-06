@@ -14,8 +14,9 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import networkx as nx
 
+from .chem_resource import chirality_codes
 from .core import G2rinsBase, GenerationBase
-from .exception import ParsingError, TooManyTokens
+from .exception import InvalidChiralityOrder, ParsingError, TooManyTokens
 from .generative_graph import _HalfBond, _PartialGraph
 
 if TYPE_CHECKING:
@@ -273,6 +274,8 @@ class Chiral(G2rinsBase):
     """
 
     _symbol: str
+    _klass: Optional[str]
+    _order: int
 
     def __init__(self, children: List["Token"]):
         """
@@ -284,6 +287,23 @@ class Chiral(G2rinsBase):
         super().__init__(children)
 
         self._symbol = "".join(str(child) for child in self._children)
+        if self._symbol in ("@", "@@"):
+            # A bare mark takes its class from the written degree of the atom.
+            self._klass, self._order = None, len(self._symbol)
+        else:
+            self._klass, self._order = self._symbol[1:3], int(self._symbol[3:])
+            if (self._klass, self._order) not in chirality_codes:
+                raise InvalidChiralityOrder(self._symbol)
+
+    @property
+    def klass(self) -> Optional[str]:
+        """Chirality class (TH, AL, SP, TB or OH); None for a bare '@' or '@@'."""
+        return self._klass
+
+    @property
+    def order(self) -> int:
+        """Chiral order within the class (1 for '@', 2 for '@@')."""
+        return self._order
 
     @property
     def generable(self) -> bool:

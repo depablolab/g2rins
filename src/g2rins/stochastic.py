@@ -7,7 +7,6 @@ import warnings
 import networkx as nx
 import numpy as np
 
-from .g2rins_molecule import G2rinsMolecule
 from .bond import (
     BondConnector,
     TerminalBondConnectorList,
@@ -26,6 +25,7 @@ from .exception import (
     StochasticMissingPath,
     UndefinedDistribution,
 )
+from .g2rins_molecule import G2rinsMolecule
 from .generative_graph import (
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
@@ -116,7 +116,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
         try:
             for element in [self] + self._repeat_residues + self._initiation_residues + self._termination_residues:
                 graph_creator = element.get_graph_creator()
-                generative_graph = graph_creator.get_generative_graph(include_bond_connectors=True)
+                generative_graph = graph_creator._build_generative_graph(include_bond_connectors=True, return_extra_graph_info=False)
                 for node, data in generative_graph.nodes(data=True):
                     if node in graph_creator._bc_idx_set:
                         if data["stochastic_id_tree"][0] == data["stochastic_id_tree"][1]:
@@ -541,8 +541,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
         # means a deliberately closed '[]' object (whose missing-terminator
         # case NoExplicitTermination covers). A declared exit that generation
         # cannot reach is caught by the StochasticMissingPath check below.
-
-
 
         # To successfully generate molecules, there needs to be path from each entry point (left half bonds)
         # to at least one end, right half bonds

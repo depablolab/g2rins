@@ -61,6 +61,10 @@ class RingBond(G2rinsBase):
     def idx(self) -> int:
         return self._num
 
+    @property
+    def bond_symbol(self) -> None | BondSymbol:
+        return self._bond_symbol
+
 
 class BondConnectorSymbol(G2rinsBase):
     def __init__(self, children: list):

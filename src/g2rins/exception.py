@@ -114,7 +114,9 @@ class IncorrectNumberOfBondConnectors(ParsingError):
         self.expected_number_of_bond_connectors = expected_number_of_bond_connectors
 
     def __str__(self):
-        return f"Incorrect Number of BondConnectors we expected {self.expected_number_of_bond_connectors} but the object {str(self.obj)} of type {type(self.obj)} has {len(self.obj.bond_connectors)}."
+        return (
+            f"Incorrect Number of BondConnectors we expected {self.expected_number_of_bond_connectors} but the object {str(self.obj)} of type {type(self.obj)} has {len(self.obj.bond_connectors)}."
+        )
 
 
 class SmilesHasNonZeroBondConnectors(IncorrectNumberOfBondConnectors):
@@ -237,14 +239,14 @@ class StochasticMissingPath(ParsingWarning):
         return f"The stochastic object {str(self.token)} defines that it can be entered via the bond connector in position {str(self.source_bc_pos)} as defined by the left terminal connector. However, when entered there there is no path to reach any of the exit bond connectors as defined by the right terminal bond connector."
 
 
-class IncompatibleBondTypeBondConnector(ParsingWarning):
+class IncompatibleBondTypeBondConnector(ParsingError):
     def __init__(self, bond_type_lhs, bond_type_rhs):
         super().__init__(None)
         self.bond_type_lhs = bond_type_lhs
         self.bond_type_rhs = bond_type_rhs
 
     def __str__(self):
-        return f"There is a connection between bond connectors with different bond types, the left is {str(self.bond_type_lhs)} and the right is {str(self.bond_type_rhs)}. There will be no generation path, since the bond type is undefined. This maybe an incorrect input G2RINS string, check the bond types for compatibility around the bond connectors: connecting bond connectors have of same type i.e. '[<]=CC[>]' is invalid, since it connects a double bond = with a single bond implicit `-`, correct would be `[<]=CC=[>]`."
+        return f"Two bond connectors that bond to each other are reached through bonds of different order, {str(self.bond_type_lhs)} on one side and {str(self.bond_type_rhs)} on the other, so the bond between them is undefined. The bonds leading to connecting bond connectors must have the same order (the cis/trans symbols / and \\ are single bonds): '[<]=CC[>]' joins a double bond with an implicit single bond, '[<]=CC=[>]' is consistent."
 
 
 class UnvalidatedGenerationSource(G2RINSWarning):
@@ -265,10 +267,7 @@ class InvalidGenerationSource(G2RINSError):
         super().__init__(source)
 
     def __str__(self):
-        return (
-            f"Attempt to create an atom graph from source node_idx {self.source!r}, "
-            f"which is not one of the {len(self.nodes)} node idx of the generative graph."
-        )
+        return f"Attempt to create an atom graph from source node_idx {self.source!r}, " f"which is not one of the {len(self.nodes)} node idx of the generative graph."
 
 
 class NoValidGenerationSource(G2RINSError):
@@ -279,15 +278,8 @@ class NoValidGenerationSource(G2RINSError):
         super().__init__(self.use_repeat_units_as_source)
 
     def __str__(self):
-        mode = (
-            "repeat-unit"
-            if self.use_repeat_units_as_source
-            else "default"
-        )
-        return (
-            f"No valid automatic generation source is available in {mode} source mode. "
-            "Supply an explicit valid source or revise the G2RINS initiation paths."
-        )
+        mode = "repeat-unit" if self.use_repeat_units_as_source else "default"
+        return f"No valid automatic generation source is available in {mode} source mode. " "Supply an explicit valid source or revise the G2RINS initiation paths."
 
 
 class PossibleNonRepresentativePolymerChain(G2RINSWarning):
@@ -436,15 +428,11 @@ class DiscardedSamplingPaths(G2RINSWarning):
 
     def __init__(self, discarded_count, reasons):
         self.discarded_count = int(discarded_count)
-        self.reasons = tuple(
-            sorted((str(reason), int(count)) for reason, count in reasons)
-        )
+        self.reasons = tuple(sorted((str(reason), int(count)) for reason, count in reasons))
         Warning.__init__(self, self.discarded_count, self.reasons)
 
     def __str__(self):
-        reason_text = ", ".join(
-            f"{reason}: {count}" for reason, count in self.reasons
-        )
+        reason_text = ", ".join(f"{reason}: {count}" for reason, count in self.reasons)
         return (
             f"Discarded {self.discarded_count} chain-local sampling path(s) "
             f"while generating the ensemble ({reason_text}). The returned "
@@ -527,3 +515,27 @@ class IncompleteStochasticGeneration(G2RINSError):
         if num_bonds == 0:
             return f"Incomplete Stochastic Generation: since there are {num_bonds} open bonds this may be intended. You can catch this exception and use the `atom_graph` property as a result."
         return f"Incomplete Stochastic Generation: {num_bonds} are still unaccounted for this is likely an imprecise G2RINS string or a bug."
+
+
+class InvalidChiralityOrder(ParsingError):
+    def __str__(self):
+        return f"The chirality specification {self.token} has an order outside the range of its class (TH and AL 1-2, SP 1-3, TB 1-20, OH 1-30)."
+
+
+def _join(words):
+    words = list(words)
+    return " and ".join(filter(None, [", ".join(words[:-1]), words[-1]]))
+
+
+class IsomerSymbolsNotInGraph(G2RINSWarning):
+    """The string writes isotope, chirality or cis/trans symbols; the generative graph does not encode them yet."""
+
+    def __str__(self):
+        return f"The string writes {_join(self.token)} symbols. The generative graph does not encode isotopes, chirality or cis/trans marks yet (available soon), so its nodes and edges carry none of them."
+
+
+class IsomerSymbolsIgnoredInGeneration(G2RINSWarning):
+    """The string writes isotope, chirality or cis/trans symbols; generation does not apply them yet."""
+
+    def __str__(self):
+        return f"The string writes {_join(self.token)} symbols. Generation does not apply isotopes, chirality or cis/trans marks yet (available soon), so the sampled molecules carry none of them."
