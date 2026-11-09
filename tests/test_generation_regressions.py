@@ -67,10 +67,12 @@ REGRESSION_CASES = [
     ),
     pytest.param(
         # Grandparent MW accounting: single-level parent_map entries starved
-        # ancestor tallies, producing molecules at ~3x the outer target.
+        # ancestor tallies, producing molecules at ~3x the outer target. The
+        # outer poisson counts few heavy units (each repeat unit carries a
+        # ~200 g/mol nested arm), so single chains scatter widely around 800.
         "{[] [<]CC({[<] [<]NN({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])[>];; [>]}|poisson(200)|[H])CC[>]; [<][H]; []}|poisson(800)|",
         800.0,
-        (0.4, 2.0),
+        (0.3, 2.0),
         id="three-level-nested-mw",
     ),
     pytest.param(
@@ -209,12 +211,17 @@ def test_undershoot_snapshot_contract():
 # that made every Schulz-Zimm polymer too narrow).
 # ---------------------------------------------------------------------------
 
+# Count laws (poisson, flory_schulz) draw repeat-unit counts; they are bound to
+# this repeat-unit mass here so their draws read as masses.
+COUNT_LAW_REPEAT_UNIT_MASS = 44.053
+
 # (id, distribution string, target Mn, target dispersity, Mn rel-tol, D abs-tol)
 DISTRIBUTION_MOMENT_CASES = [
     pytest.param("log_normal(1400.0, 1.15)", 1400.0, 1.15, 0.04, 0.04, id="log_normal"),
     pytest.param("schulz_zimm(1800.0, 1200.0)", 1200.0, 1.50, 0.05, 0.04, id="schulz_zimm-D1.5"),
     pytest.param("schulz_zimm(2400.0, 1200.0)", 1200.0, 2.00, 0.05, 0.05, id="schulz_zimm-D2.0"),
-    pytest.param("poisson(2000.0)", 2000.0, 1.00, 0.02, 0.02, id="poisson"),
+    pytest.param("poisson(2000.0)", 2000.0, 1.0 + COUNT_LAW_REPEAT_UNIT_MASS / 2000.0, 0.02, 0.005, id="poisson"),
+    pytest.param("flory_schulz(0.05)", COUNT_LAW_REPEAT_UNIT_MASS / 0.05, 2.0 - 0.05, 0.03, 0.04, id="flory_schulz"),
 ]
 
 
@@ -224,8 +231,13 @@ def test_distribution_moments(dist_string, target_mn, target_d, mn_rtol, d_atol)
     dispersity named in the string. This guards the distribution math directly
     (independent of any topology) — notably the Schulz-Zimm shape parameter,
     which if wrong keeps Mn correct but collapses the dispersity toward
-    (z+2)/(z+1) instead of the requested (z+1)/z."""
+    (z+2)/(z+1) instead of the requested (z+1)/z, and the count laws, whose
+    counts must give poisson the dispersity 1 + M_unit (Mn - M_end)/Mn^2, here
+    1 + M_unit/Mn because no end-group mass is bound, and flory_schulz the
+    number-fraction dispersity 2 - a."""
     distribution = g2rins.StochasticDistribution.make(dist_string)
+    if isinstance(distribution, g2rins.CountLaw):
+        distribution.bind_repeat_unit_mass(COUNT_LAW_REPEAT_UNIT_MASS)
     samples = np.array([distribution.draw_mw(np.random.default_rng(i)) for i in range(20000)])
     mn = samples.mean()
     mw = (samples * samples).sum() / samples.sum()
@@ -2065,3 +2077,113 @@ def test_generative_graph_and_ensemble_share_node_ids():
     direct_molecule = direct.sample_mol_graph(rng=np.random.default_rng(0))
     direct_origins = {str(data["origin_idx"]) for _node, data in direct_molecule.nodes(data=True) if "origin_idx" in data}
     assert direct_origins <= {str(node) for node in generative_graph.nodes}
+
+
+# ---------------------------------------------------------------------------
+# Count laws: the masses the ensemble creator binds to poisson / flory_schulz.
+# ---------------------------------------------------------------------------
+
+# (id, G2RINS, {sto_gen_id: (repeat-unit mass, end-group mass)}, unit-mass tol, end-mass tol)
+COUNT_LAW_BINDING_CASES = [
+    pytest.param(
+        # Methoxy-initiated, H-capped linear chain: unit 44.05, ends CH3O + H.
+        "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(2000.0)|",
+        {0: (44.053, 32.042)}, 0.05, 0.05,
+        id="linear",
+    ),
+    pytest.param(
+        # Weighted connectors and an ionic unit: the expected composition
+        # (0.9/0.1) weights the unit mass; the three-port initiator exposes
+        # three ports that end in H caps.
+        "{[] [<]CC[N+][>]|0.9|.[Cl-], [<]C(=O)CCCCCC(O[>])CC|0.1|; C(O[>])(CO[>])(CO[>]); [<][H] []}|poisson(2000)|",
+        {0: (87.20, 92.09)}, 0.3, 0.1,
+        id="ionic-three-arm",
+    ),
+    pytest.param(
+        # AB2 branching: every placed unit leaves one more open port, so each
+        # unit brings an H cap of its own (42.06 + 1.01); exactly one entry-side
+        # port stays open and gets the NH2 cap (H initiator 1.01 + NH2 16.02).
+        "{[] [<]CCN([>])[>]; [<][H]; [>]N, [<][H] []}|poisson(1900)|",
+        {0: (43.07, 17.03)}, 0.05, 0.1,
+        id="hyperbranched",
+    ),
+    pytest.param(
+        # Nested initiator with two exposed ports: the outer Mn counts the
+        # inner block (its own Mn) plus two H caps; the inner block counts its
+        # O initiator and no caps (both ends exit into the outer object).
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<][H] []}|poisson(2200)|",
+        {1: (58.08, 16.00), 0: (44.053, 442.02)}, 0.05, 0.1,
+        id="nested-initiator",
+    ),
+    pytest.param(
+        # Nested initiator exposing one port per inner repeat unit: every
+        # exposed port ends in a Br cap whether or not a chain grew from it,
+        # so the outer end mass is the inner mean 4000 plus ~19.2 Br.
+        "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|poisson(8000.0)|",
+        {0: (72.063, 5537.3)}, 0.05, 2.0,
+        id="nested-initiator-exposed-ports",
+    ),
+    pytest.param(
+        # A nested object without exits hanging off a repeat unit rides with
+        # that unit: 71.06 + its mean 400.
+        "{[] [<]CC([>])C(=O)O{[>] [<]CCO[>]; ; [<]C []}|gauss(400,100)|; COC(=O)C(C)[>]; [<]Br []}|poisson(9000)|",
+        {0: (471.06, 167.00)}, 0.1, 0.1,
+        id="nested-side-arm",
+    ),
+    pytest.param(
+        # Nested objects as alternating repeat units count one unit each at
+        # their mean mass; the chain starts with the heavier block, and the
+        # affine fit puts that alternation phase into the end mass.
+        "{[] [<]{[>] [<]C(=O)CCCCCO[>];; [<]}|gauss(2200.0, 1000.0)|[>1], [<1]{[>] [<]C(=O)C(C)O[>];; [<]}|gauss(1300.0, 600.0)|[>]; c1ccccc1CO[>]; [<,<1][H] []}|poisson(20000.0)|",
+        {0: (1750.0, 491.2)}, 0.1, 5.0,
+        id="nested-repeat-units",
+    ),
+]
+
+
+@pytest.mark.parametrize(("smi", "expected", "unit_tol", "end_tol"), COUNT_LAW_BINDING_CASES)
+def test_count_law_bindings(smi, expected, unit_tol, end_tol):
+    """The ensemble creator binds every count law to its object's mean
+    repeat-unit mass and end-group mass, both read off the generative graph."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    bindings = ensemble_creator._count_law_bindings
+    assert set(bindings) == set(expected)
+    for sto_gen_id, (repeat_unit_mass, end_group_mass) in expected.items():
+        bound_unit, bound_end = bindings[sto_gen_id]
+        assert bound_unit == pytest.approx(repeat_unit_mass, abs=unit_tol), f"object {sto_gen_id}: unit mass {bound_unit:.2f}"
+        assert bound_end == pytest.approx(end_group_mass, abs=end_tol), f"object {sto_gen_id}: end mass {bound_end:.2f}"
+
+
+def test_poisson_ensemble_dispersity():
+    """A poisson(Mn) ensemble must show the Poisson count dispersity
+    1 + M_unit (Mn - M_end)/Mn^2 (the count used to be read as g/mol, which made
+    the ensemble essentially monodisperse)."""
+    smi = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(2000.0)|"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        molecules = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().create_ensemble(n_samples=150, output_format="mol")
+    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    mn = weights.mean()
+    dispersity = (weights * weights).sum() / weights.sum() / mn
+    assert abs(mn - 2000.0) / 2000.0 < 0.03, f"Mn {mn:.0f}"
+    exact_d = 1.0 + 44.053 * (2000.0 - 32.042) / 2000.0**2  # end groups CH3O + H
+    assert abs(dispersity - exact_d) < 0.008, f"D {dispersity:.4f} vs {exact_d:.4f}"
+
+
+def test_flory_schulz_ensemble_number_fraction():
+    """flory_schulz(a) grows geometric repeat-unit counts: Mn = M_end + M_unit/a
+    and a dispersity near 2 - a."""
+    smi = "{[] [<]CCO[>]; CO[>]; [<][H] []}|flory_schulz(0.05)|"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        molecules = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().create_ensemble(n_samples=300, output_format="mol")
+    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    mn = weights.mean()
+    dispersity = (weights * weights).sum() / weights.sum() / mn
+    target_mn = 32.042 + 44.053 / 0.05
+    assert abs(mn - target_mn) / target_mn < 0.15, f"Mn {mn:.0f} vs {target_mn:.0f}"
+    assert 1.6 < dispersity < 2.1, f"D {dispersity:.3f}"

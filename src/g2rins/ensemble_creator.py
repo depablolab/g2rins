@@ -27,9 +27,10 @@ from .chem_resource import (
     atomic_masses,
     smi_bond_mapping,
 )
-from .distribution import StochasticDistribution
+from .distribution import CountLaw, StochasticDistribution
 from .exception import (
     AllZeroSamplingWeights,
+    CountLawUnresolved,
     DeadSamplingPath,
     DiscardedSamplingPaths,
     EmptyTruncatedDistributionSupport,
@@ -159,6 +160,345 @@ def _detach_tracebacks(error):
     return error
 
 
+def _unit_ports(generative_graph, unit_nodes):
+    """Connector ports of a static unit: its nodes touched by a non-static edge
+    (in or out), each with the highest bond order it can form."""
+    ports = {}
+    for node in unit_nodes:
+        for edges in (generative_graph.out_edges(node, data=True), generative_graph.in_edges(node, data=True)):
+            for _u, _v, data in edges:
+                if not data["static"]:
+                    ports[node] = max(ports.get(node, 0), int(data.get(_BOND_TYPE_NAME, 1)))
+    return ports
+
+
+def _unit_mass(generative_graph, unit_nodes, ports):
+    """Mass of a static unit with every port bonded, hydrogens inferred as the
+    sampler infers them: static bond orders to real atoms, the aromatic
+    increment, and one bond per port charged to the port's real anchor."""
+    nodes = generative_graph.nodes
+    occupied = {node: 0 for node in unit_nodes}
+    aromatic_nodes = set()
+    for node in unit_nodes:
+        for _u, v, data in generative_graph.out_edges(node, data=True):
+            if data["static"] and nodes[v].get("atomic_num", 0) > 0:
+                occupied[node] += int(data.get(_BOND_TYPE_NAME, 0))
+                if data.get(_AROMATIC_NAME):
+                    aromatic_nodes.add(node)
+    for port, order in ports.items():
+        if nodes[port].get("atomic_num", 0) > 0:
+            anchors = [port]
+        else:
+            anchors = [v for _u, v, data in generative_graph.out_edges(port, data=True) if data["static"] and nodes[v].get("atomic_num", 0) > 0]
+        for anchor in anchors:
+            occupied[anchor] = occupied.get(anchor, 0) + order
+    mass = 0.0
+    for node in unit_nodes:
+        data = nodes[node]
+        atomic_num = int(data.get("atomic_num", 0))
+        if atomic_num <= 0:
+            continue
+        total_bond = occupied[node] + (1 if node in aromatic_nodes else 0)
+        num_h = _infer_hydrogen_count(atomic_num, data.get("charge", 0), total_bond, data.get("num_explicit_h", -1), bool(data.get(_AROMATIC_NAME, False)))
+        mass += atomic_masses[atomic_num] + num_h * atomic_masses[1]
+    return mass
+
+
+def _bind_count_laws(generative_graph, distributions, static_components, node_to_component):
+    """Bind every count law (poisson, flory_schulz) to the mean repeat-unit mass
+    and the end-group mass of its stochastic object, both estimated from the
+    generative graph; returns ``{sto_gen_id: (repeat_unit_mass, end_group_mass)}``.
+
+    Each object is read as a growth chain over (unit, entry port) states: from
+    a placed unit every other port picks its next unit with the sampler's rule
+    (edge weight times the target's molar amount). The long-run frequencies of
+    that chain give the mass a further repeat unit adds, caps included (the
+    slope of the expected mass in the repeat-unit count); growing the expected
+    chain generation by generation up to the law's mean count gives the mass
+    at that count, and port conservation (a placed unit consumes one open port
+    and opens its others) gives the open ports at termination, hence the caps
+    the object places and the ports a nested object exposes to its parent.
+    Objects are processed deepest first: a nested object enters its parent's
+    chain as one unit of its expected mass, a nested initiator as end-group
+    mass, and a nested object without exits rides with the unit carrying it.
+    """
+    nodes = generative_graph.nodes
+
+    def level_tree(node):
+        return [int(level) for level in nodes[node]["stochastic_id_tree"]]
+
+    parent_of = {}
+    for node in generative_graph:
+        tree = level_tree(node)
+        if tree[0] >= 0:
+            parent_of.setdefault(tree[0], tree[1] if tree[1] >= 0 else None)
+    children_of = {}
+    for sto_id, parent in parent_of.items():
+        if parent is not None:
+            children_of.setdefault(parent, set()).add(sto_id)
+
+    def depth(sto_id):
+        count = 0
+        while sto_id is not None:
+            sto_id = parent_of.get(sto_id)
+            count += 1
+        return count
+
+    ports = [_unit_ports(generative_graph, component) for component in static_components]
+    masses = [_unit_mass(generative_graph, component, unit_ports) for component, unit_ports in zip(static_components, ports)]
+    out_edges = {}
+    for u, v, data in generative_graph.edges(data=True):
+        if not data["static"]:
+            out_edges.setdefault(u, []).append((v, data))
+
+    def molar(node, sto_id):
+        return float(nodes[node]["unit_molar_amounts"][sto_id])
+
+    mean_mass = {}  # object -> expected mass of one instance
+    exposed = {}  # object -> {port: expected open ports that continue outside the object}
+    bindings = {}
+
+    for sto_id in sorted(parent_of, key=depth, reverse=True):
+        children = children_of.get(sto_id, set())
+        inside = children | {sto_id}
+
+        def entry_weight(u, v, data):
+            """Weight with which the edge u -> v places a unit of this level or enters a nested object (0 otherwise)."""
+            weight = float(data[_PROPAGATION_NAME]) + float(data[_TRANSITION_NAME])
+            if weight <= 0:
+                return 0.0
+            level = level_tree(v)[0]
+            edge_level = int(data[_EDGE_STOCHASTIC_ID_NAME])
+            source_tree = level_tree(u)
+            if level == sto_id and (edge_level == sto_id or sto_id not in source_tree):
+                return weight * molar(v, sto_id)
+            if level in children and level not in source_tree and edge_level in (sto_id, level):
+                return weight * molar(v, edge_level)
+            return 0.0
+
+        def growth_targets(port):
+            """Units a port grows next at this level, with the sampler's weights."""
+            targets = [(v, entry_weight(port, v, data)) for v, data in out_edges.get(port, [])]
+            return [(v, weight) for v, weight in targets if weight > 0]
+
+        def state_of(node):
+            level = level_tree(node)[0]
+            return ("unit", node) if level == sto_id else ("child", level)
+
+        # Chain states (unit entered through a port, or nested object entered) and the ports that enter them.
+        states = {}
+        sources_of = {}
+        for u, edges in out_edges.items():
+            for v, data in edges:
+                weight = entry_weight(u, v, data)
+                if weight <= 0:
+                    continue
+                state = state_of(v)
+                states.setdefault(state, len(states))
+                entries = sources_of.setdefault(state, {})
+                entries[u] = entries.get(u, 0.0) + weight
+        entered_units = {node_to_component[node] for kind, node in states if kind == "unit"}
+
+        def is_chain_source(port):
+            level = level_tree(port)[0]
+            if level == sto_id:
+                return node_to_component[port] in entered_units
+            return ("child", level) in states
+
+        # Ports open before the first unit: the initiator's ports, the ports a nested
+        # initiator exposes, or the single port an outside unit enters by.
+        initial_open = {}
+        port_total = {}
+        outside_total = 0.0
+        initiator_weights = {}
+        for state in states:
+            for port, weight in sources_of[state].items():
+                if is_chain_source(port):
+                    continue
+                port_total[port] = port_total.get(port, 0.0) + weight
+                level = level_tree(port)[0]
+                if level == sto_id:
+                    initial_open[port] = 1.0
+                    key = ("unit", node_to_component[port])
+                elif level in children:
+                    initial_open[port] = exposed.get(level, {}).get(port, 0.0)
+                    key = ("child", level)
+                else:
+                    initial_open[port] = initial_open.get(port, 0.0) + weight
+                    outside_total += weight
+                    continue
+                initiator_weights[key] = initiator_weights.get(key, 0.0) + weight * molar(port, sto_id)
+        for port in initial_open:
+            if level_tree(port)[0] not in inside:
+                initial_open[port] /= outside_total
+        total = sum(initiator_weights.values())
+        initiator_mass = 0.0
+        if total > 0:
+            initiator_mass = sum(weight / total * (masses[key] if kind == "unit" else mean_mass[key]) for (kind, key), weight in initiator_weights.items())
+
+        n_states = len(states)
+        matrix = np.zeros((n_states, n_states))
+        state_mass = np.zeros(n_states)
+        created_emitting = [{} for _ in range(n_states)]  # ports a placed unit opens that grow further
+        created_quiet = [{} for _ in range(n_states)]  # ports a placed unit opens that only cap or exit
+        for (kind, key), index in states.items():
+            if kind == "unit":
+                unit = node_to_component[key]
+                mass = masses[unit]
+                port_multiplicities = [(port, 1.0) for port in ports[unit] if port != key]
+            else:
+                mass = mean_mass[key]
+                port_multiplicities = list(exposed.get(key, {}).items())
+            for port, multiplicity in port_multiplicities:
+                targets = growth_targets(port)
+                total = sum(weight for _v, weight in targets)
+                if not targets:
+                    created_quiet[index][port] = created_quiet[index].get(port, 0.0) + multiplicity
+                    continue
+                if kind == "unit" and all(level_tree(v)[0] in children and not exposed.get(level_tree(v)[0]) for v, _w in targets):
+                    # A port that only grows nested objects without exits carries them as side arms.
+                    mass += sum(weight / total * mean_mass[level_tree(v)[0]] for v, weight in targets)
+                    continue
+                created_emitting[index][port] = created_emitting[index].get(port, 0.0) + multiplicity
+                for v, weight in targets:
+                    matrix[index, states[state_of(v)]] += multiplicity * weight / total
+            state_mass[index] = mass
+
+        def cap_mass(port):
+            """Expected mass of the end group this level attaches to an open port."""
+            total = 0.0
+            mass = 0.0
+            for v, data in out_edges.get(port, []):
+                weight = float(data[_TERMINATION_NAME])
+                if weight > 0 and int(data[_EDGE_STOCHASTIC_ID_NAME]) == sto_id:
+                    weight *= molar(v, sto_id)
+                    total += weight
+                    mass += weight * masses[node_to_component[v]]
+            return mass / total if total > 0 else 0.0
+
+        def leaves(port):
+            """Whether an open port continues outside this object instead of being capped here."""
+            return any(float(data[_TRANSITION_NAME]) > 0 and level_tree(v)[0] not in inside for v, data in out_edges.get(port, []))
+
+        # Slope: mass a further repeat unit adds, from the long-run state frequencies
+        # (averaged normalized power iteration) and the ports it leaves to be capped.
+        slope = 0.0
+        if n_states:
+            v0 = np.zeros(n_states)
+            for state, index in states.items():
+                for port, weight in sources_of[state].items():
+                    if not is_chain_source(port):
+                        v0[index] += initial_open.get(port, 0.0) * weight / port_total[port]
+            if v0.sum() <= 0:
+                for (kind, key), index in states.items():
+                    v0[index] = molar(key, sto_id) if kind == "unit" else 1.0
+            if v0.sum() <= 0:
+                v0 = np.ones(n_states)
+            frequency = np.zeros(n_states)
+            tail = np.zeros(n_states)
+            vector = v0 / v0.sum()
+            for step in range(400):
+                frequency += vector
+                if step >= 200:
+                    tail += vector
+                vector = vector @ matrix
+                total = vector.sum()
+                if total <= 0:
+                    break
+                vector /= total
+            # The second half sheds one-time units; a chain that dies out early keeps the full run.
+            frequency = tail if tail.sum() > 0 else frequency
+            frequency /= frequency.sum()
+            emitting_rate = {}
+            quiet_rate = {}
+            for index in range(n_states):
+                for port, multiplicity in created_emitting[index].items():
+                    emitting_rate[port] = emitting_rate.get(port, 0.0) + frequency[index] * multiplicity
+                for port, multiplicity in created_quiet[index].items():
+                    quiet_rate[port] = quiet_rate.get(port, 0.0) + frequency[index] * multiplicity
+            emitting_total = sum(emitting_rate.values())
+            frontier_growth = max(emitting_total - 1.0, 0.0)
+            slope = float(frequency @ state_mass)
+            slope += sum(rate * cap_mass(port) for port, rate in quiet_rate.items() if not leaves(port))
+            if emitting_total > 0:
+                slope += frontier_growth * sum(rate / emitting_total * cap_mass(port) for port, rate in emitting_rate.items() if not leaves(port))
+
+        def expected_mass(target_units):
+            """Expected mass of an instance after placing target_units units, generation by
+            generation from the entry ports, and the open ports continuing outside the object."""
+            visits = np.zeros(n_states)
+            open_ports = dict(initial_open)
+            if n_states and target_units > 0:
+                current = v0.copy()
+                previous_emissions = dict(initial_open)
+                placed = 0.0
+                while True:
+                    generation_total = current.sum()
+                    if generation_total <= 1e-12:
+                        open_ports = previous_emissions
+                        break
+                    emissions = {}
+                    for index in np.nonzero(current)[0]:
+                        for port, multiplicity in created_emitting[index].items():
+                            emissions[port] = emissions.get(port, 0.0) + current[index] * multiplicity
+                    if placed + generation_total >= target_units:
+                        fraction = (target_units - placed) / generation_total
+                        visits += fraction * current
+                        open_ports = {port: (1.0 - fraction) * count for port, count in previous_emissions.items()}
+                        for port, count in emissions.items():
+                            open_ports[port] = open_ports.get(port, 0.0) + fraction * count
+                        break
+                    visits += current
+                    placed += generation_total
+                    previous_emissions = emissions
+                    current = current @ matrix
+                for index in np.nonzero(visits)[0]:
+                    for port, multiplicity in created_quiet[index].items():
+                        open_ports[port] = open_ports.get(port, 0.0) + visits[index] * multiplicity
+            mass = initiator_mass + float(visits @ state_mass)
+            mass += sum(count * cap_mass(port) for port, count in open_ports.items() if not leaves(port))
+            exits = {port: count for port, count in open_ports.items() if count > 0 and leaves(port)}
+            return mass, exits
+
+        # End-group mass: the affine fit end + N * slope must reproduce the expected
+        # mass at the law's own mean count N, which for poisson depends on the end mass.
+        distribution = distributions[sto_id] if sto_id < len(distributions) else None
+        count_law = isinstance(distribution, CountLaw) and slope > 0
+        mass_law = distribution is not None and not isinstance(distribution, CountLaw)
+        end = 0.0
+        exits = {}
+        for _ in range(5):
+            if count_law:
+                distribution.bind_repeat_unit_mass(slope, end)
+                count = distribution.mean_count()
+            elif mass_law and slope > 0:
+                count = max((distribution.mean_mw() - end) / slope, 0.0)
+            else:
+                count = 0.0
+            mass, exits = expected_mass(count)
+            new_end = max(mass - count * slope, 0.0)
+            converged = abs(new_end - end) < 1e-9
+            end = new_end
+            if converged:
+                break
+        if count_law:
+            distribution.bind_repeat_unit_mass(slope, end)
+            bindings[sto_id] = (slope, end)
+            mean_mass[sto_id] = distribution.mean_mw()
+        elif isinstance(distribution, CountLaw):
+            # No repeat unit can be placed: keep the counts in g/mol so the sampler reports the dead string itself.
+            warnings.warn(CountLawUnresolved(str(distribution)), stacklevel=2)
+            distribution.bind_repeat_unit_mass(1.0, 0.0)
+            bindings[sto_id] = (1.0, 0.0)
+            mean_mass[sto_id] = distribution.mean_mw()
+        elif mass_law:
+            mean_mass[sto_id] = distribution.mean_mw()
+        else:
+            mean_mass[sto_id] = end
+        exposed[sto_id] = exits
+    return bindings
+
+
 class _HalfAtomBond:
     def __init__(self, atom_idx: int, node_idx: str, graph, stochastic_tracker, rng):
         self.atom_idx: int = atom_idx
@@ -258,8 +598,11 @@ class _StochasticObjectTracker:
         rng=None,
         path_is_conditional=False,
         zero_support_is_unavoidable=False,
+        count_law_bindings=None,
     ):
         self._rng = rng
+        # Per stochastic object: (repeat-unit mass, end-group mass) that turn a count law's draws into masses.
+        self._count_law_bindings = {} if count_law_bindings is None else dict(count_law_bindings)
         self._path_is_conditional = bool(path_is_conditional)
         # Immutable per attempt.  A conservative template analysis sets this
         # only when every allowed source is proven to reach zero support.  It
@@ -286,12 +629,18 @@ class _StochasticObjectTracker:
             for index, _stochastic_vector in enumerate(data["molecular_weight_distribution"]):
                 stochastic_vector = _stochastic_vector.copy()
                 distribution = StochasticDistribution.from_serial_vector(stochastic_vector)
+                if isinstance(distribution, CountLaw) and index in self._count_law_bindings:
+                    distribution.bind_repeat_unit_mass(*self._count_law_bindings[index])
                 self._register_sto_gen_id(index, distribution)
             break
 
     @property
     def sto_atom_id_expected_molw(self):
         return self._sto_atom_id_expected_molw
+
+    @property
+    def count_law_bindings(self):
+        return self._count_law_bindings
 
     @property
     def sto_atom_id_actual_molw(self):
@@ -1142,6 +1491,7 @@ class _PartialAtomGraph:
                 zero_support_is_unavoidable=(
                     self.stochastic_tracker.zero_support_is_unavoidable
                 ),
+                count_law_bindings=self.stochastic_tracker.count_law_bindings,
             )
             source_sto_gen_id = self.generative_graph.nodes[source]["stochastic_id_tree"][0]
             term_sto_atom_id = stochastic_object_tracker.register_new_atom_instance(source_sto_gen_id, self.generative_graph.nodes[source]["stochastic_id_tree"][1], None, False)
@@ -1936,6 +2286,13 @@ class EnsembleCreator:
             for component_id, component in enumerate(static_components)
             for node in component
         }
+        self._distributions = self._load_distributions()
+        self._count_law_bindings = _bind_count_laws(
+            self._generative_graph,
+            self._distributions,
+            static_components,
+            self._node_to_static_component,
+        )
         self._statically_empty_nested_mw_sto_gen_ids = (
             self._find_statically_empty_nested_mw_sto_gen_ids()
         )
@@ -1982,6 +2339,15 @@ class EnsembleCreator:
             ) > 1,
         }
 
+    def _load_distributions(self):
+        """Deserialize the per-object molecular-weight distributions the graph carries."""
+        try:
+            first_node = next(iter(self._generative_graph.nodes))
+            serial_vectors = self._generative_graph.nodes[first_node]["molecular_weight_distribution"]
+        except (StopIteration, KeyError):
+            return []
+        return [StochasticDistribution.from_serial_vector(list(vector)) for vector in serial_vectors]
+
     def _find_statically_empty_nested_mw_sto_gen_ids(self):
         """Find nested MW draws whose truncated support is empty on every chain.
 
@@ -1993,43 +2359,13 @@ class EnsembleCreator:
         bounds, infinite parent support, malformed trees) stays out of the
         set, keeping the failure chain-local.
         """
-        try:
-            first_node = next(iter(self._generative_graph.nodes))
-            serial_vectors = tuple(
-                self._generative_graph.nodes[first_node][
-                    "molecular_weight_distribution"
-                ]
-            )
-        except (StopIteration, KeyError, TypeError):
-            return frozenset()
-
         bounds = {}
-        for sto_gen_id, serial_vector in enumerate(serial_vectors):
+        for sto_gen_id, distribution in enumerate(self._distributions):
+            if distribution is None:
+                continue
             try:
-                distribution = StochasticDistribution.from_serial_vector(
-                    list(serial_vector)
-                )
-                frozen = distribution._distribution
-                parameters = getattr(frozen, "kwds", {})
-                scale = parameters.get("scale")
-                if scale is not None and float(scale) == 0.0:
-                    point = float(parameters.get("loc", 0.0))
-                    if np.isfinite(point):
-                        bounds[sto_gen_id] = (point, point)
-                    continue
-                support_lower, support_upper = frozen.support()
-                bounds[sto_gen_id] = (
-                    float(support_lower),
-                    float(support_upper),
-                )
-            except (
-                AttributeError,
-                IndexError,
-                TypeError,
-                ValueError,
-                OverflowError,
-                RuntimeError,
-            ):
+                bounds[sto_gen_id] = distribution.support_mw()
+            except (NotImplementedError, RuntimeError, TypeError, ValueError, OverflowError):
                 continue
 
         parent_ids = {}
@@ -2765,6 +3101,7 @@ class EnsembleCreator:
             rng,
             path_is_conditional=source_is_conditional,
             zero_support_is_unavoidable=zero_support_is_unavoidable,
+            count_law_bindings=self._count_law_bindings,
         )
 
         source_stochastic_id_tree = generative_graph.nodes[source]["stochastic_id_tree"]

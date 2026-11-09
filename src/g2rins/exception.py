@@ -331,6 +331,27 @@ class UndershootSnapshotMissed(G2RINSWarning):
         return f"{self._MESSAGE} Token: {self.token}"
 
 
+class CountLawUnresolved(G2RINSWarning):
+    """A count law (poisson, flory_schulz) could not be converted to molecular
+    weights because no repeat unit of its stochastic object can ever be placed;
+    its counts are read in g/mol and the sampler reports the dead decision itself."""
+
+    _MESSAGE = (
+        "No repeat unit of this stochastic object can be placed, so the mean repeat-unit mass "
+        "behind its count law is undefined and the drawn counts are read in g/mol."
+    )
+
+    def __init__(self, token=None):
+        self.token = token
+        super().__init__(token)
+        Warning.__init__(self, self._MESSAGE)
+
+    def __str__(self):
+        if self.token is None:
+            return self._MESSAGE
+        return f"{self._MESSAGE} Token: {self.token}"
+
+
 class ForcedOvershootNoBoundary(G2RINSWarning):
     """A final explicit undershoot remained impossible because no valid
     owner-level boundary existed below the target.

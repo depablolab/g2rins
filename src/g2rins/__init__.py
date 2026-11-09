@@ -43,6 +43,7 @@ from .bond import (
 )
 from .core import G2rinsBase
 from .distribution import (
+    CountLaw,
     FlorySchulz,
     Gauss,
     LogNormal,
@@ -102,6 +103,7 @@ __all__ = [
     "G2RINSTransformer",
     "get_global_transformer",
     "get_global_parser",
+    "CountLaw",
     "FlorySchulz",
     "SchulzZimm",
     "Gauss",

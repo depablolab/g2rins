@@ -453,6 +453,32 @@ class StochasticDistribution(StochasticGeneration):
             return self._distribution.pmf(k=int(mw), **kwargs)
         raise NotImplementedError
 
+    def mean_mw(self) -> float:
+        """
+        Expected molecular weight of one stochastic object drawn from this distribution.
+        """
+        if self._distribution is None:
+            raise NotImplementedError
+        parameters = getattr(self._distribution, "kwds", {})
+        if parameters.get("scale") == 0:
+            return float(parameters.get("loc", 0.0))
+        return float(self._distribution.mean())
+
+    def support_mw(self) -> Tuple[float, float]:
+        """
+        Molecular-weight interval the distribution can draw from, as (lower, upper).
+        """
+        if self._distribution is None:
+            raise NotImplementedError
+        # scipy exposes a zero-scale frozen continuous distribution with NaN
+        # support even though it represents a useful point mass.
+        parameters = getattr(self._distribution, "kwds", {})
+        if parameters.get("scale") == 0:
+            point = float(parameters.get("loc", 0.0))
+            return (point, point)
+        lower, upper = self._distribution.support()
+        return (float(lower), float(upper))
+
     @classmethod
     def _default_serialize(cls: Type["StochasticDistribution"], n: int) -> Tuple[float, ...]:
         """
@@ -555,48 +581,112 @@ class StochasticDistribution(StochasticGeneration):
         raise NotImplementedError
 
 
-# TODO: Flory Schulz samples chain length rather than molecular weight. We need to implement it differently in ensemble_creator.py
-class FlorySchulz(StochasticDistribution):
+class CountLaw(StochasticDistribution):
     """
-    Flory-Schulz distribution of molecular weights for geometrically distributed chain lengths.
+    Base class for distributions over the number of repeat units of a stochastic object.
 
-    :math:`W_a(N) = a^2 N (1-a)^{N-1}`
+    The law is sampled in repeat-unit counts. A count :math:`N` becomes the
+    molecular weight :math:`M = M_{end} + N \\, M_{unit}` once the object's mean
+    repeat-unit mass :math:`M_{unit}` (each repeat unit together with the end
+    groups it brings along) and its fixed end-group mass :math:`M_{end}` (the
+    initiator and the caps of the ports it exposes) are bound with
+    :meth:`bind_repeat_unit_mass`. The ensemble creator derives both from the
+    generative graph before sampling; until then only the count law is known
+    and molecular weights cannot be drawn.
+    """
 
-    where :math:`0<a<1` is the experimentally determined constant of remaining monomers and :math:`N` is the chain length.
+    _repeat_unit_mass: Optional[float] = None
+    _end_group_mass: float = 0.0
+
+    def bind_repeat_unit_mass(self, repeat_unit_mass: float, end_group_mass: float = 0.0) -> None:
+        """
+        Binds the masses that turn repeat-unit counts into molecular weights.
+
+        Args:
+            repeat_unit_mass (float): Mean mass of one placed repeat unit in g/mol, end groups it opens included.
+            end_group_mass (float): Mass in g/mol the object carries at zero repeat units (initiator and its caps).
+        """
+        repeat_unit_mass = float(repeat_unit_mass)
+        end_group_mass = float(end_group_mass)
+        if not (math.isfinite(repeat_unit_mass) and repeat_unit_mass > 0) or not (math.isfinite(end_group_mass) and end_group_mass >= 0):
+            raise ValueError(f"{type(self).__name__} needs a positive repeat-unit mass and a non-negative end-group mass, got {repeat_unit_mass} and {end_group_mass}.")
+        previous = (self._repeat_unit_mass, self._end_group_mass)
+        self._repeat_unit_mass = repeat_unit_mass
+        self._end_group_mass = end_group_mass
+        try:
+            self._bind_count_distribution()
+        except ValueError:
+            self._repeat_unit_mass, self._end_group_mass = previous
+            raise
+
+    def _bind_count_distribution(self) -> None:
+        """Hook for laws whose count distribution depends on the bound masses."""
+
+    def _require_binding(self) -> Tuple[float, float]:
+        if self._repeat_unit_mass is None:
+            raise RuntimeError(f"{type(self).__name__} draws repeat-unit counts: bind the repeat-unit mass before asking for molecular weights.")
+        return self._repeat_unit_mass, self._end_group_mass
+
+    def mean_count(self) -> float:
+        """
+        Expected number of repeat units.
+        """
+        raise NotImplementedError
+
+    def mean_mw(self) -> float:
+        repeat_unit_mass, end_group_mass = self._require_binding()
+        return end_group_mass + self.mean_count() * repeat_unit_mass
+
+    def support_mw(self) -> Tuple[float, float]:
+        repeat_unit_mass, end_group_mass = self._require_binding()
+        lower, upper = self._distribution.support()
+        return (end_group_mass + float(lower) * repeat_unit_mass, end_group_mass + float(upper) * repeat_unit_mass)
+
+    def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None, **kwargs: Any) -> Any:
+        """
+        Draws a repeat-unit count and returns the molecular weight it corresponds to.
+        Bounds are molecular weights; they are mapped onto the count lattice.
+        """
+        repeat_unit_mass, end_group_mass = self._require_binding()
+        if rng is None:
+            rng = get_global_rng()
+        if lower is None and upper is None:
+            count = float(self._distribution.rvs(random_state=rng, **kwargs))
+        else:
+            count_lower = None if lower is None else (float(lower) - end_group_mass) / repeat_unit_mass
+            count_upper = None if upper is None else (float(upper) - end_group_mass) / repeat_unit_mass
+            count = self._draw_bounded_mw(self._distribution, rng, count_lower, count_upper, kwargs)
+        return end_group_mass + count * repeat_unit_mass
+
+    def prob_mw(self, mw: Union[float, "RememberAdd"], **kwargs: Any) -> float:
+        """
+        Probability of the repeat-unit count nearest to a molecular weight (or of the counts
+        a RememberAdd range covers).
+        """
+        repeat_unit_mass, end_group_mass = self._require_binding()
+        if isinstance(mw, RememberAdd):
+            previous = math.floor((mw.previous - end_group_mass) / repeat_unit_mass)
+            current = math.floor((mw.value - end_group_mass) / repeat_unit_mass)
+            return float(self._distribution.cdf(current, **kwargs) - self._distribution.cdf(previous, **kwargs))
+        count = int(round((float(mw) - end_group_mass) / repeat_unit_mass))
+        return float(self._distribution.pmf(count, **kwargs))
+
+
+class FlorySchulz(CountLaw):
+    """
+    Flory-Schulz (most probable) distribution of repeat-unit counts.
+
+    The number fraction of chains with :math:`N` repeat units is
+
+    :math:`P_a(N) = a (1-a)^{N-1}`
+
+    where :math:`0<a<1` is the probability that a growing chain stops after the
+    current repeat unit (one minus the extent of reaction). The number-average
+    count is :math:`1/a` and the dispersity tends to :math:`2 - a`. Counts become
+    molecular weights through the bound repeat-unit mass (see :class:`CountLaw`).
 
     The textual representation of this distribution is: `flory_schulz(a)`
     """
-
-    class flory_schulz_gen(stats.rv_discrete):
-        """Flory Schulz distribution."""
-
-        def _rvs(self, fls_a, size=None, random_state=None):
-            # If X ~ NegativeBinomial(2, a), then N = X + 1 has
-            # P(N=n) = a**2 * n * (1-a)**(n-1).  Sampling this equivalent
-            # form avoids SciPy's generic discrete PPF, which can stall while
-            # inverting the infinite support.
-            return random_state.negative_binomial(2, fls_a, size=size) + 1
-
-        def _pmf(self, k, fls_a):
-            return fls_a**2 * k * (1 - fls_a) ** (k - 1)
-
-        def _sf(self, k, fls_a):
-            # Sum_{n=k+1..inf} a^2*n*(1-a)^(n-1)
-            #   = (1-a)^k * (1 + a*k).
-            k = np.asarray(k)
-            finite_k = np.where(np.isfinite(k), k, 0.0)
-            tail_k = np.maximum(np.floor(finite_k), 0)
-            tail = (1 - fls_a) ** tail_k * (1 + fls_a * tail_k)
-            return np.where(np.isposinf(k), 0.0, np.where(np.isneginf(k), 1.0, tail))
-
-        def _logsf(self, k, fls_a):
-            k = np.asarray(k)
-            finite_k = np.where(np.isfinite(k), k, 0.0)
-            tail_k = np.maximum(np.floor(finite_k), 0)
-            log_tail = tail_k * np.log1p(-fls_a) + np.log1p(fls_a * tail_k)
-            return np.where(
-                np.isposinf(k), -math.inf, np.where(np.isneginf(k), 0.0, log_tail)
-            )
 
     _fls_a: Optional[float] = None
 
@@ -634,7 +724,7 @@ class FlorySchulz(StochasticDistribution):
             raise RuntimeError(f"The Flory-Schulz distribution needs an a parameter between 0, and 1. But got {fls_a}.")
 
         self._fls_a = fls_a
-        self._distribution = self.flory_schulz_gen(name="Flory-Schulz", a=1)(fls_a=self._fls_a)
+        self._distribution = stats.geom(p=self._fls_a)
 
     def generate_string(self, extension: bool) -> str:
         """
@@ -670,8 +760,8 @@ class FlorySchulz(StochasticDistribution):
         """
         return (self._fls_a,)
 
-    def prob_mw(self, mw):
-        return super().prob_mw(mw)
+    def mean_count(self) -> float:
+        return 1.0 / self._fls_a
 
 
 StochasticDistribution._known_distributions.append(FlorySchulz)
@@ -796,6 +886,9 @@ class SchulzZimm(StochasticDistribution):
         Returns True if the distribution is initialized (i.e., Mw and Mn are set and valid).
         """
         return self._distribution is not None and self._z is not None
+
+    def mean_mw(self) -> float:
+        return float(self._Mn)
 
     def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None) -> Any:
         """
@@ -1129,6 +1222,12 @@ class LogNormal(StochasticDistribution):
         """
         return self._distribution is not None
 
+    def mean_mw(self) -> float:
+        return float(self._M)
+
+    def support_mw(self) -> Tuple[float, float]:
+        return (0.0, math.inf)
+
     def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None) -> Any:
         """
         Draws a sample from the LogNormal distribution.
@@ -1153,32 +1252,50 @@ class LogNormal(StochasticDistribution):
 StochasticDistribution._known_distributions.append(LogNormal)
 
 
-class Poisson(StochasticDistribution):
-    # TODO: implement prob_mw()
+class Poisson(CountLaw):
     """
-    Poisson distribution of molecular weights for chain lengths.
+    Poisson distribution of repeat-unit counts, the distribution of a living polymerization.
     Flory, P. J. Molecular size distribution in ethylene oxide polymers. Journal of the American chemical society 1940, 62, 1561–1565.
 
-    The textual representation of this distribution is: `poisson(N)`
+    The parameter is the number-average molecular weight :math:`M_n` of the whole
+    stochastic object in g/mol, end groups included. The number of repeat units
+    follows a Poisson law of mean :math:`(M_n - M_{end}) / M_{unit}` once the
+    repeat-unit and end-group masses are bound (see :class:`CountLaw`), so the
+    dispersity is :math:`1 + M_{unit} (M_n - M_{end}) / M_n^2`, which is
+    :math:`1 + M_{unit} / M_n` for light end groups.
+
+    The textual representation of this distribution is: `poisson(Mn)`
     """
 
-    _N: Optional[float] = None  # Mean number of repeating units
+    _Mn: Optional[float] = None  # Number-average molecular weight of the stochastic object, g/mol
 
     def __init__(self, children: List[Any]):
         """
         Initialization of Poisson distribution object.
 
         Args:
-            children (List[Any]): List of parsed children, expected to contain the mean (N) as a float.
+            children (List[Any]): List of parsed children, expected to contain the number-average
+                                  molecular weight (Mn) as a float.
         """
         super().__init__(children)
-        N: Optional[float] = None
+        Mn: Optional[float] = None
         for child in self._children:
             if isinstance(child, float):
-                N = child
+                Mn = child
 
-        self._N = N
-        self._distribution = stats.poisson(mu=self._N)
+        self._Mn = Mn
+        # Marks the law as initialized; the count law is rebuilt when the masses are bound.
+        self._distribution = stats.poisson(mu=self._Mn)
+
+    def _bind_count_distribution(self) -> None:
+        mean_count = (self._Mn - self._end_group_mass) / self._repeat_unit_mass
+        if mean_count < 0:
+            raise ValueError(f"poisson({self._Mn}) asks for less mass than the end groups of its stochastic object already carry ({self._end_group_mass:.1f} g/mol).")
+        self._distribution = stats.poisson(mu=mean_count)
+
+    def mean_count(self) -> float:
+        repeat_unit_mass, end_group_mass = self._require_binding()
+        return (self._Mn - end_group_mass) / repeat_unit_mass
 
     @classmethod
     def default_serialize(cls) -> Tuple[float, ...]:
@@ -1189,9 +1306,9 @@ class Poisson(StochasticDistribution):
 
     def serialize(self) -> Tuple[float, ...]:
         """
-        Serializes the mean (N) of the Poisson distribution.
+        Serializes the number-average molecular weight (Mn) of the Poisson distribution.
         """
-        return (self._N,)
+        return (self._Mn,)
 
     @classmethod
     def make(cls: Type[Self], text: str) -> Self:
@@ -1220,13 +1337,13 @@ class Poisson(StochasticDistribution):
             str: The textual representation, e.g., '|poisson(10)|'.
         """
         if extension:
-            return f"|poisson({self._N})|"
+            return f"|poisson({self._Mn})|"
         return ""
 
     @property
     def generable(self) -> bool:
         """
-        Returns True if the distribution is initialized (i.e., N is set).
+        Returns True if the distribution is initialized (i.e., Mn is set).
         """
         return self._distribution is not None
 

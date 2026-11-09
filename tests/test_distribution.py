@@ -18,14 +18,17 @@ def test_empty_serialize():
 
 @pytest.mark.parametrize("a", [0.01, 0.05, 0.1, 0.3, 0.5])
 def test_flory_schulz(a):
+    """Number fraction of the most probable distribution: geometric repeat-unit
+    counts with mean 1/a (a unit repeat-unit mass makes the counts readable as masses)."""
+
     def mean(a):
-        return 2 / a - 1
+        return 1 / a
 
     def variance(a):
-        return (2 - 2 * a) / a**2
+        return (1 - a) / a**2
 
     def skew(a):
-        return (2 - a) / np.sqrt(2 - 2 * a)
+        return (2 - a) / np.sqrt(1 - a)
 
     value = int(1 / a + 1)
     if value % 2:
@@ -34,6 +37,9 @@ def test_flory_schulz(a):
         flory_schulz = g2rins.FlorySchulz.make(f"flory_schulz({a})")
 
     assert isinstance(flory_schulz, g2rins.FlorySchulz)
+    assert isinstance(flory_schulz, g2rins.CountLaw)
+    flory_schulz.bind_repeat_unit_mass(1.0)
+    assert flory_schulz.mean_count() == pytest.approx(1 / a)
 
     random_mw = flory_schulz.draw_mw()
     assert flory_schulz.prob_mw(random_mw) > 0
@@ -58,6 +64,7 @@ def test_flory_schulz_propagates_deterministic_sampling_failure(monkeypatch):
     eventually exhausts the Python stack.
     """
     flory_schulz = g2rins.StochasticDistribution.make("flory_schulz(0.2)")
+    flory_schulz.bind_repeat_unit_mass(1.0)
     expected_error = RuntimeError("deterministic inverse failure")
     calls = 0
 
@@ -88,16 +95,43 @@ def test_flory_schulz_propagates_deterministic_sampling_failure(monkeypatch):
 def test_flory_schulz_unbounded_draw_uses_stable_exact_sampler():
     """Unbounded draws must not depend on SciPy's generic discrete inverse."""
     flory_schulz = g2rins.StochasticDistribution.make("flory_schulz(0.01)")
+    flory_schulz.bind_repeat_unit_mass(1.0)
     actual_rng = np.random.default_rng(0)
     expected_rng = np.random.default_rng(0)
 
     actual = [flory_schulz.draw_mw(rng=actual_rng) for _ in range(100)]
-    expected = [
-        1 + expected_rng.negative_binomial(2, 0.01)
-        for _ in range(100)
-    ]
+    expected = [expected_rng.geometric(0.01) for _ in range(100)]
 
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_count_law_needs_bound_masses():
+    """A count law without bound masses cannot be read in g/mol; binding fixes
+    the mass lattice M_end + N * M_unit that draws, bounds and probabilities use."""
+    poisson = g2rins.StochasticDistribution.make("poisson(2000.0)")
+    assert isinstance(poisson, g2rins.CountLaw)
+    with pytest.raises(RuntimeError):
+        poisson.draw_mw(np.random.default_rng(0))
+    with pytest.raises(RuntimeError):
+        poisson.mean_mw()
+    serial_vector = poisson.get_serial_vector()
+    assert str(g2rins.StochasticDistribution.from_serial_vector(serial_vector)) == str(poisson)
+
+    repeat_unit_mass, end_group_mass = 44.053, 32.042
+    poisson.bind_repeat_unit_mass(repeat_unit_mass, end_group_mass)
+    assert poisson.mean_mw() == pytest.approx(2000.0)
+    assert poisson.support_mw() == (pytest.approx(end_group_mass), np.inf)
+    rng = np.random.default_rng(1)
+    for _ in range(50):
+        mw = poisson.draw_mw(rng, lower=1900.0, upper=2100.0)
+        assert 1900.0 <= mw <= 2100.0
+        count = (mw - end_group_mass) / repeat_unit_mass
+        assert count == pytest.approx(round(count))
+        assert poisson.prob_mw(mw) > 0
+
+    with pytest.raises(ValueError):
+        poisson.bind_repeat_unit_mass(repeat_unit_mass, 2500.0)
+    assert poisson.mean_mw() == pytest.approx(2000.0)
 
 
 @pytest.mark.parametrize(("mu", "sigma"), [(100.0, 10.0), (200.0, 100.0), (500.0, 1.0), (600.0, 0.0)])
@@ -222,14 +256,21 @@ def test_log_normal(M, D):
 
 @pytest.mark.parametrize("M", [11.3e3, 5.3e3, 20.3e3])
 def test_poisson(M):
+    """poisson(Mn) counts repeat units: once the masses are bound the mass mean
+    is Mn and the mass variance is (Mn - M_end) * M_unit."""
+    repeat_unit_mass, end_group_mass = 44.053, 18.015
+
     def mean(M):
         return M
 
     def variance(M):
-        return M
+        return (M - end_group_mass) * repeat_unit_mass
 
     poisson = g2rins.StochasticDistribution.make(f"poisson({M})")
     assert isinstance(poisson, g2rins.Poisson)
+    poisson.bind_repeat_unit_mass(repeat_unit_mass, end_group_mass)
+    assert poisson.mean_count() == pytest.approx((M - end_group_mass) / repeat_unit_mass)
+    assert poisson.mean_mw() == pytest.approx(M)
 
     data = []
     for _i in range(NSTAT):
