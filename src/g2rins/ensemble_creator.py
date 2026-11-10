@@ -254,7 +254,7 @@ class _HalfAtomBond:
 class _StochasticObjectTracker:
     def __init__(
         self,
-        generative_graph,
+        sto_gen_id_distribution,
         rng=None,
         path_is_conditional=False,
         zero_support_is_unavoidable=False,
@@ -275,19 +275,13 @@ class _StochasticObjectTracker:
         # But each monomer spawns a new instance of the inner stochastic object. So every "N" has the sto_gen_id of 1, but every monomer has a different stochastic atom id and counting
         self._stochastic_gen_id_to_atom_id = {}
         self._stochastic_atom_id_to_gen_id = OrderedDict()
-        self._sto_gen_id_distribution = {}
+        # {sto_gen_id: distribution}, deserialized once by the EnsembleCreator and only read here.
+        self._sto_gen_id_distribution = sto_gen_id_distribution
         self._sto_atom_id_actual_molw = OrderedDict()
         self._sto_atom_id_expected_molw = OrderedDict()
         self._terminated_sto_atom_ids = set()
         self.parent_map = {}
         self._parent_molw = {}
-
-        for _node_idx, data in generative_graph.nodes(data=True):
-            for index, _stochastic_vector in enumerate(data["molecular_weight_distribution"]):
-                stochastic_vector = _stochastic_vector.copy()
-                distribution = StochasticDistribution.from_serial_vector(stochastic_vector)
-                self._register_sto_gen_id(index, distribution)
-            break
 
     @property
     def sto_atom_id_expected_molw(self):
@@ -349,9 +343,6 @@ class _StochasticObjectTracker:
                 found = True
                 break
         return found
-
-    def _register_sto_gen_id(self, sto_gen_id, distribution):
-        self._sto_gen_id_distribution[sto_gen_id] = distribution
 
     def register_new_atom_instance(self, sto_gen_id, old_atom_id, parent_expected_molw=None, is_nested_parent=False):
         if sto_gen_id > 0:
@@ -1136,7 +1127,7 @@ class _PartialAtomGraph:
 
         def _get_terminator_atom_graph(source):
             stochastic_object_tracker = _StochasticObjectTracker(
-                self.generative_graph,
+                self.stochastic_tracker._sto_gen_id_distribution,
                 estimator_rng,
                 path_is_conditional=self.stochastic_tracker.path_is_conditional,
                 zero_support_is_unavoidable=(
@@ -1936,6 +1927,7 @@ class EnsembleCreator:
             for component_id, component in enumerate(static_components)
             for node in component
         }
+        self._distributions = self._load_distributions()
         self._statically_empty_nested_mw_sto_gen_ids = (
             self._find_statically_empty_nested_mw_sto_gen_ids()
         )
@@ -1981,6 +1973,15 @@ class EnsembleCreator:
                 np.asarray(self._repeat_unit_starting_node_weight) > 0.0
             ) > 1,
         }
+
+    def _load_distributions(self):
+        """Deserialize the per-object molecular-weight distributions the graph carries."""
+        try:
+            first_node = next(iter(self._generative_graph.nodes))
+            serial_vectors = self._generative_graph.nodes[first_node]["molecular_weight_distribution"]
+        except (StopIteration, KeyError):
+            return []
+        return [StochasticDistribution.from_serial_vector(list(vector)) for vector in serial_vectors]
 
     def _find_statically_empty_nested_mw_sto_gen_ids(self):
         """Find nested MW draws whose truncated support is empty on every chain.
@@ -2761,7 +2762,7 @@ class EnsembleCreator:
             )
 
         stochastic_object_tracker = _StochasticObjectTracker(
-            generative_graph,
+            dict(enumerate(self._distributions)),
             rng,
             path_is_conditional=source_is_conditional,
             zero_support_is_unavoidable=zero_support_is_unavoidable,

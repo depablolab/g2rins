@@ -36,7 +36,7 @@ _EDGE_STOCHASTIC_ID_NAME = "stochastic_id"
 _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
-_STOCHASTIC_TREE_DEPTH = 10
+_STOCHASTIC_TREE_DEPTH = 50
 
 
 def is_static_edge(edge_data):
@@ -932,7 +932,7 @@ class GraphCreator:
         generative_graph.graph["g2rins_string"] = self.text
 
         graph_with_bond_connectors = self.g.copy()
-        MW_distribution_array = [StochasticDistribution.get_empty_serial_vector()] * 10
+        MW_distribution_array = [StochasticDistribution.get_empty_serial_vector()] * _STOCHASTIC_TREE_DEPTH
 
         for node, data in graph_with_bond_connectors.nodes(data=True):
             try:

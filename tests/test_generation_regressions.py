@@ -1598,19 +1598,67 @@ def test_directional_dead_end_warns_at_parse():
     assert not any(issubclass(w.category, StochasticMissingPath) for w in caught_warnings)
 
 
-def test_too_many_stochastic_objects_raises():
-    """Stochastic-object ids index fixed-size per-node vectors, so an 11th
-    sequential stochastic object cannot be represented: it must raise
-    TooManyStochasticObjects at graph construction instead of the bare
-    IndexError it used to hit; ten still build."""
+def test_too_many_stochastic_objects_raises(monkeypatch):
+    """Stochastic-object ids index fixed-size per-node vectors, so a string
+    with more stochastic objects than the vectors have slots cannot be
+    represented: it must raise TooManyStochasticObjects at graph construction
+    instead of the bare IndexError it used to hit; a string that fills every
+    slot still builds. The limit is lowered here to keep the strings short."""
     from g2rins.exception import TooManyStochasticObjects
 
+    monkeypatch.setattr("g2rins.generative_graph._STOCHASTIC_TREE_DEPTH", 3)
     block = "{[<] [<]CC[>];; [>]}|uniform(100, 200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        g2rins.G2rins.make("CCO" + block * 10 + "CCN").get_graph_creator().get_generative_graph(include_bond_connectors=False)
+        generative_graph = g2rins.G2rins.make("CCO" + block * 3 + "CCN").get_graph_creator().get_generative_graph(include_bond_connectors=False)
         with pytest.raises(TooManyStochasticObjects):
-            g2rins.G2rins.make("CCO" + block * 11 + "CCN").get_graph_creator().get_generative_graph(include_bond_connectors=False)
+            g2rins.G2rins.make("CCO" + block * 4 + "CCN").get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    for _node, data in generative_graph.nodes(data=True):
+        assert len(data["molecular_weight_distribution"]) == len(data["unit_molar_amounts"]) == len(data["stochastic_id_tree"]) == 3
+
+
+def test_more_than_ten_stochastic_objects_build_and_sample():
+    """Ten stochastic objects per string used to be the limit, for nesting
+    levels as much as for the object count. Twelve nested objects must list
+    their eleven ancestors in order, and each of twelve objects written in
+    separate branches of one molecule must realize its own distribution."""
+    nested = "CC"
+    for level in range(11):
+        nested = "{[>] [<]" + nested + "[>];; [<]}|gauss(" + f"{100.0 * 2**level}, 1.0" + ")|"
+    nested = "{[] [<]" + nested + "[>]; C[>]; [<][H] []}|gauss(204800.0, 1.0)|"
+    side_by_side = "C" + "C({[>] [<]CCO[>]; ; [<][H] []}|gauss(300, 30)|)" * 12 + "C"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        nested_graph = g2rins.G2rins.make(nested).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+        ensemble = g2rins.G2rins.make(side_by_side).get_graph_creator().get_ensemble_creator().create_ensemble(2, output_format="smiles", ensemble_info=True, seed=0)
+
+    innermost_tree = max((data["stochastic_id_tree"] for _node, data in nested_graph.nodes(data=True)), key=lambda tree: sum(level >= 0 for level in tree))
+    assert innermost_tree[:13] == [11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, -2]
+
+    object_mol_weights = {stochastic_id: mol_weights for stochastic_id, mol_weights in ensemble.mol_weights.items() if stochastic_id >= 0}
+    assert sorted(object_mol_weights) == list(range(12))
+    for mol_weights in object_mol_weights.values():
+        assert len(mol_weights) == 2
+        assert all(100.0 < mol_weight < 500.0 for mol_weight in mol_weights)
+
+
+def test_sampling_does_not_deserialize_distributions(monkeypatch):
+    """The ensemble creator deserializes every stochastic object's distribution
+    once. Sampling used to deserialize them again for every chain and for every
+    terminator candidate of every termination-mass estimate, which made that
+    the dominant sampling cost."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make("{[] [<]CCO[>]; CO[>]; [<][H] []}|gauss(600, 50)|").get_graph_creator().get_ensemble_creator()
+
+    def deserialized_again(_vector):
+        raise AssertionError("a distribution was deserialized while sampling")
+
+    monkeypatch.setattr(g2rins.StochasticDistribution, "from_serial_vector", deserialized_again)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        chains = ensemble_creator.create_ensemble(3, output_format="smiles", seed=0)
+    assert len(chains) == 3
 
 
 def test_first_check_crossing_does_not_warn_undershoot():
@@ -1768,7 +1816,7 @@ def test_transition_bond_selection_is_level_aware():
         ensemble_creator = g2rins.G2rins.make("C{[>][<]CC(C)[>];;[<]}|poisson(900)|[H]").get_graph_creator().get_ensemble_creator()
     generative_graph = ensemble_creator.generative_graph
     rng = np.random.default_rng(0)
-    tracker = _StochasticObjectTracker(generative_graph, rng)
+    tracker = _StochasticObjectTracker(dict(enumerate(ensemble_creator._distributions)), rng)
     source = ensemble_creator._starting_node_idx[0]
     tree = generative_graph.nodes[source]["stochastic_id_tree"]
     sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
