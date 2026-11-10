@@ -1661,6 +1661,41 @@ def test_sampling_does_not_deserialize_distributions(monkeypatch):
     assert len(chains) == 3
 
 
+def test_checkpoint_shares_read_only_template_data():
+    """A checkpoint copies the growing molecule and its tracker, but neither
+    the distribution table nor the template's molar-amount vectors: sampling
+    only reads them, and copying them at every checkpoint made its cost grow
+    with the number of stochastic-object slots."""
+    import copy
+
+    from g2rins.ensemble_creator import _PartialAtomGraph, _StochasticObjectTracker
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make("C{[>][<]CC(C)[>];;[<]}|poisson(900)|[H]").get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    tracker = _StochasticObjectTracker(dict(enumerate(ensemble_creator._distributions)), rng)
+    source = ensemble_creator._starting_node_idx[0]
+    tree = generative_graph.nodes[source]["stochastic_id_tree"]
+    sto_atom_id, _parents = tracker.register_parent_atom_instances(tree[0], tree[1], tree[1:])
+    partial = _PartialAtomGraph(generative_graph, ensemble_creator._static_graph, source, tracker, sto_atom_id, rng)
+
+    checkpoint = copy.deepcopy(partial)
+
+    assert checkpoint.atom_graph is not partial.atom_graph
+    assert checkpoint.stochastic_tracker is not tracker
+    assert checkpoint.stochastic_tracker._sto_atom_id_actual_molw is not tracker._sto_atom_id_actual_molw
+    assert checkpoint.stochastic_tracker._sto_gen_id_distribution is tracker._sto_gen_id_distribution
+    half_bonds = [half_bond for bucket in checkpoint._open_half_bond_map.values() for half_bond in bucket]
+    assert half_bonds
+    for half_bond in half_bonds:
+        assert half_bond.molar_amounts is generative_graph.nodes[half_bond.node_idx]["unit_molar_amounts"]
+        for mode, targets in half_bond._mode_target_map.items():
+            for target, molar_amounts in zip(targets, half_bond._mode_target_molar_amounts_map[mode], strict=True):
+                assert molar_amounts is generative_graph.nodes[target]["unit_molar_amounts"]
+
+
 def test_first_check_crossing_does_not_warn_undershoot():
     """A target MW at or below one repeat unit crosses on the instance's
     first check, where no undershoot snapshot can exist and overshoot is

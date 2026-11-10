@@ -17,6 +17,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
 - A string can hold up to 50 stochastic objects, nested ones included, instead of 10. The per-node `molecular_weight_distribution`, `unit_molar_amounts` and `stochastic_id_tree` vectors of the generative graph have 50 entries instead of 10, so the graph and its JSON output change shape. `EnsembleCreator` takes the length from the graph and still samples graphs built with 10 entries.
 - Ensemble sampling is faster, about twice on most of the guide's examples and up to seven times, with unchanged chains: each stochastic object's molecular-weight distribution is deserialized once per `EnsembleCreator` instead of once per chain and once per terminator candidate of every termination-mass estimate.
+- Checkpoints taken while sampling share the distribution table and the per-node molar-amount vectors with the generative graph instead of copying them. Sampling is a further 3% to 20% faster on the guide's examples, and the number of vector entries no longer costs sampling time.
 
 ### Fixed
 

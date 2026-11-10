@@ -745,6 +745,11 @@ class _PartialAtomGraph:
         # cost). The tracker (including its forked rng) is still deep-copied.
         memo[id(self.generative_graph)] = self.generative_graph
         memo[id(self.static_graph)] = self.static_graph
+        # Equally read-only: the molar-amount vectors the half-bonds reference and the tracker's distribution table.
+        for _node, data in self.generative_graph.nodes(data=True):
+            memo[id(data["unit_molar_amounts"])] = data["unit_molar_amounts"]
+        distributions = self.stochastic_tracker._sto_gen_id_distribution
+        memo[id(distributions)] = distributions
         new_graph = self.__class__.__new__(self.__class__)
         memo[id(self)] = new_graph
         for key, value in self.__dict__.items():
