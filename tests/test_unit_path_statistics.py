@@ -10,10 +10,12 @@ import pytest
 
 from g2rins.ensemble_creator import (
     _UnitOccurrence,
+    _build_occurrence_adjacency,
     _public_unit_junction_statistics,
     _public_unit_path_statistics,
     _unit_path_counts,
 )
+from g2rins.exception import TopologyBudgetExceeded
 
 
 def _metadata(graph: nx.Graph) -> SimpleNamespace:
@@ -40,6 +42,35 @@ def _metadata(graph: nx.Graph) -> SimpleNamespace:
 def _totals(graph: nx.Graph) -> dict[int, int]:
     counts = _unit_path_counts(_metadata(graph), graph)
     return {k: sum(counter.values()) for k, counter in counts.items()}
+
+
+def test_build_occurrence_adjacency_reuses_shared_occurrence_edges() -> None:
+    graph = nx.path_graph(4)
+    metadata = SimpleNamespace(
+        occurrences=tuple(
+            _UnitOccurrence(
+                unit_id="R0",
+                prototype_key=("R0", (str(node),)),
+                nodes=(node,),
+                incoming_connection=(node - 1, node) if node else None,
+                incoming_edge_token=("1", False) if node else None,
+                connections=[],
+            )
+            for node in graph.nodes
+        ),
+        inter_occurrence_edges=(),
+    )
+    adjacency, edges, atom_owner = _build_occurrence_adjacency(metadata, graph)
+    assert atom_owner == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert adjacency[0] == [(1, ("1", False))]
+    assert adjacency[1] == [(0, ("1", False)), (2, ("1", False))]
+    assert adjacency[2] == [(1, ("1", False)), (3, ("1", False))]
+    assert adjacency[3] == [(2, ("1", False))]
+    assert edges == [
+        (0, 1, ("1", False)),
+        (1, 2, ("1", False)),
+        (2, 3, ("1", False)),
+    ]
 
 
 def test_linear_occurrence_graph_counts_each_physical_path_once() -> None:
@@ -149,7 +180,7 @@ def test_occurrence_id_order_does_not_change_motif_counts() -> None:
 
 def test_path_count_limit_fails_fast() -> None:
     graph = nx.path_graph(4)
-    with pytest.raises(ValueError, match="motif limit"):
+    with pytest.raises(TopologyBudgetExceeded, match="unit_path_max_motifs"):
         _unit_path_counts(_metadata(graph), graph, max_motifs=1)
 
 

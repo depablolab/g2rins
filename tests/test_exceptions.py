@@ -1,6 +1,7 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
 
+import copy
 import pickle
 import warnings
 
@@ -8,6 +9,26 @@ import lark
 import pytest
 
 import g2rins
+from g2rins.atom import AtomSymbol
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        g2rins.exception.ParsingError("missing symbol"),
+        g2rins.exception.MissingAtomSymbol("Atom"),
+        g2rins.exception.TooManyTokens("Atom", "C", "N"),
+        g2rins.exception.UnsupportedBondDescriptor("[<]", "O=[<]C[>]", 2),
+        g2rins.exception.MismatchedBondConnectorLists("[<]|[>]", "[>]", 2, 1),
+    ],
+)
+@pytest.mark.parametrize("copy_method", ["pickle", "deepcopy"])
+def test_parser_and_descriptor_diagnostics_preserve_context(diagnostic, copy_method):
+    restored = pickle.loads(pickle.dumps(diagnostic)) if copy_method == "pickle" else copy.deepcopy(diagnostic)
+    assert type(restored) is type(diagnostic)
+    assert restored.args == diagnostic.args
+    assert vars(restored) == vars(diagnostic)
+    assert str(restored) == str(diagnostic)
 
 
 @pytest.mark.parametrize(
@@ -23,8 +44,8 @@ import g2rins
             3,
             (("DeadSamplingPath", 2), ("EmptyTruncatedDistributionSupport", 1)),
         ),
-        g2rins.exception.NoValidGenerationSource(False),
-        g2rins.exception.NoValidGenerationSource(True),
+        g2rins.exception.NoValidGenerationSource(),
+        g2rins.exception.RepeatUnitInitiation("{[] [<]CC[>];; [<,>][H] []}|poisson(10)|", ("[<]CC[>]",)),
     ),
 )
 def test_sampling_path_diagnostics_pickle_roundtrip(diagnostic):
@@ -158,7 +179,15 @@ def test_warn_empty_terminal_bond_connector_without_end_groups(smi):
         g2rins.G2rins.make(smi)
 
 
-@pytest.mark.parametrize("smi", [])
+@pytest.mark.parametrize(
+    "smi",
+    [
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
+            id="only-initiator-is-a-nested-object-without-one",
+        ),
+    ],
+)
 def test_warn_no_initiation_for_stochastic_object(smi):
     with pytest.warns(g2rins.exception.NoInitiationForStochasticObject):
         obj = g2rins.G2rins.make(smi)
@@ -234,6 +263,16 @@ def test_terminator_declared_beside_its_unit_is_silent(smi):
     assert not reported, reported
 
 
+def test_object_without_initiator_warns_no_explicit_initiation_only():
+    """NoExplicitInitiation already reports an object that declares no initiator; NoInitiationForStochasticObject would repeat it."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        g2rins.G2rins.make("{[] [<]CCO[>];; [<,>][H] []}|poisson(1000)|").get_graph_creator()
+    categories = {warning.category for warning in caught}
+    assert g2rins.exception.NoExplicitInitiation in categories
+    assert g2rins.exception.NoInitiationForStochasticObject not in categories
+
+
 @pytest.mark.parametrize("smi", ["{[$] [>]CC[<];; [>]}|flory_schulz(0.9)|"])
 def test_warn_stochastic_missing_path(smi):
     with pytest.warns(g2rins.exception.StochasticMissingPath):
@@ -270,4 +309,56 @@ def test_undefined_distribution(smi):
         obj.get_graph_creator()
 
 
+@pytest.mark.parametrize(
+    "smi",
+    [
+        pytest.param(
+            "{[] [<]CCO[>], [<]|[>]{[>] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|",
+            id="bond-connector-list-meets-single-left-terminal",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>], [<]{[>]|[<] [<]CC(C)O[>];; [<]}|poisson(100)|[>];; [<,>][H] []}|poisson(600)|",
+            id="single-bond-connector-meets-left-terminal-list",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>], [<]{[>] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>];; [<,>][H] []}|poisson(600)|",
+            id="right-terminal-list-meets-single-bond-connector",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>], [<]{[>] [<]CC(C)O[>];; [<]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|",
+            id="single-right-terminal-meets-bond-connector-list",
+        ),
+        pytest.param(
+            "[H]{[>]|[<] [<]CC[>];; [<]|[>]}|poisson(10)|[H]",
+            id="atoms-meet-terminal-lists-outside-every-object",
+        ),
+    ],
+)
+def test_mismatched_bond_connector_lists_are_a_parsing_error(smi):
+    """Lists pair by position, so a list meeting a single connector, an atom or a shorter list is rejected.
+
+    Inside a stochastic object the parser raises it; a junction outside every object raises it when the
+    graph creator is built.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(g2rins.exception.MismatchedBondConnectorLists):
+            try:
+                g2rins.G2rins.make(smi).get_graph_creator()
+            except lark.exceptions.VisitError as exc:
+                raise exc.__context__  # trunk-ignore(ruff/B904)
+
+
 # TODO: implement tests for IncorrectNumberOfBondProbabilities and EmptyBondConnectorInTerminalBondConnectorList. Add nested examples.
+
+
+def test_too_many_tokens_round_trips_with_atom_symbol_tokens():
+    """Real symbol tokens have no equality, so compare by type and rendering."""
+    first, second = AtomSymbol.make("C"), AtomSymbol.make("N")
+    diagnostic = g2rins.exception.TooManyTokens("Atom", first, second)
+    for restored in (pickle.loads(pickle.dumps(diagnostic)), copy.deepcopy(diagnostic)):
+        assert type(restored) is g2rins.exception.TooManyTokens
+        assert str(restored) == str(diagnostic)
+        assert [str(token) for token in restored.args] == ["Atom", "C", "N"]
+        assert str(restored.token) == "N"
+        assert str(restored.existing_token) == "C"

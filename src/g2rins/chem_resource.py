@@ -119,6 +119,8 @@ atom_name_num["n"] = atom_name_num["N"]
 atom_name_num["o"] = atom_name_num["O"]
 atom_name_num["s"] = atom_name_num["S"]
 atom_name_num["p"] = atom_name_num["P"]
+atom_name_num["se"] = atom_name_num["Se"]
+atom_name_num["as"] = atom_name_num["As"]
 
 
 atom_color_mapping = {

@@ -5,6 +5,7 @@ import concurrent.futures
 import copy
 import faulthandler
 import functools
+import hashlib
 import inspect
 import json
 import math
@@ -19,18 +20,38 @@ from concurrent.futures.process import BrokenProcessPool
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from itertools import combinations
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import networkx as nx
 import numpy as np
 from rdkit import Chem, rdBase
 
+from ._building_block_statistics import _BuildingBlockStatistics
+from ._convergence_assembly import (
+    _assemble_convergence_checkpoint,
+    _assemble_convergence_payload,
+)
+from ._ensemble_assembly import _assemble_ensemble_data
+from ._ensemble_export import _fixed_ensemble_json_data
+from ._ensemble_options import _ChainConversionOptions, _ConversionMode
+from ._graph_copy import _copy_unit_graph
+from ._metadata_equality import (
+    _RECURSIVE_METADATA_TYPES,
+    _array_equal,
+    _comparison_result,
+    _edge_ids,
+    _graphs_equal,
+    _is_collection,
+    _masked_equal,
+    _metadata_equal,
+)
 from ._version import version as _G2RINS_VERSION
 from .convergence import ConvergenceTracker
 from .nx_rdkit_mol import (
+    _ATOM_MAP_OFFSET,
     mol_graph_to_rdkit_mol,
     mol_graph_to_smiles,
     rdkit_mol_to_smiles,
@@ -51,26 +72,64 @@ from .exception import (
     ForcedOvershootNoBoundary,
     IncompatibleGenerativeGraphSchema,
     IncompleteStochasticGeneration,
+    InvalidUnitPSmiles,
     InvalidGenerationSource,
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
+    RepeatUnitInitiation,
     TooManyDiscardedChains,
+    TopologyBudgetExceeded,
     UndershootSnapshotMissed,
     UnvalidatedGenerationSource,
+    UnsupportedWildcardGeneration,
     WorkerProcessFailure,
 )
 from .generative_graph import (
     _AROMATIC_NAME,
     _BOND_TYPE_NAME,
+    _CONNECTOR_PLACEHOLDER_NAME,
+    _DERIVED_NODE_FIELDS,
     _EDGE_STOCHASTIC_ID_NAME,
     _NON_STATIC_ATTR,
     _PROPAGATION_NAME,
     _TERMINATION_NAME,
     _TRANSITION_NAME,
+    _atomic_number,
+    _connector_placeholder_flag,
+    _is_connector_placeholder,
+    _json_safe,
+    _static_neighbors,
+    _verified_unit_texts,
     derive_unit_labels,
     generative_graph_json_data,
 )
 from .util import _determine_darkness_from_hex, get_global_rng
+
+if TYPE_CHECKING:
+    from typing import Iterator, Literal, TypeAlias, TypedDict
+
+    # Documentation for existing tuples/dicts only: no new runtime transport
+    # objects or checkpoint/pickle classes are introduced.
+    _LegacyConversionMode: TypeAlias = Literal[False, True, "materialize"]
+    _OccurrenceEdgeToken: TypeAlias = tuple[str, bool, str, str]
+    _OccurrenceEdge: TypeAlias = tuple[int, int, _OccurrenceEdgeToken]
+    _OccurrenceAdjacency: TypeAlias = list[list[tuple[int, _OccurrenceEdgeToken]]]
+    _OccurrenceView: TypeAlias = tuple[
+        _OccurrenceAdjacency, list[_OccurrenceEdge], dict[int, int]
+    ]
+    _WarningRecord: TypeAlias = tuple[Warning | str, type[Warning], str, int]
+
+    class _WorkerResultRequired(TypedDict):
+        chain_index: int
+        record: "_ChainRecord | _DeferredChainRecord | None"
+        discards: int
+        reasons: tuple[tuple[str, int], ...]
+        first_cause: DeadSamplingPath | None
+        warnings: list[_WarningRecord]
+
+    class _WorkerResult(_WorkerResultRequired, total=False):
+        building_block_statistics: _BuildingBlockStatistics
+
 
 _SEQUENCE_SMILES_CACHE_MAXSIZE = 4096
 
@@ -92,6 +151,13 @@ _DECISION_TRACE = None
 # Temporary parity escape hatch while the journal path is validated.
 _USE_LEGACY_CHECKPOINTS = False
 _VERIFY_TERMINATION_MW_CACHE = False
+
+
+class _SourceProofModes(dict):
+    """Mode-indexed proof results whose truth value means any mode is fatal."""
+
+    def __bool__(self):
+        return any(self.values())
 _USE_STATIC_SOURCE_TEMPLATES = True
 _USE_DIRECT_GRAPH_MERGE = True
 
@@ -216,6 +282,7 @@ def _sample_chain_job(
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
     smiles_policy="fast",
+    building_block_statistics=False,
 ):
     """Execute one compact chain job using the creator initialized in-worker."""
     if _WORKER_ENSEMBLE_CREATOR is None:
@@ -233,6 +300,7 @@ def _sample_chain_job(
         use_repeat_units_as_source,
         strip_unresolved_directional_markers,
         smiles_policy,
+        **({"building_block_statistics": True} if building_block_statistics else {}),
     )[0]
 
 
@@ -352,6 +420,7 @@ class _ParallelChainScheduler:
         strip_unresolved_directional_markers=False,
         fallback_on_worker_crash=False,
         smiles_policy="fast",
+        building_block_statistics=False,
     ):
         if self.executor is None:
             self._create_executor()
@@ -382,6 +451,7 @@ class _ParallelChainScheduler:
                             use_repeat_units_as_source,
                             strip_unresolved_directional_markers,
                             smiles_policy,
+                            *((True,) if building_block_statistics else ()),
                         )
                         inflight[future] = chain_job
 
@@ -480,6 +550,7 @@ def _parallel_chain_records(
     strip_unresolved_directional_markers=False,
     fallback_on_worker_crash=False,
     smiles_policy="fast",
+    building_block_statistics=False,
 ):
     """Yield ordered records from bounded, restartable compact worker jobs."""
     if scheduler is not None:
@@ -496,6 +567,7 @@ def _parallel_chain_records(
             strip_unresolved_directional_markers,
             fallback_on_worker_crash,
             smiles_policy,
+            **({"building_block_statistics": True} if building_block_statistics else {}),
         )
         return
     with _ParallelChainScheduler(
@@ -517,6 +589,7 @@ def _parallel_chain_records(
             strip_unresolved_directional_markers,
             fallback_on_worker_crash,
             smiles_policy,
+            **({"building_block_statistics": True} if building_block_statistics else {}),
         )
 
 
@@ -530,6 +603,13 @@ def _with_parallel_convergence_scheduler(method):
         values = bound.arguments
         if (
             not values["parallel"]
+            or (
+                values.get("building_block_statistics", False)
+                and (
+                    values["checkpoint"] is not None
+                    or values["checkpoint_callback"] is not None
+                )
+            )
             or values["batch_size"] < 1
             or values["max_samples"] < 1
             or (
@@ -563,6 +643,140 @@ def _with_parallel_convergence_scheduler(method):
                 _ACTIVE_PARALLEL_SCHEDULER.reset(token)
 
     return wrapped
+
+
+def _validate_bond_sequence_exports(
+    *,
+    metadata,
+    retain_bond_sequences,
+    count_bond_sequences,
+    bond_sequence_format,
+    retain_motif_membership,
+    parallel,
+    checkpoint,
+    checkpoint_callback,
+):
+    """Reject unsupported bond-sequence and motif-membership requests early.
+
+    Compact topology retention and motif membership use the serial metadata
+    path; exact whole-topology counting remains explicitly unsupported.
+    """
+    if bond_sequence_format not in {"compact", "paths", "branches"}:
+        raise ValueError(
+            "bond_sequence_format must be 'compact', 'paths', or 'branches'."
+        )
+    if retain_motif_membership and not metadata:
+        raise ValueError(
+            "metadata=True is required when motif membership exports are enabled."
+        )
+    if retain_motif_membership and parallel:
+        raise NotImplementedError(
+            "motif membership export is not supported in parallel mode until the serial M2a milestone is validated."
+        )
+    if retain_motif_membership and (checkpoint is not None or checkpoint_callback is not None):
+        raise NotImplementedError(
+            "motif membership export is not supported with convergence checkpoints or resume until the serial M2a milestone is validated."
+        )
+    export_requested = retain_bond_sequences or count_bond_sequences
+    if not export_requested:
+        return
+    if not metadata:
+        raise ValueError(
+            "metadata=True is required when bond sequence exports are enabled."
+        )
+    if parallel:
+        raise NotImplementedError(
+            "Bond sequence export is not supported in parallel mode until the serial M1 topology milestone is implemented."
+        )
+    if checkpoint is not None or checkpoint_callback is not None:
+        raise NotImplementedError(
+            "Bond sequence export is not supported with convergence checkpoints or resume until the M3b restart milestone is implemented."
+        )
+    if count_bond_sequences:
+        raise NotImplementedError(
+            "Bond sequence export exact counting is not implemented yet; count_bond_sequences requires the later M3a milestone."
+        )
+    if not retain_bond_sequences:
+        raise NotImplementedError(
+            "Bond sequence export is not implemented yet; the serial retained-topology M1 milestone is required."
+        )
+
+
+def _canonical_bond_sequence_json_bytes(value):
+    """Encode topology JSON and fingerprints with the frozen v1 byte format."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _canonical_motif_key(motif, units):
+    """Map a local path motif to a canonical public token tuple."""
+    unit_keys = {}
+    for token in motif:
+        if token[0] == "N":
+            unit_id = token[1]
+            unit = units.get(unit_id, {})
+            unit_key = unit.get("psmiles")
+            if not isinstance(unit_key, str) or not unit_key:
+                raise ValueError(f"No canonical chemistry key is available for unit {unit_id!r}")
+            unit_keys[unit_id] = unit_key
+    converted = tuple(
+        (token[0], unit_keys.get(token[1], token[1]), token[2])
+        if token[0] == "N"
+        else token
+        for token in motif
+    )
+    reversed_converted = _reverse_unit_path_motif(converted)
+    return converted if converted <= reversed_converted else reversed_converted
+
+
+def _motif_dictionary_from_counts(motif_counts, units):
+    """Build a shared motif dictionary and lookup by canonical public token."""
+    dictionary = []
+    lookup = {}
+    for canonical_motif in sorted(motif_counts):
+        motif_id = len(dictionary)
+        lookup[canonical_motif] = motif_id
+        dictionary.append({
+            "motif_id": motif_id,
+            "token": [list(part) for part in canonical_motif],
+        })
+    return dictionary, lookup
+
+
+def _motif_population_statistics_from_counts(accepted_count, motif_occurrences, motif_presence, units):
+    """Compose the exact all-accepted motif-population summary."""
+    if not motif_occurrences:
+        return {
+            "schema": "motif-population-statistics/v1",
+            "population": "all-accepted-samples",
+            "accepted_count": int(accepted_count),
+            "motif_dictionary_id": "unit-graph-simple-paths/v2",
+            "motif_dictionary": {"schema": "unit-graph-simple-paths/v2", "entries": []},
+            "entries": [],
+        }
+    dictionary, lookup = _motif_dictionary_from_counts(motif_occurrences, units)
+    entries = []
+    for canonical_motif, occurrence_count in sorted(motif_occurrences.items()):
+        motif_id = lookup[canonical_motif]
+        entries.append({
+            "motif_id": motif_id,
+            "occurrence_count": int(occurrence_count),
+            "chain_presence_count": int(motif_presence.get(canonical_motif, 0)),
+            "token": [list(part) for part in canonical_motif],
+        })
+    return {
+        "schema": "motif-population-statistics/v1",
+        "population": "all-accepted-samples",
+        "accepted_count": int(accepted_count),
+        "motif_dictionary_id": "unit-graph-simple-paths/v2",
+        "motif_dictionary": {"schema": "unit-graph-simple-paths/v2", "entries": dictionary},
+        "entries": entries,
+    }
 
 
 def _normalized_probabilities(weights, context: str):
@@ -1221,7 +1435,6 @@ class _StochasticObjectTracker:
     def should_terminate(self, sto_atom_id, avg_termination_weight=0.0):
         condition = self._sto_atom_id_actual_molw[sto_atom_id] >= self._sto_atom_id_expected_molw[sto_atom_id] - avg_termination_weight
         return condition
-        # return self.add_molw(sto_atom_id, 0, 0, 0, None)
 
     def _is_sto_gen_id_known(self, sto_gen_id):
         return sto_gen_id in self._sto_gen_id_distribution
@@ -1267,7 +1480,10 @@ class EnsembleData:
     Full result of :meth:`EnsembleCreator.create_ensemble` with ``ensemble_info=True``.
 
     ``chains`` and ``sequences`` follow the requested ``output_format``; the
-    ensemble aggregates are template-level and format-independent. ``units``
+    optional ``sequence_unit_ids`` mirrors every chain/segment/unit position
+    using exact sampled unit labels, independently of output format. It is
+    unavailable when sequence metadata is not retained. The ensemble
+    aggregates are template-level and format-independent. ``units``
     maps each derived unit_id (see :func:`g2rins.derive_unit_labels`) to
     ``{"psmiles", "g2rins", "subgraph", "count"}``, where ``subgraph`` is a
     detached copy of the unit's static subgraph of the generative graph
@@ -1288,7 +1504,24 @@ class EnsembleData:
     sequences: list
     mol_weights: dict
     distributions: dict
-    molecular_weights: list
+    molecular_weights: list = field(default_factory=list, kw_only=True)
+    # Same chain/segment/unit shape as sequences, independent of output_format.
+    sequence_unit_ids: list | None = field(default=None, kw_only=True)
+    bond_sequence_metadata: dict | None = field(default=None, kw_only=True)
+    bond_sequences: list | None = field(default=None, kw_only=True)
+    bond_sequence_indices: list | None = field(default=None, kw_only=True)
+    bond_sequence_weights: list | None = field(default=None, kw_only=True)
+    bond_sequence_parents: list | None = field(default=None, kw_only=True)
+    bond_sequence_counts: dict | None = field(default=None, kw_only=True)
+    chain_motif_index: dict | None = field(default=None, kw_only=True)
+    motif_population_statistics: dict | None = field(default=None, kw_only=True)
+    next_neighbor_motif_statistics: dict | None = field(default=None, kw_only=True)
+    building_block_statistics: dict | None = field(default=None, kw_only=True)
+
+    def __eq__(self, other):
+        if type(self) is not type(other):
+            return NotImplemented
+        return _metadata_equal(self.__dict__, other.__dict__)
 
 
 @dataclass
@@ -1328,25 +1561,25 @@ class ConvergenceCheckpoint:
     policy: str = "full"
     representative_features: tuple = ()
     representative_counts: tuple = ()
+    unit_path_counts: dict | None = None
+    unit_path_diagnostics: dict | None = None
+    unit_junction_counts: dict | None = None
     representative_member_features: tuple = ()
     representative_member_scores: tuple = ()
     representative_medoid_indices: tuple = ()
     representative_replay_batches: tuple = ()
-    unit_path_counts: dict | None = None
-    unit_path_diagnostics: dict | None = None
-    unit_junction_counts: dict | None = None
 
 
 @dataclass(frozen=True)
 class _RepresentativeFeature:
-    """Compact, SMILES-free coordinates for representative coverage."""
+    """Compact coordinates for representative coverage."""
 
-    chain_index: int
     molecular_weight: float
     total_units: int
-    unit_counts: tuple
     unit_fractions: tuple
     contact_fractions: tuple
+    chain_index: int | None = None
+    unit_counts: tuple = ()
 
 
 def _normalized_sparse_counts(counts):
@@ -1382,8 +1615,9 @@ def _reverse_unit_path_motif(motif):
     return tuple(reversed_motif)
 
 
-def _unit_path_counts(metadata, graph, max_motifs=None, junction_counts=None):
-    """Count undirected simple occurrence paths while compact metadata exists."""
+def _build_occurrence_adjacency(metadata, graph, *, preserve_self_edges=False):
+    # type: (...) -> _OccurrenceView
+    """Build the shared occurrence adjacency used by path counts and later exports."""
     occurrences = metadata.occurrences
     adjacency = [[] for _ in occurrences]
     edges = []
@@ -1396,11 +1630,14 @@ def _unit_path_counts(metadata, graph, max_motifs=None, junction_counts=None):
     unowned_atoms = set(graph) - set(atom_owner)
     if unowned_atoms:
         raise ValueError("Molecular graph contains atoms with no unit occurrence")
+
     def add_edge(left_owner, right_owner, edge_token):
-        if left_owner == right_owner:
-            return
         if not (0 <= left_owner < len(occurrences) and 0 <= right_owner < len(occurrences)):
             raise ValueError("Inter-occurrence edge references an unknown occurrence")
+        if left_owner == right_owner:
+            if preserve_self_edges:
+                edges.append((left_owner, right_owner, tuple(edge_token)))
+            return
         # Do not collapse parallel molecular bonds: they are distinct physical
         # k=2 paths and can participate independently in longer simple paths.
         edge_token = tuple(edge_token)
@@ -1431,6 +1668,233 @@ def _unit_path_counts(metadata, graph, max_motifs=None, junction_counts=None):
     ):
         add_edge(left_owner, right_owner, tuple(edge_token))
 
+    return adjacency, edges, atom_owner
+
+
+def _compact_bond_sequence_record(
+    metadata,
+    graph,
+    *,
+    unit_info,
+    occurrence_view=None,  # type: _OccurrenceView | None
+):
+    """Serialize one sampled chain to the compact occurrence-topology record."""
+    occurrences = tuple(getattr(metadata, "occurrences", ()) or ())
+    if occurrence_view is None:
+        occurrence_view = _build_occurrence_adjacency(
+            metadata,
+            graph,
+            preserve_self_edges=True,
+        )
+    occurrence_rows = [
+        [occurrence_id, occurrence.unit_id]
+        for occurrence_id, occurrence in enumerate(occurrences)
+    ]
+    unit_sites = {}
+    for occurrence in occurrences:
+        if not isinstance(occurrence.unit_id, str) or not occurrence.unit_id:
+            raise ValueError("Bond sequence occurrence unit IDs must be non-empty strings")
+        info = unit_info.get(occurrence.unit_id)
+        if info is None:
+            raise ValueError(
+                f"No canonical unit/site metadata is available for {occurrence.unit_id!r}"
+            )
+        sites = tuple(info.get("expected_maps", ()))
+        if any(isinstance(site, bool) or not isinstance(site, int) or site <= 0 for site in sites):
+            raise ValueError(f"Unit {occurrence.unit_id!r} has invalid attachment-site map IDs")
+        unit_sites.setdefault(occurrence.unit_id, set()).update(sites)
+
+    edge_rows = []
+    topology_edges = []
+    for left_owner, right_owner, edge_token in occurrence_view[1]:
+        if len(edge_token) != 4:
+            raise ValueError("Bond sequence edge is missing attachment-site provenance")
+        bond_type = edge_token[0]
+        if not isinstance(bond_type, str):
+            raise ValueError("Bond sequence bond categories must be strings")
+        if bond_type == "0":
+            continue
+        if bond_type not in {"1", "2", "3", "4"}:
+            raise ValueError(f"Unsupported covalent bond category {bond_type!r}")
+        if not isinstance(edge_token[1], (bool, np.bool_)):
+            raise ValueError("Bond sequence aromatic attribute must be boolean")
+        aromatic = bool(edge_token[1])
+        left_site = edge_token[2]
+        right_site = edge_token[3]
+        if not isinstance(left_site, str) or not isinstance(right_site, str):
+            raise ValueError(
+                "Bond sequence attachment sites must be canonical decimal strings"
+            )
+        try:
+            left_map = int(left_site)
+            right_map = int(right_site)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Bond sequence attachment sites must be positive map IDs") from exc
+        if (
+            left_map <= 0
+            or right_map <= 0
+            or str(left_map) != left_site
+            or str(right_map) != right_site
+        ):
+            raise ValueError(
+                "Bond sequence attachment sites must be canonical positive decimal map IDs"
+            )
+        left_unit = occurrences[left_owner].unit_id
+        right_unit = occurrences[right_owner].unit_id
+        if left_map not in unit_sites[left_unit] or right_map not in unit_sites[right_unit]:
+            raise ValueError("Bond sequence edge references a site absent from the unit map dictionary")
+        topology_edges.append((left_owner, right_owner))
+        if (left_owner, left_site) > (right_owner, right_site):
+            left_owner, right_owner = right_owner, left_owner
+            left_site, right_site = right_site, left_site
+        edge_rows.append(
+            [left_owner, left_site, right_owner, right_site, bond_type, aromatic]
+        )
+    edge_rows.sort(
+        key=lambda row: (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            row[4],
+            str(row[5]),
+        )
+    )
+
+    component_graph = {occurrence_id: set() for occurrence_id in range(len(occurrences))}
+    for left_owner, right_owner in topology_edges:
+        component_graph[left_owner].add(right_owner)
+        component_graph[right_owner].add(left_owner)
+    components = []
+    visited = set()
+    for occurrence_id in range(len(occurrences)):
+        if occurrence_id in visited:
+            continue
+        stack = [occurrence_id]
+        component = []
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            component.append(current)
+            stack.extend(sorted(component_graph[current] - visited, reverse=True))
+        growth_roots = [
+            occurrence_id
+            for occurrence_id in component
+            if occurrences[occurrence_id].incoming_connection is None
+        ]
+        components.append({
+            "root": min(growth_roots) if growth_roots else min(component),
+            "occurrence_ids": sorted(component),
+        })
+    components.sort(key=lambda item: item["root"])
+
+    from .bond_sequences import normalize_hydrogen_termini
+
+    return normalize_hydrogen_termini({
+        "schema": "bond-sequence-topology/v1",
+        "occurrences": occurrence_rows,
+        "edges": edge_rows,
+        "components": components,
+    }, unit_info)
+
+
+def _bond_sequence_export_metadata(
+    payloads,
+    *,
+    retention,
+    weight_semantics,
+    retained_payload_status,
+    accepted_count=None,
+    unit_info=None,
+    model_identity="",
+):
+    """Compose the shared metadata envelope for compact retained topology."""
+    if unit_info is None:
+        raise ValueError("Canonical unit/site metadata is required for bond-sequence export")
+    if not isinstance(model_identity, str):
+        raise ValueError("Bond-sequence model identity must be a string")
+    unit_sites = {}
+    for unit_id, info in unit_info.items():
+        if not isinstance(unit_id, str) or not unit_id:
+            raise ValueError("Bond-sequence unit IDs must be non-empty strings")
+        sites = tuple(info.get("expected_maps", ()))
+        if any(
+            isinstance(site, bool) or not isinstance(site, int) or site <= 0
+            for site in sites
+        ) or len(set(sites)) != len(sites):
+            raise ValueError(f"Unit {unit_id!r} has invalid attachment-site map IDs")
+        psmiles = info.get("psmiles")
+        if not isinstance(psmiles, str) or not psmiles:
+            raise ValueError(f"Unit {unit_id!r} has no canonical pSMILES")
+        unit_sites[unit_id] = set(sites)
+    unit_sites = {
+        key: sorted(value)
+        for key, value in sorted(unit_sites.items())
+    }
+    if accepted_count is None:
+        actual_accepted_count = len(payloads)
+    elif (
+        isinstance(accepted_count, bool)
+        or not isinstance(accepted_count, int)
+        or accepted_count < 0
+    ):
+        raise ValueError("accepted_count must be a non-negative integer")
+    else:
+        actual_accepted_count = accepted_count
+    if actual_accepted_count < len(payloads):
+        raise ValueError("Accepted count cannot be smaller than the retained topology count")
+    model_fingerprint_payload = {
+        "schema": "bond-sequence-topology/v1",
+        "root_policy": "surviving-growth-root/v1",
+        "model_identity": model_identity,
+        "unit_sites": unit_sites,
+        "unit_psmiles": {
+            key: info.get("psmiles")
+            for key, info in sorted((unit_info or {}).items())
+        },
+    }
+    from .bond_sequences import HYDROGEN_TERMINATION_POLICY
+
+    return {
+        "schema": "bond-sequence-topology/v1",
+        "format": "compact",
+        "root_policy": "surviving-growth-root/v1",
+        "hydrogen_termination": HYDROGEN_TERMINATION_POLICY,
+        "model_fingerprint": hashlib.sha256(
+            _canonical_bond_sequence_json_bytes(model_fingerprint_payload)
+        ).hexdigest(),
+        "accepted_count": actual_accepted_count,
+        "retained_count": len(payloads),
+        "retention": retention,
+        "retained_payload_status": retained_payload_status,
+        "weight_semantics": weight_semantics,
+        "unit_sites": unit_sites,
+    }
+
+
+def _bond_sequence_record_encoded_size(payload):
+    """Return the v1 canonical UTF-8 byte length for one wire record."""
+    return len(_canonical_bond_sequence_json_bytes(payload))
+
+
+def _unit_path_counts(
+    metadata,
+    graph,
+    max_motifs=None,
+    junction_counts=None,
+    *,
+    occurrence_view=None,  # type: _OccurrenceView | None
+):
+    """Count undirected simple occurrence paths while compact metadata exists."""
+    occurrences = metadata.occurrences
+    if occurrence_view is None:
+        occurrence_view = _build_occurrence_adjacency(metadata, graph)
+        adjacency, edges, _atom_owner = occurrence_view
+    else:
+        adjacency, shared_edges, _atom_owner = occurrence_view
+        edges = [edge for edge in shared_edges if edge[0] != edge[1]]
     node_tokens = [
         (occurrence.unit_id, len(adjacency[occurrence_id]))
         for occurrence_id, occurrence in enumerate(occurrences)
@@ -1449,9 +1913,10 @@ def _unit_path_counts(metadata, graph, max_motifs=None, junction_counts=None):
         counts[len(path)][min(motif, _reverse_unit_path_motif(motif))] += 1
         emitted_motifs += 1
         if max_motifs is not None and emitted_motifs > max_motifs:
-            raise ValueError(
-                "Unit-path motif limit exceeded; increase unit_path_max_motifs "
-                "or use a separately versioned sampled descriptor"
+            raise TopologyBudgetExceeded(
+                "unit_path_max_motifs",
+                max_motifs,
+                emitted_motifs,
             )
 
     for left, right, edge_token in edges:
@@ -1499,8 +1964,10 @@ def _unit_path_counts(metadata, graph, max_motifs=None, junction_counts=None):
                 junction_counts[motif] += 1
                 emitted_motifs += 1
                 if max_motifs is not None and emitted_motifs > max_motifs:
-                    raise ValueError(
-                        "Unit-path/junction motif limit exceeded; increase unit_path_max_motifs"
+                    raise TopologyBudgetExceeded(
+                        "unit_path_max_motifs",
+                        max_motifs,
+                        emitted_motifs,
                     )
     return counts
 
@@ -1631,12 +2098,12 @@ def _representative_feature(deferred):
     for pair, count in metadata.labeled_bond_counts.items():
         contacts["|".join(label for label, _node in pair)] += count
     return _RepresentativeFeature(
-        chain_index=deferred.chain_index,
         molecular_weight=deferred.molecular_weight,
         total_units=sum(metadata.unit_counts.values()),
-        unit_counts=tuple(sorted(metadata.unit_counts.items())),
         unit_fractions=_normalized_sparse_counts(metadata.unit_counts),
         contact_fractions=_normalized_sparse_counts(contacts),
+        chain_index=deferred.chain_index,
+        unit_counts=tuple(sorted(metadata.unit_counts.items())),
     )
 
 
@@ -1682,6 +2149,66 @@ def _typed_representative_distance(left, right):
     return max(_representative_distance(left, right), unit_count_distance)
 
 
+def _assign_typed_medoid(
+    feature,
+    threshold,
+    representative_features,
+    representative_counts,
+    member_features,
+    member_scores,
+    medoid_indices,
+):
+    """Assign one chain by complete linkage and refresh its cluster medoid.
+
+    A cluster is eligible only when ``feature`` lies within ``threshold`` of
+    every member. The nearest eligible medoid wins, ties by cluster position.
+    The medoid minimizes the summed distance to all members, ties by lowest
+    chain index. Returns the assigned cluster position.
+    """
+    best = None
+    for position, medoid in enumerate(representative_features):
+        distance = _typed_representative_distance(feature, medoid)
+        if distance > threshold or (best is not None and distance >= best[0]):
+            continue
+        member_distances = []
+        for member in member_features[position]:
+            member_distance = _typed_representative_distance(feature, member)
+            if member_distance > threshold:
+                break
+            member_distances.append(member_distance)
+        else:
+            best = (distance, position, member_distances)
+    if best is None:
+        representative_features.append(feature)
+        representative_counts.append(1)
+        member_features.append([feature])
+        member_scores.append([0.0])
+        medoid_indices.append(feature.chain_index)
+        return len(representative_features) - 1
+    _distance, position, member_distances = best
+    members = member_features[position]
+    scores = [
+        score + member_distance
+        for score, member_distance in zip(member_scores[position], member_distances)
+    ]
+    members.append(feature)
+    scores.append(sum(member_distances))
+    minimum_score = min(scores)
+    medoid = min(
+        (
+            member
+            for member, score in zip(members, scores)
+            if score <= minimum_score + 1e-12
+        ),
+        key=lambda member: member.chain_index,
+    )
+    member_scores[position] = scores
+    representative_features[position] = medoid
+    medoid_indices[position] = medoid.chain_index
+    representative_counts[position] += 1
+    return position
+
+
 class _MetadataLevel(IntEnum):
     """Amount of metadata carried between private sampling stages."""
 
@@ -1708,6 +2235,7 @@ class _CompactMetadata:
     occurrences: tuple
     sequences: tuple
     unit_prototypes: dict
+    origin_bond_id: dict | None = None
     # Tree growth records parent links in each occurrence. Future generators
     # that can close an inter-occurrence cycle must publish the additional
     # (left_occurrence, right_occurrence, edge_token) records here.
@@ -1716,7 +2244,9 @@ class _CompactMetadata:
     def materialize_sequences(self):
         def materialize_unit(occurrence_id):
             occurrence = self.occurrences[occurrence_id]
-            unit = deepcopy(self.unit_prototypes[occurrence.prototype_key])
+            unit = _copy_unit_graph(
+                self.unit_prototypes[occurrence.prototype_key], deepcopy=deepcopy
+            )
             for (
                 parent_origin,
                 connection_id,
@@ -1735,10 +2265,16 @@ class _CompactMetadata:
                 unit.add_edge(parent_node, placeholder, **edge_attributes)
             return unit
 
-        return [
+        sequences = [
             [materialize_unit(occurrence_id) for occurrence_id in sequence]
             for sequence in self.sequences
         ]
+        if self.origin_bond_id is not None:
+            EnsembleCreator._contract_sequence_phantoms(
+                sequences,
+                self.origin_bond_id,
+            )
+        return sequences
 
 
 @dataclass
@@ -1774,6 +2310,7 @@ class _ChainRecord:
     distributions: dict | None
     molecular_weight: float | None
     legacy_units: dict | None = None
+    sequence_unit_ids: list | None = None
 
     def __getitem__(self, name):
         """Preserve the historical callback/test mapping interface."""
@@ -1822,24 +2359,37 @@ def _labeled_bond_counts(bond_counts, origin_endpoint):
     return merged
 
 
-def _bond_records_from_labeled(labeled_bond_counts):
+def _bond_records_from_labeled(labeled_bond_counts, origin_node=None):
+    if origin_node is None:
+        origin_node = {}
     return [
-        {"labels": [label for label, _node in pair], "nodes": [node for _label, node in pair], "count": count}
+        {
+            "labels": [label for label, _node in pair],
+            "nodes": [origin_node.get(node, node) for _label, node in pair],
+            "count": count,
+        }
         for pair, count in sorted(labeled_bond_counts.items(), key=lambda item: tuple(_bond_endpoint_sort_key(label) for label, _node in item[0]))
     ]
 
 
-def _bond_records(bond_counts, origin_endpoint):
+def _bond_records(bond_counts, origin_endpoint, origin_node=None):
     """
     Undirected linkage records from growth-direction origin-index pairs.
     """
     return _bond_records_from_labeled(
-        _labeled_bond_counts(bond_counts, origin_endpoint)
+        _labeled_bond_counts(bond_counts, origin_endpoint),
+        origin_node,
     )
 
 
 def _merge_ensemble_data(target, batch):
     """Merge a batch into cumulative :class:`EnsembleData` in place."""
+    if target.sequence_unit_ids is not None and batch.sequence_unit_ids is not None:
+        target.sequence_unit_ids.extend(batch.sequence_unit_ids)
+    elif not target.chains and batch.sequence_unit_ids is not None:
+        target.sequence_unit_ids = deepcopy(batch.sequence_unit_ids)
+    else:
+        target.sequence_unit_ids = None
     target.chains.extend(batch.chains)
     target.sequences.extend(batch.sequences)
     target.molecular_weights.extend(batch.molecular_weights)
@@ -1884,16 +2434,44 @@ def _unit_subgraphs(generative_graph, unit_id_by_node):
     """
     unit_nodes = {}
     for node, unit_id in unit_id_by_node.items():
-        unit_nodes.setdefault(unit_id, []).append(node)
+        if node in generative_graph:
+            unit_nodes.setdefault(unit_id, []).append(node)
     subgraphs = {}
     for unit_id, nodes in unit_nodes.items():
-        subgraph = deepcopy(generative_graph.subgraph(nodes).copy())
-        subgraph.graph.clear()
-        subgraph.remove_edges_from([(u, v, key) for u, v, key, data in subgraph.edges(keys=True, data=True) if not data["static"]])
-        for node in subgraph.nodes:
-            subgraph.nodes[node]["unit_id"] = unit_id
+        members = set(nodes)
+        subgraph = generative_graph.__class__()
+        subgraph.add_nodes_from(
+            (
+                node,
+                {**_copied_attributes(generative_graph.nodes[node], f"node {node!r}"), "unit_id": unit_id},
+            )
+            for node in nodes
+        )
+        subgraph.add_edges_from(
+            (
+                u,
+                v,
+                key,
+                _copied_attributes(data, f"edge {(u, v, key)!r}"),
+            )
+            for u, v, key, data in generative_graph.edges(nodes, keys=True, data=True)
+            if v in members and data.get("static", False)
+        )
         subgraphs[unit_id] = subgraph
     return subgraphs
+
+
+def _copied_attributes(data, where):
+    """Deep-copy template attributes and name any value that cannot be copied."""
+    copied = {}
+    for key, value in data.items():
+        try:
+            copied[key] = deepcopy(value)
+        except Exception as error:
+            raise TypeError(
+                f"Template {where} attribute {key!r} cannot be deep-copied for the unit subgraph: {error}"
+            ) from error
+    return copied
 
 
 @contextmanager
@@ -1972,6 +2550,39 @@ def _attempt_chain(
     return sample, reasons, cause, deferred_warnings
 
 
+def _retry_chain(
+    atom_graph,
+    collect_info,
+    termination_flag,
+    rng,
+    use_repeat_units_as_source,
+    max_discards,
+):
+    """Retry one chain using the caller's single RNG; leave conversion there."""
+    discards = 0
+    reasons = Counter()
+    first_cause = None
+    deferred_warnings = []
+    while True:
+        sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(
+            atom_graph,
+            collect_info,
+            termination_flag,
+            rng,
+            use_repeat_units_as_source,
+        )
+        deferred_warnings.extend(attempt_warnings)
+        if sample is not None:
+            break
+        discards += 1
+        reasons.update(attempt_reasons)
+        if first_cause is None and cause is not None:
+            first_cause = _detach_tracebacks(cause)
+        if discards >= max_discards:
+            break
+    return sample, discards, reasons, first_cause, deferred_warnings
+
+
 def _convert_chain(
     sample,
     molecule_format,
@@ -2043,12 +2654,21 @@ def _convert_chain(
         molecule = mol_graph
 
     converted_sequences = None
+    sequence_unit_ids = None
     if metadata_mode >= _MetadataLevel.COMPACT_SEQUENCES and include_sequences:
         sequences = (
             sample.legacy_sequences
             if sample.legacy_sequences is not None
             else sample.metadata.materialize_sequences()
         )
+        # Preserve sampled identities before conversion discards origin IDs.
+        # These are growth segments, not independent initiator-rooted chains.
+        sequence_unit_ids = [
+            [sample.metadata.occurrences[index].unit_id for index in segment]
+            for segment in sample.metadata.sequences
+        ]
+        if [len(segment) for segment in sequence_unit_ids] != [len(segment) for segment in sequences]:
+            raise RuntimeError("Sequence unit identities do not align with sampled segments")
         # Units are static-connected fragments with dangling inter-unit
         # valences, so convert them with kekulize=False (an aromatic ring
         # at a connection point can't be kekulized in isolation).
@@ -2064,7 +2684,7 @@ def _convert_chain(
                             f"sequence-{stage}"
                         ),
                         strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                        smiles_policy=smiles_policy,
+                        smiles_policy="auto",
                     )
                     for unit in sequence
                 ]
@@ -2083,6 +2703,7 @@ def _convert_chain(
         distributions=distributions,
         molecular_weight=molecular_weight,
         legacy_units=legacy_units,
+        sequence_unit_ids=sequence_unit_ids,
     )
 
 
@@ -2308,6 +2929,25 @@ def _classify_directional_stereo_warning(message, category):
     return None
 
 
+def _replay_chain_warnings(
+    warning_records,  # type: Iterator[_WarningRecord] | list[_WarningRecord]
+    directional_warning_counts,
+    directional_warning_examples,
+):
+    """Aggregate directional events and replay others with original provenance.
+
+    Accept the existing portable tuples; caught warnings can be projected to
+    these four fields without pickling or changing their message objects.
+    """
+    for message, category, filename, lineno in warning_records:
+        warning_kind = _classify_directional_stereo_warning(message, category)
+        if warning_kind is not None:
+            directional_warning_counts[warning_kind] += 1
+            directional_warning_examples.setdefault(warning_kind, str(message))
+            continue
+        warnings.warn_explicit(message, category, filename, lineno)
+
+
 def _emit_directional_stereo_warning_summary(
     directional_warning_counts,
     directional_warning_examples,
@@ -2347,6 +2987,44 @@ def _emit_directional_stereo_warning_summary(
     )
 
 
+def _convert_sample_with_options(
+    sample, options, chain_index, seed_sequence, sequence_smiles_cache, *, worker=False,
+):
+    """Apply shared conversion settings, preserving serial/worker defer policy."""
+    if options.mode is not _ConversionMode.IMMEDIATE:
+        worker_options = (
+            {
+                "molecule_format": options.molecule_format,
+                "include_sequences": options.include_sequences,
+                "materialize_output": options.mode is _ConversionMode.MATERIALIZE,
+            }
+            if worker else {}
+        )
+        return _defer_chain_conversion(
+            sample,
+            options.collect_info,
+            chain_index,
+            seed_sequence,
+            options.native_diagnostics_path,
+            strip_unresolved_directional_markers=options.strip_unresolved_directional_markers,
+            smiles_policy=options.smiles_policy,
+            sequence_smiles_cache=sequence_smiles_cache,
+            **worker_options,
+        )
+    return _convert_chain(
+        sample,
+        options.molecule_format,
+        options.collect_info,
+        options.include_sequences,
+        chain_index,
+        seed_sequence,
+        options.native_diagnostics_path,
+        strip_unresolved_directional_markers=options.strip_unresolved_directional_markers,
+        smiles_policy=options.smiles_policy,
+        sequence_smiles_cache=sequence_smiles_cache,
+    )
+
+
 def _sample_chain_batch(
     atom_graph,
     chain_jobs,
@@ -2356,11 +3034,13 @@ def _sample_chain_batch(
     termination_flag,
     include_sequences=True,
     native_diagnostics_path=None,
-    defer_conversion=False,
+    defer_conversion=False,  # type: _LegacyConversionMode | _ConversionMode
     use_repeat_units_as_source=False,
     strip_unresolved_directional_markers=False,
     smiles_policy="fast",
+    building_block_statistics=False,
 ):
+    # type: (...) -> list[_WorkerResult]
     """Sample a batch of chains in one worker process (module level so
     ProcessPoolExecutor can pickle it).
 
@@ -2374,79 +3054,55 @@ def _sample_chain_batch(
     failure entry (record=None) with its first pickled cause; the
     ensemble-level verdict belongs to the parent. Fatal errors transition.
     """
+    conversion = _ChainConversionOptions(
+        molecule_format, collect_info, include_sequences, native_diagnostics_path,
+        _ConversionMode.from_legacy(defer_conversion),
+        strip_unresolved_directional_markers, smiles_policy,
+    )
     batch = []
     for chain_index, seed_sequence in chain_jobs:
         rng = np.random.default_rng(seed_sequence)
-        discards = 0
-        reasons = Counter()
-        first_cause = None
-        deferred_warnings = []
-        record = None
-        while True:
-            sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(
-                atom_graph,
-                collect_info,
-                termination_flag,
-                rng,
-                use_repeat_units_as_source,
-            )
-            deferred_warnings.extend(attempt_warnings)
-            if sample is not None:
-                with warnings.catch_warnings(record=True) as conversion_warnings:
-                    warnings.simplefilter("always")
-                    if defer_conversion:
-                        record = _defer_chain_conversion(
-                            sample,
-                            collect_info,
-                            chain_index,
-                            seed_sequence,
-                            native_diagnostics_path,
-                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                            molecule_format=molecule_format,
-                            include_sequences=include_sequences,
-                            materialize_output=defer_conversion == "materialize",
-                            smiles_policy=smiles_policy,
-                            sequence_smiles_cache=getattr(
-                                atom_graph,
-                                "_sequence_smiles_cache",
-                                None,
-                            ),
-                        )
-                    else:
-                        record = _convert_chain(
-                            sample,
-                            molecule_format,
-                            collect_info,
-                            include_sequences,
-                            chain_index,
-                            seed_sequence,
-                            native_diagnostics_path,
-                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                            smiles_policy=smiles_policy,
-                            sequence_smiles_cache=getattr(
-                                atom_graph,
-                                "_sequence_smiles_cache",
-                                None,
-                            ),
-                        )
-                deferred_warnings.extend(conversion_warnings)
-                break
-            discards += 1
-            reasons.update(attempt_reasons)
-            if first_cause is None and cause is not None:
-                first_cause = _detach_tracebacks(cause)
-            if discards >= max_discards:
-                break
-        batch.append(
-            {
-                "chain_index": chain_index,
-                "record": record,
-                "discards": discards,
-                "reasons": tuple(reasons.items()),
-                "first_cause": first_cause,
-                "warnings": [_portable_warning(caught) for caught in deferred_warnings],
-            }
+        sample, discards, reasons, first_cause, deferred_warnings = _retry_chain(
+            atom_graph,
+            collect_info,
+            termination_flag,
+            rng,
+            use_repeat_units_as_source,
+            max_discards,
         )
+        record = None
+        if sample is not None:
+            with warnings.catch_warnings(record=True) as conversion_warnings:
+                warnings.simplefilter("always")
+                if building_block_statistics:
+                    # Count in the worker before conversion releases compact
+                    # occurrence metadata. Ship only raw aggregate counters,
+                    # never a new graph, wire record, or normalized snapshot.
+                    block_statistics = _BuildingBlockStatistics()
+                    block_statistics.update(
+                        sample.metadata,
+                        _build_occurrence_adjacency(
+                            sample.metadata, sample.graph,
+                            preserve_self_edges=True,
+                        ),
+                    )
+                record = _convert_sample_with_options(
+                    sample, conversion, chain_index, seed_sequence,
+                    getattr(atom_graph, "_sequence_smiles_cache", None),
+                    worker=True,
+                )
+            deferred_warnings.extend(conversion_warnings)
+        chain_result = {  # type: _WorkerResult
+            "chain_index": chain_index,
+            "record": record,
+            "discards": discards,
+            "reasons": tuple(reasons.items()),
+            "first_cause": first_cause,
+            "warnings": [_portable_warning(caught) for caught in deferred_warnings],
+        }
+        if building_block_statistics and record is not None:
+            chain_result["building_block_statistics"] = block_statistics
+        batch.append(chain_result)
     return batch
 
 
@@ -2458,12 +3114,19 @@ class _UnitOccurrence:
     prototype_key: tuple
     nodes: tuple[int, ...]
     incoming_connection: tuple[int, int] | None
-    incoming_edge_token: tuple[str, bool] | None
+    incoming_edge_token: tuple[str, bool, str, str] | None
     connections: list[tuple[str, int, dict, dict]]
 
 
 class _PartialAtomGraph:
-    _ATOM_ATTRS = {"atomic_num", _AROMATIC_NAME, "charge", "num_explicit_h", "atom_chiral_token"}
+    _ATOM_ATTRS = {
+        "atomic_num",
+        _AROMATIC_NAME,
+        "charge",
+        "num_explicit_h",
+        "atom_chiral_token",
+        _CONNECTOR_PLACEHOLDER_NAME,
+    }
     _BOND_ATTRS = {
         _BOND_TYPE_NAME,
         _AROMATIC_NAME,
@@ -3933,8 +4596,18 @@ class _PartialAtomGraph:
             (
                 parent_origin,
                 self.current_connection,
-                dict(self.atom_graph.nodes[child_node]),
-                dict(self.atom_graph.edges[(parent_node, child_node)]),
+                {
+                    "atomic_num": 0,
+                    _CONNECTOR_PLACEHOLDER_NAME: False,
+                    "aromatic": False,
+                    "charge": 0,
+                    "num_explicit_h": -1,
+                    "origin_idx": self.atom_graph.nodes[child_node]["origin_idx"],
+                },
+                {
+                    **self.atom_graph.edges[(parent_node, child_node)],
+                    "aromatic": False,
+                },
             )
         )
         self.current_connection += 1
@@ -3978,7 +4651,9 @@ class _PartialAtomGraph:
 
     def _materialize_sequence_unit(self, occurrence_id):
         occurrence = self._unit_occurrences[occurrence_id]
-        unit = deepcopy(self._unit_prototypes[occurrence.prototype_key])
+        unit = _copy_unit_graph(
+            self._unit_prototypes[occurrence.prototype_key], deepcopy=deepcopy
+        )
         for parent_origin, connection_id, node_attributes, edge_attributes in occurrence.connections:
             parent_node = next(
                 node
@@ -3989,6 +4664,7 @@ class _PartialAtomGraph:
             unit.add_node(placeholder, **node_attributes)
             unit.nodes[placeholder]["atomic_num"] = 0
             unit.nodes[placeholder]["connection"] = connection_id
+            unit.nodes[placeholder][_CONNECTOR_PLACEHOLDER_NAME] = False
             unit.add_edge(parent_node, placeholder, **edge_attributes)
         return unit
 
@@ -3999,16 +4675,22 @@ class _PartialAtomGraph:
         for occurrence in self._unit_occurrences:
             if occurrence.unit_id in representative_units:
                 continue
-            unit = deepcopy(self._unit_prototypes[occurrence.prototype_key])
+            unit = _copy_unit_graph(
+                self._unit_prototypes[occurrence.prototype_key], deepcopy=deepcopy
+            )
             representative_units[occurrence.unit_id] = unit
             units[unit] = self._unit_counts[occurrence.unit_id]
         sequences = [
             [self._materialize_sequence_unit(occurrence_id) for occurrence_id in sequence]
             for sequence in self._sequences
         ]
+        EnsembleCreator._contract_sequence_phantoms(
+            sequences,
+            self._attachment_site_by_origin,
+        )
         return units, dict(self._bond_counts), sequences
 
-    def compact_metadata(self, include_sequences=False, include_occurrences=False):
+    def compact_metadata(self, include_sequences=False, include_occurrences=True):
         """Return stable IDs and optionally the compact sequence recipe."""
         return _CompactMetadata(
             unit_counts=dict(self._unit_counts),
@@ -4025,6 +4707,9 @@ class _PartialAtomGraph:
                 else ()
             ),
             unit_prototypes=(dict(self._unit_prototypes) if include_sequences else {}),
+            origin_bond_id=(
+                dict(self._attachment_site_by_origin) if include_sequences else None
+            ),
             inter_occurrence_edges=(
                 tuple(self._inter_occurrence_edges)
                 if include_sequences or include_occurrences
@@ -4242,10 +4927,49 @@ class _GrowthTransaction:
 
 
 class EnsembleCreator:
+    """Generate molecules while validating explicit placeholder identity."""
 
     def __init__(self, generative_graph):
 
         self._generative_graph = generative_graph.copy()
+        wildcard_nodes = []
+        placeholder_nodes = []
+        for node, data in self._generative_graph.nodes(data=True):
+            atomic_num = data["atomic_num"] = _atomic_number(node, data)
+            placeholder = _connector_placeholder_flag(node, data)
+            data[_CONNECTOR_PLACEHOLDER_NAME] = placeholder
+            for field in _DERIVED_NODE_FIELDS:
+                data.pop(field, None)
+            if atomic_num < 0:
+                raise IncompatibleGenerativeGraphSchema(
+                    "atomic_num",
+                    "nodes",
+                    node_id=node,
+                    reason="invalid",
+                    detail=(
+                        f"Expected a non-negative integer; received {atomic_num!r}. "
+                        "Negative values label non-atom graph objects such as bond descriptors: "
+                        "build the graph with include_bond_connectors=False."
+                    ),
+                )
+            if placeholder:
+                placeholder_nodes.append(node)
+            elif atomic_num == 0:
+                wildcard_nodes.append(node)
+
+        if wildcard_nodes:
+            node = wildcard_nodes[0]
+            unit_id = None
+            unit_text = None
+            try:
+                labels = derive_unit_labels(self._generative_graph)
+            except (KeyError, TypeError, ValueError, AttributeError, nx.NetworkXException):
+                labels = None
+            if labels is not None:
+                unit_id = labels.unit_id.get(node)
+                unit_text = _verified_unit_texts(self._generative_graph, labels).get(unit_id)
+            raise UnsupportedWildcardGeneration(node, unit_id, unit_text)
+
         self._prepared_distributions = self._prepare_distributions()
         labels = derive_unit_labels(self._generative_graph)
         self._unit_id_by_origin = {
@@ -4260,6 +4984,7 @@ class EnsembleCreator:
         self._origin_bond_id = {
             str(node): bond_id for node, bond_id in labels.bond_id.items()
         }
+        self._origin_node_by_text = {str(node): node for node in self._generative_graph.nodes}
         self._origin_endpoint = {
             origin: f"{self._origin_unit_id[origin]}.{bond_id}"
             for origin, bond_id in self._origin_bond_id.items()
@@ -4273,6 +4998,28 @@ class EnsembleCreator:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
 
         self._static_graph = self._create_static_graph(self.generative_graph)
+        for node in placeholder_nodes:
+            neighbors = _static_neighbors(self._static_graph, node)
+            if len(neighbors) != 1:
+                detail = (
+                    "A connector placeholder must have exactly one static neighbor, "
+                    f"its split atom; found {len(neighbors)}."
+                )
+            else:
+                anchor = next(iter(neighbors))
+                if self._generative_graph.nodes[anchor]["atomic_num"] > 0:
+                    continue
+                detail = (
+                    "A connector placeholder's static neighbor must be a real atom; "
+                    f"node {anchor!r} is another placeholder."
+                )
+            raise IncompatibleGenerativeGraphSchema(
+                _CONNECTOR_PLACEHOLDER_NAME,
+                "nodes",
+                node_id=node,
+                reason="invalid",
+                detail=detail,
+            )
         self._static_source_templates = self._prepare_static_source_templates()
         self._canonical_unit_info = self._prepare_canonical_unit_info(labels)
         self._sequence_smiles_cache = OrderedDict()
@@ -4315,15 +5062,34 @@ class EnsembleCreator:
             self._provably_zero_termination_states = frozenset()
         self._source_provably_dead_cache = {}
 
-        self._starting_node_idx, self._starting_node_weight = self._create_init_weights(self.generative_graph)
-
-        self._repeat_unit_starting_node_idx, self._repeat_unit_starting_node_weight = self._create_repeat_units_as_source(self.generative_graph)
+        self._repeat_unit_starting_node_idx, self._repeat_unit_starting_node_weight = (
+            self._create_repeat_unit_initiation_weights(self._generative_graph)
+        )
+        self._repeat_unit_initiation = not any(
+            data["init_weight"] > 0
+            for _node, data in self._generative_graph.nodes(data=True)
+        )
+        if self._repeat_unit_initiation:
+            self._starting_node_idx = self._repeat_unit_starting_node_idx
+            self._starting_node_weight = self._repeat_unit_starting_node_weight
+            if self._starting_node_idx:
+                warnings.warn(
+                    RepeatUnitInitiation(
+                        self._generative_graph.graph.get("g2rins_string"),
+                        self._source_unit_texts(self._starting_node_idx),
+                    ),
+                    stacklevel=2,
+                )
+        else:
+            self._starting_node_idx, self._starting_node_weight = self._create_init_weights(
+                self.generative_graph
+            )
 
         # A sticky branch flag is insufficient on its own: several positive
         # sources (or repeat-unit choices) may all converge on the same dead
         # nested expansion.  This conservative proof overrides that flag only
         # when every source with nonzero selection probability is known dead.
-        self._automatic_zero_support_is_unavoidable = {
+        self._automatic_zero_support_is_unavoidable = _SourceProofModes({
             False: self._all_reachable_sources_are_provably_dead(
                 self._starting_node_idx,
                 self._starting_node_weight,
@@ -4332,7 +5098,7 @@ class EnsembleCreator:
                 self._repeat_unit_starting_node_idx,
                 self._repeat_unit_starting_node_weight,
             ),
-        }
+        })
         # Both weight vectors are immutable after this point, so whether the
         # automatic source draw branches is a per-mode constant.
         self._automatic_source_is_conditional = {
@@ -4433,12 +5199,145 @@ class EnsembleCreator:
             )
         return templates
 
+    @staticmethod
+    def _contract_sequence_phantoms(sequences, origin_bond_id):
+        """Remove inactive split sites and merge mapped stubs onto their anchor."""
+        for sequence in sequences:
+            for unit_graph in sequence:
+                phantom_nodes = {
+                    node
+                    for node, data in unit_graph.nodes(data=True)
+                    if _is_connector_placeholder(data) and "connection" not in data
+                }
+                inactive_nodes = {
+                    node
+                    for node in phantom_nodes
+                    if str(unit_graph.nodes[node]["origin_idx"]) not in origin_bond_id
+                }
+                unit_graph.remove_nodes_from(inactive_nodes)
+                phantom_nodes.difference_update(inactive_nodes)
+                for component in list(
+                    nx.connected_components(unit_graph.subgraph(phantom_nodes))
+                ):
+                    real_anchors = set()
+                    connection_edges = []
+                    for phantom_node in component:
+                        for neighbor in list(unit_graph.neighbors(phantom_node)):
+                            if neighbor in component:
+                                continue
+                            neighbor_data = unit_graph.nodes[neighbor]
+                            if "connection" in neighbor_data:
+                                connection_edges.append(
+                                    (neighbor, deepcopy(unit_graph[phantom_node][neighbor]))
+                                )
+                            elif _is_connector_placeholder(neighbor_data):
+                                raise RuntimeError(
+                                    "A sequence phantom has an unsupported boundary node."
+                                )
+                            else:
+                                real_anchors.add(neighbor)
+                    if len(real_anchors) != 1:
+                        raise RuntimeError(
+                            "A sequence phantom component must have exactly one real anchor; "
+                            f"found {len(real_anchors)}."
+                        )
+                    real_anchor = next(iter(real_anchors))
+                    for connection_node, edge_data in connection_edges:
+                        if unit_graph.has_edge(real_anchor, connection_node):
+                            raise RuntimeError(
+                                "A sequence connection is already attached to its phantom's anchor."
+                            )
+                        unit_graph.add_edge(real_anchor, connection_node, **edge_data)
+                    if connection_edges:
+                        unit_graph.remove_nodes_from(component)
+
+    @staticmethod
+    def _unit_graph_with_stars(unit_graph, origin_bond_id):
+        """Render active template sites as mapped stars, omitting inactive phantoms."""
+        star_graph = unit_graph.copy()
+        for node, data in list(unit_graph.nodes(data=True)):
+            origin = str(data["origin_idx"])
+            bond_id = origin_bond_id.get(origin)
+            if bond_id is not None:
+                if _is_connector_placeholder(data):
+                    star_graph.nodes[node]["connection"] = bond_id - _ATOM_MAP_OFFSET
+                else:
+                    star_node = ("star", node)
+                    star_graph.add_node(
+                        star_node,
+                        atomic_num=0,
+                        aromatic=False,
+                        charge=0,
+                        connection=bond_id - _ATOM_MAP_OFFSET,
+                    )
+                    star_graph.add_edge(
+                        node,
+                        star_node,
+                        bond_type=1,
+                        aromatic=False,
+                    )
+            elif _is_connector_placeholder(data):
+                star_graph.remove_node(node)
+        return star_graph
+
+    @staticmethod
+    def _validate_unit_psmiles_mol(
+        unit_id,
+        star_mol,
+        expected_maps,
+        expected_real_atom_count,
+    ):
+        dummy_atoms = [atom for atom in star_mol.GetAtoms() if atom.GetAtomicNum() == 0]
+        actual_maps = sorted(atom.GetAtomMapNum() for atom in dummy_atoms)
+        invalid_degrees = tuple(
+            (atom.GetIdx(), atom.GetAtomMapNum(), atom.GetDegree())
+            for atom in dummy_atoms
+            if atom.GetDegree() != 1
+        )
+        actual_real_atom_count = sum(
+            atom.GetAtomicNum() > 0 for atom in star_mol.GetAtoms()
+        )
+        expected_maps = sorted(expected_maps)
+        if (
+            actual_maps != expected_maps
+            or invalid_degrees
+            or actual_real_atom_count != expected_real_atom_count
+        ):
+            raise InvalidUnitPSmiles(
+                unit_id,
+                expected_maps,
+                actual_maps,
+                invalid_degrees,
+                expected_real_atom_count,
+                actual_real_atom_count,
+            )
+
+    def _validate_unit_psmiles(self, unit_id, psmiles, info):
+        params = Chem.SmilesParserParams()
+        params.removeHs = False
+        star_mol = Chem.MolFromSmiles(psmiles, params)
+        if star_mol is None:
+            raise InvalidUnitPSmiles(
+                unit_id,
+                info["expected_maps"],
+                (),
+                (),
+                info["expected_real_atom_count"],
+                0,
+            )
+        self._validate_unit_psmiles_mol(
+            unit_id,
+            star_mol,
+            info["expected_maps"],
+            info["expected_real_atom_count"],
+        )
+
     def _prepare_canonical_unit_info(self, labels):
         """Prepare format-independent public unit metadata once per creator."""
-        unit_subgraphs = _unit_subgraphs(self._generative_graph, labels.unit_id)
-        unit_g2rins = self._generative_graph.graph.get("unit_g2rins", {})
-        if not set(unit_g2rins).issubset(unit_subgraphs):
-            unit_g2rins = {}
+        unit_g2rins = _verified_unit_texts(self._generative_graph, labels)
+        unit_nodes = {}
+        for node, unit_id in labels.unit_id.items():
+            unit_nodes.setdefault(unit_id, []).append(node)
 
         representative_sources = {}
         for source in self._generative_graph.nodes:
@@ -4459,15 +5358,14 @@ class EnsembleCreator:
             for left, right, attributes in template.edges:
                 unit_graph.add_edge(left, right, **dict(attributes))
             self._canonical_unit_prototypes[unit_id] = unit_graph
+            star_graph = None
             try:
                 with rdBase.BlockLogs():
-                    star_mol = mol_graph_to_rdkit_mol(
-                        self._unit_graph_with_stars(
-                            unit_graph,
-                            self._origin_bond_id,
-                        ),
-                        kekulize=False,
+                    star_graph = self._unit_graph_with_stars(
+                        unit_graph,
+                        self._origin_bond_id,
                     )
+                    star_mol = mol_graph_to_rdkit_mol(star_graph, kekulize=False)
                     psmiles = rdkit_mol_to_smiles(
                         star_mol,
                         smiles_policy="auto",
@@ -4479,8 +5377,17 @@ class EnsembleCreator:
                 psmiles = None
             canonical[unit_id] = {
                 "psmiles": psmiles,
+                "_star_graph": star_graph,
                 "g2rins": unit_g2rins.get(unit_id, ""),
-                "subgraph": unit_subgraphs[unit_id],
+                "expected_maps": sorted(
+                    labels.bond_id[node]
+                    for node in unit_nodes[unit_id]
+                    if node in labels.bond_id
+                ),
+                "expected_real_atom_count": sum(
+                    self._generative_graph.nodes[node]["atomic_num"] > 0
+                    for node in unit_nodes[unit_id]
+                ),
             }
         return canonical
 
@@ -5080,69 +5987,76 @@ class EnsembleCreator:
         return starting_node_idx, starting_node_weight
 
     @staticmethod
-    # TODO: consider nested stochastic object in the selection of starting nodes from repeat units
-    def _create_repeat_units_as_source(generative_graph):
-        # TODO fix this function, sometimes it brings errors.
-        starting_node_idx = []
-        starting_node_weight = []
-        graph_transitions = []
-        for u, v, data in generative_graph.edges(data=True):
-            if data[_TRANSITION_NAME] > 0:
-                graph_transitions.append((u, v))
+    def _create_repeat_unit_initiation_weights(graph):
+        """Select reachable root repeat-unit sources by flow/SCC semantics."""
+        trees = {
+            node: data["stochastic_id_tree"] for node, data in graph.nodes(data=True)
+        }
+        flow = nx.DiGraph()
+        flow.add_nodes_from(tree[0] for tree in trees.values())
+        for u, v, edge in graph.edges(data=True):
+            if edge.get(_PROPAGATION_NAME, 0) > 0 or edge.get(_TRANSITION_NAME, 0) > 0:
+                if trees[u][0] != trees[v][0]:
+                    flow.add_edge(trees[u][0], trees[v][0])
+        depth = {
+            tree[0]: sum(parent >= 0 for parent in tree[1:])
+            for tree in trees.values()
+        }
+        source_objects = set()
+        condensation = nx.condensation(flow)
+        for component in condensation:
+            if condensation.in_degree(component) == 0:
+                members = condensation.nodes[component]["members"]
+                outermost = min(depth[member] for member in members)
+                source_objects.update(
+                    member for member in members if depth[member] == outermost
+                )
 
-        if not graph_transitions:
-            for node_idx, data in generative_graph.nodes(data=True):
-                if (data["init_weight"] == -1) and (data["gen_weight"] > 0):  # and (stochastic_tree_depth[node_idx]) == max_depth:
-                    starting_node_idx.append(node_idx)
-                    starting_node_weight.append(data["gen_weight"])
-        else:
-            list_of_repeat_units = []
-            for u, _ in graph_transitions:
-                visited = set([u])
-                queue = deque([u])
+        def enters_only_own_nested_objects(node):
+            growth = [
+                (target, edge)
+                for _source, target, edge in graph.out_edges(node, data=True)
+                if edge.get(_PROPAGATION_NAME, 0) > 0
+                or edge.get(_TRANSITION_NAME, 0) > 0
+            ]
+            return bool(growth) and all(
+                edge.get(_TRANSITION_NAME, 0) > 0
+                and edge.get(_EDGE_STOCHASTIC_ID_NAME) == trees[target][0]
+                and trees[node][0] in trees[target][1:]
+                for target, edge in growth
+            )
 
-                while queue:
-                    node = queue.popleft()
+        nodes, weights = [], []
+        for node, data in graph.nodes(data=True):
+            tree = trees[node]
+            if (
+                tree[0] < 0
+                or tree[0] not in source_objects
+                or data["gen_weight"] <= 0
+                or enters_only_own_nested_objects(node)
+            ):
+                continue
+            weight = data["gen_weight"]
+            for level in tree:
+                if level >= 0:
+                    weight *= data["unit_molar_amounts"][level]
+            nodes.append(node)
+            weights.append(weight)
+        weights = np.asarray(weights, dtype=float)
+        total = weights.sum()
+        if not total > 0:
+            return [], np.asarray([])
+        return nodes, weights / total
 
-                    # Outgoing edges
-                    for _, nbr, _key, data in generative_graph.out_edges(node, keys=True, data=True):
-                        if data.get(_TRANSITION_NAME, 0) > 0:
-                            continue  # stop traversal in this direction
-                        if nbr not in visited:
-                            visited.add(nbr)
-                            queue.append(nbr)
-
-                    # Incoming edges
-                    for nbr, _, _key, data in generative_graph.in_edges(node, keys=True, data=True):
-                        if data.get(_TRANSITION_NAME, 0) > 0:
-                            continue  # stop traversal in this direction
-                        if nbr not in visited:
-                            visited.add(nbr)
-                            queue.append(nbr)
-                list_of_repeat_units.append(visited)
-            repeat_units_to_remove = []
-            for repeat_unit in list_of_repeat_units:
-                for node_idx in repeat_unit:
-                    for _u, v in graph_transitions:
-                        if node_idx == v:
-                            if repeat_unit not in repeat_units_to_remove:
-                                repeat_units_to_remove.append(repeat_unit)
-                                continue
-            for repeat_unit in repeat_units_to_remove:
-                if repeat_unit in list_of_repeat_units:
-                    list_of_repeat_units.remove(repeat_unit)
-
-            for node_idx, data in generative_graph.nodes(data=True):
-                if (any(node_idx in repeat_unit for repeat_unit in list_of_repeat_units)) or not list_of_repeat_units:
-                    if (data["init_weight"] == -1) and (data["gen_weight"] > 0):
-                        starting_node_idx.append(node_idx)
-                        starting_node_weight.append(data["gen_weight"])
-
-        if starting_node_idx:
-            starting_node_weight = np.asarray(starting_node_weight)
-            starting_node_weight /= np.sum(starting_node_weight)
-
-        return starting_node_idx, starting_node_weight
+    def _source_unit_texts(self, nodes):
+        """Return verified unit text for repeat-unit initiation diagnostics."""
+        try:
+            labels = derive_unit_labels(self._generative_graph)
+            texts = _verified_unit_texts(self._generative_graph, labels)
+        except (KeyError, TypeError, ValueError, AttributeError, nx.NetworkXException):
+            return ()
+        unit_ids = sorted({labels.unit_id[node] for node in nodes}, key=str)
+        return tuple(texts.get(unit_id, unit_id) for unit_id in unit_ids)
 
     @staticmethod
     def _create_static_graph(generative_graph):
@@ -5225,7 +6139,11 @@ class EnsembleCreator:
             source_is_conditional = self._automatic_source_is_conditional[
                 bool(use_repeat_units_as_source)
             ]
-            source = self._get_random_start_node(rng, use_repeat_units_as_source)
+            source = (
+                self._get_random_start_node(rng, True)
+                if use_repeat_units_as_source
+                else self._get_random_start_node(rng)
+            )
 
         # The generative_graph property copies the whole template graph on every access:
         # take one copy per sample instead of one per use.
@@ -5286,6 +6204,8 @@ class EnsembleCreator:
             # condition.
             partial_atom_graph.stochastic_tracker.terminate(sto_atom_id)
         else:
+            if self._repeat_unit_initiation:
+                partial_atom_graph.nested_transition(sto_atom_id, rng)
             partial_atom_graph.transition_graph(sto_atom_id, source_sto_gen_id, rng)
 
         # Pending-termination bookkeeping (P1-02 rework). An instance whose
@@ -5979,10 +6899,7 @@ class EnsembleCreator:
             except AttributeError:
                 break
         include_sequences = metadata_mode >= _MetadataLevel.COMPACT_SEQUENCES
-        compact = partial_atom_graph.compact_metadata(
-            include_sequences,
-            True,
-        )
+        compact = partial_atom_graph.compact_metadata(include_sequences)
         compact.labeled_bond_counts = _labeled_bond_counts(
             compact.bond_counts,
             self._origin_endpoint,
@@ -6013,25 +6930,6 @@ class EnsembleCreator:
             actual_mol_weights,
             distributions,
         )
-
-
-    @staticmethod
-    def _unit_graph_with_stars(unit_graph, origin_bond_id):
-        """
-        Copy of `unit_graph` with a star atom bonded to every atom whose origin
-        is a connection atom (has a derived bond id); the star's map number is
-        that bond id, so the P-SMILES prints numbered stars ``[*:n]``.
-        """
-        star_graph = unit_graph.copy()
-        for node, data in unit_graph.nodes(data=True):
-            bond_id = origin_bond_id.get(data["origin_idx"])
-            if bond_id is not None:
-                star_node = ("star", node)
-                # The converter renders map numbers as connection + 1.
-                star_graph.add_node(star_node, **{"atomic_num": 0, _AROMATIC_NAME: False, "charge": 0, "connection": bond_id - 1})
-                star_graph.add_edge(node, star_node, **{_BOND_TYPE_NAME: 1, _AROMATIC_NAME: False})
-        return star_graph
-
     def _iter_chain_records(
         self,
         n_samples,
@@ -6046,17 +6944,19 @@ class EnsembleCreator:
         include_sequences=True,
         native_diagnostics_path=None,
         max_worker_restarts=2,
-        defer_conversion=False,
+        defer_conversion=False,  # type: _LegacyConversionMode | _ConversionMode
         parallel_scheduler=None,
         use_repeat_units_as_source=False,
         strip_unresolved_directional_markers=False,
         fallback_on_worker_crash=False,
         smiles_policy="fast",
+        building_block_statistics=False,
     ):
+        # type: (...) -> Iterator[_WorkerResult]
         """Yield ordered per-chain success/failure records.
 
-        Chain-local retry and RNG policy lives here so fixed-size and
-        convergence-driven creation consume the same sampling engine.
+        Construct RNGs here and share chain-local retries with workers so
+        fixed-size and convergence creation consume the same sampling engine.
         """
         seed_sequences = None
         if seed is not None or (parallel and n_workers > 1):
@@ -6078,15 +6978,21 @@ class EnsembleCreator:
                 native_diagnostics_path,
                 n_workers,
                 max_worker_restarts,
-                defer_conversion,
+                defer_conversion.value if isinstance(defer_conversion, _ConversionMode) else defer_conversion,
                 parallel_scheduler,
                 use_repeat_units_as_source,
                 strip_unresolved_directional_markers,
                 fallback_on_worker_crash,
                 smiles_policy,
+                **({"building_block_statistics": True} if building_block_statistics else {}),
             )
             return
 
+        conversion = _ChainConversionOptions(
+            molecule_format, collect_info, include_sequences, native_diagnostics_path,
+            _ConversionMode.from_legacy(defer_conversion),
+            strip_unresolved_directional_markers, smiles_policy,
+        )
         for local_index in range(n_samples):
             chain_index = start_index + local_index
             rng = (
@@ -6094,68 +7000,28 @@ class EnsembleCreator:
                 if seed_sequences is not None
                 else None
             )
-            discards = 0
-            reasons = Counter()
-            first_cause = None
-            deferred_warnings = []
+            sample, discards, reasons, first_cause, deferred_warnings = _retry_chain(
+                self,
+                collect_info,
+                termination_flag,
+                rng,
+                use_repeat_units_as_source,
+                max_discards,
+            )
             record = None
-            while True:
-                sample, attempt_reasons, cause, attempt_warnings = _attempt_chain(
-                    self,
-                    collect_info,
-                    termination_flag,
-                    rng,
-                    use_repeat_units_as_source,
+            if sample is not None:
+                seed_sequence = (
+                    seed_sequences[local_index]
+                    if seed_sequences is not None
+                    else None
                 )
-                deferred_warnings.extend(attempt_warnings)
-                if sample is not None:
-                    seed_sequence = (
-                        seed_sequences[local_index]
-                        if seed_sequences is not None
-                        else None
+                with warnings.catch_warnings(record=True) as conversion_warnings:
+                    warnings.simplefilter("always")
+                    record = _convert_sample_with_options(
+                        sample, conversion, chain_index, seed_sequence,
+                        getattr(self, "_sequence_smiles_cache", None),
                     )
-                    with warnings.catch_warnings(record=True) as conversion_warnings:
-                        warnings.simplefilter("always")
-                        if defer_conversion:
-                            record = _defer_chain_conversion(
-                                sample,
-                                collect_info,
-                                chain_index,
-                                seed_sequence,
-                                native_diagnostics_path,
-                                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                                smiles_policy=smiles_policy,
-                                sequence_smiles_cache=getattr(
-                                    self,
-                                    "_sequence_smiles_cache",
-                                    None,
-                                ),
-                            )
-                        else:
-                            record = _convert_chain(
-                                sample,
-                                molecule_format,
-                                collect_info,
-                                include_sequences,
-                                chain_index,
-                                seed_sequence,
-                                native_diagnostics_path,
-                                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                                smiles_policy=smiles_policy,
-                                sequence_smiles_cache=getattr(
-                                    self,
-                                    "_sequence_smiles_cache",
-                                    None,
-                                ),
-                            )
-                    deferred_warnings.extend(conversion_warnings)
-                    break
-                discards += 1
-                reasons.update(attempt_reasons)
-                if first_cause is None and cause is not None:
-                    first_cause = _detach_tracebacks(cause)
-                if discards >= max_discards:
-                    break
+                deferred_warnings.extend(conversion_warnings)
             yield {
                 "chain_index": chain_index,
                 "record": record,
@@ -6171,36 +7037,228 @@ class EnsembleCreator:
                 # the first chain whose consecutive-discard budget expires.
                 return
 
+    def _replay_representative_medoids(
+        self,
+        medoid_features,
+        replay_batches,
+        *,
+        molecule_format,
+        metadata_mode,
+        max_discards,
+        termination_flag,
+        parallel,
+        n_workers,
+        include_sequences,
+        native_diagnostics_path,
+        max_worker_restarts,
+        use_repeat_units_as_source,
+        strip_unresolved_directional_markers,
+        fallback_on_worker_crash,
+        smiles_policy,
+        retain_chains,
+        retain_sequences,
+        metadata,
+        unit_path_max_motifs,
+        retained_topology_by_index,
+        retained_motif_by_index,
+        directional_warning_counts,
+        directional_warning_examples,
+    ):
+        """Regenerate typed-medoid chains and return records in cluster order.
+
+        Each chain has its own spawned seed, so replaying a recorded batch
+        prefix reproduces it. Only medoids are converted; first-pass sampling
+        warnings are not repeated.
+        """
+        target_positions = {
+            feature.chain_index: position
+            for position, feature in enumerate(medoid_features)
+        }
+        replayed_records = {}
+        for start_index, batch_size, batch_seed in replay_batches:
+            batch_targets = [
+                chain_index
+                for chain_index in target_positions
+                if start_index <= chain_index < start_index + batch_size
+            ]
+            if not batch_targets:
+                continue
+            replay_size = max(batch_targets) - start_index + 1
+            replay_workers = n_workers
+            if parallel and n_workers is None:
+                replay_workers = max(
+                    1,
+                    min((os.cpu_count() or 1) - 2, replay_size),
+                )
+            for chain_result in self._iter_chain_records(
+                n_samples=replay_size,
+                molecule_format=molecule_format,
+                collect_info=metadata_mode,
+                max_discards=max_discards,
+                termination_flag=termination_flag,
+                parallel=parallel,
+                n_workers=replay_workers,
+                seed=batch_seed,
+                start_index=start_index,
+                include_sequences=include_sequences,
+                native_diagnostics_path=native_diagnostics_path,
+                max_worker_restarts=max_worker_restarts,
+                defer_conversion=_ConversionMode.DEFERRED.value,
+                parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
+                use_repeat_units_as_source=use_repeat_units_as_source,
+                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                fallback_on_worker_crash=fallback_on_worker_crash,
+                smiles_policy=smiles_policy,
+            ):
+                chain_index = chain_result["chain_index"]
+                if chain_index not in target_positions:
+                    continue
+                deferred = chain_result["record"]
+                if not isinstance(deferred, _DeferredChainRecord):
+                    raise RuntimeError(
+                        "Typed-medoid replay did not yield a deferred chain "
+                        f"record for selected chain {chain_index}."
+                    )
+                expected_weight = medoid_features[target_positions[chain_index]].molecular_weight
+                if deferred.molecular_weight != expected_weight:
+                    raise RuntimeError(
+                        f"Typed-medoid replay reproduced chain {chain_index} with "
+                        f"molecular weight {deferred.molecular_weight}, expected "
+                        f"{expected_weight}; sampling is not reproducible."
+                    )
+                sample = deferred.sample
+                occurrence_view = None
+                if retained_topology_by_index is not None or retained_motif_by_index is not None:
+                    occurrence_view = _build_occurrence_adjacency(
+                        sample.metadata,
+                        sample.graph,
+                        preserve_self_edges=True,
+                    )
+                if retained_topology_by_index is not None and metadata:
+                    retained_topology_by_index[chain_index] = _compact_bond_sequence_record(
+                        sample.metadata,
+                        sample.graph,
+                        unit_info=self._canonical_unit_info,
+                        occurrence_view=occurrence_view,
+                    )
+                if retained_motif_by_index is not None and metadata:
+                    local_counts = Counter()
+                    path_counts = _unit_path_counts(
+                        sample.metadata,
+                        sample.graph,
+                        unit_path_max_motifs,
+                        occurrence_view=occurrence_view,
+                    )
+                    for counts in path_counts.values():
+                        for motif, count in counts.items():
+                            canonical = _canonical_motif_key(motif, self._canonical_unit_info)
+                            local_counts[canonical] += count
+                    retained_motif_by_index[chain_index] = {
+                        "chain_index": chain_index,
+                        "molar_mass": float(deferred.molecular_weight),
+                        "_counts": local_counts,
+                        "motif_exposure": int(sum(local_counts.values())),
+                    }
+                if retain_chains or retain_sequences:
+                    with warnings.catch_warnings(record=True) as replay_warnings:
+                        warnings.simplefilter("always")
+                        materialized = _materialize_deferred_chain(
+                            deferred,
+                            molecule_format,
+                            metadata_mode,
+                            retain_sequences,
+                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            smiles_policy=smiles_policy,
+                            sequence_smiles_cache=getattr(
+                                self,
+                                "_sequence_smiles_cache",
+                                None,
+                            ),
+                        )
+                    _replay_chain_warnings(
+                        (
+                            (caught.message, caught.category, caught.filename, caught.lineno)
+                            for caught in replay_warnings
+                        ),
+                        directional_warning_counts,
+                        directional_warning_examples,
+                    )
+                else:
+                    materialized = _ChainRecord(
+                        molecule=None,
+                        unit_counts=None,
+                        bonds=None,
+                        contact_counts=None,
+                        sequences=None,
+                        mol_weights=sample.mol_weights,
+                        distributions=sample.distributions,
+                        molecular_weight=deferred.molecular_weight,
+                    )
+                replayed_records[target_positions[chain_index]] = (
+                    chain_index,
+                    materialized,
+                )
+        missing_indices = sorted(
+            chain_index
+            for chain_index, position in target_positions.items()
+            if position not in replayed_records
+        )
+        if missing_indices:
+            raise RuntimeError(
+                "Typed-medoid replay failed to reproduce selected chain "
+                f"indices: {missing_indices}."
+            )
+        return [replayed_records[position] for position in range(len(medoid_features))]
+
     def _materialize_unit_counts(self, unit_counts):
         if not hasattr(self, "_canonical_unit_info"):
             return {
                 unit_id: {"count": count}
                 for unit_id, count in unit_counts.items()
             }
+        if getattr(self, "_unit_subgraph_cache", None) is None:
+            self._unit_subgraph_cache = _unit_subgraphs(
+                self._generative_graph,
+                self._unit_id_by_origin,
+            )
         canonical_units = {}
         for unit_id, count in unit_counts.items():
             info = self._canonical_unit_info[unit_id]
             psmiles = info["psmiles"]
-            if psmiles is None:
-                star_mol = mol_graph_to_rdkit_mol(
-                    self._unit_graph_with_stars(
-                        self._canonical_unit_prototypes[unit_id],
-                        self._origin_bond_id,
-                    ),
-                    kekulize=False,
-                )
+            star_graph = self._unit_graph_with_stars(
+                self._canonical_unit_prototypes[unit_id],
+                self._origin_bond_id,
+            )
+            star_graph_changed = (
+                info["_star_graph"] is None
+                or not _metadata_equal(star_graph, info["_star_graph"])
+            )
+            if psmiles is None or star_graph_changed:
                 # P-SMILES is stable unit metadata rather than a potentially
                 # enormous sampled-chain payload; keep it canonical even
                 # though chain serialization defaults to the fast policy.
+                star_mol = mol_graph_to_rdkit_mol(star_graph, kekulize=False)
+                self._validate_unit_psmiles_mol(
+                    unit_id,
+                    star_mol,
+                    info["expected_maps"],
+                    info["expected_real_atom_count"],
+                )
                 psmiles = rdkit_mol_to_smiles(
                     star_mol,
                     smiles_policy="auto",
                 )
                 info["psmiles"] = psmiles
+                info["_star_graph"] = star_graph
+            self._validate_unit_psmiles(unit_id, psmiles, info)
             canonical_units[unit_id] = {
-                **info,
+                **{
+                    key: value
+                    for key, value in info.items()
+                    if key not in {"expected_maps", "expected_real_atom_count", "_star_graph"}
+                },
+                "subgraph": deepcopy(self._unit_subgraph_cache[unit_id]),
                 "psmiles": psmiles,
-                "subgraph": deepcopy(info["subgraph"]),
                 "count": count,
             }
         return dict(
@@ -6212,55 +7270,38 @@ class EnsembleCreator:
 
     def _records_to_ensemble_data(self, records, materialize_units=True):
         """Materialize public aggregate metadata from accepted chain records."""
-        molecules = [record["molecule"] for record in records]
-        molecular_weights = [record["molecular_weight"] for record in records]
-        bond_counts = Counter()
-        labeled_bond_counts = Counter()
-        unit_counts = Counter()
-        mol_weight_lists = {}
-        ensemble_distributions = {}
-        sequences = []
-
-        for record in records:
-            if isinstance(record, _ChainRecord):
-                unit_counts.update(record.unit_counts or {})
-                labeled_bond_counts.update(record.contact_counts or {})
-            else:
-                for unit, count in (record["molecule_units"] or {}).items():
-                    unit_id = self._unit_id_by_origin[
-                        next(iter(unit.nodes(data=True)))[1]["origin_idx"]
-                    ]
-                    unit_counts[unit_id] += count
-                bond_counts.update(record["bonds"])
-            for stochastic_id, weights in record["mol_weights"].items():
-                mol_weight_lists.setdefault(stochastic_id, []).extend(weights)
-            for stochastic_id, distribution in record["distributions"].items():
-                ensemble_distributions.setdefault(stochastic_id, distribution)
-            sequences.append(record["sequences"])
-
-        canonical_units = (
-            self._materialize_unit_counts(unit_counts)
-            if materialize_units
-            else {
-                unit_id: {"count": count}
-                for unit_id, count in unit_counts.items()
-            }
-        )
-        return EnsembleData(
-            chains=molecules,
-            units=canonical_units,
-            bonds=(
-                _bond_records_from_labeled(labeled_bond_counts)
-                if labeled_bond_counts
-                else _bond_records(bond_counts, self._origin_endpoint)
-            ),
-            sequences=sequences,
-            mol_weights=mol_weight_lists,
-            distributions=ensemble_distributions,
-            molecular_weights=molecular_weights,
+        return _assemble_ensemble_data(
+            self, records, materialize_units,
+            record_type=_ChainRecord,
+            result_type=EnsembleData,
+            bond_records_from_labeled=_bond_records_from_labeled,
+            bond_records=_bond_records,
         )
 
-    def create_ensemble(self, n_samples, output_format="mol_graph", ensemble_info=False, max_number_of_discarded_chains: int = 100, termination_flag: Optional[int] = None, json_file: Optional[str] = None, json_max_chains: Optional[int] = None, parallel: bool = False, n_workers: Optional[int] = None, seed: Optional[int] = None, native_diagnostics_path=None, max_worker_restarts=2, strip_unresolved_directional_markers=True, fallback_on_worker_crash=True, smiles_policy="fast"):
+    def create_ensemble(
+        self,
+        n_samples,
+        output_format="mol_graph",
+        ensemble_info=False,
+        max_number_of_discarded_chains: int = 100,
+        termination_flag: Optional[int] = None,
+        json_file: Optional[str] = None,
+        json_max_chains: Optional[int] = None,
+        parallel: bool = False,
+        n_workers: Optional[int] = None,
+        seed: Optional[int] = None,
+        native_diagnostics_path=None,
+        max_worker_restarts=2,
+        strip_unresolved_directional_markers=True,
+        fallback_on_worker_crash=True,
+        smiles_policy="fast",
+        *,
+        retain_bond_sequences=False,
+        count_bond_sequences=False,
+        bond_sequence_format="compact",
+        retain_motif_membership=False,
+        building_block_statistics=False,
+    ):
         """Sample an ensemble while rejecting explicitly chain-local failures.
 
         ``max_number_of_discarded_chains`` limits consecutive rejected paths
@@ -6318,6 +7359,17 @@ class EnsembleCreator:
         non-canonical output without canonical ranking. Use ``"auto"`` to
         request canonical output with overflow fallbacks, or ``"canonical"``
         to request strict canonical output without fallbacks.
+
+        ``retain_motif_membership=True`` independently opts into structural
+        path-motif counts and realized whole-chain masses for every accepted
+        chain. It requires ``ensemble_info=True`` or ``json_file`` and serial
+        execution. Both result fields are also included in requested JSON.
+
+        ``building_block_statistics=True`` independently collects exact rooted
+        immediate-neighbor counts, chain presence, and site-resolved endpoint
+        probabilities over accepted chains. It requires ``ensemble_info=True``
+        or ``json_file``, not topology or motif retention. Parallel workers count
+        locally; the parent merges raw counters over accepted results.
         """
 
         supported_formats = {"smiles", "mol_graph"}
@@ -6328,6 +7380,26 @@ class EnsembleCreator:
             raise ValueError(
                 "smiles_policy must be 'auto', 'canonical', or 'fast'."
             )
+        _validate_bond_sequence_exports(
+            metadata=ensemble_info or json_file is not None,
+            retain_bond_sequences=retain_bond_sequences,
+            count_bond_sequences=count_bond_sequences,
+            bond_sequence_format=bond_sequence_format,
+            retain_motif_membership=retain_motif_membership,
+            parallel=parallel,
+            checkpoint=None,
+            checkpoint_callback=None,
+        )
+        if retain_bond_sequences:
+            raise NotImplementedError(
+                "Bond sequence retention is not supported by fixed-size create_ensemble; "
+                "use serial create_ensemble_until_converged until the fixed-size adapter is implemented."
+            )
+        if building_block_statistics:
+            if not (ensemble_info or json_file is not None):
+                raise ValueError(
+                    "building_block_statistics requires ensemble_info=True or json_file."
+                )
 
         if n_workers is not None and not parallel:
             raise ValueError("n_workers only applies to parallel=True; the default mode is serial.")
@@ -6355,6 +7427,12 @@ class EnsembleCreator:
         directional_warning_examples = {}
 
         records = []
+        block_statistics = _BuildingBlockStatistics() if building_block_statistics else None
+        worker_block_statistics = bool(building_block_statistics and parallel and n_workers > 1)
+        if retain_motif_membership:
+            motif_occurrences = Counter()
+            motif_presence = Counter()
+            retained_rows = []
         failed = False
         for chain_result in self._iter_chain_records(
             n_samples=n_samples,
@@ -6370,20 +7448,58 @@ class EnsembleCreator:
             strip_unresolved_directional_markers=strip_unresolved_directional_markers,
             fallback_on_worker_crash=fallback_on_worker_crash,
             smiles_policy=smiles_policy,
+            **({"defer_conversion": _ConversionMode.DEFERRED.value} if retain_motif_membership or (building_block_statistics and not worker_block_statistics) else {}),
+            **({"building_block_statistics": True} if worker_block_statistics else {}),
         ):
-            for message, category, filename, lineno in chain_result["warnings"]:
-                warning_kind = _classify_directional_stereo_warning(
-                    message,
-                    category,
+            if worker_block_statistics and chain_result["record"] is not None:
+                block_statistics.merge(chain_result["building_block_statistics"])
+            if (retain_motif_membership or (building_block_statistics and not worker_block_statistics)) and chain_result["record"] is not None:
+                # Read compact occurrence metadata before conversion discards
+                # it. Do not retain samples/graphs just to compute these rows.
+                deferred = chain_result["record"]
+                occurrence_view = _build_occurrence_adjacency(
+                    deferred.sample.metadata,
+                    deferred.sample.graph,
+                    preserve_self_edges=bool(building_block_statistics),
                 )
-                if warning_kind is not None:
-                    directional_warning_counts[warning_kind] += 1
-                    directional_warning_examples.setdefault(
-                        warning_kind,
-                        str(message),
+                if building_block_statistics:
+                    block_statistics.update(deferred.sample.metadata, occurrence_view)
+                if retain_motif_membership:
+                    local_counts = Counter()
+                    for counts in _unit_path_counts(
+                        deferred.sample.metadata, deferred.sample.graph,
+                        occurrence_view=occurrence_view,
+                    ).values():
+                        for motif, count in counts.items():
+                            canonical = _canonical_motif_key(motif, self._canonical_unit_info)
+                            local_counts[canonical] += count
+                    motif_occurrences.update(local_counts)
+                    motif_presence.update(local_counts.keys())
+                    retained_rows.append({
+                        "chain_index": int(chain_result["chain_index"]),
+                        "molar_mass": float(deferred.molecular_weight),
+                        "_counts": local_counts,
+                        "motif_exposure": int(sum(local_counts.values())),
+                    })
+                with warnings.catch_warnings(record=True) as conversion_warnings:
+                    warnings.simplefilter("always")
+                    chain_result["record"] = _materialize_deferred_chain(
+                        deferred,
+                        molecule_format,
+                        collect_info,
+                        True,
+                        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                        smiles_policy=smiles_policy,
+                        sequence_smiles_cache=getattr(self, "_sequence_smiles_cache", None),
                     )
-                    continue
-                warnings.warn_explicit(message, category, filename, lineno)
+                chain_result["warnings"].extend(
+                    _portable_warning(caught) for caught in conversion_warnings
+                )
+            _replay_chain_warnings(
+                chain_result["warnings"],
+                directional_warning_counts,
+                directional_warning_examples,
+            )
             total_discards += chain_result["discards"]
             discard_reasons.update(dict(chain_result["reasons"]))
             if chain_result["record"] is not None:
@@ -6420,11 +7536,38 @@ class EnsembleCreator:
         if not collect_info:
             return list_of_molecules
         ensemble_data = self._records_to_ensemble_data(records)
+        if building_block_statistics:
+            ensemble_data.building_block_statistics = block_statistics.finalize()
         canonical_units = ensemble_data.units
-        bond_records = ensemble_data.bonds
-        mol_weight_lists = ensemble_data.mol_weights
-        ensemble_distributions = ensemble_data.distributions
-        list_of_sequences = ensemble_data.sequences
+
+        if retain_motif_membership:
+            _, lookup = _motif_dictionary_from_counts(motif_occurrences, canonical_units)
+            ensemble_data.chain_motif_index = {
+                "schema": "chain-motif-membership/v1",
+                "population": "retained-samples",
+                "accepted_count": len(records),
+                "retained_count": len(retained_rows),
+                "retention": "all",
+                "retained_payload_status": "available",
+                "mass_unit": "g/mol",
+                "motif_dictionary_id": "unit-graph-simple-paths/v2",
+                "rows": [
+                    {
+                        "chain_index": row["chain_index"],
+                        "molar_mass": row["molar_mass"],
+                        "motif_counts": [
+                            [lookup[motif], int(count)]
+                            for motif, count in sorted(row["_counts"].items(), key=lambda item: lookup[item[0]])
+                            if count > 0
+                        ],
+                        "motif_exposure": row["motif_exposure"],
+                    }
+                    for row in retained_rows
+                ],
+            }
+            ensemble_data.motif_population_statistics = _motif_population_statistics_from_counts(
+                len(records), motif_occurrences, motif_presence, canonical_units,
+            )
 
         if json_file is not None:
             # The file's chains follow output_format (the caller's format
@@ -6434,39 +7577,27 @@ class EnsembleCreator:
                 "_sequence_smiles_cache",
                 OrderedDict(),
             )
-            if molecule_format == "smiles":
 
-                def _chain_json(molecule):
-                    return molecule
+            def _sequence_unit_smiles(unit):
+                return _sequence_unit_to_smiles(
+                    unit,
+                    sequence_smiles_cache,
+                    strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                    smiles_policy=smiles_policy,
+                )
 
-                def _sequence_unit_smiles(unit):
-                    return unit
-
-            else:
-
-                def _chain_json(molecule):
-                    return nx.node_link_data(molecule, edges="edges")
-
-                def _sequence_unit_smiles(unit):
-                    return _sequence_unit_to_smiles(
-                        unit,
-                        sequence_smiles_cache,
-                        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                        smiles_policy=smiles_policy,
-                    )
-
-            saved_chains = list_of_molecules if json_max_chains is None else list_of_molecules[:json_max_chains]
-            json_data = {"string": self._generative_graph.graph.get("g2rins_string", "")}
-            json_data.update(generative_graph_json_data(self._generative_graph))
-            json_data["format"]["chain_format"] = molecule_format
-            json_data["ensemble"] = {
-                "units": {unit_id: {**info, "subgraph": nx.node_link_data(info["subgraph"], edges="edges")} for unit_id, info in canonical_units.items()},
-                "chains": [_chain_json(molecule) for molecule in saved_chains],
-                "bonds": bond_records,
-                "mol_weights": mol_weight_lists,
-                "distributions": ensemble_distributions,
-                "sequences": [[[_sequence_unit_smiles(unit) for unit in sequence] for sequence in chain_sequences] for chain_sequences in list_of_sequences],
-            }
+            json_data = _fixed_ensemble_json_data(
+                self._generative_graph,
+                ensemble_data,
+                molecule_format,
+                json_max_chains,
+                getattr(self, "_origin_node_by_text", {}),
+                _sequence_unit_smiles,
+                _json_safe,
+                generative_graph_json_data,
+                retain_motif_membership=retain_motif_membership,
+                building_block_statistics=building_block_statistics,
+            )
             with open(json_file, "w") as file_handle:
                 json.dump(json_data, file_handle, indent=2)
 
@@ -6506,6 +7637,12 @@ class EnsembleCreator:
         strip_unresolved_directional_markers=True,
         fallback_on_worker_crash=True,
         smiles_policy="fast",
+        *,
+        retain_bond_sequences=False,
+        count_bond_sequences=False,
+        bond_sequence_format="compact",
+        retain_motif_membership=False,
+        building_block_statistics=False,
         representative_selection="typed-medoid",
     ):
         """Sample batches until cumulative mass and contact statistics stabilize.
@@ -6529,20 +7666,24 @@ class EnsembleCreator:
         ``unit_junctions=True`` additionally collects exact four-unit three-arm
         stars, excluding arm-to-arm closure bonds. The same per-chain motif
         limit covers paths and stars; this opt-in can be expensive at branch hubs.
-        ``representative_distance`` enables an online feature-space cover.
-        ``representative_selection='typed-medoid'`` uses per-building-block
-        counts, molecular weight, total unit count, composition and contacts.
-        Complete-link assignment keeps every cluster member within the
-        threshold of every other member; the retained chain is the cluster
-        medoid. Medoids are re-materialized in a seeded second pass, so SMILES
-        are generated only for retained representatives. ``'first-match'``
-        preserves the historical first-fit cover. ``representative_counts``
-        reports how many accepted chains each retained chain represents.
-        Alternatively, ``reservoir_size`` bounds retained samples with
-        independent uniform reservoir sampling, without changing generation
-        RNG streams. The two modes are mutually exclusive. Typed-medoid replay
-        uses the provided seed, or generates one and records it in
-        ``convergence_settings``.
+        ``representative_distance`` enables an online feature-space cover over
+        log molecular weight, log building-block count, building-block
+        composition, and contact frequencies. A useful starting value is 0.15.
+        ``representative_selection='typed-medoid'`` (default) also compares
+        the log count of each building-block type. Complete-link assignment
+        places each accepted chain in the nearest cluster whose members all
+        lie within the threshold; the retained chain is the cluster medoid.
+        Medoids are re-materialized in a seeded second pass, so conversion work
+        is spent only on retained representatives. Without ``seed``, one is
+        generated and reported in ``convergence_settings``. Typed-medoid state
+        keeps compact features for every accepted chain, so assignment cost and
+        checkpoint size grow with the sample count. ``'first-match'`` preserves
+        the historical first-fit cover, which retains the first chain of each
+        cluster and whose representatives differ by more than the threshold.
+        ``representative_counts`` reports how many accepted chains each
+        retained chain represents. Alternatively, ``reservoir_size`` bounds
+        retained samples with independent uniform reservoir sampling, without
+        changing generation RNG streams. The two modes are mutually exclusive.
         ``sample_callback``
         receives ``(global_chain_index, record)`` for every accepted chain.
         To resume at a batch boundary, pass a :class:`ConvergenceCheckpoint`
@@ -6557,6 +7698,31 @@ class EnsembleCreator:
         Set ``use_repeat_units_as_source=True`` to seed each chain from a
         repeat unit when the polymer has no initiator.
         ``smiles_policy`` follows :meth:`create_ensemble`.
+        ``retain_bond_sequences=True`` retains attachment-site-aware
+        building-block connectivity for the selected chains, without separate
+        record-count or byte budgets. Existing sampling and retention settings
+        control how many chains are kept. Record-local occurrence IDs reference
+        individual copies; building-block type labels remain unchanged.
+        ``bond_sequence_format='compact'`` (default) preserves exact topology.
+        ``'branches'`` uses sequence-like segments without repeated trunks,
+        and ``bond_sequence_parents`` identifies the existing junction at the
+        start of every non-root segment. Roots are singleton segments. Both
+        segment and position indices are zero-based. Connectivity/site identity
+        is preserved; bond order/aromaticity is not encoded.
+        ``'paths'`` renders each retained chain as root-to-leaf lists of
+        ``incoming.unit.outgoing`` tokens, with ``null`` at path endpoints.
+        Shared trunks repeat; occurrence identity and bond categories are not
+        encoded. Cycles require compact format. Rendering is limited to one
+        million tokens per chain; use compact format for larger path views.
+
+        ``building_block_statistics=True`` independently aggregates rooted
+        covalent neighborhoods and directed site-pair counts over all accepted
+        samples, without retaining chain data. It also works with
+        ``metadata=False``, avoiding legacy path-motif/sequence work. Site
+        probabilities condition on occupied source-site endpoints, not input
+        sampling weights or all eligible sites. Parallel workers collect raw
+        per-chain counters, merged only for accepted results. Checkpoint/resume
+        is not supported for this option.
         """
         if batch_size < 1:
             raise ValueError(f"batch_size must be positive, got {batch_size}.")
@@ -6571,13 +7737,13 @@ class EnsembleCreator:
                 "representative_distance must be non-negative, got "
                 f"{representative_distance}."
             )
-        if representative_selection not in {"typed-medoid", "first-match"}:
-            raise ValueError(
-                "representative_selection must be 'typed-medoid' or 'first-match'."
-            )
         if reservoir_size is not None and representative_distance is not None:
             raise ValueError(
                 "reservoir_size and representative_distance are mutually exclusive."
+            )
+        if representative_selection not in {"typed-medoid", "first-match"}:
+            raise ValueError(
+                "representative_selection must be 'typed-medoid' or 'first-match'."
             )
         if sample_callback is not None and not callable(sample_callback):
             raise TypeError("sample_callback must be callable or None.")
@@ -6606,6 +7772,21 @@ class EnsembleCreator:
             raise ValueError(
                 "smiles_policy must be 'auto', 'canonical', or 'fast'."
             )
+        _validate_bond_sequence_exports(
+            metadata=metadata,
+            retain_bond_sequences=retain_bond_sequences,
+            count_bond_sequences=count_bond_sequences,
+            bond_sequence_format=bond_sequence_format,
+            retain_motif_membership=retain_motif_membership,
+            parallel=parallel,
+            checkpoint=checkpoint,
+            checkpoint_callback=checkpoint_callback,
+        )
+        if building_block_statistics:
+            if checkpoint is not None or checkpoint_callback is not None:
+                raise NotImplementedError(
+                    "building_block_statistics does not support checkpoint/resume."
+                )
         if n_workers is not None and not parallel:
             raise ValueError(
                 "n_workers only applies to parallel=True; the default mode is serial."
@@ -6623,13 +7804,14 @@ class EnsembleCreator:
             mass_tolerance=mass_tolerance,
             contact_tolerance=contact_tolerance,
         )
-        retain_samples = retain_chains or retain_sequences
-        if (
+        retain_samples = retain_chains or retain_sequences or retain_bond_sequences or retain_motif_membership
+        typed_medoid_cover = (
             retain_samples
             and representative_distance is not None
             and representative_selection == "typed-medoid"
-            and seed is None
-        ):
+        )
+        if typed_medoid_cover and seed is None:
+            # Medoid replay needs reproducible chains.
             seed = int(np.random.SeedSequence().generate_state(1)[0])
         if sample_callback is not None:
             metadata_mode = _MetadataLevel.FULL_LEGACY
@@ -6669,6 +7851,23 @@ class EnsembleCreator:
             retention_seed = np.random.SeedSequence(seed).spawn(2)[1]
             reservoir_rng = np.random.default_rng(retention_seed)
 
+        # No export buffers/counters for the default disabled path, including
+        # representative and reservoir retention of ordinary chain output.
+        retained_topology_by_index = {} if retain_bond_sequences else None
+        retained_motif_by_index = {} if retain_motif_membership else None
+        aggregate_motif_occurrences = Counter() if retain_motif_membership else None
+        aggregate_motif_presence = Counter() if retain_motif_membership else None
+        if retain_motif_membership:
+            from .neighbor_motifs import CenteredMotifStatistics
+
+            from .bond_sequences import HYDROGEN_TERMINATION_POLICY
+
+            centered_motif_statistics = CenteredMotifStatistics(
+                hydrogen_termination=HYDROGEN_TERMINATION_POLICY,
+            )
+        else:
+            centered_motif_statistics = None
+        block_statistics = _BuildingBlockStatistics() if building_block_statistics else None
         if checkpoint is None:
             aggregate_unit_counts = Counter()
             aggregate_bond_counts = Counter()
@@ -6709,10 +7908,12 @@ class EnsembleCreator:
             saved_settings.setdefault("use_repeat_units_as_source", False)
             saved_settings.setdefault("fallback_on_worker_crash", True)
             saved_settings.setdefault("representative_distance", None)
+            # Covers checkpointed before selection was configurable used
+            # first-match assignment.
             saved_settings.setdefault(
                 "representative_selection",
                 representative_selection
-                if saved_settings.get("representative_distance") is None
+                if saved_settings["representative_distance"] is None
                 else "first-match",
             )
             # Checkpoints written before the policy was persisted inherit the
@@ -6773,15 +7974,11 @@ class EnsembleCreator:
             )
             representative_member_features = [
                 list(members)
-                for members in deepcopy(
-                    getattr(checkpoint, "representative_member_features", ())
-                )
+                for members in getattr(checkpoint, "representative_member_features", ())
             ]
             representative_member_scores = [
                 list(scores)
-                for scores in deepcopy(
-                    getattr(checkpoint, "representative_member_scores", ())
-                )
+                for scores in getattr(checkpoint, "representative_member_scores", ())
             ]
             representative_medoid_indices = list(
                 getattr(checkpoint, "representative_medoid_indices", ())
@@ -6797,16 +7994,16 @@ class EnsembleCreator:
         retain_checkpoint_payloads = not (
             checkpoint is not None and checkpoint_policy == "statistics"
         )
-        typed_medoid_cover = (
-            retain_samples
-            and representative_distance is not None
-            and representative_selection == "typed-medoid"
-        )
-        if typed_medoid_cover and checkpoint is not None and checkpoint_policy == "full":
-            if not representative_replay_batches and accepted_count:
-                raise ValueError(
-                    "Checkpoint lacks replay batches required for typed-medoid selection."
-                )
+        if (
+            typed_medoid_cover
+            and retain_checkpoint_payloads
+            and checkpoint is not None
+            and checkpoint.accepted_count
+            and not representative_replay_batches
+        ):
+            raise ValueError(
+                "Checkpoint lacks replay batches required for typed-medoid selection."
+            )
 
         converged = tracker.converged()
         progress_header_pending = True
@@ -6816,10 +8013,9 @@ class EnsembleCreator:
         while accepted_count < max_samples and not converged:
             current_batch_size = min(batch_size, max_samples - accepted_count)
             batch_seed = None if seed is None else seed + batch_index * batch_size
-            batch_start_index = next_chain_index
             if typed_medoid_cover:
                 representative_replay_batches.append(
-                    (batch_start_index, current_batch_size, batch_seed)
+                    (next_chain_index, current_batch_size, batch_seed)
                 )
             batch_workers = n_workers
             if use_default_workers:
@@ -6827,6 +8023,9 @@ class EnsembleCreator:
                     1,
                     min((os.cpu_count() or 1) - 2, current_batch_size),
                 )
+            worker_block_statistics = bool(
+                building_block_statistics and parallel and batch_workers > 1
+            )
             batch_accepted = 0
             total_discards = 0
             discard_reasons = Counter()
@@ -6846,38 +8045,32 @@ class EnsembleCreator:
                 native_diagnostics_path=native_diagnostics_path,
                 max_worker_restarts=max_worker_restarts,
                 defer_conversion=(
-                    "materialize"
+                    _ConversionMode.MATERIALIZE.value
                     if sample_callback is not None
                     or (
                         retain_samples
+                        and (retain_chains or retain_sequences)
                         and reservoir_size is None
                         and representative_distance is None
                     )
-                    else True
+                    else _ConversionMode.DEFERRED.value
                 ),
                 parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
                 use_repeat_units_as_source=use_repeat_units_as_source,
                 strip_unresolved_directional_markers=strip_unresolved_directional_markers,
                 fallback_on_worker_crash=fallback_on_worker_crash,
                 smiles_policy=smiles_policy,
+                **({"building_block_statistics": True} if worker_block_statistics else {}),
             ):
                 next_chain_index = max(
                     next_chain_index,
                     chain_result["chain_index"] + 1,
                 )
-                for message, category, filename, lineno in chain_result["warnings"]:
-                    warning_kind = _classify_directional_stereo_warning(
-                        message,
-                        category,
-                    )
-                    if warning_kind is not None:
-                        directional_warning_counts[warning_kind] += 1
-                        directional_warning_examples.setdefault(
-                            warning_kind,
-                            str(message),
-                        )
-                        continue
-                    warnings.warn_explicit(message, category, filename, lineno)
+                _replay_chain_warnings(
+                    chain_result["warnings"],
+                    directional_warning_counts,
+                    directional_warning_examples,
+                )
                 total_discards += chain_result["discards"]
                 discard_reasons.update(dict(chain_result["reasons"]))
                 if chain_result["record"] is not None:
@@ -6890,6 +8083,24 @@ class EnsembleCreator:
                     sample = deferred.sample
                     metadata_record = sample.metadata
                     molecular_weight = deferred.molecular_weight
+                    occurrence_view = None
+                    if retain_bond_sequences or retain_motif_membership or (building_block_statistics and not worker_block_statistics):
+                        occurrence_view = _build_occurrence_adjacency(
+                            metadata_record,
+                            sample.graph,
+                            preserve_self_edges=True,
+                        )
+                    if centered_motif_statistics is not None:
+                        centered_motif_statistics.update(_compact_bond_sequence_record(
+                            metadata_record, sample.graph,
+                            unit_info=self._canonical_unit_info,
+                            occurrence_view=occurrence_view,
+                        ))
+                    if building_block_statistics:
+                        if worker_block_statistics:
+                            block_statistics.merge(chain_result["building_block_statistics"])
+                        else:
+                            block_statistics.update(metadata_record, occurrence_view)
                     if metadata:
                         chain_junction_counts = Counter() if unit_junctions else None
                         path_counts = _unit_path_counts(
@@ -6897,7 +8108,17 @@ class EnsembleCreator:
                             sample.graph,
                             unit_path_max_motifs,
                             junction_counts=chain_junction_counts,
+                            occurrence_view=occurrence_view,
                         )
+                        if retain_motif_membership:
+                            chain_motif_occurrences = Counter()
+                            for counts in path_counts.values():
+                                for motif, count in counts.items():
+                                    canonical = _canonical_motif_key(motif, self._canonical_unit_info)
+                                    aggregate_motif_occurrences[canonical] += count
+                                    chain_motif_occurrences[canonical] += count
+                            for canonical_motif in set(chain_motif_occurrences):
+                                aggregate_motif_presence[canonical_motif] += 1
                         if unit_junctions:
                             aggregate_unit_junction_counts.update(chain_junction_counts)
                         chain_motif_count = sum(
@@ -6956,24 +8177,14 @@ class EnsembleCreator:
                                     None,
                                 ),
                             )
-                        for caught in callback_warnings:
-                            warning_kind = _classify_directional_stereo_warning(
-                                caught.message,
-                                caught.category,
-                            )
-                            if warning_kind is not None:
-                                directional_warning_counts[warning_kind] += 1
-                                directional_warning_examples.setdefault(
-                                    warning_kind,
-                                    str(caught.message),
-                                )
-                                continue
-                            warnings.warn_explicit(
-                                caught.message,
-                                caught.category,
-                                caught.filename,
-                                caught.lineno,
-                            )
+                        _replay_chain_warnings(
+                            (
+                                (caught.message, caught.category, caught.filename, caught.lineno)
+                                for caught in callback_warnings
+                            ),
+                            directional_warning_counts,
+                            directional_warning_examples,
+                        )
                         sample_callback(
                             chain_index,
                             materialized.callback_record(),
@@ -6981,95 +8192,33 @@ class EnsembleCreator:
                     if retain_samples:
                         retained_seen += 1
                         retained_position = None
-                        if representative_distance is not None:
+                        if typed_medoid_cover:
+                            # Medoids may change, so they are materialized
+                            # after sampling by replaying their batches.
+                            _assign_typed_medoid(
+                                _representative_feature(deferred),
+                                representative_distance,
+                                representative_features,
+                                representative_counts,
+                                representative_member_features,
+                                representative_member_scores,
+                                representative_medoid_indices,
+                            )
+                        elif representative_distance is not None:
                             feature = _representative_feature(deferred)
-                            if typed_medoid_cover:
-                                eligible = []
-                                for position, representative in enumerate(
-                                    representative_features
+                            for position, representative in enumerate(
+                                representative_features
+                            ):
+                                if (
+                                    _representative_distance(feature, representative)
+                                    <= representative_distance
                                 ):
-                                    distance = _typed_representative_distance(
-                                        feature,
-                                        representative,
-                                    )
-                                    member_features = representative_member_features[
-                                        position
-                                    ]
-                                    if distance <= representative_distance and all(
-                                        _typed_representative_distance(
-                                            feature,
-                                            member,
-                                        )
-                                        <= representative_distance
-                                        for member in member_features
-                                    ):
-                                        eligible.append((distance, position))
-                                if eligible:
-                                    _distance, retained_position = min(eligible)
-                                    members = representative_member_features[
-                                        retained_position
-                                    ]
-                                    scores = representative_member_scores[
-                                        retained_position
-                                    ]
-                                    new_scores = [
-                                        score
-                                        + _typed_representative_distance(member, feature)
-                                        for score, member in zip(scores, members)
-                                    ]
-                                    new_member_score = sum(
-                                        _typed_representative_distance(feature, member)
-                                        for member in members
-                                    )
-                                    members.append(feature)
-                                    new_scores.append(new_member_score)
-                                    minimum_score = min(new_scores)
-                                    medoid_position = min(
-                                        (
-                                            position
-                                            for position in range(len(members))
-                                            if new_scores[position]
-                                            <= minimum_score + 1e-12
-                                        ),
-                                        key=lambda position: members[
-                                            position
-                                        ].chain_index,
-                                    )
-                                    representative_features[retained_position] = (
-                                        members[medoid_position]
-                                    )
-                                    representative_medoid_indices[
-                                        retained_position
-                                    ] = members[medoid_position].chain_index
-                                    representative_member_scores[
-                                        retained_position
-                                    ] = new_scores
-                                    representative_counts[retained_position] += 1
-                                else:
-                                    retained_position = len(representative_features)
-                                    representative_features.append(feature)
-                                    representative_counts.append(1)
-                                    representative_member_features.append([feature])
-                                    representative_member_scores.append([0.0])
-                                    representative_medoid_indices.append(chain_index)
-                                retained_position = None
+                                    representative_counts[position] += 1
+                                    break
                             else:
-                                for position, representative in enumerate(
-                                    representative_features
-                                ):
-                                    if (
-                                        _representative_distance(
-                                            feature,
-                                            representative,
-                                        )
-                                        <= representative_distance
-                                    ):
-                                        representative_counts[position] += 1
-                                        break
-                                else:
-                                    retained_position = len(representative_features)
-                                    representative_features.append(feature)
-                                    representative_counts.append(1)
+                                retained_position = len(representative_features)
+                                representative_features.append(feature)
+                                representative_counts.append(1)
                         elif reservoir_size is None:
                             retained_position = len(retained_records)
                         elif retained_seen <= reservoir_size:
@@ -7080,49 +8229,79 @@ class EnsembleCreator:
                             )
                             if replacement < reservoir_size:
                                 retained_position = replacement
-                        if (
-                            retained_position is not None
-                            and retain_checkpoint_payloads
-                        ):
-                            if materialized is None:
-                                with warnings.catch_warnings(record=True) as retained_warnings:
-                                    warnings.simplefilter("always")
-                                    materialized = _materialize_deferred_chain(
-                                        deferred,
-                                        molecule_format,
-                                        metadata_mode,
-                                        retain_sequences,
-                                        strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                                        smiles_policy=smiles_policy,
-                                        sequence_smiles_cache=getattr(
-                                            self,
-                                            "_sequence_smiles_cache",
-                                            None,
-                                        ),
-                                    )
-                                for caught in retained_warnings:
-                                    warning_kind = _classify_directional_stereo_warning(
-                                        caught.message,
-                                        caught.category,
-                                    )
-                                    if warning_kind is not None:
-                                        directional_warning_counts[warning_kind] += 1
-                                        directional_warning_examples.setdefault(
-                                            warning_kind,
-                                            str(caught.message),
+                        if retained_position is not None:
+                            replaced_index = None
+                            if retained_position < len(retained_records):
+                                replaced_index = retained_records[retained_position][0]
+                            topology_payload = None
+                            if retain_bond_sequences and metadata:
+                                topology_payload = _compact_bond_sequence_record(
+                                    deferred.sample.metadata,
+                                    deferred.sample.graph,
+                                    unit_info=self._canonical_unit_info,
+                                    occurrence_view=occurrence_view,
+                                )
+                            if replaced_index is not None:
+                                if retain_bond_sequences:
+                                    retained_topology_by_index.pop(replaced_index, None)
+                                if retain_motif_membership:
+                                    retained_motif_by_index.pop(replaced_index, None)
+                            if topology_payload is not None:
+                                retained_topology_by_index[chain_index] = topology_payload
+                            if retain_motif_membership and metadata:
+                                local_counts = Counter()
+                                for counts in path_counts.values():
+                                    for motif, count in counts.items():
+                                        canonical = _canonical_motif_key(motif, self._canonical_unit_info)
+                                        local_counts[canonical] += count
+                                retained_motif_by_index[chain_index] = {
+                                    "chain_index": chain_index,
+                                    "molar_mass": float(molecular_weight),
+                                    "_counts": local_counts,
+                                    "motif_exposure": int(sum(local_counts.values())),
+                                }
+                            if retain_checkpoint_payloads:
+                                if materialized is None:
+                                    if retain_chains or retain_sequences:
+                                        with warnings.catch_warnings(record=True) as retained_warnings:
+                                            warnings.simplefilter("always")
+                                            materialized = _materialize_deferred_chain(
+                                                deferred,
+                                                molecule_format,
+                                                metadata_mode,
+                                                retain_sequences,
+                                                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                                                smiles_policy=smiles_policy,
+                                                sequence_smiles_cache=getattr(
+                                                    self,
+                                                    "_sequence_smiles_cache",
+                                                    None,
+                                                ),
+                                            )
+                                        _replay_chain_warnings(
+                                            (
+                                                (caught.message, caught.category, caught.filename, caught.lineno)
+                                                for caught in retained_warnings
+                                            ),
+                                            directional_warning_counts,
+                                            directional_warning_examples,
                                         )
-                                        continue
-                                    warnings.warn_explicit(
-                                        caught.message,
-                                        caught.category,
-                                        caught.filename,
-                                        caught.lineno,
-                                    )
-                            retained_entry = (chain_index, materialized)
-                            if retained_position == len(retained_records):
-                                retained_records.append(retained_entry)
-                            else:
-                                retained_records[retained_position] = retained_entry
+                                    else:
+                                        materialized = _ChainRecord(
+                                            molecule=None,
+                                            unit_counts=None,
+                                            bonds=None,
+                                            contact_counts=None,
+                                            sequences=None,
+                                            mol_weights=deferred.sample.mol_weights,
+                                            distributions=deferred.sample.distributions,
+                                            molecular_weight=molecular_weight,
+                                        )
+                                retained_entry = (chain_index, materialized)
+                                if retained_position == len(retained_records):
+                                    retained_records.append(retained_entry)
+                                else:
+                                    retained_records[retained_position] = retained_entry
                 else:
                     failed = True
                     if first_discard_cause is None:
@@ -7162,64 +8341,39 @@ class EnsembleCreator:
 
             if checkpoint_callback is not None:
                 checkpoint_callback(
-                    ConvergenceCheckpoint(
+                    _assemble_convergence_checkpoint(
+                        self,
                         next_chain_index=next_chain_index,
                         accepted_count=accepted_count,
                         batch_index=batch_index,
                         seed=seed,
                         mass_sum=mass_sum,
                         mass_square_sum=mass_square_sum,
-                        contact_counts=dict(contact_counts),
+                        contact_counts=contact_counts,
                         contact_total=contact_total,
-                        aggregate=EnsembleData(
-                            [],
-                            {
-                                unit_id: {"count": count}
-                                for unit_id, count in aggregate_unit_counts.items()
-                            },
-                            _bond_records_from_labeled(aggregate_bond_counts),
-                            [],
-                            {},
-                            dict(aggregate_distributions),
-                            [],
-                        ),
-                        convergence_history=deepcopy(tracker.history),
-                        retained_records=(
-                            tuple(deepcopy(retained_records))
-                            if checkpoint_policy == "full"
-                            else ()
-                        ),
+                        aggregate_unit_counts=aggregate_unit_counts,
+                        aggregate_bond_counts=aggregate_bond_counts,
+                        aggregate_distributions=aggregate_distributions,
+                        tracker=tracker,
+                        retained_records=retained_records,
+                        checkpoint_policy=checkpoint_policy,
                         retained_seen=retained_seen,
-                        reservoir_rng_state=(
-                            deepcopy(reservoir_rng.bit_generator.state)
-                            if reservoir_rng is not None
-                            else None
-                        ),
-                        settings=dict(checkpoint_settings),
-                        policy=checkpoint_policy,
-                        representative_features=tuple(
-                            deepcopy(representative_features)
-                        ),
-                        representative_counts=tuple(representative_counts),
-                        representative_member_features=tuple(
-                            deepcopy(representative_member_features)
-                        ),
-                        representative_member_scores=tuple(
-                            tuple(scores)
-                            for scores in representative_member_scores
-                        ),
-                        representative_medoid_indices=tuple(
-                            representative_medoid_indices
-                        ),
-                        representative_replay_batches=tuple(
-                            representative_replay_batches
-                        ),
-                        unit_path_counts={
-                            k: dict(counts)
-                            for k, counts in aggregate_unit_path_counts.items()
-                        },
-                        unit_path_diagnostics=dict(aggregate_unit_path_diagnostics),
-                        unit_junction_counts=dict(aggregate_unit_junction_counts) if unit_junctions else None,
+                        reservoir_rng=reservoir_rng,
+                        checkpoint_settings=checkpoint_settings,
+                        representative_features=representative_features,
+                        representative_counts=representative_counts,
+                        aggregate_unit_path_counts=aggregate_unit_path_counts,
+                        aggregate_unit_path_diagnostics=aggregate_unit_path_diagnostics,
+                        aggregate_unit_junction_counts=aggregate_unit_junction_counts,
+                        unit_junctions=unit_junctions,
+                        representative_member_features=representative_member_features,
+                        representative_member_scores=representative_member_scores,
+                        representative_medoid_indices=representative_medoid_indices,
+                        representative_replay_batches=representative_replay_batches,
+                        checkpoint_type=ConvergenceCheckpoint,
+                        result_type=EnsembleData,
+                        bond_records_from_labeled=_bond_records_from_labeled,
+                        deepcopy=deepcopy,
                     )
                 )
 
@@ -7249,139 +8403,54 @@ class EnsembleCreator:
                 strip_unresolved_directional_markers,
             )
             return None
-        if typed_medoid_cover:
-            target_positions = {
-                chain_index: position
-                for position, chain_index in enumerate(
-                    representative_medoid_indices
-                )
-            }
-            replayed_records = {}
-            for start_index, replay_size, replay_seed in representative_replay_batches:
-                for chain_result in self._iter_chain_records(
-                    n_samples=replay_size,
-                    molecule_format=molecule_format,
-                    collect_info=metadata_mode,
-                    max_discards=max_number_of_discarded_chains,
-                    termination_flag=termination_flag,
-                    parallel=parallel,
-                    n_workers=n_workers,
-                    seed=replay_seed,
-                    start_index=start_index,
-                    include_sequences=retain_sequences or sample_callback is not None,
-                    native_diagnostics_path=native_diagnostics_path,
-                    max_worker_restarts=max_worker_restarts,
-                    defer_conversion=True,
-                    parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
-                    use_repeat_units_as_source=use_repeat_units_as_source,
-                    strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                    fallback_on_worker_crash=fallback_on_worker_crash,
-                    smiles_policy=smiles_policy,
-                ):
-                    for message, category, filename, lineno in chain_result["warnings"]:
-                        warning_kind = _classify_directional_stereo_warning(
-                            message,
-                            category,
-                        )
-                        if warning_kind is not None:
-                            directional_warning_counts[warning_kind] += 1
-                            directional_warning_examples.setdefault(
-                                warning_kind,
-                                str(message),
-                            )
-                            continue
-                        warnings.warn_explicit(message, category, filename, lineno)
-                    chain_index = chain_result["chain_index"]
-                    if chain_index not in target_positions:
-                        continue
-                    deferred = chain_result["record"]
-                    if not isinstance(deferred, _DeferredChainRecord):
-                        raise RuntimeError(
-                            "Typed-medoid replay did not yield a deferred chain "
-                            f"record for selected chain {chain_index}."
-                        )
-                    with warnings.catch_warnings(record=True) as replay_warnings:
-                        warnings.simplefilter("always")
-                        materialized = _materialize_deferred_chain(
-                            deferred,
-                            molecule_format,
-                            metadata_mode,
-                            retain_sequences,
-                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
-                            smiles_policy=smiles_policy,
-                            sequence_smiles_cache=getattr(
-                                self,
-                                "_sequence_smiles_cache",
-                                None,
-                            ),
-                        )
-                    for caught in replay_warnings:
-                        warning_kind = _classify_directional_stereo_warning(
-                            caught.message,
-                            caught.category,
-                        )
-                        if warning_kind is not None:
-                            directional_warning_counts[warning_kind] += 1
-                            directional_warning_examples.setdefault(
-                                warning_kind,
-                                str(caught.message),
-                            )
-                            continue
-                        warnings.warn_explicit(
-                            caught.message,
-                            caught.category,
-                            caught.filename,
-                            caught.lineno,
-                        )
-                    replayed_records[target_positions[chain_index]] = (
-                        chain_index,
-                        materialized,
-                    )
-            replayed_indices = {
-                index for index, _record in replayed_records.values()
-            }
-            missing_indices = sorted(set(target_positions) - replayed_indices)
-            if missing_indices:
-                raise RuntimeError(
-                    "Typed-medoid replay failed to reproduce selected chain "
-                    f"indices: {missing_indices}."
-                )
-            retained_records = [
-                replayed_records[position]
-                for position in range(len(representative_medoid_indices))
-            ]
-        returned_representative_counts = None
-        if (
-            representative_distance is not None
-            and len(representative_counts) == len(retained_records)
-        ):
-            retained_with_counts = sorted(
-                zip(retained_records, representative_counts),
-                key=lambda item: item[0][0],
+        if typed_medoid_cover and retain_checkpoint_payloads:
+            retained_records = self._replay_representative_medoids(
+                representative_features,
+                representative_replay_batches,
+                molecule_format=molecule_format,
+                metadata_mode=metadata_mode,
+                max_discards=max_number_of_discarded_chains,
+                termination_flag=termination_flag,
+                parallel=parallel,
+                n_workers=n_workers,
+                include_sequences=retain_sequences or sample_callback is not None,
+                native_diagnostics_path=native_diagnostics_path,
+                max_worker_restarts=max_worker_restarts,
+                use_repeat_units_as_source=use_repeat_units_as_source,
+                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                fallback_on_worker_crash=fallback_on_worker_crash,
+                smiles_policy=smiles_policy,
+                retain_chains=retain_chains,
+                retain_sequences=retain_sequences,
+                metadata=metadata,
+                unit_path_max_motifs=unit_path_max_motifs,
+                retained_topology_by_index=retained_topology_by_index,
+                retained_motif_by_index=retained_motif_by_index,
+                directional_warning_counts=directional_warning_counts,
+                directional_warning_examples=directional_warning_examples,
             )
-            retained_records = [entry for entry, _count in retained_with_counts]
-            returned_representative_counts = [
-                count for _entry, count in retained_with_counts
-            ]
-        else:
-            retained_records.sort(key=lambda item: item[0])
-        retained = [record for _index, record in retained_records]
-        chains = [record.molecule for record in retained] if retain_chains else []
-        sequences = (
-            [record.sequences for record in retained]
-            if retain_sequences
-            else []
+        payload = _assemble_convergence_payload(
+            self,
+            retain_motif_membership=retain_motif_membership,
+            metadata=metadata,
+            reservoir_size=reservoir_size,
+            representative_distance=representative_distance,
+            aggregate_motif_occurrences=aggregate_motif_occurrences,
+            retained_motif_by_index=retained_motif_by_index,
+            accepted_count=accepted_count,
+            aggregate_motif_presence=aggregate_motif_presence,
+            representative_counts=representative_counts,
+            retained_records=retained_records,
+            retain_chains=retain_chains,
+            retain_sequences=retain_sequences,
+            retain_samples=retain_samples,
+            retain_bond_sequences=retain_bond_sequences,
+            retained_topology_by_index=retained_topology_by_index,
+            bond_sequence_format=bond_sequence_format,
+            motif_dictionary_from_counts=_motif_dictionary_from_counts,
+            motif_population_statistics_from_counts=_motif_population_statistics_from_counts,
+            bond_sequence_export_metadata=_bond_sequence_export_metadata,
         )
-        masses = (
-            [record.molecular_weight for record in retained]
-            if retain_samples
-            else []
-        )
-        retained_mol_weights = {}
-        if metadata:
-            for record in retained:
-                for stochastic_id, weights in record.mol_weights.items():
-                    retained_mol_weights.setdefault(stochastic_id, []).extend(weights)
         mn = mass_sum / accepted_count
         mw = mass_square_sum / mass_sum
         _emit_directional_stereo_warning_summary(
@@ -7395,17 +8464,37 @@ class EnsembleCreator:
             else {}
         )
         return ConvergedEnsembleData(
-            chains=chains,
+            chains=payload.chains,
             units=materialized_units,
             bonds=(
-                _bond_records_from_labeled(aggregate_bond_counts)
+                _bond_records_from_labeled(
+                    aggregate_bond_counts,
+                    getattr(self, "_origin_node_by_text", {}),
+                )
                 if metadata
                 else []
             ),
-            sequences=sequences,
-            mol_weights=retained_mol_weights if metadata else {},
+            sequences=payload.sequences,
+            sequence_unit_ids=(
+                [record.sequence_unit_ids for record in payload.retained]
+                if retain_sequences and metadata
+                and all(record.sequence_unit_ids is not None for record in payload.retained)
+                else None
+            ),
+            mol_weights=payload.retained_mol_weights if metadata else {},
             distributions=aggregate_distributions if metadata else {},
-            molecular_weights=masses,
+            molecular_weights=payload.masses,
+            bond_sequence_metadata=payload.bond_sequence_metadata,
+            bond_sequences=payload.retained_bond_sequence_payloads if retain_bond_sequences else None,
+            bond_sequence_indices=payload.retained_bond_sequence_indices if retain_bond_sequences else None,
+            bond_sequence_weights=payload.retained_bond_sequence_weights if retain_bond_sequences else None,
+            bond_sequence_parents=payload.retained_bond_sequence_parents,
+            bond_sequence_counts=None,
+            chain_motif_index=payload.chain_motif_index if retain_motif_membership else None,
+            motif_population_statistics=payload.motif_population_statistics if retain_motif_membership else None,
+            next_neighbor_motif_statistics=(centered_motif_statistics.finalize()
+                                            if centered_motif_statistics is not None else None),
+            building_block_statistics=block_statistics.finalize() if building_block_statistics else None,
             converged=converged,
             n_batches=batch_index,
             convergence_settings={
@@ -7420,6 +8509,7 @@ class EnsembleCreator:
                 "reservoir_size": reservoir_size,
                 "representative_distance": representative_distance,
                 "representative_selection": representative_selection,
+                "seed": seed,
                 "checkpoint_policy": checkpoint_policy,
                 "unit_path_max_motifs": unit_path_max_motifs,
                 "unit_junctions": bool(unit_junctions),
@@ -7446,5 +8536,5 @@ class EnsembleCreator:
                 _public_unit_junction_statistics(aggregate_unit_junction_counts, materialized_units, accepted_count)
                 if metadata and unit_junctions else None
             ),
-            representative_counts=returned_representative_counts,
+            representative_counts=payload.returned_representative_counts,
         )

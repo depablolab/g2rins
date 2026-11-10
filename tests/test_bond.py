@@ -28,7 +28,7 @@ def test_simple_bond_connectors(text, idx, ref, big):
         assert bond.idx == idx
     assert str(bond) == ref
     assert bond.generate_string(False) == big
-    assert bond.generable
+    assert bond.generable is True
 
 
 test_terminal_bond_connectors = [
@@ -45,7 +45,7 @@ def test_terminal_bond_connectors(text, idx, ref, big):
         assert bond.idx == idx
     assert str(bond) == ref
     assert bond.generate_string(False) == big
-    assert bond.generable
+    assert bond.generable is True
 
 
 test_terminal_bond_connectors_list = [("[<]|[<1]", ["[<]", "[<1]"]), ("[<1,$2|6. 3. 1 0|]", ["[<1, $2|6.0 3.0 1.0 0.0|]"]), ("[>,$1|6|]|[>2]", ["[>, $1|6.0|]", "[>2]"]), ("[]", ["[]"])]
@@ -54,10 +54,34 @@ test_terminal_bond_connectors_list = [("[<]|[<1]", ["[<]", "[<1]"]), ("[<1,$2|6.
 @pytest.mark.parametrize(("text", "expected_bc_list"), test_terminal_bond_connectors_list)
 def test_terminal_bond_connectors_list(text, expected_bc_list):
     terminal_bond_list = g2rins.bond.TerminalBondConnectorList.make(text)
+    assert terminal_bond_list.generable is True
     assert len(terminal_bond_list.terminal_bond_connectors) == len(expected_bc_list)
 
     for actual, expected in zip(terminal_bond_list.terminal_bond_connectors, expected_bc_list):
         assert str(actual) == expected
+
+
+@pytest.mark.parametrize(
+    ("connector_class", "children"),
+    [
+        (g2rins.bond.BondConnectorSymbol, ["$"]),
+        (g2rins.bond.BondConnectorSymbolIdx, [g2rins.bond.BondConnectorSymbol(["$"]), 2]),
+        (g2rins.bond.BondConnectorGeneration, []),
+        (g2rins.bond.BondConnectorGeneration, ["|", 2.0, "|"]),
+        (g2rins.bond.InnerBondConnector, [g2rins.bond.BondConnectorSymbolIdx(["$"])]),
+        (g2rins.bond.SimpleBondConnector, [g2rins.bond.InnerBondConnector([g2rins.bond.BondConnectorSymbolIdx(["$"])])]),
+        (g2rins.bond.TerminalBondConnector, []),
+        (g2rins.bond.TerminalBondConnector, [g2rins.bond.InnerBondConnector([g2rins.bond.BondConnectorSymbolIdx([">"])])]),
+        (g2rins.bond.TerminalBondConnectorList, [g2rins.bond.TerminalBondConnector([])]),
+        (g2rins.bond.BondConnectorList, [g2rins.bond.SimpleBondConnector.make("[$]")]),
+    ],
+)
+def test_connector_generable_is_boolean_property(connector_class, children):
+    connector = connector_class(children)
+
+    assert isinstance(connector_class.generable, property)
+    assert type(connector.generable) is bool
+    assert connector.generable is True
 
 
 compatibility_list = [

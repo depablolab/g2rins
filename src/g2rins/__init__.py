@@ -27,7 +27,6 @@ from .atom import (
     HCount,
     Isotope,
 )
-from .g2rins_molecule import G2rins, G2rinsMolecule, DotGeneration, DotSystemSize
 from .bond import (
     BondConnector,
     BondConnectorGeneration,
@@ -52,14 +51,27 @@ from .distribution import (
     Uniform,
 )
 from .convergence import ConvergenceTracker
+from .bond_sequences import render_bond_sequence_branches, render_bond_sequence_paths
+from .exception import TopologyBudgetExceeded
 from .ensemble_creator import (
     ConvergedEnsembleData,
     ConvergenceCheckpoint,
     EnsembleCreator,
     EnsembleData,
 )
-from .generative_graph import GraphCreator, UnitLabels, derive_unit_labels, generative_graph_json_data
-from .nx_rdkit_mol import mol_graph_to_rdkit_mol, mol_graph_to_smiles, rdkit_mol_to_smiles
+from .g2rins_molecule import DotGeneration, DotSystemSize, G2rins, G2rinsMolecule
+from .generative_graph import (
+    GraphCreator,
+    UnitLabels,
+    derive_unit_labels,
+    generative_graph_json_data,
+    mark_legacy_connector_placeholders,
+)
+from .nx_rdkit_mol import (
+    mol_graph_to_rdkit_mol,
+    mol_graph_to_smiles,
+    rdkit_mol_to_smiles,
+)
 from .parser import get_global_parser
 from .smiles import (
     AtomAssembly,
@@ -77,6 +89,8 @@ from .transformer import G2RINSTransformer, get_global_transformer
 from .util import camel_to_snake, get_global_rng, snake_to_camel
 
 __all__ = [
+    "render_bond_sequence_branches",
+    "render_bond_sequence_paths",
     "__version__",
     "version_tuple",
     "Atom",
@@ -135,10 +149,12 @@ __all__ = [
     "UnitLabels",
     "derive_unit_labels",
     "generative_graph_json_data",
+    "mark_legacy_connector_placeholders",
     "GraphCreator",
     "EnsembleCreator",
     "EnsembleData",
     "ConvergedEnsembleData",
     "ConvergenceCheckpoint",
     "ConvergenceTracker",
+    "TopologyBudgetExceeded",
 ]

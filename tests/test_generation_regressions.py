@@ -13,73 +13,19 @@ both runaway/over-counted growth and collapsed/truncated chains.
 
 import warnings
 
-import networkx as nx
 import numpy as np
 import pytest
 from rdkit import Chem
 from rdkit.Chem import Descriptors
 
 import g2rins
-import g2rins.util
 from g2rins.exception import (
     DiscardedSamplingPaths,
     PossibleNonRepresentativePolymerChain,
 )
+from tests._support import _reset_rngs
 
 SEEDS = (0, 1, 2)
-
-
-def test_adjacent_phantom_nodes_collapse_to_realized_junction_bond():
-    """A phantom pair must become one real bond with the junction attributes."""
-    from g2rins.ensemble_creator import _collapse_phantom_nodes
-
-    graph = nx.Graph()
-    graph.add_nodes_from(
-        (
-            (0, {"atomic_num": 6}),
-            (1, {"atomic_num": 0}),
-            (2, {"atomic_num": 0}),
-            (3, {"atomic_num": 8}),
-        )
-    )
-    graph.add_edge(0, 1, bond_type=1, aromatic=False)
-    graph.add_edge(1, 2, bond_type=2, aromatic=False)
-    graph.add_edge(2, 3, bond_type=1, aromatic=False)
-
-    _collapse_phantom_nodes(graph)
-
-    assert set(graph) == {0, 3}
-    assert graph.get_edge_data(0, 3) == {"bond_type": 2, "aromatic": False}
-
-
-def test_single_phantom_bridge_collapses_without_a_self_loop():
-    from g2rins.ensemble_creator import _collapse_phantom_nodes
-
-    graph = nx.Graph()
-    graph.add_nodes_from(
-        (
-            (0, {"atomic_num": 6}),
-            (1, {"atomic_num": 0}),
-            (2, {"atomic_num": 7}),
-        )
-    )
-    graph.add_edge(0, 1, bond_type=1, aromatic=False)
-    graph.add_edge(1, 2, bond_type=1, aromatic=False)
-
-    _collapse_phantom_nodes(graph)
-
-    assert set(graph) == {0, 2}
-    assert list(graph.edges(data=True)) == [
-        (0, 2, {"bond_type": 1, "aromatic": False})
-    ]
-
-
-def _reset_rngs(seed):
-    """Reset the two RNG streams the sampler consumes: numpy's legacy global
-    (truncated/nested draws) and the library global Generator (top-level
-    draws; plain get_global_rng(seed) does not reset an existing generator)."""
-    np.random.seed(seed)
-    g2rins.util._GLOBAL_RNG = np.random.default_rng(seed)
 
 
 # (id, G2RINS, target MW of the outermost stochastic object,
@@ -172,15 +118,15 @@ def test_generation_regression(smi, target_mw, band):
         Chem.SanitizeMol(mol)
 
         mol_weight = Descriptors.MolWt(mol)
-        assert lower * target_mw <= mol_weight <= upper * target_mw, (
-            f"seed {seed}: MW {mol_weight:.0f} outside [{lower:g}, {upper:g}] x target {target_mw:g}"
-        )
+        assert lower * target_mw <= mol_weight <= upper * target_mw, f"seed {seed}: MW {mol_weight:.0f} outside [{lower:g}, {upper:g}] x target {target_mw:g}"
 
 
 # Monofunctional inner stochastic object (right terminal "[]"): the generating
 # graph splits in two, chains seed inside the graft and dead-end below the
 # outer target, so every sample is a truncated chain.
-TRUNCATING_SMI = "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+TRUNCATING_SMI = (
+    "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+)
 
 
 def test_truncated_chain_contract():
@@ -207,28 +153,6 @@ def test_truncated_chain_contract():
         warnings.simplefilter("ignore")
         ensemble = ensemble_creator.create_ensemble(n_samples=1, output_format="mol_graph", max_number_of_discarded_chains=3)
     assert ensemble is None
-
-
-def test_cyclic_monomer_generation_serializes_to_smiles():
-    """Long ring-rich cyclic polymers should still serialize to SMILES even
-    when RDKit hits its open-ring label limit."""
-    g2rins_string = "{[] [>]c1nc2ccc([<])cc2[nH]1; [H][>]; [<][H] []}|poisson(100000)|"
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(g2rins_string).get_graph_creator().get_ensemble_creator()
-
-    _reset_rngs(0)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        mol_graph = ensemble_creator.sample_mol_graph()
-
-    assert all(data.get("atomic_num") != 0 for _, data in mol_graph.nodes(data=True))
-    smiles = g2rins.mol_graph_to_smiles(mol_graph)
-    assert isinstance(smiles, str) and smiles
-    mol = Chem.MolFromSmiles(smiles)
-    assert mol is not None
-    Chem.SanitizeMol(mol)
 
 
 def test_unit_id_deterministic():
@@ -307,7 +231,10 @@ EXAMPLE_ENSEMBLE_CASES = [
     pytest.param(
         # Methanol-initiated PEG/PPO random copolymer.
         "{[] [<|0.8|]CCO[>|0.8|], [<|0.2|]CC(C)O[>|0.2|]; CO[>]; [<][H] []}|log_normal(1400.0, 1.15)|",
-        1400.0, 0.12, 250, None,
+        1400.0,
+        0.12,
+        250,
+        None,
         id="peg-ppo-copolymer",
     ),
     pytest.param(
@@ -315,14 +242,20 @@ EXAMPLE_ENSEMBLE_CASES = [
         # Br-terminated. Before the nested-MW-accounting fix this sampled ~3x
         # the outer target; the whole molecule must land near 10000, not 30000.
         "{[] [<]CC([>])C(=O)OC(C)(C)C; {[] [<]CC([>])(C)C(=O)OCCO; {[] [<]CCO[>]; CO[>];  [<]}|poisson(3000.0)|CCOC(=O)C(C)(C)[>];  [<]}|poisson(6000.0)|[>]; [<]Br []}|poisson(10000.0)|",
-        10000.0, 0.10, 25, None,
+        10000.0,
+        0.10,
+        25,
+        None,
         id="nested-graft",
     ),
     pytest.param(
         # Hyperbranched poly(ethyleneimine): the AB2 monomer [<]CCN([>])[>]
         # branches at every nitrogen.
         "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(2000.0)|",
-        2000.0, 0.10, 10, None,
+        2000.0,
+        0.10,
+        10,
+        None,
         id="hyperbranched",
     ),
     pytest.param(
@@ -331,7 +264,10 @@ EXAMPLE_ENSEMBLE_CASES = [
         # the distribution (~1.5); the min-D guard catches a Schulz-Zimm
         # regression (which would pull it toward 1.33).
         "{[] [<]C(C)C(=O)O[>], [<]CC(=O)O[>]; [>]OCC(O[>])CO[>]; [<][H] []}|schulz_zimm(1800.0, 1200.0)|",
-        1200.0, 0.12, 400, 1.40,
+        1200.0,
+        0.12,
+        400,
+        1.40,
         id="star-plga",
     ),
 ]
@@ -452,9 +388,7 @@ def test_bare_bracket_atom_keeps_inferred_hydrogens():
     Chem.SanitizeMol(mol)
     # the internal carbanion carbons have 2 backbone bonds; with charge -1 (valence
     # 3) each carries one inferred H, so the chain is not a bare-carbon skeleton.
-    carbanions_with_h = sum(
-        1 for atom in mol.GetAtoms() if atom.GetSymbol() == "C" and atom.GetFormalCharge() == -1 and atom.GetTotalNumHs() > 0
-    )
+    carbanions_with_h = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "C" and atom.GetFormalCharge() == -1 and atom.GetTotalNumHs() > 0)
     assert carbanions_with_h > 0, "bare bracket [C-] was force-locked to zero H"
 
 
@@ -494,9 +428,7 @@ def test_create_ensemble_aromatic_core_unit():
         for output_format in ("mol_graph", "smiles"):
             for with_info in (False, True):
                 _reset_rngs(0)
-                result = ensemble_creator.create_ensemble(
-                    n_samples=2, output_format=output_format, ensemble_info=with_info
-                )
+                result = ensemble_creator.create_ensemble(n_samples=2, output_format=output_format, ensemble_info=with_info)
                 molecules = result.chains if with_info else result
                 assert molecules is not None and len(molecules) == 2
                 if with_info:
@@ -520,11 +452,7 @@ def test_star_initiator_has_three_arms():
         generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
     unit_labels = g2rins.derive_unit_labels(generative_graph).unit_id
     initiator_nodes = {n for n in generative_graph.nodes() if unit_labels[n].startswith("I")}
-    arm_source_atoms = {
-        u
-        for u, _v, data in generative_graph.out_edges(initiator_nodes, data=True)
-        if data.get("transition_weight", 0) > 0
-    }
+    arm_source_atoms = {u for u, _v, data in generative_graph.out_edges(initiator_nodes, data=True) if data.get("transition_weight", 0) > 0}
     assert len(arm_source_atoms) == 3, f"expected 3 arms, found {len(arm_source_atoms)}"
 
 
@@ -558,11 +486,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
     Returning the requested ensemble conditions it on avoiding the dead path,
     so the rejection must also be surfaced in a summary warning.
     """
-    smi = (
-        "{[] [<]CC[>], "
-        "[<|0.05|]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])"
-        "[>|0.05|]; [<][H]; [>][H] []}|poisson(600)|"
-    )
+    smi = "{[] [<]CC[>], " "[<|0.05|]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])" "[>|0.05|]; [<][H]; [>][H] []}|poisson(600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -577,11 +501,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
         )
 
     assert molecules is not None and len(molecules) == 1
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert summaries and summaries[0].discarded_count > 0
     assert any("DeadSamplingPath" in reason for reason, _count in summaries[0].reasons)
 
@@ -599,15 +519,9 @@ def test_undershoot_rollback_preserves_conditional_provenance(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(
-            "C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]"
-        ).get_graph_creator().get_ensemble_creator()
+        ensemble_creator = g2rins.G2rins.make("C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]").get_graph_creator().get_ensemble_creator()
 
-    source = next(
-        node
-        for node, data in ensemble_creator.generative_graph.nodes(data=True)
-        if data["stochastic_id_tree"][0] == 0 and data["gen_weight"] > 0
-    )
+    source = next(node for node, data in ensemble_creator.generative_graph.nodes(data=True) if data["stochastic_id_tree"][0] == 0 and data["gen_weight"] > 0)
     original_terminate = _PartialAtomGraph.terminate_graph
 
     def inject_post_rollback_dead_end(self, sto_atom_id, rng):
@@ -630,7 +544,6 @@ def test_undershoot_rollback_preserves_conditional_provenance(monkeypatch):
         with pytest.raises(DeadSamplingPath) as caught:
             ensemble_creator.sample_mol_graph(
                 source=source,
-                use_repeat_units_as_source=True,
                 rng=np.random.default_rng(0),
                 termination_flag=1,
             )
@@ -689,11 +602,7 @@ def test_unavoidable_nested_all_zero_after_branch_fails_fast(monkeypatch):
     """
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])[>], "
-        "[<]OO({[<] [<]SS[>]|0|;; [>]}|poisson(80)|[H])[>]; "
-        "[<][H]; [>][H] []}|poisson(600)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])[>], " "[<]OO({[<] [<]SS[>]|0|;; [>]}|poisson(80)|[H])[>]; " "[<][H]; [>][H] []}|poisson(600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -764,18 +673,12 @@ def test_zero_target_does_not_bypass_unavoidable_zero_terminator(
     """A real zero target still requires the architecture's declared caps."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "C{[>1][<1]CC[>2];;[<2][H]|0| []}|"
-        f"{distribution}|"
-    )
+    smi = "C{[>1][<1]CC[>2];;[<2][H]|0| []}|" f"{distribution}|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
-    assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert ensemble_creator._automatic_zero_support_is_unavoidable
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(AllZeroSamplingWeights, match="termination MW estimate"):
@@ -809,28 +712,23 @@ def test_exact_zero_target_terminates_at_first_molecular_boundary(monkeypatch):
 
 
 def test_unavoidable_zero_terminator_from_repeat_source_fails_fast():
-    """A repeat unit used as the source exposes its caps before any growth."""
+    """A repeat unit used as the automatic source exposes its caps before any growth."""
     from g2rins.exception import AllZeroSamplingWeights
 
     smi = "{[] [<]CC[>];;[<][H]|0| []}|uniform(80,80)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
-    assert ensemble_creator._automatic_zero_support_is_unavoidable[True]
+    assert ensemble_creator._repeat_unit_initiation
+    assert ensemble_creator._automatic_zero_support_is_unavoidable
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         with pytest.raises(
             AllZeroSamplingWeights,
             match="termination MW estimate",
         ):
-            ensemble_creator.sample_mol_graph(
-                use_repeat_units_as_source=True,
-                rng=np.random.default_rng(0),
-            )
+            ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
 
 
 def test_unavoidable_empty_nested_mw_support_fails_fast(monkeypatch):
@@ -846,19 +744,13 @@ def test_unavoidable_empty_nested_mw_support_fails_fast(monkeypatch):
         EmptyTruncatedDistributionSupport,
     )
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(500,600)|[H])CC[>]; "
-        "[<][H]; [>][H] []}|uniform(100,200)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(500,600)|[H])CC[>]; " "[<][H]; [>][H] []}|uniform(100,200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._statically_empty_nested_mw_sto_gen_ids == frozenset({1})
-    assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert ensemble_creator._automatic_zero_support_is_unavoidable
 
     original_sample = ensemble_creator.sample_mol_graph
     calls = 0
@@ -887,19 +779,13 @@ def test_overlapping_nested_mw_support_stays_retryable():
     """A budget-dependent empty support remains a chain-local rejection."""
     from g2rins.exception import EmptyTruncatedDistributionSupport
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(150,600)|[H])CC[>]; "
-        "[<][H]; [>][H] []}|uniform(100,200)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(150,600)|[H])CC[>]; " "[<][H]; [>][H] []}|uniform(100,200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert not ensemble_creator._statically_empty_nested_mw_sto_gen_ids
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
     # Whether a chain dies depends on the drawn parent budget (about half of
     # all seeds), so demonstrate both outcomes across seeds instead of one.
@@ -911,9 +797,7 @@ def test_overlapping_nested_mw_support_stays_retryable():
             if successes and rejections:
                 break
             try:
-                molecule = ensemble_creator.sample_mol_graph(
-                    rng=np.random.default_rng(seed)
-                )
+                molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
             except EmptyTruncatedDistributionSupport:
                 rejections += 1
             else:
@@ -931,17 +815,10 @@ def test_zero_molar_initiation_raises_domain_error():
     """
     from g2rins.exception import NoValidGenerationSource
 
-    smi = (
-        "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; "
-        "CC(C)[>1]|0|, CC(C)[>2]|0|; "
-        "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
-    )
+    smi = "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; " "CC(C)[>1]|0|, CC(C)[>2]|0|; " "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._starting_node_idx == []
     with pytest.raises(NoValidGenerationSource):
@@ -954,31 +831,22 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
     """A dead cap route remains local when another initiator can complete."""
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
-    smi = (
-        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; "
-        "[<1][H]|0|, [<2][H] []}|uniform(80,80)|"
-    )
+    smi = "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; " "[<1][H]|0|, [<2][H] []}|uniform(80,80)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    sources_by_unit = {
-        unit_labels[source]: source
-        for source in ensemble_creator._starting_node_idx
-    }
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I0"],
+            lambda _rng: sources_by_unit["I0"],
         )
         with pytest.raises(DeadSamplingPath) as caught:
             ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
@@ -986,7 +854,7 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I1"],
+            lambda _rng: sources_by_unit["I1"],
         )
         molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
 
@@ -996,18 +864,12 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
 
 def test_zero_target_global_arm_does_not_skip_dead_sibling():
     """Finishing a zero-target arm cannot hide another declared dead arm."""
-    smi = (
-        "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)"
-        "(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
-    )
+    smi = "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)" "(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
@@ -1026,11 +888,7 @@ def test_zero_probability_productive_source_does_not_mask_fatal_routes(monkeypat
     """An unreachable source cannot make the reachable dead routes retryable."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], N[>1], O[>2]|0|; "
-        "[<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], N[>1], O[>2]|0|; " "[<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -1121,16 +979,10 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
         frozenset(("child_entry",)),
         frozenset(("dead_leaf",)),
     )
-    probe._node_to_static_component = {
-        node: component_id
-        for component_id, component in enumerate(probe._static_components)
-        for node in component
-    }
+    probe._node_to_static_component = {node: component_id for component_id, component in enumerate(probe._static_components) for node in component}
     probe._statically_empty_nested_mw_sto_gen_ids = frozenset()
 
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 1 in immediate_components
     assert (0, "outer_entry") not in dead_states
     assert (0, "outer_other") in dead_states
@@ -1138,17 +990,13 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
     # Positive nested support is normalized, but gen_weight=0 drops the
     # half-bond before nested_transition can follow its dead child.
     graph.nodes["outer_entry"]["gen_weight"] = 0.0
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 0 not in immediate_components
     assert (0, "outer_other") not in dead_states
 
     # Empty support fails during construction, before either drop or pop.
     graph.nodes["child_entry"]["unit_molar_amounts"][1] = 0.0
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 0 in immediate_components
     assert (0, "outer_entry") in dead_states
     assert (0, "outer_other") in dead_states
@@ -1220,17 +1068,13 @@ def test_asymmetric_static_graph_disables_fatal_template_proof():
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        generative_graph = g2rins.G2rins.make(
-            "C{[>][<]CC[>]|0|;;[<]}|poisson(100)|[H]"
-        ).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+        generative_graph = g2rins.G2rins.make("C{[>][<]CC[>]|0|;;[<]}|poisson(100)|[H]").get_graph_creator().get_generative_graph(include_bond_connectors=False)
 
     reverse_removed = False
     for u, v, _key, data in list(generative_graph.edges(keys=True, data=True)):
         if u == v or not data.get("static") or not generative_graph.has_edge(v, u):
             continue
-        for reverse_key, reverse_data in list(
-            generative_graph.get_edge_data(v, u).items()
-        ):
+        for reverse_key, reverse_data in list(generative_graph.get_edge_data(v, u).items()):
             if reverse_data.get("static"):
                 generative_graph.remove_edge(v, u, reverse_key)
                 reverse_removed = True
@@ -1240,27 +1084,21 @@ def test_asymmetric_static_graph_disables_fatal_template_proof():
     assert reverse_removed, "fixture must contain a bidirectional static edge"
     ensemble_creator = EnsembleCreator(generative_graph)
     assert not ensemble_creator._static_proof_supported
-    assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
+    assert not ensemble_creator._automatic_zero_support_is_unavoidable
 
 
 def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch):
     """A dead initiator is chain-local when another initiator is productive."""
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    sources_by_unit = {
-        unit_labels[source]: source
-        for source in ensemble_creator._starting_node_idx
-    }
+    sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
 
     # Force each automatic-source outcome so the provenance assertion does not
     # depend on NumPy's seed-to-choice mapping or template node order.
@@ -1269,7 +1107,7 @@ def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I0"],
+            lambda _rng: sources_by_unit["I0"],
         )
         with pytest.raises(DeadSamplingPath) as caught:
             ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
@@ -1277,7 +1115,7 @@ def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch
         monkeypatch.setattr(
             ensemble_creator,
             "_get_random_start_node",
-            lambda _rng, _repeat=False: sources_by_unit["I1"],
+            lambda _rng: sources_by_unit["I1"],
         )
         molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
 
@@ -1289,21 +1127,14 @@ def test_explicit_dead_source_is_fatal_when_automatic_mode_can_retry():
     """An explicit source fixes the route, so its structural error is fatal."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    dead_source = next(
-        source
-        for source in ensemble_creator._starting_node_idx
-        if unit_labels[source] == "I0"
-    )
+    dead_source = next(source for source in ensemble_creator._starting_node_idx if unit_labels[source] == "I0")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1320,9 +1151,7 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(
-            "{[] [<]CC[>]; [<][H]; [>][H], [>]N []}|uniform(200, 200)|"
-        ).get_graph_creator().get_ensemble_creator()
+        ensemble_creator = g2rins.G2rins.make("{[] [<]CC[>]; [<][H]; [>][H], [>]N []}|uniform(200, 200)|").get_graph_creator().get_ensemble_creator()
 
     original_estimate = _PartialAtomGraph.get_average_termination_mw
     observations = []
@@ -1354,96 +1183,199 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
         )
 
     assert observations
-    assert all(
-        before_rng == after_rng
-        for (_before_flag, before_rng), (_after_flag, after_rng) in observations
-    ), "termination-MW estimation advanced the live RNG"
-    assert all(
-        before_flag == after_flag
-        for (before_flag, _before_rng), (after_flag, _after_rng) in observations
-    ), "termination-MW estimation changed live path provenance"
+    assert all(before_rng == after_rng for (_before_flag, before_rng), (_after_flag, after_rng) in observations), "termination-MW estimation advanced the live RNG"
+    assert all(before_flag == after_flag for (before_flag, _before_rng), (after_flag, _after_rng) in observations), "termination-MW estimation changed live path provenance"
 
 
-@pytest.mark.parametrize(
-    ("smi", "use_repeat_units_as_source"),
-    (
-        pytest.param(
-            (
-                "{[>|1 1 0 0|] [<|0 0 0 0|]CC[<|0 0 0 0|], "
-                "[>|1 1 0 0|]OO[>|1 1 0 0|];; [<]}|uniform(300, 400)|"
-            ),
-            False,
-            id="default-source-mode",
-        ),
-        pytest.param(
-            "C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]",
-            True,
-            id="repeat-unit-source-mode",
-        ),
-    ),
-)
-def test_empty_automatic_source_raises_domain_error(
-    smi,
-    use_repeat_units_as_source,
-):
-    """Both automatic-source modes must reject an empty candidate set cleanly."""
+def test_empty_automatic_source_raises_domain_error():
+    """No initiator and no repeat-unit bond connector with weight: the empty candidate set is rejected cleanly."""
     from g2rins.exception import NoValidGenerationSource
 
+    smi = "{[] [<|0|]CC[>|0|];; [<,>][H] []}|uniform(300, 400)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-        with pytest.raises(NoValidGenerationSource) as caught:
-            ensemble_creator.sample_mol_graph(
-                use_repeat_units_as_source=use_repeat_units_as_source,
-                rng=np.random.default_rng(0),
-            )
-    assert caught.value.use_repeat_units_as_source is use_repeat_units_as_source
-
-
-@pytest.mark.parametrize(
-    ("smi", "should_accept"),
-    (
-        pytest.param(
-            "{[] [<]CC[>]; ; [<][H] []}|uniform(40,40)|",
-            True,
-            id="self-initiating-repeat-unit-with-opposite-bond-connectors",
-        ),
-        pytest.param(
-            "{[] [<]CC[>]; ; []}|uniform(40,40)|",
-            True,
-            id="self-initiating-repeat-unit-without-termination",
-        ),
-        pytest.param(
-            "{[] [<]CC[>]; [>][H]; []}|uniform(40,40)|",
-            False,
-            id="empty-repeat-source-when-actual-initiation-is-missing",
-        ),
-    ),
-)
-def test_self_initiating_repeat_unit_source_requires_opposite_connectors(
-    smi,
-    should_accept,
-):
-    """A single repeat unit may initialize itself only when its bond
-    descriptors are opposite; otherwise there is no valid repeat-unit source."""
-    from g2rins.exception import NoValidGenerationSource
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-
-    if should_accept:
-        molecule = ensemble_creator.sample_mol_graph(
-            use_repeat_units_as_source=True,
-            rng=np.random.default_rng(0),
-        )
-        assert molecule.number_of_nodes() > 0
-    else:
+        assert ensemble_creator._repeat_unit_initiation
         with pytest.raises(NoValidGenerationSource):
-            ensemble_creator.sample_mol_graph(
-                use_repeat_units_as_source=True,
-                rng=np.random.default_rng(0),
-            )
+            ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
+
+
+def _repeat_unit_initiation_table(smi):
+    """Automatic source table of an initiator-less string, summed per unit text."""
+    from collections import defaultdict
+
+    from g2rins.generative_graph import _verified_unit_texts, derive_unit_labels
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert ensemble_creator._repeat_unit_initiation
+    labels = derive_unit_labels(ensemble_creator.generative_graph)
+    unit_text = _verified_unit_texts(ensemble_creator.generative_graph, labels)
+    table = defaultdict(float)
+    for node, weight in zip(ensemble_creator._starting_node_idx, ensemble_creator._starting_node_weight, strict=True):
+        table[unit_text[labels.unit_id[node]]] += float(weight)
+    return ensemble_creator, dict(table)
+
+
+@pytest.mark.parametrize(
+    ("smi", "expected"),
+    (
+        pytest.param(
+            "{[] [<]CCO[>|2|]|3|, [<]CC(C)O[>|3|];; [<,>][H] []}|uniform(1400,1400)|",
+            {"[<]CCO[>|2.0|]|3.0|": 9 / 13, "[<]CC(C)O[>|3.0|]": 4 / 13},
+            id="connector-weight-times-molar-amount",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>];; [>][H] [<]}|poisson(300)|{[>] [<]CCN[>];; [<,>][H] []}|poisson(300)|",
+            {"[<]CCO[>]": 1.0},
+            id="two-root-objects-start-left",
+        ),
+        pytest.param(
+            "{[] [<]{[>] [<]CC(C)O[>], [<]CCN[>];; [<]}|poisson(100)|[>], [<]CCO[>];; [<,>][H] []}|poisson(500)|",
+            {"[<]CCO[>]": 1.0},
+            id="nested-repeat-unit-entered-from-root",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>], [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
+            {"[<]CC(C)O[>]": 0.5, "[<]CCN[>]": 0.5},
+            id="nested-initiator-without-initiator",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>];; [<]|[>]}|poisson(500)|[>]|[<]|0.3|, {[] [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]|0.7|; [<,>]Br []}|poisson(1000)|",
+            {"[<]CC(C)O[>]": 0.3, "[<]CCN[>]": 0.7},
+            id="weighted-nested-initiators",
+        ),
+        pytest.param(
+            "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; {[] [<]CCN[>];; [<]|[>]}|poisson(100)|[>]|[<]; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|",
+            {"[<]CCN[>]": 1.0},
+            id="nested-initiator-two-levels-deep",
+        ),
+        pytest.param(
+            "{[] [<]{[>] [<]CC(C)O[>];; [<]}|poisson(100)|[>];; [<,>][H] []}|poisson(500)|",
+            {"[<]CC(C)O[>]": 1.0},
+            id="nested-only-repeat-unit",
+        ),
+        pytest.param(
+            "{[] [<]CC(c1ccccc1)[>], [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>];; [<,>]Cl []}|poisson(3000)|",
+            {"[<]CC(c1ccccc1)[>]": 0.5, "[<]CC({[<] [<]NN[>]; ;  [>]}|poisson(80.0)|Br)C[>]": 0.5},
+            id="pendant-entry-is-no-start-site",
+        ),
+    ),
+)
+def test_repeat_unit_initiation_sources(smi, expected):
+    """Without an initiator, chains start in the objects nothing enters, at bond-connector weight times molar amount."""
+    _ensemble_creator, table = _repeat_unit_initiation_table(smi)
+    assert table == pytest.approx(expected)
+
+
+def test_repeat_unit_initiation_chains_contain_the_nested_initiator():
+    """The canonical bidirectional form starts inside its block and exits head-to-tail on both sides."""
+    smi = "{[] [<]CCO[>]; {[] [<]CC(C)O[>], [<]CCN[>];; [<]|[>]}|poisson(500)|[>]|[<]; [<,>]Br []}|poisson(1000)|"
+    ensemble_creator, _table = _repeat_unit_initiation_table(smi)
+    generative_graph = ensemble_creator.generative_graph
+    rng = np.random.default_rng(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(5):
+            molecule = ensemble_creator.sample_mol_graph(rng=rng)
+            assert any(generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][1] >= 0 for _node, data in molecule.nodes(data=True))
+            assert not any(molecule.nodes[u]["atomic_num"] == 8 and molecule.nodes[v]["atomic_num"] == 8 for u, v in molecule.edges())
+            assert sum(data["atomic_num"] == 35 for _node, data in molecule.nodes(data=True)) == 2
+
+
+def test_repeat_unit_source_enters_its_own_nested_object():
+    """A source unit that carries a nested object enters it at once, so every nested object gets its own instance."""
+    import networkx as nx
+
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|poisson(80)|Br)C[>];; [<,>]Cl []}|poisson(2000)|"
+    ensemble_creator, _table = _repeat_unit_initiation_table(smi)
+    generative_graph = ensemble_creator.generative_graph
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for seed in range(5):
+            molecule, _units, _bonds, _seq, tracked, _dist = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed), molecule_info=True)
+            nested = [node for node, data in molecule.nodes(data=True) if generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][0] == 1]
+            assert len(tracked[1]) == nx.number_connected_components(molecule.subgraph(nested))
+
+
+def test_repeat_unit_initiation_warns_once_per_creator():
+    """The warning names the source units and fires when the creator is built, not per sample."""
+    from g2rins.exception import RepeatUnitInitiation, UnvalidatedGenerationSource
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        graph_creator = g2rins.G2rins.make("{[] [<]CCO[>];; [<,>][H] []}|poisson(300)|").get_graph_creator()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble_creator = graph_creator.get_ensemble_creator()
+        rng = np.random.default_rng(0)
+        ensemble_creator.sample_mol_graph(rng=rng)
+        ensemble_creator.sample_mol_graph(rng=rng)
+    issued = [warning for warning in caught if issubclass(warning.category, RepeatUnitInitiation)]
+    assert len(issued) == 1
+    assert "[<]CCO[>]" in str(issued[0].message)
+    assert not any(issubclass(warning.category, UnvalidatedGenerationSource) for warning in caught)
+
+
+def _cross_level_junctions(generative_graph):
+    """Entries (propagation) into and exits (transition) out of a depth-1 object, as (outer Z, inner Z)."""
+    from g2rins.generative_graph import _PROPAGATION_NAME, _TRANSITION_NAME
+
+    entries, exits = set(), set()
+    for u, v, data in generative_graph.edges(data=True):
+        outer_u = generative_graph.nodes[u]["stochastic_id_tree"][1] == -2
+        outer_v = generative_graph.nodes[v]["stochastic_id_tree"][1] == -2
+        z_u, z_v = generative_graph.nodes[u]["atomic_num"], generative_graph.nodes[v]["atomic_num"]
+        if data.get(_PROPAGATION_NAME, 0) > 0 and outer_u and not outer_v:
+            entries.add((z_u, z_v))
+        if data.get(_TRANSITION_NAME, 0) > 0 and outer_v and not outer_u:
+            exits.add((z_v, z_u))
+    return entries, exits
+
+
+def test_left_terminal_bond_connector_list_pairs_by_position():
+    """Each outer bond connector meets the terminal bond connector at its position on both sides of the
+    nested object, so a double-headed repeat unit enters and leaves it head-to-tail from either side."""
+    smi = "{[] [<]CCO[>], [<]|[>]{[>]|[<] [<]CC(C)O[>];; [<]|[>]}|poisson(100)|[>]|[<];; [<,>][H] []}|poisson(600)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    generative_graph = ensemble_creator.generative_graph
+    entries, exits = _cross_level_junctions(generative_graph)
+    assert entries == {(8, 6), (6, 8)}
+    assert exits == {(8, 6), (6, 8)}
+
+    junctions = set()
+    nested_chains = 0
+    rng = np.random.default_rng(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(20):
+            molecule = ensemble_creator.sample_mol_graph(rng=rng)
+            inner = {node for node, data in molecule.nodes(data=True) if generative_graph.nodes[data["origin_idx"]]["stochastic_id_tree"][1] >= 0}
+            nested_chains += bool(inner)
+            for u, v in molecule.edges():
+                assert not (molecule.nodes[u]["atomic_num"] == 8 and molecule.nodes[v]["atomic_num"] == 8)
+                if (u in inner) != (v in inner):
+                    outer, nested = (v, u) if u in inner else (u, v)
+                    if molecule.nodes[outer]["atomic_num"] > 1:  # hydrogen caps from the outer end group are not junctions
+                        junctions.add((molecule.nodes[outer]["atomic_num"], molecule.nodes[nested]["atomic_num"]))
+    assert nested_chains == 20
+    assert junctions == {(8, 6), (6, 8)}
+
+
+def test_declared_initiator_disables_repeat_unit_initiation():
+    """Initiators whose routes all carry zero weight still declare initiation: no fallback, no warning."""
+    from g2rins.exception import RepeatUnitInitiation
+
+    smi = "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; " "CC(C)[>1]|0|, CC(C)[>2]|0|; " "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    assert not ensemble_creator._repeat_unit_initiation
+    assert ensemble_creator._starting_node_idx == []
+    assert not any(issubclass(warning.category, RepeatUnitInitiation) for warning in caught)
 
 
 def test_create_ensemble_propagates_unexpected_value_error(monkeypatch):
@@ -1521,11 +1453,7 @@ def test_create_ensemble_retries_chain_local_error_with_diagnostic(monkeypatch):
 
     assert molecules == [first_molecule, second_molecule]
     assert calls == 3
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert len(summaries) == 1
     assert summaries[0].discarded_count == 1
     assert summaries[0].reasons == (("EmptyTruncatedDistributionSupport", 1),)
@@ -1640,11 +1568,7 @@ def test_create_ensemble_total_failure_emits_discard_summary(monkeypatch):
                 max_number_of_discarded_chains=3,
             )
 
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert len(summaries) == 1
     assert summaries[0].discarded_count == 3
     assert summaries[0].reasons == (("EmptyTruncatedDistributionSupport", 3),)
@@ -1789,15 +1713,15 @@ def test_legacy_edge_schema_rejected():
     [
         (15, +1, 0, 4),  # P+ fills to PH4+ — the old single-default-valence math gave 6
         (15, +1, 3, 1),  # R3PH+ phosphonium
-        (15, 0, 0, 3),   # PH3, not PH5 (chem_resource stores P as 5)
-        (15, 0, 3, 0),   # R3P phosphine, no phantom H
-        (16, 0, 3, 1),   # S climbs to its tetravalent tier
-        (16, 0, 2, 0),   # thioether
-        (7, +1, 0, 4),   # NH4+
-        (8, -1, 1, 0),   # alkoxide
-        (5, -1, 1, 3),   # borohydride-like B-
-        (6, +1, 1, 2),   # carbocation
-        (26, 0, 0, 0),   # metals get no implicit H
+        (15, 0, 0, 3),  # PH3, not PH5 (chem_resource stores P as 5)
+        (15, 0, 3, 0),  # R3P phosphine, no phantom H
+        (16, 0, 3, 1),  # S climbs to its tetravalent tier
+        (16, 0, 2, 0),  # thioether
+        (7, +1, 0, 4),  # NH4+
+        (8, -1, 1, 0),  # alkoxide
+        (5, -1, 1, 3),  # borohydride-like B-
+        (6, +1, 1, 2),  # carbocation
+        (26, 0, 0, 0),  # metals get no implicit H
     ],
 )
 def test_hydrogen_inference_matches_chemistry(atomic_num, charge, bonds, expected_h):
@@ -1814,9 +1738,9 @@ def test_hydrogen_inference_matches_chemistry(atomic_num, charge, bonds, expecte
 @pytest.mark.parametrize(
     ("atomic_num", "expected_h"),
     [
-        (6, 1),   # benzene carbon keeps its ring hydrogen
-        (7, 0),   # pyridine nitrogen
-        (8, 0),   # furan oxygen
+        (6, 1),  # benzene carbon keeps its ring hydrogen
+        (7, 0),  # pyridine nitrogen
+        (8, 0),  # furan oxygen
         (16, 0),  # thiophene sulfur — NOT the tetravalent tier of non-aromatic S(3)
         (34, 0),  # selenophene selenium
     ],
@@ -1963,11 +1887,7 @@ def test_transition_bond_selection_is_level_aware():
     assert bond is None and non_used == [] and bucket == before
 
     # A level that IS served must always be found.
-    served_levels = {
-        attr.get(_EDGE_STOCHASTIC_ID_NAME)
-        for half_bond in bucket
-        for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
-    }
+    served_levels = {attr.get(_EDGE_STOCHASTIC_ID_NAME) for half_bond in bucket for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])}
     assert served_levels, "test string must expose at least one transition level"
     level = next(iter(served_levels))
     bond, _non_used = partial._pop_random_bond(bucket, sto_atom_id, level, rng)
@@ -2027,11 +1947,7 @@ def test_hyperbranched_molecule_branches():
         mol_graph = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().sample_mol_graph()
     mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
     Chem.SanitizeMol(mol)
-    branch_points = sum(
-        1
-        for atom in mol.GetAtoms()
-        if atom.GetSymbol() == "N" and sum(1 for nb in atom.GetNeighbors() if nb.GetSymbol() == "C") >= 3
-    )
+    branch_points = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "N" and sum(1 for nb in atom.GetNeighbors() if nb.GetSymbol() == "C") >= 3)
     assert branch_points > 3, f"expected a branched network, found {branch_points} branch points"
 
 
@@ -2268,125 +2184,455 @@ def test_negative_target_draw_still_terminates():
             assert mol_graph.number_of_nodes() < 10_000, f"seed {seed}: runaway chain"
 
 
-def test_create_ensemble_json_file(tmp_path):
-    """The json_file export must be strict JSON (no NaN/numpy leakage) with the
-    documented layout: {string, format, graph, ensemble}, derived unit/bond
-    labels injected into the graph nodes, canonical unit entries with numbered
-    P-SMILES stars and static unit subgraphs, undirected bond records pairing
-    endpoint labels with generative-graph node ids, chains capped by
-    json_max_chains while statistics keep every sampled chain."""
-    import json
+def test_ensemble_equality_is_array_aware():
+    import copy
 
-    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
-    path = tmp_path / "ensemble.json"
-    _reset_rngs(0)
+    from g2rins.ensemble_creator import EnsembleData
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(generative_graph))
+    generative_graph.nodes[node]["metadata"] = {"vector": np.array([1, 2])}
+    creator = g2rins.EnsembleCreator(generative_graph)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-        chains = ensemble_creator.create_ensemble(3, output_format="smiles", json_file=str(path), json_max_chains=2)
+        result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+        again = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert result == copy.deepcopy(result)
+    assert result == again
+    changed = copy.deepcopy(result)
+    unit_id = next(unit_id for unit_id, info in changed.units.items() if node in info["subgraph"])
+    changed.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"] = np.array([1, 3])
+    assert result != changed
 
-    # json_file alone keeps the plain return shape.
-    assert isinstance(chains, list) and len(chains) == 3
+    # Arrays inside ordinary containers, not only inside graphs.
+    def data(units):
+        return EnsembleData(chains=[], units=units, bonds=[], sequences=[], mol_weights={}, distributions={})
 
-    def _reject_constant(name):
-        raise AssertionError(f"non-strict JSON constant {name} in export")
-
-    data = json.loads(path.read_text(), parse_constant=_reject_constant)
-
-    assert list(data) == ["string", "format", "graph", "ensemble"]
-    # The string is the regenerated canonical text, not the verbatim input.
-    assert data["string"].startswith("{[] [<]CC([>])c1ccccc1;")
-    assert data["format"]["version"] == 2
-    assert data["format"]["derived_node_fields"] == ["unit_id", "bond_id"]
-    assert data["format"]["chain_format"] == "smiles"
-
-    labels = g2rins.derive_unit_labels(ensemble_creator._generative_graph)
-    for node_dict in data["graph"]["nodes"]:
-        assert node_dict["unit_id"] == labels.unit_id[node_dict["id"]]
-        assert node_dict.get("bond_id") == labels.bond_id.get(node_dict["id"])
-
-    ensemble = data["ensemble"]
-    assert list(ensemble) == ["units", "chains", "bonds", "mol_weights", "distributions", "sequences"]
-
-    assert len(ensemble["chains"]) == 2, "json_max_chains caps the stored chains"
-    assert ensemble["chains"] == chains[:2]
-    # Statistics always cover ALL sampled chains (one gauss instance per chain).
-    assert all(len(mw_list) == 3 for mw_list in ensemble["mol_weights"].values())
-    assert len(ensemble["sequences"]) == 3
-
-    assert set(ensemble["units"]) == {"I0", "R0", "T0"}
-    for unit_id, info in ensemble["units"].items():
-        assert list(info) == ["psmiles", "g2rins", "subgraph", "count"]
-        assert "[*:1]" in info["psmiles"]
-        assert info["g2rins"] and info["count"] > 0
-        # The subgraph is the unit's static piece of the generative graph:
-        # the same node ids, static edges only, unit_id (only) on its nodes.
-        subgraph_ids = {node_dict["id"] for node_dict in info["subgraph"]["nodes"]}
-        assert subgraph_ids == {node for node, uid in labels.unit_id.items() if uid == unit_id}
-        assert all(node_dict["unit_id"] == unit_id and "bond_id" not in node_dict for node_dict in info["subgraph"]["nodes"])
-        assert all(edge["static"] for edge in info["subgraph"]["edges"])
-    assert "[*:2]" in ensemble["units"]["R0"]["psmiles"], "repeat unit carries two numbered stars"
-
-    for record in ensemble["bonds"]:
-        assert list(record) == ["labels", "nodes", "count"] and record["count"] > 0
-        for endpoint, node_id in zip(record["labels"], record["nodes"]):
-            unit_id, bond_id = endpoint.rsplit(".", 1)
-            assert unit_id in ensemble["units"] and int(bond_id) >= 1
-            # nodes are aligned with labels: both name the same connection atom.
-            assert labels.unit_id[node_id] == unit_id
-            assert labels.bond_id[node_id] == int(bond_id)
-    linkages = {tuple(record["labels"]) for record in ensemble["bonds"]}
-    assert ("I0.1", "R0.1") in linkages and ("R0.2", "T0.1") in linkages
+    assert data({"R0": {"vector": np.array([1, 2])}}) == data({"R0": {"vector": np.array([1, 2])}})
+    assert data({"R0": {"vector": np.array([1, 2])}}) != data({"R0": {"vector": [1, 2]}})
+    assert data({"R0": {"vector": [1, 2]}}) == data({"R0": {"vector": (1, 2)}})
 
 
-def test_create_ensemble_json_file_mol_graph_chains(tmp_path):
-    """With output_format="mol_graph" the file's chains follow the caller's
-    format as node-link graph dicts (picking the format is picking the file
-    size); sequences are written as SMILES regardless."""
-    import json
+def test_unit_subgraphs_are_detached_from_the_template():
+    """Mutating a returned subgraph's node or edge data in place leaves the
+    creator's template, and therefore the next ensemble, unchanged."""
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(node for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == 6)
+    generative_graph.nodes[node]["metadata"] = {"vector": [1, 2]}
+    edge = next(edge for edge in generative_graph.edges(keys=True, data=True) if edge[3]["static"])
+    edge[3]["tags"] = ["a"]
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        result = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+        unit_id = next(unit_id for unit_id, info in result.units.items() if node in info["subgraph"])
+        result.units[unit_id]["subgraph"].nodes[node]["metadata"]["vector"][0] = 99
+        edge_unit = next(info for info in result.units.values() if info["subgraph"].has_edge(edge[0], edge[1], edge[2]))
+        edge_unit["subgraph"].edges[edge[0], edge[1], edge[2]]["tags"].append("b")
+        again = creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+    assert creator._generative_graph.nodes[node]["metadata"] == {"vector": [1, 2]}
+    assert creator._generative_graph.edges[edge[0], edge[1], edge[2]]["tags"] == ["a"]
+    assert again.units[unit_id]["subgraph"].nodes[node]["metadata"] == {"vector": [1, 2]}
+    assert result != again
+
+
+def test_unit_subgraphs_name_an_attribute_that_cannot_be_copied():
+    """A template node attribute that cannot be deep-copied fails ensemble
+    information with the node and attribute named, not a bare pickling error."""
+    import threading
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    generative_graph = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(generative_graph))
+    generative_graph.nodes[node]["handle"] = threading.Lock()
+    creator = g2rins.EnsembleCreator(generative_graph)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert creator.create_ensemble(1, output_format="smiles", seed=0)
+        with pytest.raises(TypeError, match=rf"node {node!r} attribute 'handle'"):
+            creator.create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+
+def test_ensemble_equality_is_reflexive_and_boolean():
+    """``result == result`` holds whatever the metadata (NaN included, as for
+    Python containers), and a NumPy scalar never broadcasts against a
+    container: mismatched metadata compares unequal in both operand orders."""
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    with_nan = ensemble({"score": float("nan")})
+    assert with_nan == with_nan
+    scalar, one, two = ensemble(np.float64(2.0)), ensemble([2.0]), ensemble([2.0, 2.0])
+    for left, right in ((scalar, one), (one, scalar), (scalar, two), (two, scalar)):
+        assert (left == right) is False
+        assert (left != right) is True
+    assert scalar == ensemble(np.float64(2.0))
+
+
+def test_ensemble_equality_handles_object_and_structured_numpy_metadata():
+    """Metadata that generation and the JSON export accept must compare
+    without raising: object arrays compare element-wise (their elements may
+    hold arrays), and structured NumPy data compares only with structured
+    data of the same dtype, so a record never meets a plain float inside a
+    NumPy comparison."""
+    import copy
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    objects = np.empty(1, dtype=object)
+    objects[0] = {"vector": np.array([1, 2])}
+    other_objects = np.empty(1, dtype=object)
+    other_objects[0] = {"vector": np.array([1, 3])}
+    result = ensemble(objects)
+    assert result == copy.deepcopy(result)
+    assert result == ensemble(copy.deepcopy(objects))
+    assert result != ensemble(other_objects)
+
+    record = np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")])[0]
+    same_record = np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")])[0]
+    structured, plain = ensemble(record), ensemble(2.0)
+    assert (structured == plain) is False
+    assert (plain == structured) is False
+    assert structured == ensemble(same_record)
+
+    # Structured data equals structured data of the same dtype only: neither
+    # an object array holding the same tuple nor a record with other field
+    # names is the same value, in either operand order.
+    tuple_array = np.empty(1, dtype=object)
+    tuple_array[0] = (4, 0.5)
+    records = ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
+    renamed = ensemble(np.array([(4, 0.5)], dtype=[("n", "i4"), ("w", "f4")]))
+    tuples = ensemble(tuple_array)
+    for left, right in ((records, tuples), (tuples, records), (renamed, tuples), (tuples, renamed), (records, renamed), (renamed, records)):
+        assert (left == right) is False
+    assert records == ensemble(np.array([(4, 0.5)], dtype=[("count", "i4"), ("weight", "f4")]))
+
+    # An object whose own == is ambiguous (a dataclass holding an array)
+    # compares unequal, in both orders, instead of raising: it equals itself
+    # only. A NumPy scalar next to any collection is unequal instead of
+    # broadcasting into a wrong True.
+    import dataclasses
+    from collections import deque
+
+    @dataclasses.dataclass
+    class Payload:
+        vector: np.ndarray
+
+    payload = ensemble(Payload(np.array([1.0, 2.0])))
+    assert payload == payload
+    assert (payload == copy.deepcopy(payload)) is False
+    assert (copy.deepcopy(payload) == payload) is False
+    assert (payload == ensemble(Payload(np.array([1.0, 2.0])))) is False
+    scalar_one, queue = ensemble(np.float64(1.0)), ensemble(deque([1.0]))
+    assert (scalar_one == queue) is False
+    assert (queue == scalar_one) is False
+    assert queue == ensemble(deque([1.0]))
+
+    # Masked arrays compare by mask and unmasked values, as the JSON file
+    # shows them (masked entries are written as null): values hidden under
+    # matching masks do not matter, an unmasked array counts as unmasked
+    # everywhere, and structured masks apply field by field.
+    masked = ensemble(np.ma.array([1.0, 2.0], mask=[False, True]))
+    assert masked == copy.deepcopy(masked)
+    assert masked == ensemble(np.ma.array([1.0, 2.0], mask=[False, True]))
+    assert masked == ensemble(np.ma.array([1.0, 9.0], mask=[False, True]))
+    for other in (np.ma.array([1.0, 2.0], mask=[True, False]), np.ma.array([5.0, 2.0], mask=[False, True]), np.array([1.0, 2.0])):
+        assert (masked == ensemble(other)) is False
+        assert (ensemble(other) == masked) is False
+    assert ensemble(np.ma.array([1.0, 2.0], mask=[False, False])) == ensemble(np.array([1.0, 2.0]))
+    assert ensemble(np.ma.array([1.0, 2.0], mask=[True, True])) == ensemble(np.ma.array([3.0, 4.0], mask=[True, True]))
+    assert (ensemble(np.ma.array([1.0, 2.0], mask=[True, True])) == ensemble(np.array([1.0, 2.0]))) is False
+    assert ensemble(np.ma.array(2.0, mask=True)) == ensemble(np.ma.array(3.0, mask=True))
+    assert (ensemble(np.ma.array(2.0, mask=True)) == ensemble(np.float64(2.0))) is False
+    objects = np.ma.array([{"vector": np.array([1, 2])}, None], mask=[False, True], dtype=object)
+    assert ensemble(objects) == ensemble(copy.deepcopy(objects))
+    assert (ensemble(objects) == ensemble(np.ma.array([{"vector": np.array([1, 3])}, None], mask=[False, True], dtype=object))) is False
+    record_dtype = [("count", "i4"), ("weight", "f4")]
+    masked_record = ensemble(np.ma.array([(4, 0.5)], mask=[(False, True)], dtype=record_dtype))
+    assert masked_record == ensemble(np.ma.array([(4, 9.0)], mask=[(False, True)], dtype=record_dtype))
+    assert (masked_record == ensemble(np.ma.array([(5, 0.5)], mask=[(False, True)], dtype=record_dtype))) is False
+    assert (masked_record == ensemble(np.ma.array([(4, 0.5)], mask=[(True, False)], dtype=record_dtype))) is False
+
+    # Structured data whose field holds Python objects (kind "V", not "O")
+    # compares field by field, for arrays and for their record scalars.
+    def object_records(vector):
+        records = np.empty(1, dtype=[("metadata", object)])
+        records["metadata"][0] = {"vector": np.array(vector)}
+        return records
+
+    with_objects = ensemble(object_records([1, 2]))
+    assert with_objects == copy.deepcopy(with_objects)
+    assert with_objects == ensemble(object_records([1, 2]))
+    assert with_objects != ensemble(object_records([1, 3]))
+    record_with_objects = ensemble(object_records([1, 2])[0])
+    assert record_with_objects == copy.deepcopy(record_with_objects)
+    assert record_with_objects != ensemble(object_records([1, 3])[0])
+
+    # A NumPy scalar without a Python equivalent (longdouble) against a plain
+    # value settles directly instead of converting back and forth.
+    long_double, none, big_int = ensemble(np.longdouble(2)), ensemble(None), ensemble(2**100)
+    for left, right in ((long_double, none), (none, long_double), (long_double, big_int), (big_int, long_double)):
+        assert (left == right) is False
+    assert long_double == ensemble(np.longdouble(2))
+    assert long_double == ensemble(2.0)
+
+
+def test_ensemble_equality_boundary_for_cyclic_shared_and_unconvertible_metadata():
+    """The structural-equality domain is closed: metadata that refers back to
+    itself compares unequal instead of recursing, a structure that merely
+    shares references compares normally, and an object whose array conversion
+    fails compares unequal instead of raising, in both operand orders."""
+    import copy
+
+    class Unconvertible:
+        def __array__(self, dtype=None, copy=None):
+            raise ValueError("cannot be converted")
+
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    def cyclic():
+        value = {"x": 1}
+        value["self"] = value
+        return value
+
+    cycle = ensemble(cyclic())
+    assert cycle == cycle
+    assert (cycle == copy.deepcopy(cycle)) is False
+    assert (cycle == ensemble(cyclic())) is False
+    assert (ensemble(cyclic()) == cycle) is False
+
+    shared = np.array([1, 2])
+    references = {"a": shared, "b": shared, "c": [shared, {"d": shared}]}
+    with_shared = ensemble(references)
+    assert with_shared == copy.deepcopy(with_shared)
+    assert with_shared == ensemble(copy.deepcopy(references))
+    assert with_shared == ensemble({"a": np.array([1, 2]), "b": np.array([1, 2]), "c": [np.array([1, 2]), {"d": np.array([1, 2])}]})
+    assert (with_shared == ensemble({"a": shared, "b": shared, "c": [shared, {"d": np.array([1, 3])}]})) is False
+
+    unconvertible = ensemble(Unconvertible())
+    assert unconvertible == unconvertible
+    for other in (np.array([1.0]), np.float64(1.0), np.ma.array([1.0], mask=[False]), Unconvertible()):
+        assert (unconvertible == ensemble(other)) is False
+        assert (ensemble(other) == unconvertible) is False
+
+
+@pytest.mark.parametrize("kind, depth", [("list", 400), ("dict", 400), ("tuple", 250), ("deque", 400)])
+def test_ensemble_equality_survives_deeply_nested_metadata(kind, depth):
+    """Deeply nested dicts and sequences that generation can deep-copy still
+    compare at the default recursion limit, including on Python 3.10 where
+    recursive all() calls also consume recursion depth. Tuples use a lower
+    depth because their deep copy adds a list-comprehension frame on Python
+    3.10."""
+    import copy
+    import sys
+    from collections import deque
+
+    wrap = {
+        "list": lambda value: [value],
+        "dict": lambda value: {"child": value},
+        "tuple": lambda value: (value,),
+        "deque": lambda value: deque([value]),
+    }[kind]
+    text = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(200)|"
+    template = g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+    node = next(iter(template))
+
+    def ensemble(metadata):
+        graph = template.copy()
+        graph.nodes[node]["metadata"] = metadata
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return g2rins.EnsembleCreator(graph).create_ensemble(1, output_format="smiles", ensemble_info=True, seed=0)
+
+    def nested(innermost):
+        value = innermost
+        for _ in range(depth):
+            value = wrap(value)
+        return value
+
+    def cyclic():
+        # Start with a mutable container so deepcopy can memoize the cycle
+        # before traversing even a chain of immutable tuples.
+        value = []
+        value.append(nested(value))
+        return value
+
+    def compared(left, right):
+        # A sentinel makes overflow fail both the is True and is False checks
+        # without pytest's expensive recursion scan over deep frame locals.
+        try:
+            return left == right
+        except RecursionError:
+            return RecursionError
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)  # a larger ambient limit would hide the regression
+    try:
+        deep = ensemble(nested([1.0]))
+        twin = copy.deepcopy(deep)
+        assert compared(deep, twin) is True
+        assert compared(twin, deep) is True
+        assert compared(deep, ensemble(nested([1.0]))) is True
+        assert compared(deep, ensemble(nested([2.0]))) is False
+        assert compared(ensemble(nested([2.0])), deep) is False
+
+        cycle = ensemble(cyclic())
+        assert compared(cycle, cycle) is True
+        assert compared(cycle, copy.deepcopy(cycle)) is False
+        assert compared(copy.deepcopy(cycle), cycle) is False
+        assert compared(cycle, ensemble(cyclic())) is False
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def test_ensemble_equality_never_raises_across_metadata_types():
+    """Every ordered pair of supported metadata values compares to a Python
+    bool, symmetrically; a value equals its deep copy (a NaN array aside: a
+    NaN float deep-copies to the same object), and a plainly different value
+    of the same kind is unequal. The space of user metadata is open-ended;
+    this pins the kinds generation and export accept."""
+    import copy
+    import dataclasses
+    import itertools
+    from collections import deque
 
     import networkx as nx
 
-    smi = "{[] [<]CC([>])c1ccccc1; CO[>]; [<][H] []}|gauss(1000, 45)|"
-    path = tmp_path / "ensemble_graphs.json"
-    _reset_rngs(0)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-        chains = ensemble_creator.create_ensemble(2, output_format="mol_graph", json_file=str(path))
+    from g2rins.ensemble_creator import EnsembleData
 
-    data = json.loads(path.read_text())
-    assert data["format"]["chain_format"] == "mol_graph"
-    stored_chains = data["ensemble"]["chains"]
-    assert len(stored_chains) == 2
-    for chain_data, chain_graph in zip(stored_chains, chains):
-        restored = nx.node_link_graph(chain_data, edges="edges")
-        assert restored.number_of_nodes() == chain_graph.number_of_nodes()
-        assert restored.number_of_edges() == chain_graph.number_of_edges()
-    for chain_sequences in data["ensemble"]["sequences"]:
-        for sequence in chain_sequences:
-            assert sequence and all(isinstance(unit, str) for unit in sequence)
+    @dataclasses.dataclass
+    class Payload:
+        vector: np.ndarray
 
+    class Ambiguous:
+        def __init__(self, vector):
+            self.vector = vector
 
-def test_generative_graph_and_ensemble_share_node_ids():
-    """Node ids are UUIDs minted per GraphCreator, so a generative graph and an
-    ensemble only correspond when both come from ONE held creator (or when the
-    ensemble creator is built directly from the graph in hand)."""
-    g2rins_object = g2rins.G2rins.make("{[] [<]CC([>])c1ccccc1; [>][H]; [<][H] []}|gauss(1000, 45)|")
+        def __eq__(self, other):
+            if not isinstance(other, Ambiguous):
+                return NotImplemented
+            return bool(self.vector == other.vector)
 
-    graph_creator = g2rins_object.get_graph_creator()
-    generative_graph = graph_creator.get_generative_graph()
-    ensemble_creator = graph_creator.get_ensemble_creator()
+    class Unconvertible:
+        def __array__(self, dtype=None, copy=None):
+            raise ValueError("cannot be converted")
 
-    molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(0))
-    origins = {str(data["origin_idx"]) for _node, data in molecule.nodes(data=True) if "origin_idx" in data}
+    def cyclic(vector):
+        value = {"vector": np.array(vector)}
+        value["self"] = value
+        return value
 
-    assert origins, "sampled atoms must carry origin_idx back to the generative graph"
-    assert origins <= {str(node) for node in generative_graph.nodes}
-    assert origins <= {str(node) for node in ensemble_creator.generative_graph.nodes}
+    def shared(vector):
+        array = np.array(vector)
+        return {"a": array, "b": [array, array]}
 
-    # By-construction path: an EnsembleCreator built from the graph in hand shares its ids.
-    direct = g2rins.EnsembleCreator(generative_graph)
-    direct_molecule = direct.sample_mol_graph(rng=np.random.default_rng(0))
-    direct_origins = {str(data["origin_idx"]) for _node, data in direct_molecule.nodes(data=True) if "origin_idx" in data}
-    assert direct_origins <= {str(node) for node in generative_graph.nodes}
+    def object_array(*elements):
+        array = np.empty(len(elements), dtype=object)
+        for index, element in enumerate(elements):
+            array[index] = element
+        return array
+
+    def object_records(vector):
+        records = np.empty(1, dtype=[("metadata", object)])
+        records["metadata"][0] = {"vector": np.array(vector)}
+        return records
+
+    def nested_records(vector):
+        records = np.empty(1, dtype=[("inner", [("tag", "U2"), ("payload", object)]), ("weight", "f4")])
+        records["inner"]["tag"][0] = "ab"
+        records["inner"]["payload"][0] = [np.array(vector), {"k": np.array(vector)}]
+        records["weight"][0] = 0.5
+        return records
+
+    def values(vector):
+        return {
+            "none": None,
+            "bool": True,
+            "int": 2,
+            "float": 2.0,
+            "big_int": 2**100,
+            "str": "a",
+            "np_int": np.int64(vector[1]),
+            "np_float32": np.float32(vector[1]),
+            "np_float64": np.float64(vector[1]),
+            "np_longdouble": np.longdouble(vector[1]),
+            "np_bool": np.bool_(True),
+            "np_str": np.str_("a"),
+            "array_int": np.array(vector),
+            "array_float": np.array(vector, dtype=float),
+            "array_longdouble": np.array(vector, dtype=np.longdouble),
+            "array_0d": np.array(float(vector[1])),
+            "object_dicts": object_array({"vector": np.array(vector)}),
+            "object_mixed": object_array(None, np.longdouble(vector[1]), np.array(vector), "a"),
+            "record_numeric": np.array([(4, vector[1] / 2)], dtype=[("count", "i4"), ("weight", "f4")]),
+            "record_numeric_scalar": np.array([(4, vector[1] / 2)], dtype=[("count", "i4"), ("weight", "f4")])[0],
+            "record_objects": object_records(vector),
+            "record_objects_scalar": object_records(vector)[0],
+            "record_nested": nested_records(vector),
+            "record_nested_scalar": nested_records(vector)[0],
+            "list": [1, np.array(vector)],
+            "tuple": (1, np.array(vector)),
+            "dict": {"a": np.longdouble(vector[1]), "b": None},
+            "set": {1, vector[1]},
+            "nan": float("nan"),
+            "array_nan": np.array([np.nan]),
+            "graph": nx.MultiDiGraph([(1, vector[1])]),
+            "deque": deque([1, np.array(vector)]),
+            "frozenset": frozenset({1, vector[1]}),
+            "dataclass_array": Payload(np.array(vector)),
+            "ambiguous_object": Ambiguous(np.array(vector)),
+            "masked": np.ma.array(vector, mask=[False, True]),
+            "masked_all_visible": np.ma.array(vector, mask=[False, False]),
+            "masked_record": np.ma.array([(4, vector[1] / 2)], mask=[(False, True)], dtype=[("count", "i4"), ("weight", "f4")]),
+            "cyclic": cyclic(vector),
+            "shared_references": shared(vector),
+            "unconvertible": Unconvertible(),
+        }
+
+    def data(value):
+        return EnsembleData(chains=[], units={"R0": {"metadata": value}}, bonds=[], sequences=[], mol_weights={}, distributions={})
+
+    same, other = values([1, 2]), values([1, 3])
+    results = {}
+    for (left_name, left), (right_name, right) in itertools.product(same.items(), repeat=2):
+        result = data(left) == data(right)
+        assert isinstance(result, bool), (left_name, right_name)
+        results[(left_name, right_name)] = result
+    for (left_name, right_name), result in results.items():
+        assert result == results[(right_name, left_name)], (left_name, right_name)
+    # Objects whose own comparison is ambiguous equal themselves only; a
+    # masked value that hides the differing element makes the variants equal.
+    unequal_to_copy = ("array_nan", "dataclass_array", "ambiguous_object", "cyclic", "unconvertible")
+    equal_to_other = ("none", "bool", "int", "float", "big_int", "str", "np_bool", "np_str", "masked", "masked_record")
+    for name, value in same.items():
+        assert data(value) == data(value)
+        assert (data(value) == data(copy.deepcopy(value))) is (name not in unequal_to_copy)
+        assert (data(value) == data(other[name])) is (name in equal_to_other)

@@ -27,6 +27,8 @@ class classproperty(object):
 
 
 class MetaSkipInitIfChildIsInstance(ABCMeta):
+    """Reuse a sole child already of the requested type without reinitializing it."""
+
     def __call__(cls, children):
         # Special allocation function. For inherited objects.
         # If the inherited object is already fully created, we don't create a new object, but just use that child

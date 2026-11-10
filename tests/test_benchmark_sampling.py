@@ -4,11 +4,45 @@
 """Tests for the deterministic benchmark reporting interface."""
 
 import json
+import hashlib
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from benchmarks import benchmark_sampling, compare_versions
+from benchmarks import _common, benchmark_bond_sequences, benchmark_sampling, compare_versions
 from benchmarks.profile_sampling import _profile_record
+
+
+@pytest.mark.parametrize("platform, raw", [("linux", 128 * 1024), ("darwin", 128 * 1024 * 1024)])
+def test_peak_rss_helper_preserves_platform_units(monkeypatch, platform, raw):
+    sentinel = object()
+    calls = []
+
+    def getrusage(who):
+        calls.append(who)
+        return SimpleNamespace(ru_maxrss=raw)
+
+    monkeypatch.setattr(_common, "sys", SimpleNamespace(platform=platform))
+    monkeypatch.setattr(_common, "resource", SimpleNamespace(RUSAGE_SELF=sentinel, getrusage=getrusage))
+    assert _common._peak_rss_mib() == 128.0
+    assert calls == [sentinel]
+
+
+def test_benchmarks_share_only_the_rss_measurement():
+    for harness in (benchmark_sampling, benchmark_bond_sequences, compare_versions):
+        assert harness._peak_rss_mib is _common._peak_rss_mib
+    # Different JSON policies intentionally stay local: production rejects
+    # non-finite values, historical comparison preserves its old normalization.
+    with pytest.raises(ValueError):
+        benchmark_bond_sequences._stable_json(float("nan"))
+    assert compare_versions._stable_json(float("nan")) == "NaN"
+
+
+def test_feature_benchmark_records_shared_measurement_source_hash():
+    identity = benchmark_bond_sequences._source_identity()
+    common = Path(_common.__file__)
+    assert identity["benchmark_common_sha256"] == hashlib.sha256(common.read_bytes()).hexdigest()
 
 
 def test_summary_only_omits_raw_runs(monkeypatch, capsys):

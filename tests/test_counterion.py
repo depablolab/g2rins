@@ -33,11 +33,7 @@ def _association_pairs(generative_graph):
 def _association_degrees(generative_graph, atomic_num):
     """Sorted association-edge counts of every atom of the given element."""
     pairs = _association_pairs(generative_graph)
-    return sorted(
-        sum(1 for pair in pairs if node in pair)
-        for node, data in generative_graph.nodes(data=True)
-        if data["atomic_num"] == atomic_num
-    )
+    return sorted(sum(1 for pair in pairs if node in pair) for node, data in generative_graph.nodes(data=True) if data["atomic_num"] == atomic_num)
 
 
 MONOVALENT = "{[] [<]CC(C[NH3+])[>].[Cl-]; C[>]; [<][H] []}|poisson(500.0)|"

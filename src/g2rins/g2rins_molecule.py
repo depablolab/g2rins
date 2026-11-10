@@ -7,7 +7,7 @@ import networkx as nx
 
 from .core import G2rinsBase, GenerationBase
 from .exception import ParsingError, SmilesHasNonZeroBondConnectors
-from .generative_graph import _PartialGraph
+from .generative_graph import _check_positional_pairing, _PartialGraph
 
 
 class _AbstractIterativeClass(G2rinsBase):
@@ -49,8 +49,9 @@ class _AbstractIterativeGenerativeClass(_AbstractIterativeClass, GenerationBase)
         if len(self._children) > 0:
             partial_graph = self._children[0]._generate_partial_graph()
 
-            for child in self._children[1:]:
+            for previous_child, child in zip(self._children, self._children[1:]):
                 child_partial_graph = child._generate_partial_graph()
+                _check_positional_pairing(partial_graph.g, partial_graph.right_half_bonds, child_partial_graph.g, child_partial_graph.left_half_bonds, previous_child, child)
                 bonds_to_add = product(partial_graph.right_half_bonds, child_partial_graph.left_half_bonds)
                 # Transfer the child right bond to the partial graph, and reset partial graph
                 partial_graph.right_half_bonds = child_partial_graph.right_half_bonds

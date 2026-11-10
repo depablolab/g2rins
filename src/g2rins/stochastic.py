@@ -233,12 +233,8 @@ class StochasticObject(G2rinsBase, GenerationBase):
             full_idx,
             attr_name=_PROPAGATION_NAME,
             ignore_bond_probabilities=False,
-            prints=False,
         ):
             non_connected_bc = []
-            if prints:
-                print("first index is: ", first_idx)
-                print("target index is: ", second_idx)
             for bc_idx_a in first_idx:
                 obj_a = graph.nodes[bc_idx_a]["obj"]
                 if obj_a.bond_probabilities is not None and not ignore_bond_probabilities:
@@ -249,17 +245,11 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     probabilities = [graph.nodes[bc_idx_b]["obj"].weight for bc_idx_b in second_idx]
                 probabilities = np.asarray(probabilities)
                 # Set weights to zero if bond are incompatible, note different lengths from above.
-                if prints:
-                    print("before checking compatibility, probabilities are ", probabilities)
                 for i in range(len(probabilities)):
                     bc_idx_b = full_idx[i]
                     obj_b = graph.nodes[bc_idx_b]["obj"]
-                    if prints:
-                        print("target node is: ", graph.nodes[bc_idx_b])
                     if not obj_a.is_compatible(obj_b):
                         probabilities[i] = 0
-                if prints:
-                    print("after checking compatibility, probabilities are ", probabilities)
                 # Normalizing probabilities
                 if probabilities.sum() > 0:
                     probabilities /= probabilities.sum()
@@ -268,8 +258,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
                     if prob > 0:
                         bc_idx_b = full_idx[i]
                         graph.add_edge(bc_idx_a, bc_idx_b, **dict([(attr_name, prob)]))
-                if prints:
-                    print("At the end, probabilities are: ", probabilities)
                 if sum(probabilities) == 0:
                     non_connected_bc.append(bc_idx_a)
             return graph, non_connected_bc
@@ -284,7 +272,7 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 attr_name=_PROPAGATION_NAME,
             )
 
-        def connect_monomers_to_terminators(graph, mono_idx_pos, end_idx_pos):
+        def connect_monomers_to_terminators(graph, mono_idx_pos, terminator_idx_pos):
             result = _connect(
                 graph,
                 mono_idx_pos,
@@ -303,7 +291,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 mono_idx_pos,
                 ignore_bond_probabilities=False,
                 attr_name=_TRANSITION_NAME,
-                prints=False,
             )
 
         def connect_initiators_to_terminators(graph, initiator_idx_pos, terminator_idx_pos):
@@ -314,7 +301,6 @@ class StochasticObject(G2rinsBase, GenerationBase):
                 terminator_idx_pos,
                 ignore_bond_probabilities=True,
                 attr_name=_TERMINATION_NAME,
-                prints=False,
             )
 
         # Build graph without any connections between bond connectors.
@@ -337,24 +323,17 @@ class StochasticObject(G2rinsBase, GenerationBase):
                         node_data["token_text"] = residue_text
 
         # Add molar amount information
-        for i, subgraph in enumerate(repeat_subgraphs):
-            for node, data in subgraph.g.nodes(data=True):
-                if "molar_amount" in data:
-                    data["molar_amount"][id(self)] = self._repeat_residues[i].molar_amount
-                else:
-                    data["molar_amount"] = {id(self): self._repeat_residues[i].molar_amount}
-        for i, subgraph in enumerate(initiator_subgraphs):
-            for node, data in subgraph.g.nodes(data=True):
-                if "molar_amount" in data:
-                    data["molar_amount"][id(self)] = self._initiation_residues[i].molar_amount
-                else:
-                    data["molar_amount"] = {id(self): self._initiation_residues[i].molar_amount}
-        for i, subgraph in enumerate(terminator_subgraphs):
-            for node, data in subgraph.g.nodes(data=True):
-                if "molar_amount" in data:
-                    data["molar_amount"][id(self)] = self._termination_residues[i].molar_amount
-                else:
-                    data["molar_amount"] = {id(self): self._termination_residues[i].molar_amount}
+        def stamp_molar_amounts(subgraphs, residues):
+            for i, subgraph in enumerate(subgraphs):
+                for node, data in subgraph.g.nodes(data=True):
+                    if "molar_amount" in data:
+                        data["molar_amount"][id(self)] = residues[i].molar_amount
+                    else:
+                        data["molar_amount"] = {id(self): residues[i].molar_amount}
+
+        stamp_molar_amounts(repeat_subgraphs, self._repeat_residues)
+        stamp_molar_amounts(initiator_subgraphs, self._initiation_residues)
+        stamp_molar_amounts(terminator_subgraphs, self._termination_residues)
         partial_graph = _PartialGraph(None)
         copy_of_initiator_subgraphs = copy.deepcopy(initiator_subgraphs)
 
@@ -425,34 +404,43 @@ class StochasticObject(G2rinsBase, GenerationBase):
                         node = graph.nodes[node_idx]["obj"]
                         partial_graph.left_half_bonds.append(_HalfBond(node, node_idx, dict([(_TRANSITION_NAME, prob), ("init_weight", prob)])))
         else:
-            # TODO: loop over left_terminal_bc_list to connect things with all left bond connectors
-            left_partial_graph = self._left_terminal_bc_list.terminal_bond_connectors[0]._generate_partial_graph()
-            left_partial_graph.left_half_bonds = []
-            left_partial_graph.right_half_bonds = []
-            left_idx = list(left_partial_graph.g.nodes)[0]
-            partial_graph.merge(left_partial_graph, [])
-            partial_graph.left_half_bonds.append(_HalfBond(self._left_terminal_bc_list.terminal_bond_connectors[0], left_idx, {}))
-            graph = partial_graph.g
-
-            # With non-empty left bond connectors we connect first to one of the monomers inside.
-            left_bc = self._left_terminal_bc_list.terminal_bond_connectors[0]
-            if left_bc.bond_probabilities is not None:
-                weights = left_bc.bond_probabilities[: len(mono_idx_pos)]
+            # Every left terminal bond connector is an entry; like the right
+            # terminals, list entries carry the position they pair with.
+            if len(self._left_terminal_bc_list.terminal_bond_connectors) > 1:
+                matching_index = 0
             else:
-                weights = [graph.nodes[bc_idx]["obj"].weight for bc_idx in mono_idx_pos]
-            weights = np.asarray(weights)
+                matching_index = -1
 
-            for i, bc_idx in enumerate(mono_idx_pos):
-                if not left_bc.is_compatible(graph.nodes[bc_idx]["obj"]):
-                    weights[i] = 0
+            for left_terminal_bond_connector in self._left_terminal_bc_list.terminal_bond_connectors:
+                left_partial_graph = left_terminal_bond_connector._generate_partial_graph()
+                left_partial_graph.left_half_bonds = []
+                left_partial_graph.right_half_bonds = []
+                left_idx = list(left_partial_graph.g.nodes)[0]
+                partial_graph.merge(left_partial_graph, [])
+                partial_graph.left_half_bonds.append(_HalfBond(left_terminal_bond_connector, left_idx, {}))
+                graph = partial_graph.g
 
-            probabilities = []
-            if weights.sum() > 0:
-                probabilities = weights / weights.sum()
-            for i, prob in enumerate(probabilities):
-                if prob > 0:
-                    node_idx = mono_idx_pos[i]
-                    graph.add_edge(left_idx, node_idx, **dict([(_TRANSITION_NAME, prob)]))
+                graph.nodes[left_idx]["matching_index"] = matching_index
+                matching_index += 1
+
+                # With non-empty left bond connectors we connect first to one of the monomers inside.
+                if left_terminal_bond_connector.bond_probabilities is not None:
+                    weights = left_terminal_bond_connector.bond_probabilities[: len(mono_idx_pos)]
+                else:
+                    weights = [graph.nodes[bc_idx]["obj"].weight for bc_idx in mono_idx_pos]
+                weights = np.asarray(weights)
+
+                for i, bc_idx in enumerate(mono_idx_pos):
+                    if not left_terminal_bond_connector.is_compatible(graph.nodes[bc_idx]["obj"]):
+                        weights[i] = 0
+
+                probabilities = []
+                if weights.sum() > 0:
+                    probabilities = weights / weights.sum()
+                for i, prob in enumerate(probabilities):
+                    if prob > 0:
+                        node_idx = mono_idx_pos[i]
+                        graph.add_edge(left_idx, node_idx, **dict([(_TRANSITION_NAME, prob)]))
 
         # Add out-going bonds
 
@@ -514,11 +502,13 @@ class StochasticObject(G2rinsBase, GenerationBase):
 
     def _post_validate_partial_graph(self, partial_graph, bc_idx):
 
-        if len(partial_graph.left_half_bonds) == 0:
+        if len(partial_graph.left_half_bonds) == 0 and len(self._initiation_residues) > 0:
             # Only reachable with an empty '[]' left terminal: a declared left
             # symbol always creates a left half-bond (unconditional append in
             # _generate_partial_graph), and a declared entry that generation
-            # cannot use is reported by StochasticMissingPath below.
+            # cannot use is reported by StochasticMissingPath below. Without any
+            # initiator NoExplicitInitiation has already reported the object, so
+            # this remains for initiators that are nested objects without one.
             warnings.warn(NoInitiationForStochasticObject(self, partial_graph), stacklevel=1)
 
         # The right side needs no warning at all: a declared right terminal

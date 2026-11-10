@@ -627,13 +627,6 @@ class StochasticDistribution(StochasticGeneration):
         return tuple((-1.0 for _ in range(n)))
 
     @classmethod
-    def default_serialize(cls: Type["StochasticDistribution"]) -> Tuple[float, ...]:
-        """
-        Returns the default serialization vector for this distribution type (an empty tuple).
-        """
-        return cls._default_serialize(0)
-
-    @classmethod
     def get_empty_serial_vector(cls: Type["StochasticDistribution"]) -> List[float]:
         """
         Returns an empty serialization vector with the correct length to hold

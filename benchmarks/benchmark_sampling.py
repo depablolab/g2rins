@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
-import resource
 import statistics
 import subprocess
 import sys
@@ -33,6 +32,7 @@ import g2rins.ensemble_creator as ensemble_module
 from g2rins.ensemble_creator import _GrowthTransaction, _PartialAtomGraph, _attempt_chain
 from g2rins.nx_rdkit_mol import rdkit_mol_to_smiles
 
+from ._common import _peak_rss_mib
 from .cases import CASES
 
 _TERMINATION_FLAGS = {"exact": None, "overshoot": 0, "undershoot": 1}
@@ -42,14 +42,6 @@ def _elapsed(callable_):
     start = time.perf_counter()
     value = callable_()
     return value, time.perf_counter() - start
-
-
-def _peak_rss_mib() -> float:
-    # Linux reports KiB; macOS reports bytes. G2RINS CI and reference profiling
-    # are Linux, but retaining this branch makes local output unsurprising.
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
-    return rss / divisor
 
 
 def _worker(case_name: str, metadata: bool, termination: str, max_discards: int) -> dict:
