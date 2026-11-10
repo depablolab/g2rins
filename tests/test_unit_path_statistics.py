@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from types import SimpleNamespace
 
 import networkx as nx
@@ -9,6 +10,7 @@ import pytest
 
 from g2rins.ensemble_creator import (
     _UnitOccurrence,
+    _public_unit_junction_statistics,
     _public_unit_path_statistics,
     _unit_path_counts,
 )
@@ -73,6 +75,58 @@ def test_star_occurrence_graph_counts_shared_center_once() -> None:
     graph = nx.Graph()
     graph.add_edges_from((0, leaf) for leaf in (1, 2, 3))
     assert _totals(graph) == {2: 3, 3: 3, 4: 0}
+
+
+def test_four_unit_junction_counts_once_independent_of_occurrence_order() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from((0, leaf) for leaf in (1, 2, 3))
+    junctions = Counter()
+    paths = _unit_path_counts(_metadata(graph), graph, junction_counts=junctions)
+    assert {k: sum(counts.values()) for k, counts in paths.items()} == {
+        2: 3,
+        3: 3,
+        4: 0,
+    }
+    assert sum(junctions.values()) == 1
+    exported = _public_unit_junction_statistics(
+        junctions, {"R0": {"psmiles": "unit-a"}}, 1
+    )
+    assert exported["schema"] == "unit-graph-three-arm-junctions/v1"
+    assert exported["counts"][0]["token"] == [
+        ["N", "unit-a", 3],
+        [[["E", "1", False], ["N", "unit-a", 1]]] * 3,
+    ]
+    relabeled = nx.relabel_nodes(graph, {0: 20, 1: 5, 2: 8, 3: 11})
+    reordered = Counter()
+    _unit_path_counts(_metadata(relabeled), relabeled, junction_counts=reordered)
+    assert reordered == junctions
+
+
+def test_junctions_require_three_distinct_neighbors() -> None:
+    graph = nx.path_graph(2)
+    metadata = _metadata(graph)
+    metadata.inter_occurrence_edges = ((0, 1, ("1", False)),) * 3
+    junctions = Counter()
+    _unit_path_counts(metadata, graph, junction_counts=junctions)
+    assert not junctions
+
+
+def test_parallel_link_does_not_duplicate_four_unit_star() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from((0, leaf) for leaf in (1, 2, 3))
+    metadata = _metadata(graph)
+    metadata.inter_occurrence_edges += ((0, 1, ("1", False)),)
+    junctions = Counter()
+    _unit_path_counts(metadata, graph, junction_counts=junctions)
+    assert not junctions
+
+
+def test_junction_does_not_misclassify_arm_chords() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from(((0, 1), (0, 2), (0, 3), (1, 2)))
+    junctions = Counter()
+    _unit_path_counts(_metadata(graph), graph, junction_counts=junctions)
+    assert not junctions
 
 
 def test_ring_closure_is_enumerated_from_compact_closure_metadata() -> None:
