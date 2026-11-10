@@ -195,6 +195,19 @@
     "pyproject",
     "svg",
     "RINS",
-    "docstrings"
+    "docstrings",
+    "monodisperse",
+    "hyperbranched",
+    "OCCOC",
+    "CCCCCO",
+    "CCCCO",
+    "logaddexp",
+    "underflowed",
+    "followable",
+    "carbanions",
+    "thioether",
+    "alkoxide",
+    "borohydride",
+    "carbocation"
   ]
 }
