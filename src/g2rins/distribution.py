@@ -660,8 +660,9 @@ class CountLaw(StochasticDistribution):
 
     def prob_mw(self, mw: Union[float, "RememberAdd"], **kwargs: Any) -> float:
         """
-        Probability of the repeat-unit count nearest to a molecular weight (or of the counts
-        a RememberAdd range covers).
+        Probability density per g/mol at a molecular weight: the probability of the nearest
+        repeat-unit count spread over one repeat-unit mass, so that it compares with the
+        continuous laws. For a RememberAdd range, the probability of the counts it covers.
         """
         repeat_unit_mass, end_group_mass = self._require_binding()
         if isinstance(mw, RememberAdd):
@@ -669,7 +670,7 @@ class CountLaw(StochasticDistribution):
             current = math.floor((mw.value - end_group_mass) / repeat_unit_mass)
             return float(self._distribution.cdf(current, **kwargs) - self._distribution.cdf(previous, **kwargs))
         count = int(round((float(mw) - end_group_mass) / repeat_unit_mass))
-        return float(self._distribution.pmf(count, **kwargs))
+        return float(self._distribution.pmf(count, **kwargs)) / repeat_unit_mass
 
 
 class FlorySchulz(CountLaw):

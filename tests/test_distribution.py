@@ -128,6 +128,9 @@ def test_count_law_needs_bound_masses():
         count = (mw - end_group_mass) / repeat_unit_mass
         assert count == pytest.approx(round(count))
         assert poisson.prob_mw(mw) > 0
+    # prob_mw is a density per g/mol: the lattice probabilities times the lattice spacing sum to one.
+    lattice = end_group_mass + repeat_unit_mass * np.arange(400)
+    assert sum(poisson.prob_mw(float(mw)) for mw in lattice) * repeat_unit_mass == pytest.approx(1.0)
 
     with pytest.raises(ValueError):
         poisson.bind_repeat_unit_mass(repeat_unit_mass, 2500.0)

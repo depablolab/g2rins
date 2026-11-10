@@ -3018,6 +3018,13 @@ class EnsembleCreator:
     def generative_graph(self):
         return self._generative_graph.copy()
 
+    def get_distributions(self):
+        """Molecular-weight distributions the sampler draws from, keyed by stochastic object
+        id as in the ensemble output; count laws carry their bound repeat-unit and end-group
+        masses, so they can be evaluated and drawn like the continuous laws."""
+        # The graph carries a fixed number of distribution slots; unused ones are None.
+        return {sto_gen_id: distribution for sto_gen_id, distribution in enumerate(self._distributions) if distribution is not None}
+
     def _get_random_start_node(self, rng, use_repeat_units_as_source=False):
         if use_repeat_units_as_source:
             candidates = self._repeat_unit_starting_node_idx

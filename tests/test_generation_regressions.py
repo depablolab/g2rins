@@ -2156,6 +2156,26 @@ def test_count_law_bindings(smi, expected, unit_tol, end_tol):
         assert bound_end == pytest.approx(end_group_mass, abs=end_tol), f"object {sto_gen_id}: end mass {bound_end:.2f}"
 
 
+def test_get_distributions_are_the_sampled_laws():
+    """The ensemble creator hands out the laws it samples from, keyed like the
+    ensemble output, with count laws bound so they evaluate and draw as masses."""
+    smi = "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|gauss(440.0, 50.0)|[>]; [<][H] []}|poisson(2200.0)|"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        distributions = ensemble_creator.get_distributions()
+        data = ensemble_creator.create_ensemble(n_samples=2, output_format="smiles", ensemble_info=True)
+    assert set(distributions) == set(data.distributions) == {0, 1}
+    for stochastic_id, text in data.distributions.items():
+        assert distributions[stochastic_id].generate_string(True) == text
+    poisson = distributions[0]
+    assert isinstance(poisson, g2rins.CountLaw)
+    assert poisson.mean_mw() == pytest.approx(2200.0)
+    assert poisson.prob_mw(2200.0) > 0
+    assert distributions[1].mean_mw() == pytest.approx(440.0)
+
+
 def test_poisson_ensemble_dispersity():
     """A poisson(Mn) ensemble must show the Poisson count dispersity
     1 + M_unit (Mn - M_end)/Mn^2 (the count used to be read as g/mol, which made

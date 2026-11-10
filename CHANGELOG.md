@@ -8,10 +8,12 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
+- `EnsembleCreator.get_distributions()` returns the molecular-weight distributions the sampler draws from, keyed by stochastic object id as in the ensemble output, with count laws bound to their repeat-unit and end-group masses. The guide plots its reference distributions from them.
 
 ### Changed
 
 - `flory_schulz(a)` samples the number fraction of the most probable distribution, `a (1-a)^(N-1)` over repeat-unit counts `N` (number-average count `1/a`, dispersity approaching `2 - a`). It previously sampled the weight fraction and read the count as a molecular weight in g/mol.
+- `prob_mw` of a count law is a probability density per g/mol (the nearest count's probability over one repeat-unit mass), comparable with the continuous laws.
 - New `CountLaw` base class for `poisson` and `flory_schulz` (`bind_repeat_unit_mass`, `mean_count`), and `mean_mw`/`support_mw` on every molecular-weight distribution.
 - Pull requests now run a faster Linux-only Python 3.10/3.14 test matrix, while the full Linux/Windows/macOS compatibility matrix runs after merges to `main` and on the monthly schedule. Python 3.14 replaces 3.13 as the highest version tested in CI (RDKit ≥ 2026.3 publishes Python 3.14 wheels).
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
