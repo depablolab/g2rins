@@ -30,6 +30,7 @@ from .chem_resource import (
 from .distribution import CountLaw, StochasticDistribution
 from .exception import (
     AllZeroSamplingWeights,
+    CountLawBelowEndGroups,
     CountLawUnresolved,
     DeadSamplingPath,
     DiscardedSamplingPaths,
@@ -496,6 +497,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 break
         if count_law:
             distribution.bind_repeat_unit_mass(slope, end)
+            if distribution.mean_count() == 0.0:
+                warnings.warn(CountLawBelowEndGroups(end, str(distribution)), stacklevel=2)
             bindings[sto_id] = (slope, end)
             mean_mass[sto_id] = distribution.mean_mw()
         elif isinstance(distribution, CountLaw):

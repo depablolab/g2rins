@@ -352,6 +352,27 @@ class CountLawUnresolved(G2RINSWarning):
         return f"{self._MESSAGE} Token: {self.token}"
 
 
+class CountLawBelowEndGroups(G2RINSWarning):
+    """A count law (poisson) asks for no more mass than the end groups of its
+    stochastic object carry; it is read with zero repeat units and the sampler
+    builds the shortest chains it can."""
+
+    def __init__(self, end_group_mass, token=None):
+        self.token = token
+        self.end_group_mass = end_group_mass
+        super().__init__(token)
+        Warning.__init__(self, end_group_mass, token)
+
+    def __str__(self):
+        message = (
+            f"This count law asks for no more mass than the end groups of its stochastic object carry ({self.end_group_mass:.1f} g/mol), "
+            "so it is read with zero repeat units and the sampler builds the shortest chains it can."
+        )
+        if self.token is None:
+            return message
+        return f"{message} Token: {self.token}"
+
+
 class ForcedOvershootNoBoundary(G2RINSWarning):
     """A final explicit undershoot remained impossible because no valid
     owner-level boundary existed below the target.

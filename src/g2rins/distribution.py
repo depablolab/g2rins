@@ -610,14 +610,9 @@ class CountLaw(StochasticDistribution):
         end_group_mass = float(end_group_mass)
         if not (math.isfinite(repeat_unit_mass) and repeat_unit_mass > 0) or not (math.isfinite(end_group_mass) and end_group_mass >= 0):
             raise ValueError(f"{type(self).__name__} needs a positive repeat-unit mass and a non-negative end-group mass, got {repeat_unit_mass} and {end_group_mass}.")
-        previous = (self._repeat_unit_mass, self._end_group_mass)
         self._repeat_unit_mass = repeat_unit_mass
         self._end_group_mass = end_group_mass
-        try:
-            self._bind_count_distribution()
-        except ValueError:
-            self._repeat_unit_mass, self._end_group_mass = previous
-            raise
+        self._bind_count_distribution()
 
     def _bind_count_distribution(self) -> None:
         """Hook for laws whose count distribution depends on the bound masses."""
@@ -1263,7 +1258,8 @@ class Poisson(CountLaw):
     follows a Poisson law of mean :math:`(M_n - M_{end}) / M_{unit}` once the
     repeat-unit and end-group masses are bound (see :class:`CountLaw`), so the
     dispersity is :math:`1 + M_{unit} (M_n - M_{end}) / M_n^2`, which is
-    :math:`1 + M_{unit} / M_n` for light end groups.
+    :math:`1 + M_{unit} / M_n` for light end groups. An :math:`M_n` at or below
+    :math:`M_{end}` is read as zero repeat units.
 
     The textual representation of this distribution is: `poisson(Mn)`
     """
@@ -1289,14 +1285,11 @@ class Poisson(CountLaw):
         self._distribution = stats.poisson(mu=self._Mn)
 
     def _bind_count_distribution(self) -> None:
-        mean_count = (self._Mn - self._end_group_mass) / self._repeat_unit_mass
-        if mean_count < 0:
-            raise ValueError(f"poisson({self._Mn}) asks for less mass than the end groups of its stochastic object already carry ({self._end_group_mass:.1f} g/mol).")
-        self._distribution = stats.poisson(mu=mean_count)
+        self._distribution = stats.poisson(mu=self.mean_count())
 
     def mean_count(self) -> float:
         repeat_unit_mass, end_group_mass = self._require_binding()
-        return (self._Mn - end_group_mass) / repeat_unit_mass
+        return max((self._Mn - end_group_mass) / repeat_unit_mass, 0.0)
 
     @classmethod
     def default_serialize(cls) -> Tuple[float, ...]:

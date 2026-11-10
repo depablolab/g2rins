@@ -132,9 +132,11 @@ def test_count_law_needs_bound_masses():
     lattice = end_group_mass + repeat_unit_mass * np.arange(400)
     assert sum(poisson.prob_mw(float(mw)) for mw in lattice) * repeat_unit_mass == pytest.approx(1.0)
 
-    with pytest.raises(ValueError):
-        poisson.bind_repeat_unit_mass(repeat_unit_mass, 2500.0)
-    assert poisson.mean_mw() == pytest.approx(2000.0)
+    # An Mn at or below the end-group mass is read as zero repeat units.
+    poisson.bind_repeat_unit_mass(repeat_unit_mass, 2500.0)
+    assert poisson.mean_count() == 0.0
+    assert poisson.mean_mw() == pytest.approx(2500.0)
+    assert poisson.draw_mw(rng, lower=1.0, upper=3000.0) == pytest.approx(2500.0)
 
 
 @pytest.mark.parametrize(("mu", "sigma"), [(100.0, 10.0), (200.0, 100.0), (500.0, 1.0), (600.0, 0.0)])
