@@ -814,7 +814,7 @@ class GraphCreator:
                     traversal_condition = GraphDecider(bc_idx_set, in_idx)
                     non_bond_connector_successor = conditional_traversal(graph, in_idx, traversal_condition)
                     for target in sorted(non_bond_connector_successor, key=_graph_node_order.__getitem__):
-                        all_paths = list(nx.all_simple_edge_paths(graph, in_idx, target))
+                        all_paths = list(nx.all_simple_edge_paths(graph.subgraph(bc_idx_set | {in_idx, target}), in_idx, target))
                         for path in all_paths:
                             bond_connector_path = BondConnectorPath(path, graph)
                             if bond_connector_path.valid(bc_idx):

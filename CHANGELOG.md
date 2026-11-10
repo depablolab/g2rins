@@ -20,6 +20,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 
 - CI explicitly installs the `[test]` extra so pytest is available in test jobs (#1).
 - Removed a machine-local `.trunk/plugins/trunk` artifact from version control.
+- Graph construction no longer enumerates every simple path of the atom graph to skip over bond connectors, only the paths that run through bond connectors. The graphs are unchanged; construction time no longer doubles with each further sequential stochastic object (twelve objects: 15 s before, 0.1 s now).
 
 ## [1.0.0] - 2026-08-08
 
