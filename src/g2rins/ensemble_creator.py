@@ -204,7 +204,7 @@ def _unit_mass(generative_graph, unit_nodes, ports):
     return mass
 
 
-def _bind_count_laws(generative_graph, distributions, static_components, node_to_component):
+def _bind_count_laws(generative_graph, distributions, static_components, node_to_component, start_weights):
     """Bind every count law (poisson, flory_schulz) to the mean repeat-unit mass
     and the end-group mass of its stochastic object, both estimated from the
     generative graph; returns ``{sto_gen_id: (repeat_unit_mass, end_group_mass)}``.
@@ -218,6 +218,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
     at that count, and port conservation (a placed unit consumes one open port
     and opens its others) gives the open ports at termination, hence the caps
     the object places and the ports a nested object exposes to its parent.
+    Alternative initiators open their ports with the sampler's start weights
+    (``start_weights``, per starting node), so a chain starts at one of them.
     Objects are processed deepest first: a nested object enters its parent's
     chain as one unit of its expected mass, a nested initiator as end-group
     mass, and a nested object without exits rides with the unit carrying it.
@@ -253,6 +255,19 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
 
     def molar(node, sto_id):
         return float(nodes[node]["unit_molar_amounts"][sto_id])
+
+    # Probability that a chain of a level starts in each of its initiator alternatives (an
+    # initiator unit of the level or a nested initiator), summed over their starting nodes.
+    start_share = {}
+    for node, weight in start_weights.items():
+        tree = [level for level in level_tree(node) if level >= 0]
+        for position, level in enumerate(tree):
+            branch = ("unit", node_to_component[node]) if position == 0 else ("child", tree[position - 1])
+            start_share[level, branch] = start_share.get((level, branch), 0.0) + float(weight)
+    level_total = {}
+    for (level, _branch), weight in start_share.items():
+        level_total[level] = level_total.get(level, 0.0) + weight
+    start_share = {key: weight / level_total[key[0]] for key, weight in start_share.items() if level_total[key[0]] > 0}
 
     mean_mass = {}  # object -> expected mass of one instance
     exposed = {}  # object -> {port: expected open ports that continue outside the object}
@@ -305,12 +320,13 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 return node_to_component[port] in entered_units
             return ("child", level) in states
 
-        # Ports open before the first unit: the initiator's ports, the ports a nested
-        # initiator exposes, or the single port an outside unit enters by.
+        # Ports open before the first unit: the ports of the initiator the chain starts at
+        # (an initiator unit, or the ports a nested initiator exposes, each alternative
+        # with its start probability), or the single port an outside unit enters by.
         initial_open = {}
         port_total = {}
         outside_total = 0.0
-        initiator_weights = {}
+        initiator_masses = {}
         for state in states:
             for port, weight in sources_of[state].items():
                 if is_chain_source(port):
@@ -318,23 +334,20 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 port_total[port] = port_total.get(port, 0.0) + weight
                 level = level_tree(port)[0]
                 if level == sto_id:
-                    initial_open[port] = 1.0
                     key = ("unit", node_to_component[port])
+                    initial_open[port] = start_share.get((sto_id, key), 0.0)
+                    initiator_masses[key] = masses[key[1]]
                 elif level in children:
-                    initial_open[port] = exposed.get(level, {}).get(port, 0.0)
                     key = ("child", level)
+                    initial_open[port] = start_share.get((sto_id, key), 0.0) * exposed.get(level, {}).get(port, 0.0)
+                    initiator_masses[key] = mean_mass[level]
                 else:
                     initial_open[port] = initial_open.get(port, 0.0) + weight
                     outside_total += weight
-                    continue
-                initiator_weights[key] = initiator_weights.get(key, 0.0) + weight * molar(port, sto_id)
         for port in initial_open:
             if level_tree(port)[0] not in inside:
                 initial_open[port] /= outside_total
-        total = sum(initiator_weights.values())
-        initiator_mass = 0.0
-        if total > 0:
-            initiator_mass = sum(weight / total * (masses[key] if kind == "unit" else mean_mass[key]) for (kind, key), weight in initiator_weights.items())
+        initiator_mass = sum(start_share.get((sto_id, key), 0.0) * mass for key, mass in initiator_masses.items())
 
         n_states = len(states)
         matrix = np.zeros((n_states, n_states))
@@ -2286,12 +2299,15 @@ class EnsembleCreator:
             for component_id, component in enumerate(static_components)
             for node in component
         }
+        self._starting_node_idx, self._starting_node_weight = self._create_init_weights(self.generative_graph)
+
         self._distributions = self._load_distributions()
         self._count_law_bindings = _bind_count_laws(
             self._generative_graph,
             self._distributions,
             static_components,
             self._node_to_static_component,
+            dict(zip(self._starting_node_idx, self._starting_node_weight)),
         )
         self._statically_empty_nested_mw_sto_gen_ids = (
             self._find_statically_empty_nested_mw_sto_gen_ids()
@@ -2309,8 +2325,6 @@ class EnsembleCreator:
             self._provably_immediate_zero_components = frozenset()
             self._provably_zero_termination_states = frozenset()
         self._source_provably_dead_cache = {}
-
-        self._starting_node_idx, self._starting_node_weight = self._create_init_weights(self.generative_graph)
 
         self._repeat_unit_starting_node_idx, self._repeat_unit_starting_node_weight = self._create_repeat_units_as_source(self.generative_graph)
 

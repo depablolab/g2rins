@@ -2092,6 +2092,22 @@ COUNT_LAW_BINDING_CASES = [
         id="linear",
     ),
     pytest.param(
+        # Alternative initiators: a chain starts at one of them, with the
+        # sampler's start weights (here the molar amounts), so the end mass is
+        # their mean mass (0.8 CH3O + 0.2 C2H5O) plus the caps of one initiator.
+        "{[] [<]CCO[>]; CO[>]|0.8|, CCO[>]|0.2|; [<]Br []}|poisson(2000.0)|",
+        {0: (44.053, 113.74)}, 0.05, 0.1,
+        id="alternative-initiators",
+    ),
+    pytest.param(
+        # The sampler draws its start among the initiating ports, so a
+        # three-port initiator next to a one-port one starts 3/4 of the chains:
+        # end = 1/4 (CH3O + Br) + 3/4 (C3H5O3 + 3 Br).
+        "{[] [<]CCO[>]; CO[>], C(O[>])(CO[>])(CO[>]); [<]Br []}|poisson(2000.0)|",
+        {0: (44.053, 274.32)}, 0.05, 0.1,
+        id="alternative-initiators-ports",
+    ),
+    pytest.param(
         # Weighted connectors and an ionic unit: the expected composition
         # (0.9/0.1) weights the unit mass; the three-port initiator exposes
         # three ports that end in H caps.
