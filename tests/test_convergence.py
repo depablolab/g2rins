@@ -105,6 +105,7 @@ def test_tracker_requires_complete_stable_window():
         ({"contact_tolerance": -0.1}, "contact_tolerance"),
         ({"checkpoint_policy": "compact"}, "checkpoint_policy"),
         ({"representative_distance": -0.1}, "representative_distance"),
+        ({"representative_selection": "unknown"}, "representative_selection"),
         (
             {"reservoir_size": 1, "representative_distance": 0.15},
             "mutually exclusive",
@@ -1802,6 +1803,133 @@ def test_representative_cover_distinguishes_composition_and_contacts(monkeypatch
 
     assert len(result.chains) == 3
     assert result.representative_counts == [1, 1, 1]
+
+
+def _iter_weighted_chain_records(molecular_weights):
+    def iter_chain_records(**kwargs):
+        for offset in range(kwargs["n_samples"]):
+            chain_index = kwargs["start_index"] + offset
+            yield {
+                "chain_index": chain_index,
+                "record": _deferred(
+                    chain_index,
+                    molecular_weight=molecular_weights[chain_index],
+                ),
+                "discards": 0,
+                "reasons": (),
+                "first_cause": None,
+                "warnings": [],
+            }
+
+    return iter_chain_records
+
+
+def test_typed_medoid_cover_assigns_to_nearest_eligible_cluster(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    monkeypatch.setattr(
+        creator,
+        "_iter_chain_records",
+        _iter_weighted_chain_records([100.0, 120.0, 113.0]),
+    )
+    result = creator.create_ensemble_until_converged(
+        batch_size=3,
+        max_samples=3,
+        window=10,
+        representative_distance=0.15,
+        seed=17,
+    )
+
+    assert result.representative_counts == [1, 2]
+    assert result.molecular_weights == [100.0, 120.0]
+    assert result.convergence_settings["representative_selection"] == "typed-medoid"
+    assert result.convergence_settings["seed"] == 17
+
+
+def test_typed_medoid_cover_enforces_pairwise_distance_limit(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    checkpoints = []
+    monkeypatch.setattr(
+        creator,
+        "_iter_chain_records",
+        _iter_weighted_chain_records([100.0, 110.0, 120.0]),
+    )
+    result = creator.create_ensemble_until_converged(
+        batch_size=3,
+        max_samples=3,
+        window=10,
+        representative_distance=0.11,
+        seed=19,
+        checkpoint_callback=checkpoints.append,
+    )
+
+    assert result.representative_counts == [2, 1]
+    assert result.molecular_weights == [100.0, 120.0]
+    checkpoint = checkpoints[-1]
+    assert checkpoint.representative_replay_batches == ((0, 3, 19),)
+    for members in checkpoint.representative_member_features:
+        for left_index, left in enumerate(members):
+            for right in members[left_index + 1:]:
+                assert (
+                    ensemble_creator_module._typed_representative_distance(
+                        left,
+                        right,
+                    )
+                    <= 0.11
+                )
+
+
+def test_typed_medoid_cover_retains_medoid_and_replays_only_needed_prefix(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    molecular_weights = [100.0, 110.0, 105.0, 300.0]
+    sampled = _iter_weighted_chain_records(molecular_weights)
+    calls = []
+    materialized_indices = []
+
+    def iter_chain_records(**kwargs):
+        calls.append((kwargs["start_index"], kwargs["n_samples"], kwargs["seed"]))
+        yield from sampled(**kwargs)
+
+    def materialize(deferred, *args, **kwargs):
+        materialized_indices.append(deferred.chain_index)
+        return _materialize_deferred_chain(deferred, *args, **kwargs)
+
+    monkeypatch.setattr(creator, "_iter_chain_records", iter_chain_records)
+    monkeypatch.setattr(ensemble_creator_module, "_materialize_deferred_chain", materialize)
+    result = creator.create_ensemble_until_converged(
+        batch_size=2,
+        max_samples=4,
+        window=10,
+        representative_distance=0.15,
+        seed=23,
+    )
+
+    # Chain 2 (105) minimizes the summed distance within {100, 110, 105}.
+    assert result.molecular_weights == [105.0, 300.0]
+    assert result.representative_counts == [3, 1]
+    assert materialized_indices == [2, 3]
+    assert calls == [(0, 2, 23), (2, 2, 25), (2, 2, 25)]
+
+
+def test_first_match_cover_keeps_historical_first_fit(monkeypatch):
+    creator = EnsembleCreator.__new__(EnsembleCreator)
+    monkeypatch.setattr(
+        creator,
+        "_iter_chain_records",
+        _iter_weighted_chain_records([100.0, 120.0, 113.0]),
+    )
+    result = creator.create_ensemble_until_converged(
+        batch_size=3,
+        max_samples=3,
+        window=10,
+        representative_distance=0.15,
+        representative_selection="first-match",
+    )
+
+    # 113 joins the first cluster within range; typed-medoid picks 120's.
+    assert result.representative_counts == [2, 1]
+    assert result.molecular_weights == [100.0, 120.0]
+    assert result.convergence_settings["representative_selection"] == "first-match"
+    assert result.convergence_settings["seed"] is None
 
 
 def test_convergence_can_omit_returned_metadata():

@@ -455,7 +455,9 @@ def test_checkpoint_hook_evaluation_and_constructor_field_order(policy):
             "aggregate", "convergence_history", "retained_records", "retained_seen",
             "reservoir_rng_state", "settings", "policy", "representative_features",
             "representative_counts", "unit_path_counts", "unit_path_diagnostics",
-            "unit_junction_counts",
+            "unit_junction_counts", "representative_member_features",
+            "representative_member_scores", "representative_medoid_indices",
+            "representative_replay_batches",
         ]
         assert events == ["serialize", "result", "history"] + (
             ["records"] if policy == "full" else []

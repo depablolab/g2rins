@@ -238,8 +238,15 @@ def _assemble_convergence_checkpoint(
     result_type,
     bond_records_from_labeled,
     deepcopy,
+    representative_member_features=(),
+    representative_member_scores=(),
+    representative_medoid_indices=(),
+    representative_replay_batches=(),
 ):
-    """Build the existing checkpoint, preserving constructor and copy order."""
+    """Build the existing checkpoint, preserving constructor and copy order.
+
+    Typed-medoid state holds immutable features, so tuple snapshots suffice.
+    """
     return checkpoint_type(
         next_chain_index=next_chain_index,
         accepted_count=accepted_count,
@@ -287,4 +294,12 @@ def _assemble_convergence_checkpoint(
         },
         unit_path_diagnostics=dict(aggregate_unit_path_diagnostics),
         unit_junction_counts=dict(aggregate_unit_junction_counts) if unit_junctions else None,
+        representative_member_features=tuple(
+            tuple(members) for members in representative_member_features
+        ),
+        representative_member_scores=tuple(
+            tuple(scores) for scores in representative_member_scores
+        ),
+        representative_medoid_indices=tuple(representative_medoid_indices),
+        representative_replay_batches=tuple(representative_replay_batches),
     )
