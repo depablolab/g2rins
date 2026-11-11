@@ -46,6 +46,7 @@ DEFAULT_ENTRYPOINTS = [
     ("log_normal", "log_normal(100, 50)"),
     ("gauss", "gauss(100, 10)"),
     ("poisson", "poisson(10)"),
+    ("mwd", "mwd(740, 500)"),
 ]
 
 

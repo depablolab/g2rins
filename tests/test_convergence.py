@@ -1846,7 +1846,9 @@ def test_typed_medoid_cover_assigns_to_nearest_eligible_cluster(monkeypatch):
 
 
 def test_typed_medoid_cover_enforces_pairwise_distance_limit(monkeypatch):
-    creator = EnsembleCreator.__new__(EnsembleCreator)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
     checkpoints = []
     monkeypatch.setattr(
         creator,

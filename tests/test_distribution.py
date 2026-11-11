@@ -1,10 +1,13 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
+import networkx as nx
 import numpy as np
 import pytest
 from scipy import stats
 
 import g2rins
+
+from g2rins import ensemble_creator
 
 EPSILON = 0.15
 NSTAT = 2000
@@ -218,9 +221,43 @@ def test_log_normal(M, D, rng):
     assert str(log_normal) == f"|log_normal({M}, {D})|"
     assert log_normal.generable
 
-    serial_vector = log_normal.get_serial_vector()
+
+def test_mwd_direct_mass_declaration():
+    distribution = g2rins.StochasticDistribution.make("mwd(740, 500)")
+    assert isinstance(distribution, g2rins.Mwd)
+    assert bool(distribution)
+    assert distribution.reference_mw() == 500.0
+    assert str(distribution) == "|mwd(740.0, 500.0)|"
+    assert distribution.generable
+    assert distribution.draw_mw(rng=np.random.default_rng(0)) > 0
+
+    serial_vector = distribution.get_serial_vector()
     new_instance = g2rins.StochasticDistribution.from_serial_vector(serial_vector)
-    assert str(new_instance) == str(log_normal)
+    assert str(new_instance) == str(distribution)
+
+
+def test_mwd_does_not_quantize_masses():
+    distribution = g2rins.Mwd.from_moments(Mw=740.0, Mn=500.0)
+    assert distribution.support_mw() == (0.0, np.inf)
+
+    rng = np.random.default_rng(0)
+    data = np.asarray([distribution.draw_mw(rng=rng) for _ in range(200)])
+    assert np.all(data > 0.0)
+    assert np.any(np.remainder(data, 100.0) != 0)
+    assert np.unique(data).size > 1
+
+    serial_vector = distribution.get_serial_vector()
+    new_instance = g2rins.StochasticDistribution.from_serial_vector(serial_vector)
+    assert str(new_instance) == str(distribution)
+
+
+def test_mwd_tracker_rejects_missing_schema():
+    distribution = g2rins.StochasticDistribution.make("mwd(740, 500)")
+    graph = nx.MultiDiGraph()
+    graph.add_node(0, molecular_weight_distribution=[distribution.get_serial_vector()] + [g2rins.StochasticDistribution.get_empty_serial_vector()] * 9)
+
+    with pytest.raises(ValueError, match="schema"):
+        ensemble_creator._StochasticObjectTracker(graph, rng=np.random.default_rng(0))
 
 
 @pytest.mark.parametrize("M", [11.3e3, 5.3e3, 20.3e3])
