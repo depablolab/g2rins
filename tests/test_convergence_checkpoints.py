@@ -106,6 +106,53 @@ def test_seeded_convergence_checkpoint_resumes_exactly():
     assert resumed.unit_junction_statistics == uninterrupted.unit_junction_statistics
 
 
+@pytest.mark.parametrize("representative_distance", [None, 0.15])
+def test_checkpoint_without_selection_preserves_historical_cover(representative_distance):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        creator = g2rins.G2rins.make(FAST_SMI).get_graph_creator().get_ensemble_creator()
+        options = dict(
+            batch_size=2,
+            window=10,
+            output_format="smiles",
+            seed=53,
+            representative_distance=representative_distance,
+        )
+        checkpoints = []
+        creator.create_ensemble_until_converged(
+            **options,
+            max_samples=2,
+            representative_selection="first-match",
+            checkpoint_callback=checkpoints.append,
+        )
+        checkpoint = pickle.loads(pickle.dumps(checkpoints[-1]))
+        checkpoint.settings.pop("representative_selection")
+        selection = "typed-medoid" if representative_distance is None else "first-match"
+        resumed = creator.create_ensemble_until_converged(
+            **options,
+            max_samples=6,
+            representative_selection=selection,
+            checkpoint=checkpoint,
+        )
+        uninterrupted = creator.create_ensemble_until_converged(
+            **options, max_samples=6, representative_selection=selection,
+        )
+
+        if representative_distance is not None:
+            with pytest.raises(ValueError, match="checkpoint settings"):
+                creator.create_ensemble_until_converged(
+                    **options,
+                    max_samples=6,
+                    representative_selection="typed-medoid",
+                    checkpoint=checkpoint,
+                )
+
+    assert resumed.chains == uninterrupted.chains
+    assert resumed.molecular_weights == uninterrupted.molecular_weights
+    assert resumed.representative_counts == uninterrupted.representative_counts
+    assert resumed.convergence_trace == uninterrupted.convergence_trace
+
+
 def test_statistics_checkpoint_is_compact_and_omits_retained_payloads():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

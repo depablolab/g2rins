@@ -244,6 +244,8 @@
     "getmaskarray",
     "dtypes",
     "deques",
-    "setrecursionlimit"
+    "setrecursionlimit",
+    "medoid",
+    "medoids"
   ]
 }

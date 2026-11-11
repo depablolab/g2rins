@@ -178,6 +178,7 @@ timing table is copied here; historical audits and plans retain their scope.
 
 ### Changed
 
+- **Convergence representative cover defaults to typed-medoid selection.** With `representative_distance`, keyword-only `representative_selection="typed-medoid"` also compares log counts per building-block type, assigns each accepted chain to the nearest cluster whose members all lie within the threshold (complete linkage), and retains each cluster's medoid. Medoids are converted in a seeded replay of their batches, so SMILES/graph work is spent only on representatives; unseeded runs generate a seed, reported with the selection in `convergence_settings`. Retained chains and `representative_counts` can differ from earlier runs; pass `representative_selection="first-match"` for the historical first-fit cover. Feature state for every accepted chain is kept in memory and in checkpoints, so assignment cost grows with sample count. Older cover checkpoints resume only with `"first-match"`.
 - The preferred recipe-calibrated distribution spelling is `mwd(Mw,Mn)`;
 	`shifted_negative_binomial(Mw,Mn)` remains an accepted alias without warnings.
 	Rendered model/distribution strings and metadata now use `mwd(...)`, also when

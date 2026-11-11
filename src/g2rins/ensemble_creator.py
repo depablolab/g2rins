@@ -1588,6 +1588,10 @@ class ConvergenceCheckpoint:
     unit_path_counts: dict | None = None
     unit_path_diagnostics: dict | None = None
     unit_junction_counts: dict | None = None
+    representative_member_features: tuple = ()
+    representative_member_scores: tuple = ()
+    representative_medoid_indices: tuple = ()
+    representative_replay_batches: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -1598,6 +1602,8 @@ class _RepresentativeFeature:
     total_units: int
     unit_fractions: tuple
     contact_fractions: tuple
+    chain_index: int | None = None
+    unit_counts: tuple = ()
 
 
 def _normalized_sparse_counts(counts):
@@ -2120,6 +2126,8 @@ def _representative_feature(deferred):
         total_units=sum(metadata.unit_counts.values()),
         unit_fractions=_normalized_sparse_counts(metadata.unit_counts),
         contact_fractions=_normalized_sparse_counts(contacts),
+        chain_index=deferred.chain_index,
+        unit_counts=tuple(sorted(metadata.unit_counts.items())),
     )
 
 
@@ -2144,6 +2152,85 @@ def _representative_distance(left, right):
         _total_variation(left.unit_fractions, right.unit_fractions),
         _total_variation(left.contact_fractions, right.contact_fractions),
     )
+
+
+def _typed_representative_distance(left, right):
+    """Include absolute changes in each building-block count in the cover."""
+    left_counts = dict(left.unit_counts)
+    right_counts = dict(right.unit_counts)
+    unit_count_distance = max(
+        (
+            abs(
+                math.log(
+                    (left_counts.get(unit, 0) + 1)
+                    / (right_counts.get(unit, 0) + 1)
+                )
+            )
+            for unit in left_counts.keys() | right_counts.keys()
+        ),
+        default=0.0,
+    )
+    return max(_representative_distance(left, right), unit_count_distance)
+
+
+def _assign_typed_medoid(
+    feature,
+    threshold,
+    representative_features,
+    representative_counts,
+    member_features,
+    member_scores,
+    medoid_indices,
+):
+    """Assign one chain by complete linkage and refresh its cluster medoid.
+
+    A cluster is eligible only when ``feature`` lies within ``threshold`` of
+    every member. The nearest eligible medoid wins, ties by cluster position.
+    The medoid minimizes the summed distance to all members, ties by lowest
+    chain index. Returns the assigned cluster position.
+    """
+    best = None
+    for position, medoid in enumerate(representative_features):
+        distance = _typed_representative_distance(feature, medoid)
+        if distance > threshold or (best is not None and distance >= best[0]):
+            continue
+        member_distances = []
+        for member in member_features[position]:
+            member_distance = _typed_representative_distance(feature, member)
+            if member_distance > threshold:
+                break
+            member_distances.append(member_distance)
+        else:
+            best = (distance, position, member_distances)
+    if best is None:
+        representative_features.append(feature)
+        representative_counts.append(1)
+        member_features.append([feature])
+        member_scores.append([0.0])
+        medoid_indices.append(feature.chain_index)
+        return len(representative_features) - 1
+    _distance, position, member_distances = best
+    members = member_features[position]
+    scores = [
+        score + member_distance
+        for score, member_distance in zip(member_scores[position], member_distances)
+    ]
+    members.append(feature)
+    scores.append(sum(member_distances))
+    minimum_score = min(scores)
+    medoid = min(
+        (
+            member
+            for member, score in zip(members, scores)
+            if score <= minimum_score + 1e-12
+        ),
+        key=lambda member: member.chain_index,
+    )
+    member_scores[position] = scores
+    representative_features[position] = medoid
+    medoid_indices[position] = medoid.chain_index
+    representative_counts[position] += 1
+    return position
 
 
 class _MetadataLevel(IntEnum):
@@ -6985,6 +7072,179 @@ class EnsembleCreator:
                 # the first chain whose consecutive-discard budget expires.
                 return
 
+    def _replay_representative_medoids(
+        self,
+        medoid_features,
+        replay_batches,
+        *,
+        molecule_format,
+        metadata_mode,
+        max_discards,
+        termination_flag,
+        parallel,
+        n_workers,
+        include_sequences,
+        native_diagnostics_path,
+        max_worker_restarts,
+        use_repeat_units_as_source,
+        strip_unresolved_directional_markers,
+        fallback_on_worker_crash,
+        smiles_policy,
+        retain_chains,
+        retain_sequences,
+        metadata,
+        unit_path_max_motifs,
+        retained_topology_by_index,
+        retained_motif_by_index,
+        directional_warning_counts,
+        directional_warning_examples,
+    ):
+        """Regenerate typed-medoid chains and return records in cluster order.
+
+        Each chain has its own spawned seed, so replaying a recorded batch
+        prefix reproduces it. Only medoids are converted; first-pass sampling
+        warnings are not repeated.
+        """
+        target_positions = {
+            feature.chain_index: position
+            for position, feature in enumerate(medoid_features)
+        }
+        replayed_records = {}
+        for start_index, batch_size, batch_seed in replay_batches:
+            batch_targets = [
+                chain_index
+                for chain_index in target_positions
+                if start_index <= chain_index < start_index + batch_size
+            ]
+            if not batch_targets:
+                continue
+            replay_size = max(batch_targets) - start_index + 1
+            replay_workers = n_workers
+            if parallel and n_workers is None:
+                replay_workers = max(
+                    1,
+                    min((os.cpu_count() or 1) - 2, replay_size),
+                )
+            for chain_result in self._iter_chain_records(
+                n_samples=replay_size,
+                molecule_format=molecule_format,
+                collect_info=metadata_mode,
+                max_discards=max_discards,
+                termination_flag=termination_flag,
+                parallel=parallel,
+                n_workers=replay_workers,
+                seed=batch_seed,
+                start_index=start_index,
+                include_sequences=include_sequences,
+                native_diagnostics_path=native_diagnostics_path,
+                max_worker_restarts=max_worker_restarts,
+                defer_conversion=_ConversionMode.DEFERRED.value,
+                parallel_scheduler=_ACTIVE_PARALLEL_SCHEDULER.get(),
+                use_repeat_units_as_source=use_repeat_units_as_source,
+                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                fallback_on_worker_crash=fallback_on_worker_crash,
+                smiles_policy=smiles_policy,
+            ):
+                chain_index = chain_result["chain_index"]
+                if chain_index not in target_positions:
+                    continue
+                deferred = chain_result["record"]
+                if not isinstance(deferred, _DeferredChainRecord):
+                    raise RuntimeError(
+                        "Typed-medoid replay did not yield a deferred chain "
+                        f"record for selected chain {chain_index}."
+                    )
+                expected_weight = medoid_features[target_positions[chain_index]].molecular_weight
+                if deferred.molecular_weight != expected_weight:
+                    raise RuntimeError(
+                        f"Typed-medoid replay reproduced chain {chain_index} with "
+                        f"molecular weight {deferred.molecular_weight}, expected "
+                        f"{expected_weight}; sampling is not reproducible."
+                    )
+                sample = deferred.sample
+                occurrence_view = None
+                if retained_topology_by_index is not None or retained_motif_by_index is not None:
+                    occurrence_view = _build_occurrence_adjacency(
+                        sample.metadata,
+                        sample.graph,
+                        preserve_self_edges=True,
+                    )
+                if retained_topology_by_index is not None and metadata:
+                    retained_topology_by_index[chain_index] = _compact_bond_sequence_record(
+                        sample.metadata,
+                        sample.graph,
+                        unit_info=self._canonical_unit_info,
+                        occurrence_view=occurrence_view,
+                    )
+                if retained_motif_by_index is not None and metadata:
+                    local_counts = Counter()
+                    path_counts = _unit_path_counts(
+                        sample.metadata,
+                        sample.graph,
+                        unit_path_max_motifs,
+                        occurrence_view=occurrence_view,
+                    )
+                    for counts in path_counts.values():
+                        for motif, count in counts.items():
+                            canonical = _canonical_motif_key(motif, self._canonical_unit_info)
+                            local_counts[canonical] += count
+                    retained_motif_by_index[chain_index] = {
+                        "chain_index": chain_index,
+                        "molar_mass": float(deferred.molecular_weight),
+                        "_counts": local_counts,
+                        "motif_exposure": int(sum(local_counts.values())),
+                    }
+                if retain_chains or retain_sequences:
+                    with warnings.catch_warnings(record=True) as replay_warnings:
+                        warnings.simplefilter("always")
+                        materialized = _materialize_deferred_chain(
+                            deferred,
+                            molecule_format,
+                            metadata_mode,
+                            retain_sequences,
+                            strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                            smiles_policy=smiles_policy,
+                            sequence_smiles_cache=getattr(
+                                self,
+                                "_sequence_smiles_cache",
+                                None,
+                            ),
+                        )
+                    _replay_chain_warnings(
+                        (
+                            (caught.message, caught.category, caught.filename, caught.lineno)
+                            for caught in replay_warnings
+                        ),
+                        directional_warning_counts,
+                        directional_warning_examples,
+                    )
+                else:
+                    materialized = _ChainRecord(
+                        molecule=None,
+                        unit_counts=None,
+                        bonds=None,
+                        contact_counts=None,
+                        sequences=None,
+                        mol_weights=sample.mol_weights,
+                        distributions=sample.distributions,
+                        molecular_weight=deferred.molecular_weight,
+                    )
+                replayed_records[target_positions[chain_index]] = (
+                    chain_index,
+                    materialized,
+                )
+        missing_indices = sorted(
+            chain_index
+            for chain_index, position in target_positions.items()
+            if position not in replayed_records
+        )
+        if missing_indices:
+            raise RuntimeError(
+                "Typed-medoid replay failed to reproduce selected chain "
+                f"indices: {missing_indices}."
+            )
+        return [replayed_records[position] for position in range(len(medoid_features))]
+
     def _materialize_unit_counts(self, unit_counts):
         if not hasattr(self, "_canonical_unit_info"):
             return {
@@ -7418,6 +7678,7 @@ class EnsembleCreator:
         bond_sequence_format="compact",
         retain_motif_membership=False,
         building_block_statistics=False,
+        representative_selection="typed-medoid",
     ):
         """Sample batches until cumulative mass and contact statistics stabilize.
 
@@ -7440,10 +7701,20 @@ class EnsembleCreator:
         ``unit_junctions=True`` additionally collects exact four-unit three-arm
         stars, excluding arm-to-arm closure bonds. The same per-chain motif
         limit covers paths and stars; this opt-in can be expensive at branch hubs.
-        ``representative_distance`` enables an online feature-space cover:
-        retained representatives differ by more than the threshold in at least
-        one of log molecular weight, log building-block count, building-block
-        composition, or contact frequencies. A useful starting value is 0.15.
+        ``representative_distance`` enables an online feature-space cover over
+        log molecular weight, log building-block count, building-block
+        composition, and contact frequencies. A useful starting value is 0.15.
+        ``representative_selection='typed-medoid'`` (default) also compares
+        the log count of each building-block type. Complete-link assignment
+        places each accepted chain in the nearest cluster whose members all
+        lie within the threshold; the retained chain is the cluster medoid.
+        Medoids are re-materialized in a seeded second pass, so conversion work
+        is spent only on retained representatives. Without ``seed``, one is
+        generated and reported in ``convergence_settings``. Typed-medoid state
+        keeps compact features for every accepted chain, so assignment cost and
+        checkpoint size grow with the sample count. ``'first-match'`` preserves
+        the historical first-fit cover, which retains the first chain of each
+        cluster and whose representatives differ by more than the threshold.
         ``representative_counts`` reports how many accepted chains each
         retained chain represents. Alternatively, ``reservoir_size`` bounds
         retained samples with independent uniform reservoir sampling, without
@@ -7508,6 +7779,10 @@ class EnsembleCreator:
             raise ValueError(
                 "reservoir_size and representative_distance are mutually exclusive."
             )
+        if representative_selection not in {"typed-medoid", "first-match"}:
+            raise ValueError(
+                "representative_selection must be 'typed-medoid' or 'first-match'."
+            )
         if sample_callback is not None and not callable(sample_callback):
             raise TypeError("sample_callback must be callable or None.")
         if checkpoint_callback is not None and not callable(checkpoint_callback):
@@ -7568,6 +7843,14 @@ class EnsembleCreator:
             contact_tolerance=contact_tolerance,
         )
         retain_samples = retain_chains or retain_sequences or retain_bond_sequences or retain_motif_membership
+        typed_medoid_cover = (
+            retain_samples
+            and representative_distance is not None
+            and representative_selection == "typed-medoid"
+        )
+        if typed_medoid_cover and seed is None:
+            # Medoid replay needs reproducible chains.
+            seed = int(np.random.SeedSequence().generate_state(1)[0])
         if sample_callback is not None:
             metadata_mode = _MetadataLevel.FULL_LEGACY
         elif retain_sequences:
@@ -7591,6 +7874,7 @@ class EnsembleCreator:
             "metadata": metadata,
             "reservoir_size": reservoir_size,
             "representative_distance": representative_distance,
+            "representative_selection": representative_selection,
             "checkpoint_policy": checkpoint_policy,
             "unit_path_max_motifs": unit_path_max_motifs,
             "unit_junctions": bool(unit_junctions),
@@ -7627,6 +7911,13 @@ class EnsembleCreator:
             saved_settings.setdefault("use_repeat_units_as_source", False)
             saved_settings.setdefault("fallback_on_worker_crash", True)
             saved_settings.setdefault("representative_distance", None)
+            # Covers saved before selection was configurable used first-match.
+            saved_settings.setdefault(
+                "representative_selection",
+                representative_selection
+                if saved_settings["representative_distance"] is None
+                else "first-match",
+            )
             saved_settings.setdefault("smiles_policy", smiles_policy)
             saved_settings.setdefault("unit_path_max_motifs", unit_path_max_motifs)
             saved_settings.setdefault("unit_junctions", False)
@@ -7679,6 +7970,10 @@ class EnsembleCreator:
             retained_seen = 0
             representative_features = []
             representative_counts = []
+            representative_member_features = []
+            representative_member_scores = []
+            representative_medoid_indices = []
+            representative_replay_batches = []
         else:
             aggregate_unit_counts = Counter(
                 {
@@ -7728,6 +8023,20 @@ class EnsembleCreator:
             representative_counts = list(
                 getattr(checkpoint, "representative_counts", ())
             )
+            representative_member_features = [
+                list(members)
+                for members in getattr(checkpoint, "representative_member_features", ())
+            ]
+            representative_member_scores = [
+                list(scores)
+                for scores in getattr(checkpoint, "representative_member_scores", ())
+            ]
+            representative_medoid_indices = list(
+                getattr(checkpoint, "representative_medoid_indices", ())
+            )
+            representative_replay_batches = list(
+                getattr(checkpoint, "representative_replay_batches", ())
+            )
             if reservoir_rng is not None and checkpoint.reservoir_rng_state is not None:
                 reservoir_rng.bit_generator.state = deepcopy(
                     checkpoint.reservoir_rng_state
@@ -7736,6 +8045,16 @@ class EnsembleCreator:
         retain_checkpoint_payloads = not (
             checkpoint is not None and checkpoint_policy == "statistics"
         )
+        if (
+            typed_medoid_cover
+            and retain_checkpoint_payloads
+            and checkpoint is not None
+            and checkpoint.accepted_count
+            and not representative_replay_batches
+        ):
+            raise ValueError(
+                "Checkpoint lacks replay batches required for typed-medoid selection."
+            )
 
         converged = tracker.converged()
         progress_header_pending = True
@@ -7745,6 +8064,10 @@ class EnsembleCreator:
         while accepted_count < max_samples and not converged:
             current_batch_size = min(batch_size, max_samples - accepted_count)
             batch_seed = None if seed is None else seed + batch_index * batch_size
+            if typed_medoid_cover:
+                representative_replay_batches.append(
+                    (next_chain_index, current_batch_size, batch_seed)
+                )
             batch_workers = n_workers
             if use_default_workers:
                 batch_workers = max(
@@ -7920,7 +8243,19 @@ class EnsembleCreator:
                     if retain_samples:
                         retained_seen += 1
                         retained_position = None
-                        if representative_distance is not None:
+                        if typed_medoid_cover:
+                            # Medoids may change, so they are materialized
+                            # after sampling by replaying their batches.
+                            _assign_typed_medoid(
+                                _representative_feature(deferred),
+                                representative_distance,
+                                representative_features,
+                                representative_counts,
+                                representative_member_features,
+                                representative_member_scores,
+                                representative_medoid_indices,
+                            )
+                        elif representative_distance is not None:
                             feature = _representative_feature(deferred)
                             for position, representative in enumerate(
                                 representative_features
@@ -8082,6 +8417,10 @@ class EnsembleCreator:
                         aggregate_unit_path_diagnostics=aggregate_unit_path_diagnostics,
                         aggregate_unit_junction_counts=aggregate_unit_junction_counts,
                         unit_junctions=unit_junctions,
+                        representative_member_features=representative_member_features,
+                        representative_member_scores=representative_member_scores,
+                        representative_medoid_indices=representative_medoid_indices,
+                        representative_replay_batches=representative_replay_batches,
                         checkpoint_type=ConvergenceCheckpoint,
                         result_type=EnsembleData,
                         bond_records_from_labeled=_bond_records_from_labeled,
@@ -8115,6 +8454,32 @@ class EnsembleCreator:
                 strip_unresolved_directional_markers,
             )
             return None
+        if typed_medoid_cover and retain_checkpoint_payloads:
+            retained_records = self._replay_representative_medoids(
+                representative_features,
+                representative_replay_batches,
+                molecule_format=molecule_format,
+                metadata_mode=metadata_mode,
+                max_discards=max_number_of_discarded_chains,
+                termination_flag=termination_flag,
+                parallel=parallel,
+                n_workers=n_workers,
+                include_sequences=retain_sequences or sample_callback is not None,
+                native_diagnostics_path=native_diagnostics_path,
+                max_worker_restarts=max_worker_restarts,
+                use_repeat_units_as_source=use_repeat_units_as_source,
+                strip_unresolved_directional_markers=strip_unresolved_directional_markers,
+                fallback_on_worker_crash=fallback_on_worker_crash,
+                smiles_policy=smiles_policy,
+                retain_chains=retain_chains,
+                retain_sequences=retain_sequences,
+                metadata=metadata,
+                unit_path_max_motifs=unit_path_max_motifs,
+                retained_topology_by_index=retained_topology_by_index,
+                retained_motif_by_index=retained_motif_by_index,
+                directional_warning_counts=directional_warning_counts,
+                directional_warning_examples=directional_warning_examples,
+            )
         payload = _assemble_convergence_payload(
             self,
             retain_motif_membership=retain_motif_membership,
@@ -8194,6 +8559,8 @@ class EnsembleCreator:
                 "metadata": metadata,
                 "reservoir_size": reservoir_size,
                 "representative_distance": representative_distance,
+                "representative_selection": representative_selection,
+                "seed": seed,
                 "checkpoint_policy": checkpoint_policy,
                 "unit_path_max_motifs": unit_path_max_motifs,
                 "unit_junctions": bool(unit_junctions),
