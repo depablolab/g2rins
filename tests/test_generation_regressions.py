@@ -21,6 +21,7 @@ from rdkit.Chem import Descriptors
 import g2rins
 import g2rins.util
 from g2rins.exception import (
+    CountLawBelowEndGroups,
     DiscardedSamplingPaths,
     PossibleNonRepresentativePolymerChain,
 )
@@ -67,10 +68,12 @@ REGRESSION_CASES = [
     ),
     pytest.param(
         # Grandparent MW accounting: single-level parent_map entries starved
-        # ancestor tallies, producing molecules at ~3x the outer target.
+        # ancestor tallies, producing molecules at ~3x the outer target. The
+        # outer poisson counts few heavy units (each repeat unit carries a
+        # ~200 g/mol nested arm), so single chains scatter widely around 800.
         "{[] [<]CC({[<] [<]NN({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])[>];; [>]}|poisson(200)|[H])CC[>]; [<][H]; []}|poisson(800)|",
         800.0,
-        (0.4, 2.0),
+        (0.3, 2.0),
         id="three-level-nested-mw",
     ),
     pytest.param(
@@ -126,15 +129,15 @@ def test_generation_regression(smi, target_mw, band):
         Chem.SanitizeMol(mol)
 
         mol_weight = Descriptors.MolWt(mol)
-        assert lower * target_mw <= mol_weight <= upper * target_mw, (
-            f"seed {seed}: MW {mol_weight:.0f} outside [{lower:g}, {upper:g}] x target {target_mw:g}"
-        )
+        assert lower * target_mw <= mol_weight <= upper * target_mw, f"seed {seed}: MW {mol_weight:.0f} outside [{lower:g}, {upper:g}] x target {target_mw:g}"
 
 
 # Monofunctional inner stochastic object (right terminal "[]"): the generating
 # graph splits in two, chains seed inside the graft and dead-end below the
 # outer target, so every sample is a truncated chain.
-TRUNCATING_SMI = "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+TRUNCATING_SMI = (
+    "{[] [<|9.0|]CC(C)O[>|9.0|], [<|6.0|]CC(CC)O[>|6.0|]; {[] [<|7.0|]CCO[>|7.0|], [<|4.0|]CC(CC)O[>|4.0|]; CCCCO[>]; [<] []}|gauss(680.0, 215.0)|[>]; [<][H] []}|gauss(1649.0, 521.5)|"
+)
 
 
 def test_truncated_chain_contract():
@@ -209,12 +212,17 @@ def test_undershoot_snapshot_contract():
 # that made every Schulz-Zimm polymer too narrow).
 # ---------------------------------------------------------------------------
 
+# Count laws (poisson, flory_schulz) draw repeat-unit counts; they are bound to
+# this repeat-unit mass here so their draws read as masses.
+COUNT_LAW_REPEAT_UNIT_MASS = 44.053
+
 # (id, distribution string, target Mn, target dispersity, Mn rel-tol, D abs-tol)
 DISTRIBUTION_MOMENT_CASES = [
     pytest.param("log_normal(1400.0, 1.15)", 1400.0, 1.15, 0.04, 0.04, id="log_normal"),
     pytest.param("schulz_zimm(1800.0, 1200.0)", 1200.0, 1.50, 0.05, 0.04, id="schulz_zimm-D1.5"),
     pytest.param("schulz_zimm(2400.0, 1200.0)", 1200.0, 2.00, 0.05, 0.05, id="schulz_zimm-D2.0"),
-    pytest.param("poisson(2000.0)", 2000.0, 1.00, 0.02, 0.02, id="poisson"),
+    pytest.param("poisson(2000.0)", 2000.0, 1.0 + COUNT_LAW_REPEAT_UNIT_MASS / 2000.0, 0.02, 0.005, id="poisson"),
+    pytest.param("flory_schulz(0.05)", COUNT_LAW_REPEAT_UNIT_MASS / 0.05, 2.0 - 0.05, 0.03, 0.04, id="flory_schulz"),
 ]
 
 
@@ -224,8 +232,13 @@ def test_distribution_moments(dist_string, target_mn, target_d, mn_rtol, d_atol)
     dispersity named in the string. This guards the distribution math directly
     (independent of any topology) — notably the Schulz-Zimm shape parameter,
     which if wrong keeps Mn correct but collapses the dispersity toward
-    (z+2)/(z+1) instead of the requested (z+1)/z."""
+    (z+2)/(z+1) instead of the requested (z+1)/z, and the count laws, whose
+    counts must give poisson the dispersity 1 + M_unit (Mn - M_end)/Mn^2, here
+    1 + M_unit/Mn because no end-group mass is bound, and flory_schulz the
+    number-fraction dispersity 2 - a."""
     distribution = g2rins.StochasticDistribution.make(dist_string)
+    if isinstance(distribution, g2rins.CountLaw):
+        distribution.bind_repeat_unit_mass(COUNT_LAW_REPEAT_UNIT_MASS)
     samples = np.array([distribution.draw_mw(np.random.default_rng(i)) for i in range(20000)])
     mn = samples.mean()
     mw = (samples * samples).sum() / samples.sum()
@@ -239,7 +252,10 @@ EXAMPLE_ENSEMBLE_CASES = [
     pytest.param(
         # Methanol-initiated PEG/PPO random copolymer.
         "{[] [<|0.8|]CCO[>|0.8|], [<|0.2|]CC(C)O[>|0.2|]; CO[>]; [<][H] []}|log_normal(1400.0, 1.15)|",
-        1400.0, 0.12, 250, None,
+        1400.0,
+        0.12,
+        250,
+        None,
         id="peg-ppo-copolymer",
     ),
     pytest.param(
@@ -247,14 +263,20 @@ EXAMPLE_ENSEMBLE_CASES = [
         # Br-terminated. Before the nested-MW-accounting fix this sampled ~3x
         # the outer target; the whole molecule must land near 10000, not 30000.
         "{[] [<]CC([>])C(=O)OC(C)(C)C; {[] [<]CC([>])(C)C(=O)OCCO; {[] [<]CCO[>]; CO[>];  [<]}|poisson(3000.0)|CCOC(=O)C(C)(C)[>];  [<]}|poisson(6000.0)|[>]; [<]Br []}|poisson(10000.0)|",
-        10000.0, 0.10, 25, None,
+        10000.0,
+        0.10,
+        25,
+        None,
         id="nested-graft",
     ),
     pytest.param(
         # Hyperbranched poly(ethyleneimine): the AB2 monomer [<]CCN([>])[>]
         # branches at every nitrogen.
         "{[] [<]CCN([>])[>]; [<][H]; O[>], [<][H] []}|poisson(2000.0)|",
-        2000.0, 0.10, 10, None,
+        2000.0,
+        0.10,
+        10,
+        None,
         id="hyperbranched",
     ),
     pytest.param(
@@ -263,7 +285,10 @@ EXAMPLE_ENSEMBLE_CASES = [
         # the distribution (~1.5); the min-D guard catches a Schulz-Zimm
         # regression (which would pull it toward 1.33).
         "{[] [<]C(C)C(=O)O[>], [<]CC(=O)O[>]; [>]OCC(O[>])CO[>]; [<][H] []}|schulz_zimm(1800.0, 1200.0)|",
-        1200.0, 0.12, 400, 1.40,
+        1200.0,
+        0.12,
+        400,
+        1.40,
         id="star-plga",
     ),
 ]
@@ -384,9 +409,7 @@ def test_bare_bracket_atom_keeps_inferred_hydrogens():
     Chem.SanitizeMol(mol)
     # the internal carbanion carbons have 2 backbone bonds; with charge -1 (valence
     # 3) each carries one inferred H, so the chain is not a bare-carbon skeleton.
-    carbanions_with_h = sum(
-        1 for atom in mol.GetAtoms() if atom.GetSymbol() == "C" and atom.GetFormalCharge() == -1 and atom.GetTotalNumHs() > 0
-    )
+    carbanions_with_h = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "C" and atom.GetFormalCharge() == -1 and atom.GetTotalNumHs() > 0)
     assert carbanions_with_h > 0, "bare bracket [C-] was force-locked to zero H"
 
 
@@ -426,9 +449,7 @@ def test_create_ensemble_aromatic_core_unit():
         for output_format in ("mol_graph", "mol", "smiles"):
             for with_info in (False, True):
                 _reset_rngs(0)
-                result = ensemble_creator.create_ensemble(
-                    n_samples=2, output_format=output_format, ensemble_info=with_info
-                )
+                result = ensemble_creator.create_ensemble(n_samples=2, output_format=output_format, ensemble_info=with_info)
                 molecules = result.chains if with_info else result
                 assert molecules is not None and len(molecules) == 2
                 if with_info:
@@ -448,11 +469,7 @@ def test_star_initiator_has_three_arms():
         generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
     unit_labels = g2rins.derive_unit_labels(generative_graph).unit_id
     initiator_nodes = {n for n in generative_graph.nodes() if unit_labels[n].startswith("I")}
-    arm_source_atoms = {
-        u
-        for u, _v, data in generative_graph.out_edges(initiator_nodes, data=True)
-        if data.get("transition_weight", 0) > 0
-    }
+    arm_source_atoms = {u for u, _v, data in generative_graph.out_edges(initiator_nodes, data=True) if data.get("transition_weight", 0) > 0}
     assert len(arm_source_atoms) == 3, f"expected 3 arms, found {len(arm_source_atoms)}"
 
 
@@ -486,11 +503,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
     Returning the requested ensemble conditions it on avoiding the dead path,
     so the rejection must also be surfaced in a summary warning.
     """
-    smi = (
-        "{[] [<]CC[>], "
-        "[<|0.05|]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])"
-        "[>|0.05|]; [<][H]; [>][H] []}|poisson(600)|"
-    )
+    smi = "{[] [<]CC[>], " "[<|0.05|]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])" "[>|0.05|]; [<][H]; [>][H] []}|poisson(600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -505,11 +518,7 @@ def test_conditional_zero_molar_path_is_a_counted_discard():
         )
 
     assert molecules is not None and len(molecules) == 1
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert summaries and summaries[0].discarded_count > 0
     assert any("DeadSamplingPath" in reason for reason, _count in summaries[0].reasons)
 
@@ -527,15 +536,9 @@ def test_undershoot_rollback_preserves_conditional_provenance(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(
-            "C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]"
-        ).get_graph_creator().get_ensemble_creator()
+        ensemble_creator = g2rins.G2rins.make("C{[>][<]CC[>];;[<]}|uniform(40,40)|[H]").get_graph_creator().get_ensemble_creator()
 
-    source = next(
-        node
-        for node, data in ensemble_creator.generative_graph.nodes(data=True)
-        if data["stochastic_id_tree"][0] == 0 and data["gen_weight"] > 0
-    )
+    source = next(node for node, data in ensemble_creator.generative_graph.nodes(data=True) if data["stochastic_id_tree"][0] == 0 and data["gen_weight"] > 0)
     original_terminate = _PartialAtomGraph.terminate_graph
 
     def inject_post_rollback_dead_end(self, sto_atom_id, rng):
@@ -617,11 +620,7 @@ def test_unavoidable_nested_all_zero_after_branch_fails_fast(monkeypatch):
     """
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])[>], "
-        "[<]OO({[<] [<]SS[>]|0|;; [>]}|poisson(80)|[H])[>]; "
-        "[<][H]; [>][H] []}|poisson(600)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>]|0|;; [>]}|poisson(80)|[H])[>], " "[<]OO({[<] [<]SS[>]|0|;; [>]}|poisson(80)|[H])[>]; " "[<][H]; [>][H] []}|poisson(600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -692,16 +691,10 @@ def test_zero_target_does_not_bypass_unavoidable_zero_terminator(
     """A real zero target still requires the architecture's declared caps."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "C{[>1][<1]CC[>2];;[<2][H]|0| []}|"
-        f"{distribution}|"
-    )
+    smi = "C{[>1][<1]CC[>2];;[<2][H]|0| []}|" f"{distribution}|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
     with warnings.catch_warnings():
@@ -743,10 +736,7 @@ def test_unavoidable_zero_terminator_from_repeat_source_fails_fast():
     smi = "{[] [<]CC[>];;[<][H]|0| []}|uniform(80,80)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._automatic_zero_support_is_unavoidable[True]
     with warnings.catch_warnings():
@@ -774,16 +764,10 @@ def test_unavoidable_empty_nested_mw_support_fails_fast(monkeypatch):
         EmptyTruncatedDistributionSupport,
     )
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(500,600)|[H])CC[>]; "
-        "[<][H]; [>][H] []}|uniform(100,200)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(500,600)|[H])CC[>]; " "[<][H]; [>][H] []}|uniform(100,200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._statically_empty_nested_mw_sto_gen_ids == frozenset({1})
     assert ensemble_creator._automatic_zero_support_is_unavoidable[False]
@@ -815,16 +799,10 @@ def test_overlapping_nested_mw_support_stays_retryable():
     """A budget-dependent empty support remains a chain-local rejection."""
     from g2rins.exception import EmptyTruncatedDistributionSupport
 
-    smi = (
-        "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(150,600)|[H])CC[>]; "
-        "[<][H]; [>][H] []}|uniform(100,200)|"
-    )
+    smi = "{[] [<]CC({[<] [<]NN[>];; [>]}|uniform(150,600)|[H])CC[>]; " "[<][H]; [>][H] []}|uniform(100,200)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert not ensemble_creator._statically_empty_nested_mw_sto_gen_ids
     assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
@@ -839,9 +817,7 @@ def test_overlapping_nested_mw_support_stays_retryable():
             if successes and rejections:
                 break
             try:
-                molecule = ensemble_creator.sample_mol_graph(
-                    rng=np.random.default_rng(seed)
-                )
+                molecule = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
             except EmptyTruncatedDistributionSupport:
                 rejections += 1
             else:
@@ -859,17 +835,10 @@ def test_zero_molar_initiation_raises_domain_error():
     """
     from g2rins.exception import NoValidGenerationSource
 
-    smi = (
-        "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; "
-        "CC(C)[>1]|0|, CC(C)[>2]|0|; "
-        "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
-    )
+    smi = "{[][<1]CC([>1])c1ccccc1, [<2]CC([>2])C(=O)OC; " "CC(C)[>1]|0|, CC(C)[>2]|0|; " "[<1][Br], [<2][Br][]}|schulz_zimm(700, 600)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert ensemble_creator._starting_node_idx == []
     with pytest.raises(NoValidGenerationSource):
@@ -882,23 +851,14 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
     """A dead cap route remains local when another initiator can complete."""
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
-    smi = (
-        "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; "
-        "[<1][H]|0|, [<2][H] []}|uniform(80,80)|"
-    )
+    smi = "{[] [<1]CC[>1], [<2]NN[>2]; C[>1], O[>2]; " "[<1][H]|0|, [<2][H] []}|uniform(80,80)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    sources_by_unit = {
-        unit_labels[source]: source
-        for source in ensemble_creator._starting_node_idx
-    }
+    sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
     assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
 
     with warnings.catch_warnings():
@@ -924,16 +884,10 @@ def test_zero_terminator_source_with_productive_alternative_is_retryable(
 
 def test_zero_target_global_arm_does_not_skip_dead_sibling():
     """Finishing a zero-target arm cannot hide another declared dead arm."""
-    smi = (
-        "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)"
-        "(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
-    )
+    smi = "C(O{[>1][<1]CC[>2];;[<2][H]|0| []}|uniform(80,80)|)" "(N{[>3][<3]NN[>4];;[<4][H] []}|uniform(0,0)|)"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = (
-            g2rins.G2rins.make(smi)
-            .get_graph_creator().get_ensemble_creator()
-        )
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     assert not ensemble_creator._automatic_zero_support_is_unavoidable[False]
 
@@ -954,11 +908,7 @@ def test_zero_probability_productive_source_does_not_mask_fatal_routes(monkeypat
     """An unreachable source cannot make the reachable dead routes retryable."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], N[>1], O[>2]|0|; "
-        "[<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], N[>1], O[>2]|0|; " "[<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
@@ -1049,16 +999,10 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
         frozenset(("child_entry",)),
         frozenset(("dead_leaf",)),
     )
-    probe._node_to_static_component = {
-        node: component_id
-        for component_id, component in enumerate(probe._static_components)
-        for node in component
-    }
+    probe._node_to_static_component = {node: component_id for component_id, component in enumerate(probe._static_components) for node in component}
     probe._statically_empty_nested_mw_sto_gen_ids = frozenset()
 
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 1 in immediate_components
     assert (0, "outer_entry") not in dead_states
     assert (0, "outer_other") in dead_states
@@ -1066,17 +1010,13 @@ def test_dead_construction_proof_respects_consumed_and_dropped_half_bonds():
     # Positive nested support is normalized, but gen_weight=0 drops the
     # half-bond before nested_transition can follow its dead child.
     graph.nodes["outer_entry"]["gen_weight"] = 0.0
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 0 not in immediate_components
     assert (0, "outer_other") not in dead_states
 
     # Empty support fails during construction, before either drop or pop.
     graph.nodes["child_entry"]["unit_molar_amounts"][1] = 0.0
-    dead_states, immediate_components = (
-        probe._find_provably_dead_construction_states()
-    )
+    dead_states, immediate_components = probe._find_provably_dead_construction_states()
     assert 0 in immediate_components
     assert (0, "outer_entry") in dead_states
     assert (0, "outer_other") in dead_states
@@ -1148,17 +1088,13 @@ def test_asymmetric_static_graph_disables_fatal_template_proof():
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        generative_graph = g2rins.G2rins.make(
-            "C{[>][<]CC[>]|0|;;[<]}|poisson(100)|[H]"
-        ).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+        generative_graph = g2rins.G2rins.make("C{[>][<]CC[>]|0|;;[<]}|poisson(100)|[H]").get_graph_creator().get_generative_graph(include_bond_connectors=False)
 
     reverse_removed = False
     for u, v, _key, data in list(generative_graph.edges(keys=True, data=True)):
         if u == v or not data.get("static") or not generative_graph.has_edge(v, u):
             continue
-        for reverse_key, reverse_data in list(
-            generative_graph.get_edge_data(v, u).items()
-        ):
+        for reverse_key, reverse_data in list(generative_graph.get_edge_data(v, u).items()):
             if reverse_data.get("static"):
                 generative_graph.remove_edge(v, u, reverse_key)
                 reverse_removed = True
@@ -1175,20 +1111,14 @@ def test_source_branch_with_productive_alternative_remains_retryable(monkeypatch
     """A dead initiator is chain-local when another initiator is productive."""
     from g2rins.exception import AllZeroSamplingWeights, DeadSamplingPath
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    sources_by_unit = {
-        unit_labels[source]: source
-        for source in ensemble_creator._starting_node_idx
-    }
+    sources_by_unit = {unit_labels[source]: source for source in ensemble_creator._starting_node_idx}
 
     # Force each automatic-source outcome so the provenance assertion does not
     # depend on NumPy's seed-to-choice mapping or template node order.
@@ -1217,21 +1147,14 @@ def test_explicit_dead_source_is_fatal_when_automatic_mode_can_retry():
     """An explicit source fixes the route, so its structural error is fatal."""
     from g2rins.exception import AllZeroSamplingWeights
 
-    smi = (
-        "{[] [<1]CC[>1]|0|, [<2]NN[>2]; "
-        "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
-    )
+    smi = "{[] [<1]CC[>1]|0|, [<2]NN[>2]; " "C[>1], O[>2]; [<1][H], [<2][H] []}|poisson(100)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
 
     graph = ensemble_creator.generative_graph
     unit_labels = g2rins.derive_unit_labels(graph).unit_id
-    dead_source = next(
-        source
-        for source in ensemble_creator._starting_node_idx
-        if unit_labels[source] == "I0"
-    )
+    dead_source = next(source for source in ensemble_creator._starting_node_idx if unit_labels[source] == "I0")
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1248,9 +1171,7 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        ensemble_creator = g2rins.G2rins.make(
-            "{[] [<]CC[>]; [<][H]; [>][H], [>]N []}|uniform(200, 200)|"
-        ).get_graph_creator().get_ensemble_creator()
+        ensemble_creator = g2rins.G2rins.make("{[] [<]CC[>]; [<][H]; [>][H], [>]N []}|uniform(200, 200)|").get_graph_creator().get_ensemble_creator()
 
     original_estimate = _PartialAtomGraph.get_average_termination_mw
     observations = []
@@ -1282,24 +1203,15 @@ def test_termination_mw_estimate_preserves_live_provenance_and_rng(monkeypatch):
         )
 
     assert observations
-    assert all(
-        before_rng == after_rng
-        for (_before_flag, before_rng), (_after_flag, after_rng) in observations
-    ), "termination-MW estimation advanced the live RNG"
-    assert all(
-        before_flag == after_flag
-        for (before_flag, _before_rng), (after_flag, _after_rng) in observations
-    ), "termination-MW estimation changed live path provenance"
+    assert all(before_rng == after_rng for (_before_flag, before_rng), (_after_flag, after_rng) in observations), "termination-MW estimation advanced the live RNG"
+    assert all(before_flag == after_flag for (before_flag, _before_rng), (after_flag, _after_rng) in observations), "termination-MW estimation changed live path provenance"
 
 
 @pytest.mark.parametrize(
     ("smi", "use_repeat_units_as_source"),
     (
         pytest.param(
-            (
-                "{[>|1 1 0 0|] [<|0 0 0 0|]CC[<|0 0 0 0|], "
-                "[>|1 1 0 0|]OO[>|1 1 0 0|];; [<]}|uniform(300, 400)|"
-            ),
+            ("{[>|1 1 0 0|] [<|0 0 0 0|]CC[<|0 0 0 0|], " "[>|1 1 0 0|]OO[>|1 1 0 0|];; [<]}|uniform(300, 400)|"),
             False,
             id="default-source-mode",
         ),
@@ -1403,11 +1315,7 @@ def test_create_ensemble_retries_chain_local_error_with_diagnostic(monkeypatch):
 
     assert molecules == [first_molecule, second_molecule]
     assert calls == 3
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert len(summaries) == 1
     assert summaries[0].discarded_count == 1
     assert summaries[0].reasons == (("EmptyTruncatedDistributionSupport", 1),)
@@ -1522,11 +1430,7 @@ def test_create_ensemble_total_failure_emits_discard_summary(monkeypatch):
                 max_number_of_discarded_chains=3,
             )
 
-    summaries = [
-        warning.message
-        for warning in caught_warnings
-        if isinstance(warning.message, DiscardedSamplingPaths)
-    ]
+    summaries = [warning.message for warning in caught_warnings if isinstance(warning.message, DiscardedSamplingPaths)]
     assert len(summaries) == 1
     assert summaries[0].discarded_count == 3
     assert summaries[0].reasons == (("EmptyTruncatedDistributionSupport", 3),)
@@ -1671,15 +1575,15 @@ def test_legacy_edge_schema_rejected():
     [
         (15, +1, 0, 4),  # P+ fills to PH4+ — the old single-default-valence math gave 6
         (15, +1, 3, 1),  # R3PH+ phosphonium
-        (15, 0, 0, 3),   # PH3, not PH5 (chem_resource stores P as 5)
-        (15, 0, 3, 0),   # R3P phosphine, no phantom H
-        (16, 0, 3, 1),   # S climbs to its tetravalent tier
-        (16, 0, 2, 0),   # thioether
-        (7, +1, 0, 4),   # NH4+
-        (8, -1, 1, 0),   # alkoxide
-        (5, -1, 1, 3),   # borohydride-like B-
-        (6, +1, 1, 2),   # carbocation
-        (26, 0, 0, 0),   # metals get no implicit H
+        (15, 0, 0, 3),  # PH3, not PH5 (chem_resource stores P as 5)
+        (15, 0, 3, 0),  # R3P phosphine, no phantom H
+        (16, 0, 3, 1),  # S climbs to its tetravalent tier
+        (16, 0, 2, 0),  # thioether
+        (7, +1, 0, 4),  # NH4+
+        (8, -1, 1, 0),  # alkoxide
+        (5, -1, 1, 3),  # borohydride-like B-
+        (6, +1, 1, 2),  # carbocation
+        (26, 0, 0, 0),  # metals get no implicit H
     ],
 )
 def test_hydrogen_inference_matches_chemistry(atomic_num, charge, bonds, expected_h):
@@ -1696,9 +1600,9 @@ def test_hydrogen_inference_matches_chemistry(atomic_num, charge, bonds, expecte
 @pytest.mark.parametrize(
     ("atomic_num", "expected_h"),
     [
-        (6, 1),   # benzene carbon keeps its ring hydrogen
-        (7, 0),   # pyridine nitrogen
-        (8, 0),   # furan oxygen
+        (6, 1),  # benzene carbon keeps its ring hydrogen
+        (7, 0),  # pyridine nitrogen
+        (8, 0),  # furan oxygen
         (16, 0),  # thiophene sulfur — NOT the tetravalent tier of non-aromatic S(3)
         (34, 0),  # selenophene selenium
     ],
@@ -1782,11 +1686,7 @@ def test_transition_bond_selection_is_level_aware():
     assert bond is None and non_used == [] and bucket == before
 
     # A level that IS served must always be found.
-    served_levels = {
-        attr.get(_EDGE_STOCHASTIC_ID_NAME)
-        for half_bond in bucket
-        for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])
-    }
+    served_levels = {attr.get(_EDGE_STOCHASTIC_ID_NAME) for half_bond in bucket for attr in half_bond._mode_attr_map.get(_TRANSITION_NAME, [])}
     assert served_levels, "test string must expose at least one transition level"
     level = next(iter(served_levels))
     bond, _non_used = partial._pop_random_bond(bucket, sto_atom_id, level, rng)
@@ -1846,11 +1746,7 @@ def test_hyperbranched_molecule_branches():
         mol_graph = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().sample_mol_graph()
     mol = g2rins.mol_graph_to_rdkit_mol(mol_graph)
     Chem.SanitizeMol(mol)
-    branch_points = sum(
-        1
-        for atom in mol.GetAtoms()
-        if atom.GetSymbol() == "N" and sum(1 for nb in atom.GetNeighbors() if nb.GetSymbol() == "C") >= 3
-    )
+    branch_points = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == "N" and sum(1 for nb in atom.GetNeighbors() if nb.GetSymbol() == "C") >= 3)
     assert branch_points > 3, f"expected a branched network, found {branch_points} branch points"
 
 
@@ -2065,3 +1961,234 @@ def test_generative_graph_and_ensemble_share_node_ids():
     direct_molecule = direct.sample_mol_graph(rng=np.random.default_rng(0))
     direct_origins = {str(data["origin_idx"]) for _node, data in direct_molecule.nodes(data=True) if "origin_idx" in data}
     assert direct_origins <= {str(node) for node in generative_graph.nodes}
+
+
+# ---------------------------------------------------------------------------
+# Count laws: the masses the ensemble creator binds to poisson / flory_schulz.
+# ---------------------------------------------------------------------------
+
+# (id, G2RINS, {sto_gen_id: (repeat-unit mass, end-group mass)}, unit-mass tol, end-mass tol)
+COUNT_LAW_BINDING_CASES = [
+    pytest.param(
+        # Linear chain, CH3O initiator and H cap: unit 44.05, ends CH3O + H.
+        "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(2000.0)|",
+        {0: (44.053, 32.042)},
+        0.05,
+        0.05,
+        id="linear",
+    ),
+    pytest.param(
+        # Alternative initiators: a chain starts at one of them, with the
+        # sampler's start weights (here the molar amounts), so the end mass is
+        # their mean mass (0.8 CH3O + 0.2 C2H5O) plus the caps of one initiator.
+        "{[] [<]CCO[>]; CO[>]|0.8|, CCO[>]|0.2|; [<]Br []}|poisson(2000.0)|",
+        {0: (44.053, 113.74)},
+        0.05,
+        0.1,
+        id="alternative-initiators",
+    ),
+    pytest.param(
+        # The sampler draws its start among the initiating ports, so a
+        # three-port initiator next to a one-port one starts 3/4 of the chains:
+        # end = 1/4 (CH3O + Br) + 3/4 (C3H5O3 + 3 Br).
+        "{[] [<]CCO[>]; CO[>], C(O[>])(CO[>])(CO[>]); [<]Br []}|poisson(2000.0)|",
+        {0: (44.053, 274.32)},
+        0.05,
+        0.1,
+        id="alternative-initiators-ports",
+    ),
+    pytest.param(
+        # Weighted connectors and an ionic unit: the expected composition
+        # (0.9/0.1) weights the unit mass; the three-port initiator exposes
+        # three ports that end in H caps.
+        "{[] [<]CC[N+][>]|0.9|.[Cl-], [<]C(=O)CCCCCC(O[>])CC|0.1|; C(O[>])(CO[>])(CO[>]); [<][H] []}|poisson(2000)|",
+        {0: (87.20, 92.09)},
+        0.3,
+        0.1,
+        id="ionic-three-arm",
+    ),
+    pytest.param(
+        # AB2 branching: every placed unit leaves one more open port, so each
+        # unit brings an H cap of its own (42.06 + 1.01); exactly one entry-side
+        # port stays open and gets the NH2 cap (H initiator 1.01 + NH2 16.02).
+        "{[] [<]CCN([>])[>]; [<][H]; [>]N, [<][H] []}|poisson(1900)|",
+        {0: (43.07, 17.03)},
+        0.05,
+        0.1,
+        id="hyperbranched",
+    ),
+    pytest.param(
+        # Nested initiator with two exposed ports: the outer Mn counts the
+        # inner block (its own Mn) plus two H caps; the inner block counts its
+        # O initiator and no caps (both ends exit into the outer object).
+        "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|poisson(440)|[>]; [<][H] []}|poisson(2200)|",
+        {1: (58.08, 16.00), 0: (44.053, 442.02)},
+        0.05,
+        0.1,
+        id="nested-initiator",
+    ),
+    pytest.param(
+        # Nested initiator exposing one port per inner repeat unit: every
+        # exposed port ends in a Br cap whether or not a chain grew from it,
+        # so the outer end mass is the inner mean 4000 plus ~19.2 Br.
+        "{[] [<1]CC(C(=O)O)[>1]; {[] [<0]C(C)(C(=O)OCCOC(=O)C(C)(C)[>1])C[>0]; COC(=O)C(C)[>0]; [<0]Br [<1]}|gauss(4000.0, 500.0)|[>1]; [<1]Br []}|poisson(8000.0)|",
+        {0: (72.063, 5537.3)},
+        0.05,
+        2.0,
+        id="nested-initiator-exposed-ports",
+    ),
+    pytest.param(
+        # A nested object without exits hanging off a repeat unit rides with
+        # that unit: 71.06 + its mean 400.
+        "{[] [<]CC([>])C(=O)O{[>] [<]CCO[>]; ; [<]C []}|gauss(400,100)|; COC(=O)C(C)[>]; [<]Br []}|poisson(9000)|",
+        {0: (471.06, 167.00)},
+        0.1,
+        0.1,
+        id="nested-side-arm",
+    ),
+    pytest.param(
+        # Nested objects as alternating repeat units count one unit each at
+        # their mean mass; the chain starts with the heavier block, and the
+        # affine fit puts that alternation phase into the end mass.
+        "{[] [<]{[>] [<]C(=O)CCCCCO[>];; [<]}|gauss(2200.0, 1000.0)|[>1], [<1]{[>] [<]C(=O)C(C)O[>];; [<]}|gauss(1300.0, 600.0)|[>]; c1ccccc1CO[>]; [<,<1][H] []}|poisson(20000.0)|",
+        {0: (1750.0, 491.2)},
+        0.1,
+        5.0,
+        id="nested-repeat-units",
+    ),
+    pytest.param(
+        # Two arms growing different units: the sampler draws the growing port
+        # with the bond-connector weights, so nine of ten placed units are the
+        # lighter one (0.9 x 28.05 + 0.1 x 84.16; unweighted it would be 56.11).
+        "{[] [<1]CC[>1|9|], [<2]CCCCCC[>2|1|]; O([>1|9|])[>2|1|]; [<1][H], [<2][H] []}|poisson(2000.0)|",
+        {0: (33.665, 18.01)},
+        0.05,
+        0.05,
+        id="weighted-arms",
+    ),
+    pytest.param(
+        # Weighted ports on branching units: each placed unit opens a weight-9
+        # and a weight-1 port, the slower ports pile up at the open front (3/4
+        # of it) and 3/4 of the units grow from the weight-9 ports, so a unit
+        # adds 0.75 x 42.06 + 0.25 x 98.17 and the cap of the port it leaves
+        # open, 0.25 x 1.01 (H) + 0.75 x 79.90 (Br).
+        "{[] [<1]CCN([>1|9|])[>2|1|], [<2]CCCCCCN([>1|9|])[>2|1|]; C[>1|9|]; [<1][H], [<2]Br []}|poisson(3000)|",
+        {0: (116.268, 32.69)},
+        0.05,
+        0.1,
+        id="weighted-branching",
+    ),
+    pytest.param(
+        # A port with weight 0 never opens: it neither grows nor gets an end
+        # group, so that arm stops after its first unit and only the other arm
+        # grows (unit 84.16); the end mass swaps one heavier unit for the
+        # lighter one: O 16.00 + Br 79.90 + 28.05 - 84.16.
+        "{[] [<1]CC[>1|0|], [<2]CCCCCC[>2]; O([>1])[>2]; [<1]Br, [<2]Br []}|poisson(2000.0)|",
+        {0: (84.162, 39.80)},
+        0.05,
+        0.1,
+        id="unopened-port",
+    ),
+]
+
+
+@pytest.mark.parametrize(("smi", "expected", "unit_tol", "end_tol"), COUNT_LAW_BINDING_CASES)
+def test_count_law_bindings(smi, expected, unit_tol, end_tol):
+    """The ensemble creator binds every count law to its object's mean
+    repeat-unit mass and end-group mass, both read off the generative graph."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    bindings = ensemble_creator._count_law_bindings
+    assert set(bindings) == set(expected)
+    for sto_gen_id, (repeat_unit_mass, end_group_mass) in expected.items():
+        bound_unit, bound_end = bindings[sto_gen_id]
+        assert bound_unit == pytest.approx(repeat_unit_mass, abs=unit_tol), f"object {sto_gen_id}: unit mass {bound_unit:.2f}"
+        assert bound_end == pytest.approx(end_group_mass, abs=end_tol), f"object {sto_gen_id}: end mass {bound_end:.2f}"
+
+
+def test_poisson_below_end_groups_warns_and_builds_the_shortest_chains():
+    """A poisson(Mn) below the end-group mass of its stochastic object is
+    read with zero repeat units: it warns, draws the end-group mass and the
+    sampler builds the shortest chain it can (one repeat unit)."""
+    smi = "{[] [<]CCO[>]; CO[>]; [<]Br []}|poisson(100.0)|"
+    _reset_rngs(0)
+    with pytest.warns(CountLawBelowEndGroups):
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    law = ensemble_creator.get_distributions()[0]
+    assert law.mean_count() == 0.0
+    assert law.mean_mw() == pytest.approx(110.938, abs=0.01)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        molecules = ensemble_creator.create_ensemble(n_samples=5, output_format="mol")
+    assert [Descriptors.MolWt(m) for m in molecules] == pytest.approx([154.991] * 5, abs=0.01)
+
+
+def test_get_distributions_are_the_sampled_laws():
+    """The ensemble creator hands out the laws it samples from, keyed like the
+    ensemble output, with count laws bound so they evaluate and draw as masses."""
+    smi = "{[] [<]CCO[>]; {[] [<]CC(C)O[>]; O([>])[>]; [<]}|gauss(440.0, 50.0)|[>]; [<][H] []}|poisson(2200.0)|"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        distributions = ensemble_creator.get_distributions()
+        data = ensemble_creator.create_ensemble(n_samples=2, output_format="smiles", ensemble_info=True)
+    assert set(distributions) == set(data.distributions) == {0, 1}
+    for stochastic_id, text in data.distributions.items():
+        assert distributions[stochastic_id].generate_string(True) == text
+    poisson = distributions[0]
+    assert isinstance(poisson, g2rins.CountLaw)
+    assert poisson.mean_mw() == pytest.approx(2200.0)
+    assert poisson.prob_mw(2200.0) > 0
+    assert distributions[1].mean_mw() == pytest.approx(440.0)
+
+
+def test_poisson_ensemble_dispersity():
+    """A poisson(Mn) ensemble must show the Poisson count dispersity
+    1 + M_unit (Mn - M_end)/Mn^2 (the count used to be read as g/mol, which made
+    the ensemble essentially monodisperse)."""
+    smi = "{[] [<]CCO[>]; CO[>]; [<][H] []}|poisson(2000.0)|"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        molecules = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().create_ensemble(n_samples=150, output_format="mol")
+    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    mn = weights.mean()
+    dispersity = (weights * weights).sum() / weights.sum() / mn
+    assert abs(mn - 2000.0) / 2000.0 < 0.05, f"Mn {mn:.0f}"
+    exact_d = 1.0 + 44.053 * (2000.0 - 32.042) / 2000.0**2  # end groups CH3O + H
+    assert abs(dispersity - exact_d) < 0.008, f"D {dispersity:.4f} vs {exact_d:.4f}"
+
+
+def test_weighted_ports_ensemble_carries_the_law_mean_count():
+    """Unequal bond-connector weights on two arms decide which arm grows, so
+    they weight the mean repeat-unit mass: the chains must carry the law's mean
+    number of repeat units (read with unweighted frequencies the law expected
+    35 repeat units where the sampler placed 59)."""
+    smi = "{[] [<1]CC[>1|9|], [<2]CCCCCC[>2|1|]; O([>1|9|])[>2|1|]; [<1][H], [<2][H] []}|poisson(2000.0)|"
+    n_samples = 150
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        data = ensemble_creator.create_ensemble(n_samples=n_samples, output_format="smiles", ensemble_info=True)
+    repeat_units = sum(info["frequency"] for unit_id, info in data.units.items() if unit_id.startswith("R")) / n_samples
+    mean_count = ensemble_creator.get_distributions()[0].mean_count()
+    assert repeat_units == pytest.approx(mean_count, rel=0.05), f"{repeat_units:.1f} repeat units per chain vs the law's {mean_count:.1f}"
+
+
+def test_flory_schulz_ensemble_number_fraction():
+    """flory_schulz(a) grows geometric repeat-unit counts: Mn = M_end + M_unit/a
+    and a dispersity near 2 - a."""
+    smi = "{[] [<]CCO[>]; CO[>]; [<][H] []}|flory_schulz(0.05)|"
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        molecules = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator().create_ensemble(n_samples=300, output_format="mol")
+    weights = np.array([Descriptors.MolWt(m) for m in molecules])
+    mn = weights.mean()
+    dispersity = (weights * weights).sum() / weights.sum() / mn
+    target_mn = 32.042 + 44.053 / 0.05
+    assert abs(mn - target_mn) / target_mn < 0.15, f"Mn {mn:.0f} vs {target_mn:.0f}"
+    assert 1.6 < dispersity < 2.1, f"D {dispersity:.3f}"
