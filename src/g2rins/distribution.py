@@ -591,6 +591,13 @@ class CountLaw(StochasticDistribution):
             raise RuntimeError(f"{type(self).__name__} draws repeat-unit counts: bind the repeat-unit mass before asking for molecular weights.")
         return self._repeat_unit_mass, self._end_group_mass
 
+    def _count_at(self, mw: float) -> float:
+        """Repeat-unit count of a molecular weight; within rounding error of a lattice point it is that point's count."""
+        repeat_unit_mass, end_group_mass = self._require_binding()
+        count = (float(mw) - end_group_mass) / repeat_unit_mass
+        nearest = float(np.round(count))
+        return nearest if math.isclose(count, nearest, rel_tol=1e-9, abs_tol=1e-9) else count
+
     def mean_count(self) -> float:
         """
         Expected number of repeat units.
@@ -609,7 +616,8 @@ class CountLaw(StochasticDistribution):
     def draw_mw(self, rng: Optional[np.random.Generator] = None, lower=None, upper=None, **kwargs: Any) -> Any:
         """
         Draws a repeat-unit count and returns the molecular weight it corresponds to.
-        Bounds are molecular weights; they are mapped onto the count lattice.
+        Bounds are molecular weights; they are mapped onto the count lattice, where a bound
+        within rounding error of a lattice point includes that point.
         """
         repeat_unit_mass, end_group_mass = self._require_binding()
         if rng is None:
@@ -617,9 +625,13 @@ class CountLaw(StochasticDistribution):
         if lower is None and upper is None:
             count = float(self._distribution.rvs(random_state=rng, **kwargs))
         else:
-            count_lower = None if lower is None else (float(lower) - end_group_mass) / repeat_unit_mass
-            count_upper = None if upper is None else (float(upper) - end_group_mass) / repeat_unit_mass
-            count = self._draw_bounded_mw(self._distribution, rng, count_lower, count_upper, kwargs)
+            count_lower = None if lower is None else self._count_at(lower)
+            count_upper = None if upper is None else self._count_at(upper)
+            try:
+                count = self._draw_bounded_mw(self._distribution, rng, count_lower, count_upper, kwargs)
+            except EmptyTruncatedDistributionSupport:
+                # Report the bounds as they were asked for, in g/mol, not their repeat-unit counts.
+                raise EmptyTruncatedDistributionSupport(type(self).__name__, -math.inf if lower is None else float(lower), math.inf if upper is None else float(upper)) from None
         return end_group_mass + count * repeat_unit_mass
 
     def prob_mw(self, mw: Union[float, "RememberAdd"], **kwargs: Any) -> float:
@@ -630,8 +642,8 @@ class CountLaw(StochasticDistribution):
         """
         repeat_unit_mass, end_group_mass = self._require_binding()
         if isinstance(mw, RememberAdd):
-            previous = math.floor((mw.previous - end_group_mass) / repeat_unit_mass)
-            current = math.floor((mw.value - end_group_mass) / repeat_unit_mass)
+            previous = math.floor(self._count_at(mw.previous))
+            current = math.floor(self._count_at(mw.value))
             return float(self._distribution.cdf(current, **kwargs) - self._distribution.cdf(previous, **kwargs))
         count = int(round((float(mw) - end_group_mass) / repeat_unit_mass))
         return float(self._distribution.pmf(count, **kwargs)) / repeat_unit_mass

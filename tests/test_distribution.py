@@ -139,6 +139,39 @@ def test_count_law_needs_bound_masses():
     assert poisson.draw_mw(rng, lower=1.0, upper=3000.0) == pytest.approx(2500.0)
 
 
+def test_count_law_bounds_keep_their_lattice_points():
+    """A bound on a lattice mass M_end + N * M_unit keeps its own count, although the mass
+    converts back to the count off by a rounding error (25 repeat units read as 24.999999999999996)."""
+    repeat_unit_mass, end_group_mass = 44.053, 32.042
+    poisson = g2rins.StochasticDistribution.make("poisson(2000.0)")
+    poisson.bind_repeat_unit_mass(repeat_unit_mass, end_group_mass)
+    rng = np.random.default_rng(0)
+
+    def lattice_mass(count):
+        return end_group_mass + count * repeat_unit_mass
+
+    for count in range(201):
+        assert poisson.draw_mw(rng, lower=lattice_mass(count), upper=lattice_mass(count)) == lattice_mass(count)
+    assert poisson.draw_mw(rng, lower=1133.367, upper=1133.367) == pytest.approx(1133.367)
+
+    # Inclusive bounds whose count conversion lands just below (50 units) and just above (46 units) the count.
+    assert max(poisson.draw_mw(rng, upper=lattice_mass(50)) for _ in range(400)) == lattice_mass(50)
+    assert min(poisson.draw_mw(rng, lower=lattice_mass(46)) for _ in range(400)) == lattice_mass(46)
+
+    # Only rounding error is absorbed: bounds 0.001 g/mol inside two adjacent lattice points hold neither, and the error reports g/mol.
+    lower, upper = lattice_mass(24) + 1e-3, lattice_mass(25) - 1e-3
+    with pytest.raises(g2rins.exception.EmptyTruncatedDistributionSupport) as caught:
+        poisson.draw_mw(rng, lower=lower, upper=upper)
+    assert (caught.value.lower, caught.value.upper) == (lower, upper)
+
+    # The range form of prob_mw covers the counts in (previous, value].
+    counts = stats.poisson(mu=poisson.mean_count())
+    for count in range(1, 81):
+        mass_range = g2rins.util.RememberAdd(lattice_mass(count))
+        mass_range += 2 * repeat_unit_mass
+        assert poisson.prob_mw(mass_range) == pytest.approx(counts.pmf(count + 1) + counts.pmf(count + 2))
+
+
 @pytest.mark.parametrize(("mu", "sigma"), [(100.0, 10.0), (200.0, 100.0), (500.0, 1.0), (600.0, 0.0)])
 def test_gauss(mu, sigma):
     def mean(mu, sigma):
