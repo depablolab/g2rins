@@ -2056,6 +2056,39 @@ COUNT_LAW_BINDING_CASES = [
         5.0,
         id="nested-repeat-units",
     ),
+    pytest.param(
+        # Two arms growing different units: the sampler draws the growing port
+        # with the bond-connector weights, so nine of ten placed units are the
+        # lighter one (0.9 x 28.05 + 0.1 x 84.16; unweighted it would be 56.11).
+        "{[] [<1]CC[>1|9|], [<2]CCCCCC[>2|1|]; O([>1|9|])[>2|1|]; [<1][H], [<2][H] []}|poisson(2000.0)|",
+        {0: (33.665, 18.01)},
+        0.05,
+        0.05,
+        id="weighted-arms",
+    ),
+    pytest.param(
+        # Weighted ports on branching units: each placed unit opens a weight-9
+        # and a weight-1 port, the slower ports pile up at the open front (3/4
+        # of it) and 3/4 of the units grow from the weight-9 ports, so a unit
+        # adds 0.75 x 42.06 + 0.25 x 98.17 and the cap of the port it leaves
+        # open, 0.25 x 1.01 (H) + 0.75 x 79.90 (Br).
+        "{[] [<1]CCN([>1|9|])[>2|1|], [<2]CCCCCCN([>1|9|])[>2|1|]; C[>1|9|]; [<1][H], [<2]Br []}|poisson(3000)|",
+        {0: (116.268, 32.69)},
+        0.05,
+        0.1,
+        id="weighted-branching",
+    ),
+    pytest.param(
+        # A port with weight 0 never opens: it neither grows nor gets an end
+        # group, so that arm stops after its first unit and only the other arm
+        # grows (unit 84.16); the end mass swaps one heavier unit for the
+        # lighter one: O 16.00 + Br 79.90 + 28.05 - 84.16.
+        "{[] [<1]CC[>1|0|], [<2]CCCCCC[>2]; O([>1])[>2]; [<1]Br, [<2]Br []}|poisson(2000.0)|",
+        {0: (84.162, 39.80)},
+        0.05,
+        0.1,
+        id="unopened-port",
+    ),
 ]
 
 
@@ -2126,6 +2159,23 @@ def test_poisson_ensemble_dispersity():
     assert abs(mn - 2000.0) / 2000.0 < 0.05, f"Mn {mn:.0f}"
     exact_d = 1.0 + 44.053 * (2000.0 - 32.042) / 2000.0**2  # end groups CH3O + H
     assert abs(dispersity - exact_d) < 0.008, f"D {dispersity:.4f} vs {exact_d:.4f}"
+
+
+def test_weighted_ports_ensemble_carries_the_law_mean_count():
+    """Unequal bond-connector weights on two arms decide which arm grows, so
+    they weight the mean repeat-unit mass: the chains must carry the law's mean
+    number of repeat units (read with unweighted frequencies the law expected
+    35 repeat units where the sampler placed 59)."""
+    smi = "{[] [<1]CC[>1|9|], [<2]CCCCCC[>2|1|]; O([>1|9|])[>2|1|]; [<1][H], [<2][H] []}|poisson(2000.0)|"
+    n_samples = 150
+    _reset_rngs(0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+        data = ensemble_creator.create_ensemble(n_samples=n_samples, output_format="smiles", ensemble_info=True)
+    repeat_units = sum(info["frequency"] for unit_id, info in data.units.items() if unit_id.startswith("R")) / n_samples
+    mean_count = ensemble_creator.get_distributions()[0].mean_count()
+    assert repeat_units == pytest.approx(mean_count, rel=0.05), f"{repeat_units:.1f} repeat units per chain vs the law's {mean_count:.1f}"
 
 
 def test_flory_schulz_ensemble_number_fraction():

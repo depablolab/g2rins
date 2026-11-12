@@ -217,7 +217,11 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
 
     Each object is read as a growth chain over (unit, entry port) states: from
     a placed unit every other port picks its next unit with the sampler's rule
-    (edge weight times the target's molar amount). The long-run frequencies of
+    (edge weight times the target's molar amount). Which open port grows next
+    is drawn with the ports' own weights: per generation a port fires with its
+    weight relative to the heaviest growing port of the object and waits
+    otherwise (a single growing port is a forced draw), and a port without a
+    positive weight is never opened. The long-run frequencies of
     that chain give the mass a further repeat unit adds, caps included (the
     slope of the expected mass in the repeat-unit count); growing the expected
     chain generation by generation up to the law's mean count gives the mass
@@ -356,11 +360,16 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 initial_open[port] /= outside_total
         initiator_mass = sum(start_share.get((sto_id, key), 0.0) * mass for key, mass in initiator_masses.items())
 
-        n_states = len(states)
-        matrix = np.zeros((n_states, n_states))
-        state_mass = np.zeros(n_states)
-        created_emitting = [{} for _ in range(n_states)]  # ports a placed unit opens that grow further
-        created_quiet = [{} for _ in range(n_states)]  # ports a placed unit opens that only cap or exit
+        def opens(port):
+            """Whether the sampler opens the port: without a positive weight it neither grows nor gets an end group."""
+            return float(nodes[port]["gen_weight"]) > 0
+
+        initial_open = {port: count for port, count in initial_open.items() if opens(port)}
+
+        n_units = len(states)
+        state_mass = np.zeros(n_units)
+        created_emitting = [{} for _ in range(n_units)]  # ports a placed unit opens that grow further
+        created_quiet = [{} for _ in range(n_units)]  # ports a placed unit opens that only cap or exit
         for (kind, key), index in states.items():
             if kind == "unit":
                 unit = node_to_component[key]
@@ -370,6 +379,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 mass = mean_mass[key]
                 port_multiplicities = list(exposed.get(key, {}).items())
             for port, multiplicity in port_multiplicities:
+                if not opens(port):
+                    continue
                 targets = growth_targets(port)
                 total = sum(weight for _v, weight in targets)
                 if not targets:
@@ -380,9 +391,28 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                     mass += sum(weight / total * mean_mass[level_tree(v)[0]] for v, weight in targets)
                     continue
                 created_emitting[index][port] = created_emitting[index].get(port, 0.0) + multiplicity
-                for v, weight in targets:
-                    matrix[index, states[state_of(v)]] += multiplicity * weight / total
             state_mass[index] = mass
+
+        # A port fires with its draw weight relative to the heaviest growing port, else it waits; a single growing port is a forced draw.
+        firing = {}
+        if sum(initial_open.values()) > 1.0 + 1e-9 or any(sum(created.values()) > 1.0 + 1e-9 for created in created_emitting):
+            draw_weight = {port: float(nodes[port]["gen_weight"]) for created in (initial_open, *created_emitting) for port in created}
+            heaviest = max(draw_weight.values())
+            firing = {port: weight / heaviest for port, weight in draw_weight.items() if weight < heaviest}
+        waiting_state = {port: n_units + offset for offset, port in enumerate(firing)}  # a zero-mass state per slower port
+        n_states = n_units + len(waiting_state)
+        state_mass = np.pad(state_mass, (0, len(waiting_state)))
+        created_emitting += [{port: 1.0} for port in waiting_state]
+        created_quiet += [{} for _ in waiting_state]
+        matrix = np.zeros((n_states, n_states))
+        for index, created in enumerate(created_emitting):
+            for port, multiplicity in created.items():
+                targets = growth_targets(port)
+                total = sum(weight for _v, weight in targets)
+                for v, weight in targets:
+                    matrix[index, states[state_of(v)]] += multiplicity * firing.get(port, 1.0) * weight / total
+                if port in waiting_state:
+                    matrix[index, waiting_state[port]] += multiplicity * (1.0 - firing[port])
 
         def cap_mass(port):
             """Expected mass of the end group this level attaches to an open port."""
@@ -408,7 +438,9 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
             for state, index in states.items():
                 for port, weight in sources_of[state].items():
                     if not is_chain_source(port):
-                        v0[index] += initial_open.get(port, 0.0) * weight / port_total[port]
+                        v0[index] += initial_open.get(port, 0.0) * firing.get(port, 1.0) * weight / port_total[port]
+            for port, index in waiting_state.items():
+                v0[index] += initial_open.get(port, 0.0) * (1.0 - firing[port])
             if v0.sum() <= 0:
                 for (kind, key), index in states.items():
                     v0[index] = molar(key, sto_id) if kind == "unit" else 1.0
@@ -417,6 +449,14 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
             frequency = np.zeros(n_states)
             tail = np.zeros(n_states)
             vector = v0 / v0.sum()
+            if waiting_state:
+                # Waiting slows the chain down by the smallest firing rate: run it that many times longer first, by squaring.
+                jump = matrix
+                for _ in range(min(int(np.ceil(np.log2(200.0 / min(firing.values())))), 60)):
+                    jump = jump @ jump
+                    jump /= jump.max()
+                ahead = vector @ jump
+                vector = ahead / ahead.sum() if ahead.sum() > 0 else vector
             for step in range(400):
                 frequency += vector
                 if step >= 200:
@@ -428,7 +468,7 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 vector /= total
             # The second half sheds one-time units; a chain that dies out early keeps the full run.
             frequency = tail if tail.sum() > 0 else frequency
-            frequency /= frequency.sum()
+            frequency /= frequency[:n_units].sum()  # per placed unit: waits are not units
             emitting_rate = {}
             quiet_rate = {}
             for index in range(n_states):
@@ -437,11 +477,25 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 for port, multiplicity in created_quiet[index].items():
                     quiet_rate[port] = quiet_rate.get(port, 0.0) + frequency[index] * multiplicity
             emitting_total = sum(emitting_rate.values())
-            frontier_growth = max(emitting_total - 1.0, 0.0)
+            frontier_growth = max(emitting_total - 1.0 - frequency[n_units:].sum(), 0.0)  # a placed unit and a wait each use up one open port
             slope = float(frequency @ state_mass)
             slope += sum(rate * cap_mass(port) for port, rate in quiet_rate.items() if not leaves(port))
             if emitting_total > 0:
                 slope += frontier_growth * sum(rate / emitting_total * cap_mass(port) for port, rate in emitting_rate.items() if not leaves(port))
+
+        doublings = [(matrix, np.eye(n_states))]  # (matrix^(2^k), sum of the lower powers)
+
+        def skip_generations(current, visits, target_units):
+            """Jump whole generations by doubling while the generation after the jump still ends below the target (waits make generations place few units)."""
+            while len(doublings) < 64 and (v0 @ doublings[-1][1] + v0 @ doublings[-1][0])[:n_units].sum() < target_units:
+                power, partial = doublings[-1]
+                doublings.append((power @ power, partial + power @ partial))
+            for power, partial in reversed(doublings):
+                jumped_visits = visits + current @ partial
+                jumped = current @ power
+                if (jumped_visits + jumped)[:n_units].sum() < target_units:
+                    current, visits = jumped, jumped_visits
+            return current, visits
 
         def expected_mass(target_units):
             """Expected mass of an instance after placing target_units units, generation by
@@ -452,8 +506,12 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 current = v0.copy()
                 previous_emissions = dict(initial_open)
                 placed = 0.0
+                if waiting_state:
+                    current, visits = skip_generations(current, visits, target_units)
+                    if visits.any():  # a jump is followed by a full generation, so the emissions before it are never read
+                        placed, previous_emissions = visits[:n_units].sum(), {}
                 while True:
-                    generation_total = current.sum()
+                    generation_total = current[:n_units].sum()  # units placed: waits are not units
                     if generation_total <= 1e-12:
                         open_ports = previous_emissions
                         break
