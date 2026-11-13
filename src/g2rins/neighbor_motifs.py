@@ -125,3 +125,89 @@ class CenteredMotifStatistics:
             "accepted_count": self.accepted_count,
             "rows": [json.loads(json.dumps(self.rows[key])) for key in sorted(self.rows)],
         }
+
+NEXT_NEIGHBOR_MOTIF_SCHEMA = "next-neighbor-motif-membership/v3"
+
+
+def _row_key(row):
+    identity = {key: row[key] for key in ("center_unit", "center_position", "motif", "topology")}
+    return json.dumps(identity, sort_keys=True, separators=(",", ":"))
+
+
+def next_neighbor_motif_membership(
+    *,
+    records,
+    weights,
+    retained_chain_count,
+    accepted_count,
+    weight_semantics,
+    units=None,
+    population_statistics=None,
+    unit_descriptors=None,
+):
+    """Export exact centered motifs with finite fragment chemistry.
+
+    ``records`` are the retained compact ``bond-sequence-topology/v1`` records.
+    Occurrence and chain counts come from all accepted samples
+    (``population_statistics`` from :class:`CenteredMotifStatistics`); only
+    when every accepted chain is retained may they be rebuilt from ``records``.
+    ``retained_chain_count`` per row counts retained records containing it.
+    """
+    if records is None:
+        raise RuntimeError("Next-neighbor motifs require retained compact bond-sequence topology")
+    if len(records) != retained_chain_count or len(weights) != len(records):
+        raise RuntimeError("Retained motif topology is not aligned with retained chains")
+    if population_statistics is None:
+        if weight_semantics != "retained-observation":
+            raise RuntimeError(
+                "Representative weights are not exact chain incidence; "
+                "all-accepted centered motif statistics are required"
+            )
+        policies = {record.get("hydrogen_termination") for record in records}
+        population = CenteredMotifStatistics(
+            hydrogen_termination=policies.pop() if len(policies) == 1 else None,
+        )
+        for record, weight in zip(records, weights):
+            population.update(record, weight)
+        population_statistics = population.finalize()
+    if population_statistics.get("schema") != "centered-motif-population/v1":
+        raise ValueError("Unsupported centered motif population schema")
+    if population_statistics["accepted_count"] != accepted_count:
+        raise RuntimeError("Centered motif statistics do not cover the accepted population")
+    if units is None:
+        raise ValueError("Unit pSMILES are required for motif chemistry")
+
+    from .motif_chemistry import motif_chemical_strings
+
+    retained = {}
+    for record in records:
+        for key in {_row_key(row) for row in centered_motif_rows(record)}:
+            retained[key] = retained.get(key, 0) + 1
+    rows, identities = [], set()
+    for row in population_statistics["rows"]:
+        chemistry = motif_chemical_strings(row["topology"], units, unit_descriptors=unit_descriptors)
+        identity = (row["center_unit"], row["center_position"], row["motif"], chemistry["psmiles"])
+        if identity in identities:
+            raise ValueError(f"Distinct topologies share one centered motif identity: {identity}")
+        identities.add(identity)
+        rows.append({
+            "center_unit": row["center_unit"],
+            "center_position": row["center_position"],
+            "motif": row["motif"],
+            **chemistry,
+            "count": row["count"],
+            "chain_count": row["chain_count"],
+            "chain_fraction": row["chain_count"] / accepted_count,
+            "retained_chain_count": retained.get(_row_key(row), 0),
+        })
+    rows.sort(key=lambda row: (row["center_unit"], row["motif"],
+                               -1 if row["center_position"] is None else row["center_position"],
+                               row["psmiles"]))
+    metadata = {"schema": NEXT_NEIGHBOR_MOTIF_SCHEMA}
+    if population_statistics.get("hydrogen_termination") is not None:
+        metadata["hydrogen_termination"] = population_statistics["hydrogen_termination"]
+    return {
+        "next_neighbor_motif_metadata": metadata,
+        "next_neighbor_motifs": rows,
+        "motif_membership": [dict(row) for row in rows],
+    }
