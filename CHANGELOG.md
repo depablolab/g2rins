@@ -15,6 +15,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - Updated official GitHub Actions to current stable majors and tightened workflow permissions.
 - Packaging and installation workflows fetch full Git history and tags so `setuptools-scm` can derive versions reliably.
 - Simplified the `setuptools-scm` configuration in `pyproject.toml` while preserving `g2rins.__version__`.
+- The guide samples its ensembles in parallel worker processes and with a fixed seed, so repeated runs reproduce the same ensembles and statistics; `SEED = None` samples new ones at every run. A new options cell ahead of the helper functions holds `PARALLEL`, `N_WORKERS` and `SEED`.
 
 ### Fixed
 
