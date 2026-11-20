@@ -2089,6 +2089,28 @@ COUNT_LAW_BINDING_CASES = [
         0.1,
         id="unopened-port",
     ),
+    pytest.param(
+        # An initiator port that matches only a terminator grows nothing and
+        # is capped on every chain, so the end mass counts its Br next to the
+        # CH2 initiator and the H cap of the growing end, exactly as when the
+        # Br is written inside the initiator (BrC[>1]).
+        "{[] [<1]CC[>1]; C([>1])[>2]; [<1][H], [<2]Br []}|flory_schulz(0.1)|",
+        {0: (28.054, 94.939)},
+        0.05,
+        0.05,
+        id="initiator-capped-port",
+    ),
+    pytest.param(
+        # Nested initiator whose own initiator has two ports that grow nothing
+        # inside it and leave through its terminal bond connector: the inner
+        # object exposes both, so the outer end mass is the inner mean 440 plus
+        # two Br caps; the inner end is CH plus the H cap of its growing end.
+        "{[] [<]CCO[>]; {[] [<1]CC[>1]; C([>1])([>3])[>3]; [<1][H] [<3]}|poisson(440)|[>]; [<]Br []}|poisson(2200)|",
+        {1: (28.054, 14.027), 0: (44.053, 599.81)},
+        0.05,
+        0.1,
+        id="nested-initiator-leaving-ports",
+    ),
 ]
 
 

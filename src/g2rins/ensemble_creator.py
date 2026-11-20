@@ -229,7 +229,9 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
     and opens its others) gives the open ports at termination, hence the caps
     the object places and the ports a nested object exposes to its parent.
     Alternative initiators open their ports with the sampler's start weights
-    (``start_weights``, per starting node), so a chain starts at one of them.
+    (``start_weights``, per starting node), so a chain starts at one of them;
+    a port of that initiator that grows nothing stays open for the whole
+    chain, so it is capped or exposed like the ports open at termination.
     Objects are processed deepest first: a nested object enters its parent's
     chain as one unit of its expected mass, a nested initiator as end-group
     mass, and a nested object without exits rides with the unit carrying it.
@@ -365,6 +367,12 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
             return float(nodes[port]["gen_weight"]) > 0
 
         initial_open = {port: count for port, count in initial_open.items() if opens(port)}
+        initial_quiet = {}  # ports of the starting initiator unit that only cap or exit: nothing grows from them, so they never close
+        for key in initiator_masses:
+            if key[0] == "unit":
+                for port in ports[key[1]]:
+                    if opens(port) and not growth_targets(port):
+                        initial_quiet[port] = start_share.get((sto_id, key), 0.0)
 
         n_units = len(states)
         state_mass = np.zeros(n_units)
@@ -533,6 +541,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 for index in np.nonzero(visits)[0]:
                     for port, multiplicity in created_quiet[index].items():
                         open_ports[port] = open_ports.get(port, 0.0) + visits[index] * multiplicity
+            for port, count in initial_quiet.items():
+                open_ports[port] = open_ports.get(port, 0.0) + count
             mass = initiator_mass + float(visits @ state_mass)
             mass += sum(count * cap_mass(port) for port, count in open_ports.items() if not leaves(port))
             exits = {port: count for port, count in open_ports.items() if count > 0 and leaves(port)}
