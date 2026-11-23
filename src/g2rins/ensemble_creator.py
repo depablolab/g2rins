@@ -235,6 +235,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
     Objects are processed deepest first: a nested object enters its parent's
     chain as one unit of its expected mass, a nested initiator as end-group
     mass, and a nested object without exits rides with the unit carrying it.
+    A nested object is placed wherever growth enters it, through any unit it
+    holds at any depth, and also when it follows itself.
     """
     nodes = generative_graph.nodes
 
@@ -288,19 +290,33 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
     def bind_object(sto_id):
         """Bind the law of one stochastic object, its nested objects already bound."""
         children = children_of.get(sto_id, set())
-        inside = children | {sto_id}
+        inside = {sto_id}  # this object and the objects nested in it, at any depth
+        pending = [sto_id]
+        while pending:
+            nested = children_of.get(pending.pop(), set())
+            inside |= nested
+            pending.extend(nested)
+
+        def branch(node):
+            """Where a node sits in this object: sto_id for its own units, the nested object (a child of this one) that holds it at any depth, None outside."""
+            tree = level_tree(node)
+            if sto_id not in tree:
+                return None
+            position = tree.index(sto_id)
+            return sto_id if position == 0 else tree[position - 1]
 
         def entry_weight(u, v, data):
             """Weight with which the edge u -> v places a unit of this level or enters a nested object (0 otherwise)."""
             weight = float(data[_PROPAGATION_NAME]) + float(data[_TRANSITION_NAME])
             if weight <= 0:
                 return 0.0
-            level = level_tree(v)[0]
+            level = branch(v)
             edge_level = int(data[_EDGE_STOCHASTIC_ID_NAME])
             source_tree = level_tree(u)
             if level == sto_id and (edge_level == sto_id or sto_id not in source_tree):
                 return weight * molar(v, sto_id)
-            if level in children and level not in source_tree and edge_level in (sto_id, level):
+            # A nested object is entered by an edge of this level (from its own exit too, when it follows itself), by an outside unit, or by its own edge from outside it.
+            if level in children and (edge_level == sto_id or sto_id not in source_tree or (edge_level == level and level not in source_tree)):
                 return weight * molar(v, edge_level)
             return 0.0
 
@@ -310,7 +326,7 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
             return [(v, weight) for v, weight in targets if weight > 0]
 
         def state_of(node):
-            level = level_tree(node)[0]
+            level = branch(node)
             return ("unit", node) if level == sto_id else ("child", level)
 
         # Chain states (unit entered through a port, or nested object entered) and the ports that enter them.
@@ -328,7 +344,7 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
         entered_units = {node_to_component[node] for kind, node in states if kind == "unit"}
 
         def is_chain_source(port):
-            level = level_tree(port)[0]
+            level = branch(port)
             if level == sto_id:
                 return node_to_component[port] in entered_units
             return ("child", level) in states
@@ -345,7 +361,7 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 if is_chain_source(port):
                     continue
                 port_total[port] = port_total.get(port, 0.0) + weight
-                level = level_tree(port)[0]
+                level = branch(port)
                 if level == sto_id:
                     key = ("unit", node_to_component[port])
                     initial_open[port] = start_share.get((sto_id, key), 0.0)
@@ -358,7 +374,7 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                     initial_open[port] = initial_open.get(port, 0.0) + weight
                     outside_total += weight
         for port in initial_open:
-            if level_tree(port)[0] not in inside:
+            if branch(port) is None:
                 initial_open[port] /= outside_total
         initiator_mass = sum(start_share.get((sto_id, key), 0.0) * mass for key, mass in initiator_masses.items())
 
@@ -394,9 +410,9 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
                 if not targets:
                     created_quiet[index][port] = created_quiet[index].get(port, 0.0) + multiplicity
                     continue
-                if kind == "unit" and all(level_tree(v)[0] in children and not exposed.get(level_tree(v)[0]) for v, _w in targets):
+                if kind == "unit" and all(branch(v) in children and not exposed.get(branch(v)) for v, _w in targets):
                     # A port that only grows nested objects without exits carries them as side arms.
-                    mass += sum(weight / total * mean_mass[level_tree(v)[0]] for v, weight in targets)
+                    mass += sum(weight / total * mean_mass[branch(v)] for v, weight in targets)
                     continue
                 created_emitting[index][port] = created_emitting[index].get(port, 0.0) + multiplicity
             state_mass[index] = mass
@@ -435,8 +451,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
             return mass / total if total > 0 else 0.0
 
         def leaves(port):
-            """Whether an open port continues outside this object instead of being capped here."""
-            return any(float(data[_TRANSITION_NAME]) > 0 and level_tree(v)[0] not in inside for v, data in out_edges.get(port, []))
+            """Whether an open port continues outside this object (to a unit outside it, or by a transition of an enclosing object) instead of being capped here."""
+            return any(float(data[_TRANSITION_NAME]) > 0 and (branch(v) is None or int(data[_EDGE_STOCHASTIC_ID_NAME]) not in inside) for v, data in out_edges.get(port, []))
 
         # Slope: mass a further repeat unit adds, from the long-run state frequencies
         # (averaged normalized power iteration) and the ports it leaves to be capped.

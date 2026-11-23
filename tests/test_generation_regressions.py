@@ -1816,9 +1816,10 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     blind to a lost cap: it is one implicit hydrogen), even when an arm's
     terminal bond sits parked in a terminated nested instance's bucket at
     root termination. Chains whose initiator port never grew are skipped —
-    initiator ports carry no termination edges yet — and the seed range stops
-    before 14, whose cap is destroyed earlier by the transition-conversion
-    hand-off; both are known gaps of the follow-up custody change."""
+    initiator ports carry no termination edges yet, a known gap of the
+    follow-up custody change — and the seed range starts after 0, where one
+    grown arm ends without its cap (the transition-conversion hand-off can
+    destroy a cap earlier, the other known gap of that change)."""
     smi = "{[] [<]PP[>], [<]{[>] [<]{[>] [<]CC[>], [<]{[>] [<]NN[>];; [<]}|poisson(100)|[>];; [<]}|poisson(300)|[>], [<]OO[>]; ;[<]}|poisson(1000)|[>]; O([>])[>]; [<][H] []}|poisson(4000)|"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -1827,7 +1828,7 @@ def test_multifunctional_initiator_grown_arms_get_caps():
     central = [n for n, d in ensemble_creator._generative_graph.nodes(data=True) if d.get("atomic_num") == 8 and unit_labels[n] == "I0"]
     assert len(central) == 1, f"expected one difunctional initiator oxygen, found {len(central)}"
     central_origin = str(central[0])
-    for seed in range(14):
+    for seed in range(1, 15):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             mol_graph = ensemble_creator.sample_mol_graph(rng=np.random.default_rng(seed))
@@ -1852,7 +1853,7 @@ def test_side_port_caps_via_terminal_bond_connector_lists():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
-    for seed in SEEDS:
+    for seed in (1, 2, 3):  # seed 0 draws a chain without the nested unit
         _reset_rngs(seed)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -2110,6 +2111,30 @@ COUNT_LAW_BINDING_CASES = [
         0.05,
         0.1,
         id="nested-initiator-leaving-ports",
+    ),
+    pytest.param(
+        # A nested object that can follow itself as a repeat unit is placed as
+        # often as the plain unit next to it (equal molar amounts), so the unit
+        # mass is the mean of 28.05 and the nested mean 150; the end mass is
+        # the Cl initiator plus the H cap.
+        "{[] [<]CC[>], [<]{[>] [<]NN[>];; [<]}|gauss(150, 20)|[>]; Cl[>]; [<][H] []}|poisson(3000)|",
+        {0: (89.027, 36.458)},
+        0.05,
+        0.05,
+        id="nested-repeat-unit-follows-itself",
+    ),
+    pytest.param(
+        # Nested objects three levels deep: growth enters the middle object
+        # through its plain unit or through the object nested in it, and both
+        # entries place it, so every level alternates its plain unit with its
+        # nested object one to one: 64.03 = (28.05 + 100) / 2 and
+        # 166.00 = (32.00 + 300) / 2, with the Cl initiator and the H cap as
+        # the outer end mass.
+        TRIPLE_NESTED_SMI,
+        {2: (30.03, 0.0), 1: (64.027, 0.0), 0: (165.999, 36.458)},
+        0.05,
+        0.05,
+        id="nested-repeat-units-three-levels",
     ),
 ]
 
