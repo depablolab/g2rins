@@ -69,8 +69,8 @@ REGRESSION_CASES = [
     pytest.param(
         # Grandparent MW accounting: single-level parent_map entries starved
         # ancestor tallies, producing molecules at ~3x the outer target. The
-        # outer poisson counts few heavy units (each repeat unit carries a
-        # ~200 g/mol nested arm), so single chains scatter widely around 800.
+        # outer poisson draws a small repeat-unit count, so single chains
+        # scatter widely around 800.
         "{[] [<]CC({[<] [<]NN({[<] [<]C(C)O[>];; [>]}|poisson(80)|[H])[>];; [>]}|poisson(200)|[H])CC[>]; [<][H]; []}|poisson(800)|",
         800.0,
         (0.3, 2.0),

@@ -238,6 +238,8 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
     A nested object is placed wherever growth enters it, through any unit it
     holds at any depth, and also when it follows itself.
     """
+    if not any(isinstance(distribution, CountLaw) for distribution in distributions):
+        return {}
     nodes = generative_graph.nodes
 
     def level_tree(node):
