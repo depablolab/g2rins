@@ -2136,6 +2136,28 @@ COUNT_LAW_BINDING_CASES = [
         0.05,
         id="nested-repeat-units-three-levels",
     ),
+    pytest.param(
+        # An object whose only repeat unit is a nested object and whose end
+        # atoms are written outside it holds no atoms of its own; it is bound
+        # all the same, to the nested mean 100 per unit and no end-group mass.
+        "C{[>] [<]{[>] [<]CC[>];; [<]}|gauss(100, 10)|[>]; ; [<]}|poisson(1000)|C",
+        {0: (100.0, 0.0)},
+        0.05,
+        0.05,
+        id="object-without-own-atoms",
+    ),
+    pytest.param(
+        # A nested repeat unit without atoms of its own: its count law is bound
+        # to the mean 100 of the object nested in it, and its parent counts it
+        # as one unit of its own mean 300 next to the plain unit:
+        # 164.03 = (28.05 + 300) / 2, with the Cl initiator and the H cap as
+        # the outer end mass.
+        "{[] [<]CC[>], [<]{[>] [<]{[>] [<]NN[>];; [<]}|gauss(100, 10)|[>];; [<]}|poisson(300)|[>]; Cl[>]; [<][H] []}|poisson(3000)|",
+        {1: (100.0, 0.0), 0: (164.027, 36.458)},
+        0.05,
+        0.05,
+        id="nested-object-without-own-atoms",
+    ),
 ]
 
 

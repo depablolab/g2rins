@@ -243,11 +243,12 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
     def level_tree(node):
         return [int(level) for level in nodes[node]["stochastic_id_tree"]]
 
+    # An object whose units are all nested objects holds no node of its own, so every level of a node's tree is registered.
     parent_of = {}
     for node in generative_graph:
-        tree = level_tree(node)
-        if tree[0] >= 0:
-            parent_of.setdefault(tree[0], tree[1] if tree[1] >= 0 else None)
+        tree = [level for level in level_tree(node) if level >= 0]
+        for position, level in enumerate(tree):
+            parent_of.setdefault(level, tree[position + 1] if position + 1 < len(tree) else None)
     children_of = {}
     for sto_id, parent in parent_of.items():
         if parent is not None:
