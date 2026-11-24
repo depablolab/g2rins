@@ -41,10 +41,12 @@ def test_flory_schulz(a):
     flory_schulz.bind_repeat_unit_mass(1.0)
     assert flory_schulz.mean_count() == pytest.approx(1 / a)
 
-    random_mw = flory_schulz.draw_mw()
+    # Seeded, because the skewness of a sample this size misses EPSILON by chance in about one run of 300.
+    rng = np.random.default_rng(0)
+    random_mw = flory_schulz.draw_mw(rng)
     assert flory_schulz.prob_mw(random_mw) > 0
 
-    data = np.asarray([flory_schulz.draw_mw() for i in range(4 * NSTAT)])
+    data = np.asarray([flory_schulz.draw_mw(rng) for i in range(4 * NSTAT)])
 
     assert np.abs((np.mean(data) - mean(a)) / mean(a)) < EPSILON
     assert np.abs((np.var(data) - variance(a)) / variance(a)) < EPSILON
