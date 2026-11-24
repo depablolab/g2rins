@@ -40,6 +40,7 @@ from .exception import (
     NoValidGenerationSource,
     PossibleNonRepresentativePolymerChain,
     TooManyDiscardedChains,
+    TruncatedNestedDistribution,
     UndershootSnapshotMissed,
     UnvalidatedGenerationSource,
 )
@@ -65,6 +66,10 @@ from .util import _determine_darkness_from_hex, get_global_rng
 # (A previous fixed floor of 0.25x the target MW kept a whole-molecule deepcopy
 # running on most iterations of the last quarter of every chain.)
 _LOOKAHEAD_MARGIN = 3.0
+
+# A nested distribution is reported above this overlapped mass, estimated from this many draws per distribution.
+_NESTED_OVERLAP_THRESHOLD = 0.01
+_NESTED_OVERLAP_DRAWS = 1000
 
 # Debug hook: when set to a list, sample_mol_graph appends one dict per
 # crossing / retire / finalize decision. Diagnostic only, no runtime cost
@@ -1906,6 +1911,9 @@ class _PartialAtomGraph:
 
 class EnsembleCreator:
 
+    # Nothing to report for a creator built without __init__.
+    _overlapping_nested_distributions = ()
+
     def __init__(self, generative_graph):
 
         self._generative_graph = generative_graph.copy()
@@ -1939,6 +1947,7 @@ class EnsembleCreator:
         self._statically_empty_nested_mw_sto_gen_ids = (
             self._find_statically_empty_nested_mw_sto_gen_ids()
         )
+        self._overlapping_nested_distributions = self._find_overlapping_nested_distributions()
         if self._static_proof_supported:
             (
                 self._provably_dead_construction_states,
@@ -2066,6 +2075,37 @@ class EnsembleCreator:
                 empty_ids.add(child)
 
         return frozenset(empty_ids)
+
+    def _find_overlapping_nested_distributions(self):
+        """Find the nested distributions that overlap the distribution of their parent.
+
+        A nested stochastic object draws its target molecular weight below the
+        target of its parent.  The overlapped mass is the probability that a
+        free draw of the nested distribution exceeds a draw of the parent's.
+        """
+        graph = self._generative_graph
+        parent_of = {}
+        for _node, data in graph.nodes(data=True):
+            child, parent = data["stochastic_id_tree"][:2]
+            if child >= 0 and parent >= 0:
+                parent_of[int(child)] = int(parent)
+        if not parent_of:
+            return ()
+
+        serial_vectors = graph.nodes[next(iter(graph.nodes))]["molecular_weight_distribution"]
+        distributions = [StochasticDistribution.from_serial_vector(list(vector)) for vector in serial_vectors]
+        # A private generator keeps the check out of the random stream of the chains.
+        rng = np.random.default_rng(0)
+        draws = {}
+        for sto_gen_id in sorted({*parent_of, *parent_of.values()}):
+            draws[sto_gen_id] = np.array([distributions[sto_gen_id].draw_mw(rng) for _ in range(_NESTED_OVERLAP_DRAWS)])
+
+        overlapping = []
+        for child, parent in sorted(parent_of.items()):
+            overlapped_mass = float(np.mean(draws[child][:, None] > draws[parent]))
+            if overlapped_mass > _NESTED_OVERLAP_THRESHOLD:
+                overlapping.append((str(distributions[child]), str(distributions[parent]), overlapped_mass))
+        return tuple(overlapping)
 
     def _find_provably_dead_construction_states(self):
         """Find ``(unit, consumed entry)`` states that must hit zero support.
@@ -3653,6 +3693,9 @@ class EnsembleCreator:
             raise ValueError(f"n_workers must be a positive integer, got {n_workers}.")
         if parallel and n_workers is None:
             n_workers = max(1, min((os.cpu_count() or 1) - 2, n_samples))
+
+        for inner, outer, overlapped_mass in self._overlapping_nested_distributions:
+            warnings.warn(TruncatedNestedDistribution(inner, outer, overlapped_mass), stacklevel=2)
 
         # The JSON dump needs unit/sequence info even when the caller did not
         # ask for the returned ensemble information.

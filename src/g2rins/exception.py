@@ -452,6 +452,23 @@ class DiscardedSamplingPaths(G2RINSWarning):
         )
 
 
+class TruncatedNestedDistribution(G2RINSWarning):
+    """The distribution of a nested stochastic object reaches above the targets of its parent."""
+
+    def __init__(self, inner, outer, overlapped_mass):
+        self.inner = inner
+        self.outer = outer
+        self.overlapped_mass = overlapped_mass
+        Warning.__init__(self, inner, outer, overlapped_mass)
+
+    def __str__(self):
+        return (
+            f"The distribution {self.inner} is likely to be truncated by the parent distribution {self.outer}. "
+            f"About {self.overlapped_mass:.0%} of its probability mass lies above the parent's target molecular weight. "
+            "In the generated ensemble, the molecular weights of the nested object are likely to be biased towards lower values."
+        )
+
+
 class TooManyStochasticObjects(G2RINSError):
     """The string declares more stochastic objects than the graph schema holds.
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import pickle
+import warnings
 
 import lark
 import pytest
@@ -179,6 +180,24 @@ def test_warn_counterion_fallback_and_imbalance(smi):
         g2rins.G2rins.make(smi).get_graph_creator()
     with pytest.warns(g2rins.exception.CounterionChargeImbalance):
         g2rins.G2rins.make(smi).get_graph_creator()
+
+
+def test_warn_truncated_nested_distribution():
+    smi = "{[] [<]CC(C)O[>]; {[] [<]CCO[>]; CO[>]; [<]}|gauss(900.0, 400.0)|[>]; [<][H] []}|uniform(1000.0, 1000.0)|"
+    ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    with pytest.warns(g2rins.exception.TruncatedNestedDistribution) as caught:
+        ensemble_creator.create_ensemble(1, seed=0)
+    (warning,) = (w.message for w in caught if isinstance(w.message, g2rins.exception.TruncatedNestedDistribution))
+    assert (warning.inner, warning.outer) == ("|gauss(900.0, 400.0)|", "|uniform(1000.0, 1000.0)|")
+    assert warning.overlapped_mass == pytest.approx(0.40, abs=0.05)
+
+
+def test_no_warning_for_separated_nested_distribution():
+    smi = "{[] [<]CC(C)O[>]; {[] [<]CCO[>]; CO[>]; [<]}|gauss(900.0, 100.0)|[>]; [<][H] []}|gauss(3000.0, 300.0)|"
+    ensemble_creator = g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", g2rins.exception.TruncatedNestedDistribution)
+        ensemble_creator.create_ensemble(1, seed=0)
 
 
 @pytest.mark.parametrize("smi", [])
