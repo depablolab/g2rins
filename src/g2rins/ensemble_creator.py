@@ -263,8 +263,11 @@ def _bind_count_laws(generative_graph, distributions, static_components, node_to
             count += 1
         return count
 
-    ports = [_unit_ports(generative_graph, component) for component in static_components]
-    masses = [_unit_mass(generative_graph, component, unit_ports) for component, unit_ports in zip(static_components, ports, strict=True)]
+    # A unit's nodes are read in graph order: the order of a set changes from one build to the next, and with it the last digit of a sum.
+    position = {node: index for index, node in enumerate(generative_graph)}
+    units = [sorted(component, key=position.__getitem__) for component in static_components]
+    ports = [_unit_ports(generative_graph, unit) for unit in units]
+    masses = [_unit_mass(generative_graph, unit, unit_ports) for unit, unit_ports in zip(units, ports, strict=True)]
     out_edges = {}
     for u, v, data in generative_graph.edges(data=True):
         if not data["static"]:

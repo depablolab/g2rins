@@ -2176,6 +2176,15 @@ def test_count_law_bindings(smi, expected, unit_tol, end_tol):
         assert bound_end == pytest.approx(end_group_mass, abs=end_tol), f"object {sto_gen_id}: end mass {bound_end:.2f}"
 
 
+def test_count_law_bound_masses_are_the_same_in_every_build():
+    """Every build draws new node ids. Bound masses that follow them differ in
+    their last digit, which is enough for a seeded ensemble to differ from one
+    session to the next."""
+    smi = "{[] [<]CC([>])Cc1c[nH]c2ccccc12; [<][H]; [>][H] []}|poisson(2000)|"
+    bound = {tuple(g2rins.G2rins.make(smi).get_graph_creator().get_ensemble_creator()._count_law_bindings[0]) for _ in range(10)}
+    assert len(bound) == 1
+
+
 def test_poisson_below_end_groups_warns_and_builds_the_shortest_chains():
     """A poisson(Mn) below the end-group mass of its stochastic object is
     read with zero repeat units: it warns, draws the end-group mass and the
