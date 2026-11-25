@@ -44,7 +44,9 @@ _CIS_TRANS_SYMBOLS = ("/", "\\")
 
 
 def _bond_order(bond_type):
-    return smi_bond_mapping.get(str(bond_type), 1)
+    """Order a bond symbol is compared by: the cis/trans symbols are single bonds, the aromatic symbol is an order of its own."""
+    symbol = str(bond_type)
+    return 1.5 if symbol == ":" else smi_bond_mapping.get(symbol, 1)
 
 
 def is_static_edge(edge_data):
@@ -313,7 +315,7 @@ class _PartialGraph:
         ring_bond_pairs = []
         for ring_bond_idx in other.ring_bond_map:
             if ring_bond_idx in new_ring_bond_map:
-                ring_bond_pairs.append((new_ring_bond_map[ring_bond_idx], other.ring_bond_map[ring_bond_idx]))
+                ring_bond_pairs.append((ring_bond_idx, new_ring_bond_map[ring_bond_idx], other.ring_bond_map[ring_bond_idx]))
                 del new_ring_bond_map[ring_bond_idx]
             else:
                 new_ring_bond_map[ring_bond_idx] = other.ring_bond_map[ring_bond_idx]
@@ -322,15 +324,16 @@ class _PartialGraph:
 
         self.g = nx.union(self.g, other.g)
 
-        for opening, closing in ring_bond_pairs:
-            self._close_ring_bond(opening, closing)
-
         for self_bond, other_bond in half_bond_tuples:
             if ("matching_index" in self.g.nodes[self_bond.node_id]) and ("matching_index" in other.g.nodes[other_bond.node_id]):
                 if self.g.nodes[self_bond.node_id]["matching_index"] == other.g.nodes[other_bond.node_id]["matching_index"]:
                     self.add_half_bond_edge(self_bond, other_bond)
             else:
                 self.add_half_bond_edge(self_bond, other_bond)
+
+        # Ring bonds close after the half bonds: the order of the edges decides which molecule a seed generates.
+        for ring_bond_idx, opening, closing in ring_bond_pairs:
+            self._close_ring_bond(opening, closing, ring_bond_idx)
 
     def add_half_bond_edge(self, self_half_bond_edge: _HalfBond, other_half_bond_edge: _HalfBond) -> None:
         overlapping_keys = self_half_bond_edge.bond_attributes.keys() & other_half_bond_edge.bond_attributes.keys()
@@ -347,13 +350,13 @@ class _PartialGraph:
             half_bond.bond_attributes[_BOND_TYPE_NAME] = ring_bond.bond_symbol
 
         if ring_bond.idx in self.ring_bond_map:
-            self._close_ring_bond(self.ring_bond_map.pop(ring_bond.idx), half_bond)
+            self._close_ring_bond(self.ring_bond_map.pop(ring_bond.idx), half_bond, ring_bond.idx)
             return False
 
         self.ring_bond_map[ring_bond.idx] = half_bond
         return True
 
-    def _close_ring_bond(self, opening: _HalfBond, closing: _HalfBond) -> None:
+    def _close_ring_bond(self, opening: _HalfBond, closing: _HalfBond, ring_bond_idx: int) -> None:
         closing = _HalfBond(closing.node, closing.node_id, dict(closing.bond_attributes))
         # Both digits may write the bond symbol, in which case they have to agree and it is kept once.
         if _BOND_TYPE_NAME in opening.bond_attributes and _BOND_TYPE_NAME in closing.bond_attributes:
@@ -365,7 +368,7 @@ class _PartialGraph:
             else:
                 agree = opening_symbol == closing_symbol
             if not agree:
-                raise DoubleBondSymbolDefinition(self, closing.bond_attributes[_BOND_TYPE_NAME], opening.bond_attributes)
+                raise DoubleBondSymbolDefinition(self, closing.bond_attributes[_BOND_TYPE_NAME], opening.bond_attributes, ring_bond_symbols=(ring_bond_idx, opening_symbol, closing_symbol))
             del closing.bond_attributes[_BOND_TYPE_NAME]
         self.add_half_bond_edge(opening, closing)
 
@@ -650,12 +653,6 @@ class GraphCreator:
 
                     weight_type_list.append(current_type)
 
-                # The path runs source atom -> bond connectors -> target atom; its first and last edges are the two half bonds.
-                # Only their bond order has to agree: an unwritten bond is single, and so are the cis/trans symbols / and \.
-                source_bond, target_bond = (d.get(_BOND_TYPE_NAME, "-") for d in (self.data_path[0], self.data_path[-1]))
-                if _bond_order(source_bond) != _bond_order(target_bond):
-                    raise IncompatibleBondTypeBondConnector(str(source_bond), str(target_bond))
-
                 last_rank = 0
                 max_rank = 0
 
@@ -744,6 +741,14 @@ class GraphCreator:
                                 weight_type = _PROPAGATION_NAME
 
                 if weight > 0:
+                    # The first and last edges are the two half bonds, single when unwritten; they and every symbol written between the bond connectors agree in bond order.
+                    source_bond, target_bond = (str(d.get(_BOND_TYPE_NAME, "-")) for d in (self.data_path[0], self.data_path[-1]))
+                    boundary_bonds = [str(d[_BOND_TYPE_NAME]) for d in self.data_path[1:-1] if _BOND_TYPE_NAME in d]
+                    if len({_bond_order(symbol) for symbol in (source_bond, target_bond, *boundary_bonds)}) > 1:
+                        written_path = str(graph.nodes[self.node_path[0]]["obj"])
+                        for node, d in zip(self.node_path[1:], self.data_path):
+                            written_path += str(d.get(_BOND_TYPE_NAME, "")) + str(graph.nodes[node]["obj"])
+                        raise IncompatibleBondTypeBondConnector(source_bond, target_bond, written_path)
                     data[weight_type] = weight
 
                 return weight, data
@@ -1258,8 +1263,11 @@ class GraphCreator:
         Load the graph back with
         ``networkx.node_link_graph(json.load(fp)["graph"], edges="edges")``.
         """
+        kinds = self._written_isomer_symbols()
+        if kinds:
+            warnings.warn(IsomerSymbolsNotInGraph(kinds), stacklevel=2)
         with open(filename, "w") as file_handle:
-            json.dump(generative_graph_json_data(self.get_generative_graph()), file_handle, indent=2)
+            json.dump(generative_graph_json_data(self._build_generative_graph(include_bond_connectors=False, return_extra_graph_info=False)), file_handle, indent=2)
 
     _DEFAULT_EDGE_COLOR = {
         _STATIC_NAME: "#000000",

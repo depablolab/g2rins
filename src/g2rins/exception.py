@@ -82,12 +82,16 @@ class GenerationError(G2RINSError):
 
 
 class DoubleBondSymbolDefinition(GenerationError):
-    def __init__(self, partial_graph, symbol, bond_attributes):
+    def __init__(self, partial_graph, symbol, bond_attributes, ring_bond_symbols=None):
         self.partial_graph = partial_graph
         self.symbol = symbol
         self.bond_attributes = bond_attributes
+        self.ring_bond_symbols = ring_bond_symbols
 
     def __str__(self):
+        if self.ring_bond_symbols is not None:
+            ring_bond_idx, opening_symbol, closing_symbol = self.ring_bond_symbols
+            return f"The two digits of ring closure {ring_bond_idx} write bond symbols that do not describe the same bond: {opening_symbol} on the first digit and {closing_symbol} on the second. Write the symbol on one digit only or the same symbol on both; the cis/trans symbols / and \\ are read along the string, so on the two digits one must be / and the other \\."
         return f"{self.partial_graph}, {self.symbol}, {self.bond_attributes}"
 
 
@@ -240,13 +244,14 @@ class StochasticMissingPath(ParsingWarning):
 
 
 class IncompatibleBondTypeBondConnector(ParsingError):
-    def __init__(self, bond_type_lhs, bond_type_rhs):
+    def __init__(self, bond_type_lhs, bond_type_rhs, written_path):
         super().__init__(None)
         self.bond_type_lhs = bond_type_lhs
         self.bond_type_rhs = bond_type_rhs
+        self.written_path = written_path
 
     def __str__(self):
-        return f"Two bond connectors that bond to each other are reached through bonds of different order, {str(self.bond_type_lhs)} on one side and {str(self.bond_type_rhs)} on the other, so the bond between them is undefined. The bonds leading to connecting bond connectors must have the same order (the cis/trans symbols / and \\ are single bonds): '[<]=CC[>]' joins a double bond with an implicit single bond, '[<]=CC=[>]' is consistent."
+        return f"Two bond connectors that bond to each other join bonds of different order, so the bond between their atoms is undefined. Written from one atom to the other, through the bond connectors: {self.written_path}, where no symbol next to an atom is a single bond. The two bonds leading to connecting bond connectors and any symbol written between the bond connectors must have the same order (the cis/trans symbols / and \\ are single bonds): '[<]=CC[>]' joins a double bond with an implicit single bond, '[<]=CC=[>]' is consistent."
 
 
 class UnvalidatedGenerationSource(G2RINSWarning):

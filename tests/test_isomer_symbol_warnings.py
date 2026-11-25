@@ -55,3 +55,10 @@ def test_strings_without_isomer_symbols_warn_nothing(text):
     creator = g2rins.G2rins.make(text).get_graph_creator()
     assert _isomer_warnings(creator.get_generative_graph) == []
     assert _isomer_warnings(creator.get_ensemble_creator) == []
+
+
+def test_the_json_writer_warns_at_the_call_that_writes(tmp_path):
+    creator = g2rins.G2rins.make("C[C@H](F)Cl").get_graph_creator()
+    with pytest.warns(IsomerSymbolsNotInGraph) as record:
+        creator.write_generative_graph_json(tmp_path / "graph.json")
+    assert [warning.filename for warning in record] == [__file__]
