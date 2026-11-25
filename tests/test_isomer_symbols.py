@@ -105,9 +105,21 @@ def test_double_bond_symbol_at_a_stochastic_object_with_unwritten_connector_bond
         g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
 
 
-def test_aromatic_bond_symbol_against_an_explicit_single_bond_raises():
+@pytest.mark.parametrize(
+    "text",
+    [
+        "{[] [<]-c1ccc(:[>])cc1; C[>]; [<]C []}|gauss(400,10)|",  # against an explicit single bond
+        "{[] [<]c1ccc(:[>])cc1; c1ccccc1[>]; [<]:c1ccccc1 []}|gauss(400,10)|",  # against an unwritten bond
+    ],
+)
+def test_aromatic_bond_symbol_against_a_single_bond_raises(text):
     with pytest.raises(g2rins.exception.IncompatibleBondTypeBondConnector):
-        g2rins.G2rins.make("{[] [<]-c1ccc(:[>])cc1; C[>]; [<]C []}|gauss(400,10)|").get_graph_creator().get_generative_graph()
+        g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
+
+
+def test_aromatic_bond_symbol_on_both_bond_connectors_builds():
+    graph = g2rins.G2rins.make("{[] [<]:c1ccc(:[>])cc1; c1ccccc1:[>]; [<]:c1ccccc1 []}|gauss(400,10)|").get_graph_creator().get_generative_graph()
+    assert graph.number_of_nodes() == 18
 
 
 def test_incompatible_bond_order_is_reported_on_a_pairing_that_can_form():
@@ -116,7 +128,13 @@ def test_incompatible_bond_order_is_reported_on_a_pairing_that_can_form():
     with pytest.raises(g2rins.exception.IncompatibleBondTypeBondConnector) as excinfo:
         g2rins.G2rins.make(text).get_graph_creator().get_generative_graph()
     assert excinfo.value.written_path == "C=[<][>]C"
-    assert "C=[<][>]C, where no symbol next to an atom is a single bond" in str(excinfo.value)
+    assert "C=[<][>]C, where a bond written without a symbol is single" in str(excinfo.value)
+
+
+def test_incompatible_bond_order_shows_the_atom_that_carries_several_bond_connectors():
+    with pytest.raises(g2rins.exception.IncompatibleBondTypeBondConnector) as excinfo:
+        g2rins.G2rins.make("{[] [<]C(=[>])C; [H][>]; [<][H] []}|gauss(400,10)|").get_graph_creator().get_generative_graph()
+    assert excinfo.value.written_path == "C[<][>]=C"
 
 
 def test_ring_closed_across_a_branch_keeps_the_molecule_a_seed_generates():

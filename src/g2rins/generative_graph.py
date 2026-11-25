@@ -473,6 +473,7 @@ class GraphCreator:
 
                 self._g.add_node(new_node_idx)
                 self._g.nodes[new_node_idx]["smi_text"] = "[*]"
+                self._g.nodes[new_node_idx]["stand_in_for"] = node
                 obj = self._create_bracket_atom("[*]")
                 self._g.nodes[new_node_idx]["obj"] = obj
 
@@ -745,9 +746,10 @@ class GraphCreator:
                     source_bond, target_bond = (str(d.get(_BOND_TYPE_NAME, "-")) for d in (self.data_path[0], self.data_path[-1]))
                     boundary_bonds = [str(d[_BOND_TYPE_NAME]) for d in self.data_path[1:-1] if _BOND_TYPE_NAME in d]
                     if len({_bond_order(symbol) for symbol in (source_bond, target_bond, *boundary_bonds)}) > 1:
-                        written_path = str(graph.nodes[self.node_path[0]]["obj"])
+                        # An atom with several bond connectors reaches each of them through a stand-in node; the path shows the atom.
+                        written_path = str(graph.nodes[graph.nodes[self.node_path[0]].get("stand_in_for", self.node_path[0])]["obj"])
                         for edge in self.edge_path:
-                            written_path += str(graph.get_edge_data(*edge).get(_BOND_TYPE_NAME, "")) + str(graph.nodes[edge[1]]["obj"])
+                            written_path += str(graph.get_edge_data(*edge).get(_BOND_TYPE_NAME, "")) + str(graph.nodes[graph.nodes[edge[1]].get("stand_in_for", edge[1])]["obj"])
                         raise IncompatibleBondTypeBondConnector(source_bond, target_bond, written_path)
                     data[weight_type] = weight
 

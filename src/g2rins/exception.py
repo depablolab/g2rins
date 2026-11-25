@@ -251,7 +251,7 @@ class IncompatibleBondTypeBondConnector(ParsingError):
         self.written_path = written_path
 
     def __str__(self):
-        return f"Two bond connectors that bond to each other join bonds of different order, so the bond between their atoms is undefined. Written from one atom to the other, through the bond connectors: {self.written_path}, where no symbol next to an atom is a single bond. The two bonds leading to connecting bond connectors and any symbol written between the bond connectors must have the same order (the cis/trans symbols / and \\ are single bonds): '[<]=CC[>]' joins a double bond with an implicit single bond, '[<]=CC=[>]' is consistent."
+        return f"Two bond connectors that bond to each other join bonds of different order, so the bond between their atoms is undefined. Written from one atom to the other, through the bond connectors: {self.written_path}, where a bond written without a symbol is single. The two bonds leading to connecting bond connectors and any symbol written between the bond connectors must have the same order (the cis/trans symbols / and \\ are single bonds): '[<]=CC[>]' joins a double bond with an implicit single bond, '[<]=CC=[>]' is consistent."
 
 
 class UnvalidatedGenerationSource(G2RINSWarning):
