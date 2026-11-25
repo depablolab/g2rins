@@ -1900,6 +1900,7 @@ class EnsembleCreator:
             if _EDGE_STOCHASTIC_ID_NAME not in edge_data:
                 raise IncompatibleGenerativeGraphSchema(_EDGE_STOCHASTIC_ID_NAME)
 
+        self._distributions = self._load_distributions()
         self._static_graph = self._create_static_graph(self.generative_graph)
         self._static_proof_supported = all(u == v or self._static_graph.has_edge(v, u) for u, v in self._static_graph.edges())
 
@@ -1907,7 +1908,6 @@ class EnsembleCreator:
         static_components = tuple(frozenset(component) for component in nx.connected_components(self._static_graph.to_undirected(as_view=True)))
         self._static_components = static_components
         self._node_to_static_component = {node: component_id for component_id, component in enumerate(static_components) for node in component}
-        self._distributions = self._load_distributions()
         self._statically_empty_nested_mw_sto_gen_ids = self._find_statically_empty_nested_mw_sto_gen_ids()
         if self._static_proof_supported:
             (
@@ -1947,12 +1947,14 @@ class EnsembleCreator:
         }
 
     def _load_distributions(self):
-        """Deserialize the per-object molecular-weight distributions the graph carries."""
-        try:
-            first_node = next(iter(self._generative_graph.nodes))
-            serial_vectors = self._generative_graph.nodes[first_node]["molecular_weight_distribution"]
-        except (StopIteration, KeyError):
+        """Deserialize the per-object molecular-weight distributions from a private copy of the graph's vectors."""
+        nodes = self._generative_graph.nodes
+        if not nodes:
             return []
+        # The copied graph still shares its vectors with the caller's graph; sampling and export both read this snapshot.
+        serial_vectors = deepcopy(nodes[next(iter(nodes))]["molecular_weight_distribution"])
+        for node in nodes:
+            nodes[node]["molecular_weight_distribution"] = serial_vectors
         return [StochasticDistribution.from_serial_vector(list(vector)) for vector in serial_vectors]
 
     def _find_statically_empty_nested_mw_sto_gen_ids(self):

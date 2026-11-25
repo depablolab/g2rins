@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import pickle
+import warnings
 
 import lark
 import pytest
@@ -181,11 +182,19 @@ def test_warn_counterion_fallback_and_imbalance(smi):
         g2rins.G2rins.make(smi).get_graph_creator()
 
 
-@pytest.mark.parametrize("smi", [])
+@pytest.mark.parametrize("smi", ["{[] [<]=CC#[>]; C[>]; [<][H] []}|gauss(500, 50)|"])
 def test_warn_incompatible_bond_type_bond_connectors(smi):
     with pytest.warns(g2rins.exception.IncompatibleBondTypeBondConnector):
         obj = g2rins.G2rins.make(smi)
-        obj.get_graph_creator()
+        obj.get_graph_creator().get_generative_graph(include_bond_connectors=False)
+
+
+def test_no_incompatible_bond_type_warning_for_bonds_inside_a_unit():
+    # The = and # join atoms of the unit; its bond connectors write no bond symbol.
+    smi = "{[] [<]C=CC#C[>]; C[>]; [<][H] []}|gauss(500, 50)|"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", g2rins.exception.IncompatibleBondTypeBondConnector)
+        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
 
 
 undefined_distribution = [

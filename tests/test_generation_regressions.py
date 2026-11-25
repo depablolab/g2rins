@@ -2009,6 +2009,38 @@ def test_create_ensemble_json_file(tmp_path):
     assert ("I0.1", "R0.1") in linkages and ("R0.2", "T0.1") in linkages
 
 
+def test_json_file_records_the_distributions_the_chains_were_drawn_from(tmp_path):
+    """The ensemble creator reads the distributions when it is built. The graph it saves must carry
+    those same distributions, also when the caller's graph is edited in place afterwards."""
+    import json
+
+    smi = "{[] [<]CCO[>]; CO[>]; [<][H] []}|gauss(600, 50)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    ensemble_creator = g2rins.EnsembleCreator(generative_graph)
+    vector = generative_graph.nodes[next(iter(generative_graph.nodes))]["molecular_weight_distribution"][0]
+    vector[vector.index(600.0)] = 3000.0
+
+    path = tmp_path / "ensemble.json"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        ensemble_creator.create_ensemble(8, output_format="smiles", seed=3, json_file=str(path))
+    data = json.loads(path.read_text())
+
+    assert data["ensemble"]["distributions"] == {"0": "|gauss(600.0, 50.0)|"}
+    for node_dict in data["graph"]["nodes"]:
+        saved = g2rins.StochasticDistribution.from_serial_vector(list(node_dict["molecular_weight_distribution"][0]))
+        assert saved.generate_string(True) == "|gauss(600.0, 50.0)|"
+
+
+def test_missing_distribution_attribute_is_named():
+    smi = "{[] [<]CCO[>]; CO[>]; [<][H] []}|gauss(600, 50)|"
+    generative_graph = g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
+    for _node, data in generative_graph.nodes(data=True):
+        del data["molecular_weight_distribution"]
+    with pytest.raises(KeyError, match="molecular_weight_distribution"):
+        g2rins.EnsembleCreator(generative_graph)
+
+
 def test_generative_graph_and_ensemble_share_node_ids():
     """Node ids are UUIDs minted per GraphCreator, so a generative graph and an
     ensemble only correspond when both come from ONE held creator (or when the
