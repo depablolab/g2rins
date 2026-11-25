@@ -746,8 +746,8 @@ class GraphCreator:
                     boundary_bonds = [str(d[_BOND_TYPE_NAME]) for d in self.data_path[1:-1] if _BOND_TYPE_NAME in d]
                     if len({_bond_order(symbol) for symbol in (source_bond, target_bond, *boundary_bonds)}) > 1:
                         written_path = str(graph.nodes[self.node_path[0]]["obj"])
-                        for node, d in zip(self.node_path[1:], self.data_path):
-                            written_path += str(d.get(_BOND_TYPE_NAME, "")) + str(graph.nodes[node]["obj"])
+                        for edge in self.edge_path:
+                            written_path += str(graph.get_edge_data(*edge).get(_BOND_TYPE_NAME, "")) + str(graph.nodes[edge[1]]["obj"])
                         raise IncompatibleBondTypeBondConnector(source_bond, target_bond, written_path)
                     data[weight_type] = weight
 
