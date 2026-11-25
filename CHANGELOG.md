@@ -9,7 +9,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - `CONTRIBUTING.md`, `CITATION.cff`, this changelog, issue forms, and a pull request template.
 - GitHub Release automation for future `v*` tags: build, verify, attach wheel/sdist, and generate release notes.
 - `EnsembleCreator.get_distributions()` returns the molecular-weight distributions the sampler draws from, keyed by stochastic object id as in the ensemble output, with count laws bound to their repeat-unit and end-group masses. The guide plots its reference distributions from them.
-- Building an ensemble creator warns with `TruncatedNestedDistribution` when the distribution of a nested stochastic object overlaps that of its parent. A nested target molecular weight is drawn below the target of its parent, so the warning is raised when more than 1% of the probability mass of the nested distribution lies above the parent's targets.
+- Building an ensemble creator warns with `TruncatedNestedDistribution` when the distribution of a nested stochastic object overlaps that of its parent. A nested target molecular weight is drawn below the target of its parent, so the warning is raised when more than 5% of the probability mass of the nested distribution lies above the parent's targets.
 
 ### Changed
 

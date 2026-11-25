@@ -74,7 +74,7 @@ from .util import _determine_darkness_from_hex, get_global_rng
 _LOOKAHEAD_MARGIN = 3.0
 
 # A nested distribution is reported above this overlapped mass, estimated from this many draws per distribution.
-_NESTED_OVERLAP_THRESHOLD = 0.01
+_NESTED_OVERLAP_THRESHOLD = 0.05
 _NESTED_OVERLAP_DRAWS = 1000
 
 # Debug hook: when set to a list, sample_mol_graph appends one dict per
