@@ -197,6 +197,16 @@
     "RINS",
     "docstrings",
     "klass",
-    "excinfo"
+    "excinfo",
+    "OCCOC",
+    "OCCCCCC",
+    "OCCCCCCO",
+    "CCCCO",
+    "followable",
+    "carbanions",
+    "thioether",
+    "alkoxide",
+    "borohydride",
+    "carbocation"
   ]
 }

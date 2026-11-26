@@ -52,3 +52,24 @@ def test_generative_graph_json_data_format_block():
     for node_dict in data["graph"]["nodes"]:
         assert node_dict["unit_id"] == labels.unit_id[node_dict["id"]]
         assert node_dict.get("bond_id") == labels.bond_id.get(node_dict["id"])
+
+
+def test_bond_connector_paths_are_enumerated_among_bond_connectors(monkeypatch):
+    """Skipping over bond connectors only needs the paths whose intermediate nodes are all
+    bond connectors. Every simple path of the atom graph used to be enumerated and the rest
+    discarded, which doubled the construction time with each further sequential stochastic object."""
+    block = "{[<] [<]CC[>];; [>]}|uniform(100, 200)|"
+    graph_creator = g2rins.G2rins.make("CCO" + block * 3 + "CCN").get_graph_creator()
+    enumerate_paths = nx.all_simple_edge_paths
+    paths = []
+
+    def recorded_paths(graph, source, target):
+        for path in enumerate_paths(graph, source, target):
+            paths.append(path)
+            yield path
+
+    monkeypatch.setattr(nx, "all_simple_edge_paths", recorded_paths)
+    graph_creator.get_generative_graph(include_bond_connectors=False)
+
+    assert paths
+    assert all({edge[1] for edge in path[:-1]} <= graph_creator._bc_idx_set for path in paths)
