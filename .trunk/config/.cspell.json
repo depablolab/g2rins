@@ -195,6 +195,18 @@
     "pyproject",
     "svg",
     "RINS",
-    "docstrings"
+    "docstrings",
+    "klass",
+    "excinfo",
+    "OCCOC",
+    "OCCCCCC",
+    "OCCCCCCO",
+    "CCCCO",
+    "followable",
+    "carbanions",
+    "thioether",
+    "alkoxide",
+    "borohydride",
+    "carbocation"
   ]
 }

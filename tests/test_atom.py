@@ -1,9 +1,11 @@
 # (C) 2025 Gervasio Zaldivar, Yuan Tian
 # SPDX-License-Identifier: GPL-3.0-only
 
+import lark
 import pytest
 
 from g2rins.atom import Atom, BracketAtom
+from g2rins.exception import InvalidChiralityOrder
 from g2rins.parser import get_global_parser
 from g2rins.transformer import get_global_transformer
 
@@ -47,11 +49,18 @@ def test_simple_bracket_atom(string):
     assert a.charge == 0
 
 
-@pytest.mark.parametrize("string", ["[se@]", "[H@@]", "[He@SP2]", "[Li@TB4]", "[Be@TB14]", "[B@OH3]", "[C@OH45]"])
+@pytest.mark.parametrize("string", ["[se@]", "[H@@]", "[He@SP2]", "[Li@TB4]", "[Be@TB14]", "[B@OH3]", "[C@OH30]"])
 def test_chiral_bracket_atom(string):
     a = BracketAtom.make(string)
     assert str(a) == string
     assert isinstance(a, Atom)
+
+
+@pytest.mark.parametrize("string", ["[C@OH45]", "[C@OH0]", "[C@TB0]", "[C@TB21]"])
+def test_chirality_order_out_of_range(string):
+    with pytest.raises(lark.exceptions.VisitError) as excinfo:
+        BracketAtom.make(string)
+    assert isinstance(excinfo.value.orig_exc, InvalidChiralityOrder)
 
 
 @pytest.mark.parametrize("string", ["[seH]", "[H]", "[BkH]", "[UH2]"])
