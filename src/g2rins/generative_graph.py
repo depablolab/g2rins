@@ -23,7 +23,10 @@ from .chem_resource import (
     smi_bond_mapping,
 )
 from .exception import (
+    DoubleBondSymbolDefinition,
     IncompatibleBondTypeBondConnector,
+    IsomerSymbolsIgnoredInGeneration,
+    IsomerSymbolsNotInGraph,
     TooManyStochasticObjects,
 )
 from .util import _determine_darkness_from_hex
@@ -37,6 +40,13 @@ _AROMATIC_NAME = "aromatic"
 _BOND_TYPE_NAME = "bond_type"
 _NON_STATIC_ATTR = (_PROPAGATION_NAME, _TERMINATION_NAME, _TRANSITION_NAME)
 _STOCHASTIC_TREE_DEPTH = 50
+_CIS_TRANS_SYMBOLS = ("/", "\\")
+
+
+def _bond_order(bond_type):
+    """Order a bond symbol is compared by: the cis/trans symbols are single bonds, the aromatic symbol is an order of its own."""
+    symbol = str(bond_type)
+    return 1.5 if symbol == ":" else smi_bond_mapping.get(symbol, 1)
 
 
 def is_static_edge(edge_data):
@@ -302,9 +312,10 @@ class _PartialGraph:
         half_bond_tuples = list(half_bond_tuples)
 
         new_ring_bond_map = self.ring_bond_map
+        ring_bond_pairs = []
         for ring_bond_idx in other.ring_bond_map:
             if ring_bond_idx in new_ring_bond_map:
-                half_bond_tuples.append((new_ring_bond_map[ring_bond_idx], other.ring_bond_map[ring_bond_idx]))
+                ring_bond_pairs.append((ring_bond_idx, new_ring_bond_map[ring_bond_idx], other.ring_bond_map[ring_bond_idx]))
                 del new_ring_bond_map[ring_bond_idx]
             else:
                 new_ring_bond_map[ring_bond_idx] = other.ring_bond_map[ring_bond_idx]
@@ -320,6 +331,10 @@ class _PartialGraph:
             else:
                 self.add_half_bond_edge(self_bond, other_bond)
 
+        # Ring bonds close after the half bonds: the order of the edges decides which molecule a seed generates.
+        for ring_bond_idx, opening, closing in ring_bond_pairs:
+            self._close_ring_bond(opening, closing, ring_bond_idx)
+
     def add_half_bond_edge(self, self_half_bond_edge: _HalfBond, other_half_bond_edge: _HalfBond) -> None:
         overlapping_keys = self_half_bond_edge.bond_attributes.keys() & other_half_bond_edge.bond_attributes.keys()
         if len(overlapping_keys) > 0:
@@ -329,14 +344,33 @@ class _PartialGraph:
         self.g.add_edge(self_half_bond_edge.node_id, other_half_bond_edge.node_id, **new_bond_attributes)
 
     def add_ring_bond(self, ring_bond, half_bond: _HalfBond) -> bool:
+        # The digit's own bond symbol belongs to the ring bond alone, so it goes on a copy of the atom's half-bond attributes.
+        half_bond = _HalfBond(half_bond.node, half_bond.node_id, dict(half_bond.bond_attributes))
+        if ring_bond.bond_symbol is not None:
+            half_bond.bond_attributes[_BOND_TYPE_NAME] = ring_bond.bond_symbol
 
         if ring_bond.idx in self.ring_bond_map:
-            self.add_half_bond_edge(half_bond, self.ring_bond_map[ring_bond.idx])
-            del self.ring_bond_map[ring_bond.idx]
+            self._close_ring_bond(self.ring_bond_map.pop(ring_bond.idx), half_bond, ring_bond.idx)
             return False
 
         self.ring_bond_map[ring_bond.idx] = half_bond
         return True
+
+    def _close_ring_bond(self, opening: _HalfBond, closing: _HalfBond, ring_bond_idx: int) -> None:
+        closing = _HalfBond(closing.node, closing.node_id, dict(closing.bond_attributes))
+        # Both digits may write the bond symbol, in which case they have to agree and it is kept once.
+        if _BOND_TYPE_NAME in opening.bond_attributes and _BOND_TYPE_NAME in closing.bond_attributes:
+            opening_symbol = str(opening.bond_attributes[_BOND_TYPE_NAME])
+            closing_symbol = str(closing.bond_attributes[_BOND_TYPE_NAME])
+            # Two directional symbols are read along the string, so they describe the same bond only when opposite.
+            if opening_symbol in _CIS_TRANS_SYMBOLS and closing_symbol in _CIS_TRANS_SYMBOLS:
+                agree = opening_symbol != closing_symbol
+            else:
+                agree = opening_symbol == closing_symbol
+            if not agree:
+                raise DoubleBondSymbolDefinition(self, closing.bond_attributes[_BOND_TYPE_NAME], opening.bond_attributes, ring_bond_symbols=(ring_bond_idx, opening_symbol, closing_symbol))
+            del closing.bond_attributes[_BOND_TYPE_NAME]
+        self.add_half_bond_edge(opening, closing)
 
     def __str__(self):
         return f"PartialGraph({self.g}, {self.left_half_bonds}, {self.right_half_bonds}, {self.ring_bond_map})"
@@ -439,6 +473,7 @@ class GraphCreator:
 
                 self._g.add_node(new_node_idx)
                 self._g.nodes[new_node_idx]["smi_text"] = "[*]"
+                self._g.nodes[new_node_idx]["stand_in_for"] = node
                 obj = self._create_bracket_atom("[*]")
                 self._g.nodes[new_node_idx]["obj"] = obj
 
@@ -586,7 +621,10 @@ class GraphCreator:
                 self.data_path = data_path
                 self._weight, self._combined_attr = self.create_combined_attr()
 
-            def create_combined_attr(self) -> dict | None:
+            def create_combined_attr(self) -> tuple[float, dict | None]:
+                if not self.only_bond_connectors:
+                    # A path through atoms never becomes a bond; its bond symbols are not compared.
+                    return 0.0, None
                 data = {}
                 weight = 1.0
                 weight_type_list = []
@@ -602,16 +640,8 @@ class GraphCreator:
                             data[_AROMATIC_NAME] |= d[_AROMATIC_NAME]
                         else:
                             data[_AROMATIC_NAME] = d[_AROMATIC_NAME]
-                    if _BOND_TYPE_NAME in d:
-                        if _BOND_TYPE_NAME in data:
-                            if str(data[_BOND_TYPE_NAME]) != str(d[_BOND_TYPE_NAME]):
-                                warnings.warn(
-                                    IncompatibleBondTypeBondConnector(str(data[_BOND_TYPE_NAME]), str(d[_BOND_TYPE_NAME])),
-                                    stacklevel=2,
-                                )
-                                return 0.0, None
-                        else:
-                            data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
+                    if _BOND_TYPE_NAME in d and _BOND_TYPE_NAME not in data:
+                        data[_BOND_TYPE_NAME] = d[_BOND_TYPE_NAME]
 
                     non_static_weights = [d[attr] if attr in d else 0 for attr in non_static_attribute_list]
                     if max(non_static_weights) > 0:
@@ -712,6 +742,15 @@ class GraphCreator:
                                 weight_type = _PROPAGATION_NAME
 
                 if weight > 0:
+                    # The first and last edges are the two half bonds, single when unwritten; they and every symbol written between the bond connectors agree in bond order.
+                    source_bond, target_bond = (str(d.get(_BOND_TYPE_NAME, "-")) for d in (self.data_path[0], self.data_path[-1]))
+                    boundary_bonds = [str(d[_BOND_TYPE_NAME]) for d in self.data_path[1:-1] if _BOND_TYPE_NAME in d]
+                    if len({_bond_order(symbol) for symbol in (source_bond, target_bond, *boundary_bonds)}) > 1:
+                        # An atom with several bond connectors reaches each of them through a stand-in node; the path shows the atom.
+                        written_path = str(graph.nodes[graph.nodes[self.node_path[0]].get("stand_in_for", self.node_path[0])]["obj"])
+                        for edge in self.edge_path:
+                            written_path += str(graph.get_edge_data(*edge).get(_BOND_TYPE_NAME, "")) + str(graph.nodes[graph.nodes[edge[1]].get("stand_in_for", edge[1])]["obj"])
+                        raise IncompatibleBondTypeBondConnector(source_bond, target_bond, written_path)
                     data[weight_type] = weight
 
                 return weight, data
@@ -910,8 +949,28 @@ class GraphCreator:
         **init_weight**, the **{static_name}** edge flag and the three
         non-static weights produces a graph that every consumer, including the
         label derivation, can handle.
-        """
 
+        Isotope, chirality and cis/trans symbols are parsed but not encoded yet:
+        a string that writes them emits the ``IsomerSymbolsNotInGraph`` warning.
+        """
+        kinds = self._written_isomer_symbols()
+        if kinds:
+            warnings.warn(IsomerSymbolsNotInGraph(kinds), stacklevel=2)
+        return self._build_generative_graph(include_bond_connectors, return_extra_graph_info)
+
+    def _written_isomer_symbols(self) -> list[str]:
+        """Kinds of isomer symbols the string writes, in a fixed order (isotope, chirality, cis/trans); empty when it writes none."""
+        atoms = [data.get("obj") for _node, data in self._g.nodes(data=True)]
+        kinds = []
+        if any(getattr(atom, "isotope", None) is not None for atom in atoms):
+            kinds.append("isotope")
+        if any(getattr(atom, "chiral", None) is not None for atom in atoms):
+            kinds.append("chirality")
+        if any(str(data.get(_BOND_TYPE_NAME, "")) in _CIS_TRANS_SYMBOLS for _u, _v, data in self._g.edges(data=True)):
+            kinds.append("cis/trans")
+        return kinds
+
+    def _build_generative_graph(self, include_bond_connectors, return_extra_graph_info):
         from .distribution import StochasticDistribution
 
         extra_graph_info = {0: "None"}
@@ -1206,8 +1265,11 @@ class GraphCreator:
         Load the graph back with
         ``networkx.node_link_graph(json.load(fp)["graph"], edges="edges")``.
         """
+        kinds = self._written_isomer_symbols()
+        if kinds:
+            warnings.warn(IsomerSymbolsNotInGraph(kinds), stacklevel=2)
         with open(filename, "w") as file_handle:
-            json.dump(generative_graph_json_data(self.get_generative_graph()), file_handle, indent=2)
+            json.dump(generative_graph_json_data(self._build_generative_graph(include_bond_connectors=False, return_extra_graph_info=False)), file_handle, indent=2)
 
     _DEFAULT_EDGE_COLOR = {
         _STATIC_NAME: "#000000",
@@ -1311,7 +1373,7 @@ class GraphCreator:
         if color_by not in ("atom", "unit"):
             raise ValueError(f"color_by must be 'atom' or 'unit', got {color_by!r}")
 
-        graph, extra_graph_info = self.get_generative_graph(include_bond_connectors=include_bond_connectors, return_extra_graph_info=True)
+        graph, extra_graph_info = self._build_generative_graph(include_bond_connectors, return_extra_graph_info=True)
 
         node_to_unit = None
         if color_by == "unit" or (hide_unused_nonstatic_bonds and not include_bond_connectors):
@@ -1402,6 +1464,10 @@ class GraphCreator:
         return dot_str
 
     def get_ensemble_creator(self):
+        """Ensemble creator for this graph. Isotope, chirality and cis/trans symbols are not applied yet: a string that writes them emits ``IsomerSymbolsIgnoredInGeneration``."""
         from .ensemble_creator import EnsembleCreator
 
-        return EnsembleCreator(self.get_generative_graph(include_bond_connectors=False))
+        kinds = self._written_isomer_symbols()
+        if kinds:
+            warnings.warn(IsomerSymbolsIgnoredInGeneration(kinds), stacklevel=2)
+        return EnsembleCreator(self._build_generative_graph(include_bond_connectors=False, return_extra_graph_info=False))

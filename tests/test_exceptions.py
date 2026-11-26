@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 import pickle
-import warnings
 
 import lark
 import pytest
@@ -182,19 +181,24 @@ def test_warn_counterion_fallback_and_imbalance(smi):
         g2rins.G2rins.make(smi).get_graph_creator()
 
 
-@pytest.mark.parametrize("smi", ["{[] [<]=CC#[>]; C[>]; [<][H] []}|gauss(500, 50)|"])
-def test_warn_incompatible_bond_type_bond_connectors(smi):
-    with pytest.warns(g2rins.exception.IncompatibleBondTypeBondConnector):
-        obj = g2rins.G2rins.make(smi)
-        obj.get_graph_creator().get_generative_graph(include_bond_connectors=False)
+@pytest.mark.parametrize(
+    "smi",
+    [
+        "{[] [<]=CC[>]; [H][>]; [<][H] []}|gauss(400,10)|",
+        "{[] [$]=CC[$]; [H][$]; [$][H] []}|gauss(400,10)|",
+        "{[] [<]=CC#[>]; C[>]; [<][H] []}|gauss(500, 50)|",
+    ],
+)
+def test_incompatible_bond_order_at_bond_connectors_raises(smi):
+    # Connector paths are merged when the generative graph is requested, so the error surfaces there, not at parse time.
+    with pytest.raises(g2rins.exception.IncompatibleBondTypeBondConnector):
+        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
 
 
-def test_no_incompatible_bond_type_warning_for_bonds_inside_a_unit():
+def test_bonds_inside_a_unit_build():
     # The = and # join atoms of the unit; its bond connectors write no bond symbol.
     smi = "{[] [<]C=CC#C[>]; C[>]; [<][H] []}|gauss(500, 50)|"
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", g2rins.exception.IncompatibleBondTypeBondConnector)
-        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
+    g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph(include_bond_connectors=False)
 
 
 undefined_distribution = [
