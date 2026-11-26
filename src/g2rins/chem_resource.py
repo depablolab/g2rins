@@ -452,3 +452,10 @@ smi_bond_mapping = {
 }
 
 bond_num_smi = dict((v, k) for k, v in smi_bond_mapping.items())
+
+# General chiral specification (@TH1 ... @OH30): one stable integer per explicit class and
+# order, 0 = no mark. A bare @/@@ is order 1/2 of the class selected by the written degree.
+chirality_codes = {
+    klass_order: code
+    for code, klass_order in enumerate([(klass, order) for klass, max_order in (("TH", 2), ("AL", 2), ("SP", 3), ("TB", 20), ("OH", 30)) for order in range(1, max_order + 1)], start=1)
+}

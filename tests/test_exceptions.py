@@ -181,11 +181,11 @@ def test_warn_counterion_fallback_and_imbalance(smi):
         g2rins.G2rins.make(smi).get_graph_creator()
 
 
-@pytest.mark.parametrize("smi", [])
-def test_warn_incompatible_bond_type_bond_connectors(smi):
-    with pytest.warns(g2rins.exception.IncompatibleBondTypeBondConnector):
-        obj = g2rins.G2rins.make(smi)
-        obj.get_graph_creator()
+@pytest.mark.parametrize("smi", ["{[] [<]=CC[>]; [H][>]; [<][H] []}|gauss(400,10)|", "{[] [$]=CC[$]; [H][$]; [$][H] []}|gauss(400,10)|"])
+def test_incompatible_bond_order_at_bond_connectors_raises(smi):
+    # Connector paths are merged when the generative graph is requested, so the error surfaces there, not at parse time.
+    with pytest.raises(g2rins.exception.IncompatibleBondTypeBondConnector):
+        g2rins.G2rins.make(smi).get_graph_creator().get_generative_graph()
 
 
 undefined_distribution = [
