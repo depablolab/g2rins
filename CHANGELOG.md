@@ -22,6 +22,7 @@ Notable, user-visible changes to G²RINS. The format is based on [Keep a Changel
 - A string can hold up to 50 stochastic objects, nested ones included, instead of 10. The per-node `molecular_weight_distribution`, `unit_molar_amounts` and `stochastic_id_tree` vectors of the generative graph have 50 entries instead of 10, so the graph and its JSON output change shape. `EnsembleCreator` takes the length from the graph and still samples graphs built with 10 entries.
 - Ensemble sampling is faster, about twice on most of the guide's examples and up to seven times, with unchanged chains: each stochastic object's molecular-weight distribution is deserialized once per `EnsembleCreator` instead of once per chain and once per terminator candidate of every termination-mass estimate.
 - Sampling checkpoints reuse the ensemble creator's distribution table and the template graph's per-node molar-amount vectors. Sampling is a further 3% to 20% faster on the guide's examples, and the number of vector entries no longer costs sampling time.
+- The guide samples its ensembles in parallel worker processes and with a fixed seed, so repeated runs reproduce the same ensembles and statistics; `SEED = None` samples new ones at every run. A new options cell ahead of the helper functions holds `PARALLEL`, `N_WORKERS` and `SEED`.
 
 ### Fixed
 
